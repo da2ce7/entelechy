@@ -21,7 +21,7 @@ ADAM_BETA2 = 0.999
 CL_KERNEL_FILES = [
     'kernel_forward_pass.cl',
     'kernel_backpropagation.cl',
-    'kernel_adam_optimizer.cl',
+    'kernel_adam_update.cl',
     'kernel_multi_exit.cl'
 ]
 
@@ -36,16 +36,26 @@ def pad_to_multiple(arr, multiple):
     return padded
 
 def preprocess_weights(w):
-    """Reshape weights for vectorized OpenCL access"""
-    if w.ndim == 2:  # Main weights [IN, HID]
-        return w.T.reshape(HIDDEN_DIM, INPUT_DIM//4, 4)
-    elif w.ndim == 3:  # Exit weights [EXIT, HID, OUT]
-        return w.transpose(0, 2, 1).reshape(NUM_EXITS, OUTPUT_CLASSES, HIDDEN_DIM//4, 4)
+    """Reshape weights for vectorized OpenCL access with SIMD padding"""
+    if w.ndim == 2:  # Main weights [INPUT_DIM, HIDDEN_DIM]
+        return w.T.reshape(HIDDEN_DIM//4, INPUT_DIM//4, 4)
+
+    elif w.ndim == 3:  # Exit weights [NUM_EXITS, HIDDEN_DIM, OUTPUT_CLASSES]
+        # Pad class dimension to multiple of 4 and reshape for vectorization
+        w_padded = pad_to_multiple(w, 4, axis=-1)  # Pad class dimension
+        return w_padded.transpose(0, 2, 1).reshape(
+            NUM_EXITS,
+            w_padded.shape[-1],  # Padded classes dimension
+            HIDDEN_DIM//4,
+            4
+        )
+
     raise ValueError(f"Unsupported weight dim {w.ndim}")
 
 def safe_init(shape, std=0.1):
     arr = np.random.normal(0, std, shape).astype(np.float32)
-    if arr.ndim >= 2:  # Only pad weight matrices
+    # All 2D+ tensors get last dim padded to multiples of 4
+    if arr.ndim >= 2:
         return pad_to_multiple(arr, 4)
     return arr
 
@@ -74,143 +84,168 @@ def main():
     program = cl.Program(ctx, "\n".join(kernel_sources)).build(" ".join(build_opts))
     mf = cl.mem_flags
 
-    # Parameter Initialization
-    # Main network weights [IN, HID]
-    np_weights = safe_init((INPUT_DIM, HIDDEN_DIM))
-    np_weights = preprocess_weights(np_weights)  # [HID, IN/4, 4]
+    # Parameter Initialization -------------------------------------------------
+    # Main network parameters
+    np_weights_vec4 = preprocess_weights(safe_init((INPUT_DIM, HIDDEN_DIM)))
     np_biases = safe_init(HIDDEN_DIM)
 
-    # Exit layers weights [EXITS, HID, OUT]
-    np_exit_weights = safe_init((NUM_EXITS, HIDDEN_DIM, OUTPUT_CLASSES))
-    np_exit_weights = preprocess_weights(np_exit_weights)  # [EXITS, OUT, HID/4,4]
+    # Exit layer parameters
+    np_exit_weights_vec4 = preprocess_weights(
+        safe_init((NUM_EXITS, HIDDEN_DIM, OUTPUT_CLASSES))
+    )
     np_exit_biases = safe_init((NUM_EXITS, OUTPUT_CLASSES))
 
     # Validation checks
     assert HIDDEN_DIM % 4 == 0, "HIDDEN_DIM not SIMD-aligned"
-    assert np_weights.shape == (HIDDEN_DIM, INPUT_DIM//4, 4), \
-        f"Main weights shape invalid: {np_weights.shape}"
-    assert np_exit_weights.shape == (NUM_EXITS, OUTPUT_CLASSES, HIDDEN_DIM//4,4), \
-        f"Exit weights shape invalid: {np_exit_weights.shape}"
+    assert np_weights_vec4.shape == (HIDDEN_DIM//4, INPUT_DIM//4, 4), \
+        f"Main weights shape invalid: {np_weights_vec4.shape}"
+    assert np_exit_weights_vec4.shape == (NUM_EXITS, OUTPUT_CLASSES, HIDDEN_DIM//4, 4), \
+        f"Exit weights shape invalid: {np_exit_weights_vec4.shape}"
+    assert np_exit_biases.shape == (NUM_EXITS, OUTPUT_CLASSES), \
+        f"Exit biases shape invalid: {np_exit_biases.shape}"
 
-    # Create buffers
-    cl_weights = cl.Buffer(ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=np_weights)
+    # Create OpenCL Buffers ----------------------------------------------------
+    cl_input_vec4 = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                            hostbuf=X.reshape(BATCH_SIZE, INPUT_DIM//4, 4))
+    cl_weights_vec4 = cl.Buffer(ctx, mf.READ_WRITE | mf.COPY_HOST_PTR,
+                              hostbuf=np_weights_vec4)
     cl_biases = cl.Buffer(ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=np_biases)
-    cl_exit_weights = cl.Buffer(ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=np_exit_weights)
-    cl_exit_biases = cl.Buffer(ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=np_exit_biases)
+    cl_exit_weights_vec4 = cl.Buffer(ctx, mf.READ_WRITE | mf.COPY_HOST_PTR,
+                                   hostbuf=np_exit_weights_vec4)
+    cl_exit_biases = cl.Buffer(ctx, mf.READ_WRITE | mf.COPY_HOST_PTR,
+                             hostbuf=np_exit_biases)
 
     # Training buffers
-    cl_hidden = cl.Buffer(ctx, mf.READ_WRITE, BATCH_SIZE*HIDDEN_DIM*4)
-    cl_X = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=X)
-    cl_y = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=y_true)
-    cl_all_exits = cl.Buffer(ctx, mf.READ_WRITE, BATCH_SIZE*NUM_EXITS*OUTPUT_CLASSES*4)
-    cl_loss = cl.Buffer(ctx, mf.READ_WRITE, BATCH_SIZE*NUM_EXITS*4)
+    cl_hidden_vec4 = cl.Buffer(ctx, mf.READ_WRITE,
+                             BATCH_SIZE * (HIDDEN_DIM//4) * 16)  # float4: 4 elements * 4 bytes each * 4 bytes
+    cl_targets = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=y_true)
+    num_classes_padded = ((OUTPUT_CLASSES + 3) // 4) * 4
+    cl_exit_probs = cl.Buffer(
+        ctx, mf.READ_WRITE,
+        BATCH_SIZE * NUM_EXITS * num_classes_padded * 4
+    )
+    cl_losses = cl.Buffer(ctx, mf.READ_WRITE, BATCH_SIZE*NUM_EXITS*4)
 
     # Moment buffers
-    def create_moments(param):
+    def create_moments_vec4(param_vec4):
         return (
-            cl.Buffer(ctx, mf.READ_WRITE, param.nbytes),
-            cl.Buffer(ctx, mf.READ_WRITE, param.nbytes)
+            cl.Buffer(ctx, mf.READ_WRITE, param_vec4.nbytes),
+            cl.Buffer(ctx, mf.READ_WRITE, param_vec4.nbytes)
         )
-    hidden_w_m1, hidden_w_m2 = create_moments(np_weights)
-    hidden_b_m1, hidden_b_m2 = create_moments(np_biases)
-    exit_w_m1, exit_w_m2 = create_moments(np_exit_weights)
-    exit_b_m1, exit_b_m2 = create_moments(np_exit_biases)
+    hidden_w_m1, hidden_w_m2 = create_moments_vec4(np_weights_vec4)
+    hidden_b_m1, hidden_b_m2 = create_moments_vec4(np_biases)
+    exit_w_m1, exit_w_m2 = create_moments_vec4(np_exit_weights_vec4)
+    exit_b_m1, exit_b_m2 = create_moments_vec4(np_exit_biases)
 
     # Gradient buffers
-    cl_dW = cl.Buffer(ctx, mf.READ_WRITE, np_weights.nbytes)
-    cl_db = cl.Buffer(ctx, mf.READ_WRITE, np_biases.nbytes)
-    cl_exit_dW = cl.Buffer(ctx, mf.READ_WRITE, np_exit_weights.nbytes)
-    cl_exit_db = cl.Buffer(ctx, mf.READ_WRITE, np_exit_biases.nbytes)
+    cl_grad_weights_vec4 = cl.Buffer(ctx, mf.READ_WRITE, np_weights_vec4.nbytes)
+    cl_grad_biases = cl.Buffer(ctx, mf.READ_WRITE, np_biases.nbytes)
+    cl_grad_exit_weights_vec4 = cl.Buffer(ctx, mf.READ_WRITE, np_exit_weights_vec4.nbytes)
+    cl_grad_exit_biases = cl.Buffer(ctx, mf.READ_WRITE, np_exit_biases.nbytes)
 
     learning_rate = 0.001
     global_step = 0
 
+    # Training Loop ------------------------------------------------------------
     for epoch in range(EPOCHS):
         # Forward Pass
-        global_x = ((BATCH_SIZE + WORKGROUP_SIZE-1) // WORKGROUP_SIZE) * WORKGROUP_SIZE
-        global_size = (global_x, HIDDEN_DIM//4)
-
         program.forward_pass(
-            queue, global_size, (WORKGROUP_SIZE, 1),
-            cl_X, cl_weights, cl_biases, cl_hidden,
-            np.int32(INPUT_DIM), np.int32(HIDDEN_DIM)
+            queue,
+            ((BATCH_SIZE + WORKGROUP_SIZE-1)//WORKGROUP_SIZE*WORKGROUP_SIZE, HIDDEN_DIM//4),
+            (WORKGROUP_SIZE, 1),
+            cl_input_vec4,
+            cl_weights_vec4,
+            cl_biases,
+            cl_hidden_vec4,
+            np.int32(INPUT_DIM),
+            np.int32(HIDDEN_DIM)
         )
 
-        # Exit Probability Computation
+        # Multi-Exit Processing
         events = []
-        for exit_id in range(NUM_EXITS):
+        for exit_idx in range(NUM_EXITS):
             event = program.compute_exit_probabilities(
                 queue, (BATCH_SIZE,), None,
-                cl_hidden, cl_exit_weights, cl_exit_biases,
-                cl_all_exits, cl_loss, cl_y,
-                np.int32(HIDDEN_DIM), np.int32(OUTPUT_CLASSES),
-                np.int32(NUM_EXITS), np.int32(exit_id)
+                cl_hidden_vec4,
+                cl_exit_weights_vec4,
+                cl_exit_biases,
+                cl_exit_probs,
+                cl_losses,
+                cl_targets,
+                np.int32(HIDDEN_DIM),
+                np.int32(OUTPUT_CLASSES),
+                np.int32(NUM_EXITS),
+                np.int32(exit_idx)
             )
             events.append(event)
         cl.wait_for_events(events)
 
-        # Backpropagation
-        cl.enqueue_fill_buffer(queue, cl_dW, np.float32(0), 0, np_weights.nbytes)
-        cl.enqueue_fill_buffer(queue, cl_db, np.float32(0), 0, np_biases.nbytes)
-        cl.enqueue_fill_buffer(queue, cl_exit_dW, np.float32(0), 0, np_exit_weights.nbytes)
-        cl.enqueue_fill_buffer(queue, cl_exit_db, np.float32(0), 0, np_exit_biases.nbytes)
+        # Backpropagation Setup
+        cl.enqueue_fill_buffer(queue, cl_grad_weights_vec4, np.float32(0), 0, np_weights_vec4.nbytes)
+        cl.enqueue_fill_buffer(queue, cl_grad_biases, np.float32(0), 0, np_biases.nbytes)
+        cl.enqueue_fill_buffer(queue, cl_grad_exit_weights_vec4, np.float32(0), 0, np_exit_weights_vec4.nbytes)
+        cl.enqueue_fill_buffer(queue, cl_grad_exit_biases, np.float32(0), 0, np_exit_biases.nbytes)
         queue.finish()
 
-        # Backprop Kernel
-        program.compute_backprop_gradients(
+        # Compute Gradients
+        program.compute_gradients(
             queue,
             ((INPUT_DIM + 31)//32 * 32, HIDDEN_DIM),
             (32, 8),
-            cl_X, cl_hidden, cl_all_exits, cl_y, cl_exit_weights,
-            cl_dW, cl_db, cl_exit_dW, cl_exit_db,
-            np.int32(INPUT_DIM), np.int32(HIDDEN_DIM),
-            np.int32(np_exit_weights.shape[-2]*4),  # Account for padding
-            np.int32(OUTPUT_CLASSES), np.int32(NUM_EXITS)
+            cl_input_vec4,
+            cl_hidden_vec4,
+            cl_exit_probs,
+            cl_targets,
+            cl_exit_weights_vec4,
+            cl_grad_weights_vec4,
+            cl_grad_biases,
+            np.int32(INPUT_DIM),
+            np.int32(HIDDEN_DIM),
+            np.int32(OUTPUT_CLASSES),
+            np.int32(NUM_EXITS)
         )
 
-        # Adam Updates
-        def run_adam(buffer, grad, m1, m2, param_array):
+        # Adam Updates for All Parameters
+        def run_adam(param_vec4, grad_vec4, m1, m2):
             t = global_step + 1
             b1_t = 1/(1 - ADAM_BETA1**t)
             b2_t = 1/(1 - ADAM_BETA2**t)
 
-            program.adam_optimize(
-                queue, (param_array.size//4,), (ADAM_WORKGROUP_SIZE,),
-                grad, buffer, m1, m2, np.float32(learning_rate),
-                np.float32(ADAM_BETA1), np.float32(ADAM_BETA2),
-                np.float32(b1_t), np.float32(b2_t),
-                np.int32(param_array.size)
+            program.adam_update(
+                queue,
+                (param_vec4.size//4,),
+                (ADAM_WORKGROUP_SIZE,),
+                grad_vec4,
+                param_vec4,
+                m1,
+                m2,
+                np.float32(learning_rate),
+                np.float32(ADAM_BETA1),
+                np.float32(ADAM_BETA2),
+                np.float32(b1_t),
+                np.float32(b2_t),
+                np.int32(param_vec4.size)
             )
 
-        run_adam(cl_weights, cl_dW, hidden_w_m1, hidden_w_m2, np_weights)
-        run_adam(cl_biases, cl_db, hidden_b_m1, hidden_b_m2, np_biases)
-        run_adam(cl_exit_weights, cl_exit_dW, exit_w_m1, exit_w_m2, np_exit_weights)
-        run_adam(cl_exit_biases, cl_exit_db, exit_b_m1, exit_b_m2, np_exit_biases)
+        run_adam(cl_weights_vec4, cl_grad_weights_vec4, hidden_w_m1, hidden_w_m2)
+        run_adam(cl_biases, cl_grad_biases, hidden_b_m1, hidden_b_m2)
+        run_adam(cl_exit_weights_vec4, cl_grad_exit_weights_vec4, exit_w_m1, exit_w_m2)
+        run_adam(cl_exit_biases, cl_grad_exit_biases, exit_b_m1, exit_b_m2)
+
         global_step += 1
 
         # Validation
         if epoch % 10 == 0:
-            # Check numerical stability
-            check_weights = np.empty_like(np_weights)
-            cl.enqueue_copy(queue, check_weights, cl_weights)
-            if not np.all(np.isfinite(check_weights)):
-                print(f"Numerical instability at epoch {epoch}")
-                break
+            check_weights = np.empty_like(np_weights_vec4)
+            cl.enqueue_copy(queue, check_weights, cl_weights_vec4)
 
-            # Accuracy computation
             exit_probs = np.empty((BATCH_SIZE, NUM_EXITS, OUTPUT_CLASSES), np.float32)
-            cl.enqueue_copy(queue, exit_probs, cl_all_exits)
+            cl.enqueue_copy(queue, exit_probs, cl_exit_probs)
 
-            weights = np.array([0.4, 0.3, 0.3])  # Learned weights would be better
-            ensemble = np.average(exit_probs, axis=1, weights=weights)
+            ensemble = np.average(exit_probs, axis=1, weights=[0.4, 0.3, 0.3])
             acc = np.mean(np.argmax(ensemble, 1) == y_true[:BATCH_SIZE])
 
-            # Loss retrieval
-            losses = np.empty((BATCH_SIZE, NUM_EXITS), np.float32)
-            cl.enqueue_copy(queue, losses, cl_loss)
-            avg_losses = np.mean(losses, 0)
-
-            print(f"Epoch {epoch:3d} | Acc: {acc:.1%} | Losses: {avg_losses.round(3)}")
+            print(f"Epoch {epoch:3d} | Acc: {acc:.1%}")
 
 if __name__ == "__main__":
     main()
