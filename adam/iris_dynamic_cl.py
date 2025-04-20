@@ -2,6 +2,7 @@
 import pyopencl as cl
 import numpy as np
 import math
+from math import gcd
 from sklearn.datasets import load_iris
 from sklearn.preprocessing import OneHotEncoder
 
@@ -19,14 +20,21 @@ CL_KERNEL_FILES = [
     'kernel_multi_exit.cl'
 ]
 
+def lcm(a, b):
+    """Calculate Least Common Multiple"""
+    return a * b // gcd(a, b)
+
 def next_pow2(n):
     return 1 if n == 0 else 1 << (n - 1).bit_length()
 
 def pad_to_multiple(arr, multiple, axis=-1):
     """Pad array to ensure SIMD alignment along specified axis"""
     pad_size = (-arr.shape[axis]) % multiple
-    return np.pad(arr, [(0, pad_size) if i == axis else (0,0) for i in range(arr.ndim)],
+    padded = np.pad(arr, [(0, pad_size) if i == axis else (0,0) for i in range(arr.ndim)],
                   mode='constant') if pad_size !=0 else arr
+    assert padded.shape[axis] % multiple == 0, \
+        f"Padded axis {axis} to {padded.shape[axis]} not {multiple} aligned"
+    return padded
 
 def select_simd_width(device):
     """Intelligent SIMD width selection with architectural awareness"""
@@ -75,20 +83,48 @@ def create_aligned_buffer(ctx, host_data, simd_width, mode='r'):
     return cl.Buffer(ctx, flags | cl.mem_flags.COPY_HOST_PTR, hostbuf=padded_data)
 
 def validate_workgroup(global_size, local_size, device, local_mem_per_item=0):
-    """Comprehensive workgroup validation with memory checks"""
-    # Size compatibility
-    if not all(g % l == 0 for g,l in zip(global_size, local_size)):
-        raise ValueError(f"Global {global_size} not divisible by local {local_size}")
+    """Validate workgroup configuration with memory safety prioritization"""
+    # Maintain original parameters as tuples for clear error messages
+    global_size = tuple(global_size)
+    local_size = tuple(local_size)
 
-    # Total workgroup size
-    total_wg = np.prod(local_size)
-    if total_wg > device.max_work_group_size:
-        raise ValueError(f"Workgroup {total_wg} exceeds device limit {device.max_work_group_size}")
+    # 1. Local Memory Validation (Critical Safety Gate)
+    total_work_items = np.prod(local_size)
+    required_local = total_work_items * local_mem_per_item
 
-    # Local memory requirements
-    required_local = total_wg * local_mem_per_item
     if required_local > device.local_mem_size:
-        raise ValueError(f"Insufficient local memory: {required_local} > {device.local_mem_size}")
+        raise ValueError(
+            f"Local memory overflow: {required_local/1024:.1f}KB > "
+            f"{device.local_mem_size/1024:.1f}KB\n"
+            f"Calculation: {total_work_items} workers × "
+            f"{local_mem_per_item} B/item = {required_local}B"
+        )
+
+    # 2. Total Workgroup Size Limit
+    if total_work_items > device.max_work_group_size:
+        raise ValueError(
+            f"Workgroup size {total_work_items} exceeds device limit "
+            f"{device.max_work_group_size}\n"
+            f"Local size: {local_size} → {total_work_items} items"
+        )
+
+    # 3. Workgroup Divisibility Check
+    for g_dim, l_dim in zip(global_size, local_size):
+        if l_dim == 0:
+            raise ValueError(f"Invalid local dimension: {l_dim}")
+        if g_dim % l_dim != 0:
+            raise ValueError(
+                f"Global size {g_dim} not divisible by local {l_dim}\n"
+                f"Required multiplier: {math.ceil(g_dim / l_dim)}"
+            )
+
+    # 4. ND-Range Alignment (Optional but recommended)
+    if len(global_size) != len(local_size):
+        raise ValueError(
+            f"Dimension mismatch: Global {len(global_size)}D vs Local {len(local_size)}D"
+        )
+
+    return True  # Explicit success return for monitoring
 
 def main():
     # Data preparation
@@ -96,28 +132,33 @@ def main():
     X = iris.data.astype(np.float32)
     y_true = iris.target.astype(np.int32).reshape(-1,1)
 
-    # One-Hot targets must be aligned and used in buffers
-    y_onehot = OneHotEncoder(sparse_output=False).fit_transform(y_true)
-    y_targets = pad_to_multiple(y_onehot, simd_width, axis=1).astype(np.float32)
-
     # OpenCL context setup
     ctx = cl.create_some_context()
-    queue = cl.CommandQueue(ctx,
-                          properties=cl.command_queue_properties.PROFILING_ENABLE)
+    queue = cl.CommandQueue(ctx,properties=cl.command_queue_properties.PROFILING_ENABLE)
     device = ctx.devices[0]
 
     # Device configuration
     simd_width = select_simd_width(device)
     max_wg = min(device.max_work_group_size, 1024)  # Sanitize driver reports
     print(f"Training on {device.name} with SIMD-{simd_width}")
+    batch_multiple = lcm(
+        simd_width,
+        min(device.max_work_group_size,
+            next_pow2(HIDDEN_DIM//simd_width) * simd_width)
+    )
+
+    # Create and align one-hot targets only once
+    y_onehot = OneHotEncoder(sparse_output=False).fit_transform(y_true)
+    y_targets = pad_to_multiple(y_onehot, simd_width, axis=1)
 
     # Workgroup optimization
-    # next_pow2() ensures coalesced memory access across wavefronts
     wg_config = {
         'forward': (BATCH_SIZE, HIDDEN_DIM//simd_width),
         'gradients': (next_pow2(X.shape[1]//simd_width), next_pow2(HIDDEN_DIM)),
         'adam': max(1, (HIDDEN_DIM * X.shape[1])//(simd_width * 256))
     }
+    max_padded_batch = ((BATCH_SIZE + batch_multiple -1) // batch_multiple) * batch_multiple
+    output_classes_padded = ((OUTPUT_CLASSES + simd_width-1) // simd_width) * simd_width
 
     assert (HIDDEN_DIM % simd_width) == 0, \
         f"Hidden dim {HIDDEN_DIM} not aligned to SIMD-{simd_width}"
@@ -130,7 +171,7 @@ def main():
 
     build_opts = [
         f"-D SIMD_WIDTH={simd_width}",
-        f"-D FLOATV=float{simd_width if simd_width>1 else ''}",
+        f"-D FLOATV={'float'+str(simd_width) if simd_width>1 else 'float'}",
         f"-D BATCH_SIZE={BATCH_SIZE}",
         f"-D HIDDEN_DIM={HIDDEN_DIM}",
         f"-D OUTPUT_CLASSES={OUTPUT_CLASSES}",
@@ -142,15 +183,33 @@ def main():
     if 'Mali' in device.vendor or 'Adreno' in device.vendor:
         build_opts.append("-cl-single-precision-constant -cl-opt-disable")
 
-    program = cl.Program(ctx, "\n".join(kernel_src)).build(" ".join(build_opts))
+    program = cl.Program(ctx, "\n".join(kernel_src))
+
+    try:
+        program.build(options=" ".join(build_opts))
+    except cl.RuntimeError as e:
+        print(f"Build failed with OPTS: {' '.join(build_opts)}")
+
+        if hasattr(e, 'log'):
+            print("Kernel Build Log:")
+            print(e.log)
+
+        print(f"Device Max WG Size: {device.max_work_group_size}")
+        print(f"SIMD Configured: {simd_width}")
+        raise
 
     # Data preparation with SIMD alignment
-    X_padded = pad_to_multiple(X, simd_width)
+    X_padded = pad_to_multiple(X, simd_width, axis=1)
     input_dim = X_padded.shape[1]
+    y_padded = pad_to_multiple(y_targets, batch_multiple, axis=0)  # Align batch dim to LCM
     assert input_dim % simd_width == 0, f"Input dim {input_dim} not SIMD-{simd_width} aligned"
 
     # Parameter initialization
     def init_param(shape, scale=0.1):
+        """
+        Ensure weights and biases are aligned both for input and output dimensions
+        while accounting for SIMD vector width.
+        """
         arr = np.random.normal(0, scale, shape).astype(np.float32)
         return pad_to_multiple(arr, simd_width) if arr.ndim >=2 else arr
 
@@ -162,17 +221,31 @@ def main():
     # Buffer creation
     buffers = {
         'input': create_aligned_buffer(ctx, X_padded, simd_width, 'r'),
+        # DELETE EXCESS BUFFERS
         'weights': create_aligned_buffer(ctx, weights, simd_width, 'rw'),
         'biases': create_aligned_buffer(ctx, biases, simd_width, 'rw'),
         'exit_weights': create_aligned_buffer(ctx, exit_weights, simd_width, 'rw'),
         'exit_biases': create_aligned_buffer(ctx, exit_biases, simd_width, 'rw'),
-        'hidden': cl.Buffer(ctx, cl.mem_flags.READ_WRITE,
-                          X_padded.nbytes * HIDDEN_DIM//input_dim),
-        'targets': create_aligned_buffer(ctx, y_targets, simd_width, 'r'),  # Now proper one-hot
+        'hidden': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * HIDDEN_DIM *4),
+        'targets': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * output_classes_padded *4),
         'exit_probs': cl.Buffer(ctx, cl.mem_flags.READ_WRITE,
-            BATCH_SIZE * NUM_EXITS * ((OUTPUT_CLASSES + simd_width-1)//simd_width*simd_width)*4),
-        'losses': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, BATCH_SIZE * NUM_EXITS *4)
+            max_padded_batch * NUM_EXITS * output_classes_padded *4),
+        'losses': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * NUM_EXITS *4)
     }
+
+    # ===== Buffer Allocation Tests =====
+    buffer_meta = {
+        'input': (max_padded_batch * input_dim, "batch × input features"),
+        'targets': (max_padded_batch * output_classes_padded, "batch × classes"),
+        'hidden': (max_padded_batch * HIDDEN_DIM, "batch × hidden units"),
+        'exit_probs': (max_padded_batch * NUM_EXITS * output_classes_padded, "batch × exits × classes"),
+        'losses': (max_padded_batch * NUM_EXITS, "batch × exits")
+    }
+
+    for buf_name, (expected_size, dim_desc) in buffer_meta.items():
+        actual_size = buffers[buf_name].size // 4  # int32 to float32 conversion
+        assert actual_size == expected_size, \
+            f"Buffer {buf_name} ({dim_desc}) size mismatch: {actual_size} ≠ {expected_size}"
 
     # Gradient and moment buffers
     for param in ['weights', 'biases', 'exit_weights', 'exit_biases']:
@@ -182,39 +255,59 @@ def main():
             cl.Buffer(ctx, cl.mem_flags.READ_WRITE, buffers[param].size)
             for _ in range(2)
         ]
-        buffer_elements = buffers[param].size // 4  # 4 bytes/float
-        init_m1 = np.zeros(buffer_elements, dtype=np.float32)
-        cl.enqueue_copy(queue, buffers[f'm1_{param}'], init_m1)
-        cl.enqueue_copy(queue, buffers[f'm2_{param}'], init_m1)
+
+        cl.enqueue_fill_buffer(queue, buffers[f'm1_{param}'], np.float32(0), 0, buffers[param].size)
+        cl.enqueue_fill_buffer(queue, buffers[f'm2_{param}'], np.float32(0), 0, buffers[param].size)
 
     # Training loop
     global_step = 1
     for epoch in range(EPOCHS):
+        # Shuffle and pad full dataset once per epoch
+        shuffled_indices = np.random.permutation(len(X))
+        # Extract from X_padded to maintain feature padding
+        shuffled_X_padded = X_padded[shuffled_indices]
+        shuffled_y = y_padded[shuffled_indices]  # Shuffle targets while preserving padding
+        shuffled_X_padded = pad_to_multiple(shuffled_X_padded, batch_multiple, axis=0)
+        shuffled_y_padded = pad_to_multiple(shuffled_y, batch_multiple, axis=0)
+
+        num_samples = len(shuffled_indices)
+        num_batches = (num_samples + BATCH_SIZE - 1) // BATCH_SIZE
+
         epoch_loss = 0.0
         correct_predictions = 0
 
-        # Shuffle dataset each epoch
-        indices = np.random.permutation(len(X))
-        for batch_start in range(0, len(indices), BATCH_SIZE):
-            batch_end = min(batch_start + BATCH_SIZE, len(indices))
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * BATCH_SIZE
+            batch_end = min(batch_start + BATCH_SIZE, num_samples)
             actual_batch_size = batch_end - batch_start
-            batch_indices = indices[batch_start:batch_end]
 
-            # Get batch data (with SIMD padding if needed)
-            X_batch = pad_to_multiple(X[batch_indices], simd_width)
-            y_batch = y_true[batch_indices]
+            # Get pre-padded batch data
+            X_batch = shuffled_X_padded[batch_start:batch_end]
+            y_batch = shuffled_y_padded[batch_start:batch_end]  # 1. Padded inputs
+            valid_y = shuffled_y[batch_start:batch_end]         # 2. Original targets
+            actual_batch_size = batch_end - batch_start  # True sample count
+            padded_batch_size = X_batch.shape[0]         # With padding
 
-            # Update input buffer
+            # ===== Batch Integrity Tests =====
+            assert X_batch.shape == (padded_batch_size, input_dim), \
+                f"X_batch shape {X_batch.shape} ≠ ({padded_batch_size}, {input_dim})"
+            assert y_batch.shape == (padded_batch_size, output_classes_padded), \
+                f"y_batch shape {y_batch.shape} ≠ ({padded_batch_size}, {output_classes_padded})"
+            
+            # Update device buffers
             cl.enqueue_copy(queue, buffers['input'], X_batch)
-            cl.enqueue_copy(queue, buffers['targets'], y_batch)
+            cl.enqueue_copy(queue, buffers['targets'], y_batch,
+                           size=padded_batch_size*output_classes_padded*4)
             queue.finish()
 
-            # =========== Forward Pass ===========
-            global_forward = (actual_batch_size, HIDDEN_DIM//simd_width)
+            padded_batch_size = X_batch.shape[0]
+            global_forward = (padded_batch_size, HIDDEN_DIM//simd_width)
+
+            # Calculate optimal local size
             max_wg_x = min(device.max_work_group_size // simd_width,
-              next_pow2(actual_batch_size))  # Align to batch-size
-            local_forward_x = max_wg_x if actual_batch_size % max_wg_x ==0 \
-                else next_pow2(math.gcd(actual_batch_size, max_wg_x))
+                         next_pow2(padded_batch_size))
+            local_forward_x = max_wg_x if padded_batch_size % max_wg_x ==0 \
+                            else next_pow2(math.gcd(padded_batch_size, max_wg_x))
             compute_units = device.max_compute_units
             local_forward_x_limited = min(local_forward_x, compute_units * 64)
             local_forward = (local_forward_x_limited, simd_width)
@@ -224,27 +317,32 @@ def main():
             forward_event = program.forward_pass(
                 queue, global_forward, local_forward,
                 buffers['input'], buffers['weights'], buffers['biases'],
-                buffers['hidden'], cl.LocalMemory(np.prod(local_forward)*4),
-                np.int32(X_batch.shape[1]), np.int32(actual_batch_size)
+                buffers['hidden'],
+                np.int32(input_dim), np.int32(hidden_dim),
+                cl.LocalMemory(local_forward[0] * simd_width * 16)  # 4 floats * 4 bytes
             )
             forward_event.wait()
 
             # ============ Early Exits ===========
             exit_events = []
             for exit_idx in range(NUM_EXITS):
-                global_exit = (actual_batch_size,)
                 local_exit = (min(device.max_work_group_size,
-                                next_pow2(actual_batch_size)),)
+                                next_pow2(padded_batch_size)),)
+                global_exit = ( (padded_batch_size + local_exit[0] -1) // local_exit[0] ) * local_exit[0]
+
                 validate_workgroup(global_exit, local_exit, device,
-                                 local_exit[0]*simd_width*4)
+                                local_exit[0]*simd_width*4)
 
                 exit_event = program.compute_exit_probabilities(
                     queue, global_exit, local_exit,
-                    buffers['hidden'], buffers['exit_weights'],
-                    buffers['exit_biases'], buffers['targets'],
-                    buffers['exit_probs'], buffers['losses'],
+                    buffers['hidden'],
+                    buffers['exit_weights'],
+                    buffers['exit_biases'],
+                    buffers['targets'],
+                    buffers['exit_probs'],
+                    buffers['losses'],
                     cl.LocalMemory(local_exit[0]*simd_width*4),
-                    np.int32(exit_idx), np.int32(actual_batch_size)
+                    np.int32(exit_idx), np.int32(padded_batch_size)
                 )
                 exit_events.append(exit_event)
             cl.wait_for_events(exit_events)
@@ -264,7 +362,8 @@ def main():
                 buffers['targets'], buffers['exit_weights'],
                 buffers['grad_weights'], buffers['grad_biases'],
                 cl.LocalMemory(np.prod(local_grad)*simd_width*4),
-                np.int32(X_batch.shape[1]), np.int32(actual_batch_size)
+                np.int32(OUTPUT_CLASSES), np.int32(NUM_EXITS),
+                np.int32(X_batch.shape[1]), np.int32(padded_batch_size)
             )
             grad_event.wait()
 
@@ -275,7 +374,6 @@ def main():
 
             for param in ['weights', 'biases', 'exit_weights', 'exit_biases']:
                 total_params = buffers[param].size // 4
-                # Round up to nearest multiple of workgroup size
                 global_size = ((total_params + wg_config['adam'] -1) // wg_config['adam']) * wg_config['adam']
                 vector_stride = max(1, global_size // wg_config['adam'])
 
@@ -285,33 +383,38 @@ def main():
                     buffers[f'm1_{param}'], buffers[f'm2_{param}'],
                     np.float32(0.001), np.float32(0.9), np.float32(0.999),
                     np.float32(beta1_t), np.float32(beta2_t),
-                    np.int32(vector_stride), np.int32(actual_batch_size)
+                    np.int32(total_params)
                 )
                 update_events.append(update_event)
-            cl.wait_for_events(update_events)
-
-            # Calculate batch accuracy
-            padded_classes = (OUTPUT_CLASSES + simd_width -1) // simd_width * simd_width
-            exit_probs = np.empty((actual_batch_size, NUM_EXITS, padded_classes), np.float32)
-            cl.enqueue_copy(queue, exit_probs, buffers['exit_probs'],
-                size=actual_batch_size*NUM_EXITS*padded_classes*4).wait()
-            valid_probs = exit_probs[:, :, :OUTPUT_CLASSES]
-
-            ensemble = np.mean(valid_probs, axis=1)
-            correct_predictions += np.sum(np.argmax(ensemble, axis=1) == y_batch.flatten())
-            losses = np.empty(actual_batch_size * NUM_EXITS, dtype=np.float32)
-            cl.enqueue_copy(queue, losses, buffers['losses'],
-                size=actual_batch_size*NUM_EXITS*4).wait()
-            epoch_loss += np.mean(losses)
 
             global_step += 1
 
+            cl.wait_for_events(update_events)
+
+            # ========= Batch Metrics =========
+            padded_classes = (OUTPUT_CLASSES + simd_width -1) // simd_width * simd_width
+            exit_probs = np.empty((padded_batch_size, NUM_EXITS, padded_classes), np.float32)
+            cl.enqueue_copy(queue, exit_probs, buffers['exit_probs'],
+                size=padded_batch_size*NUM_EXITS*padded_classes*4).wait()
+
+            # ===== Output Validation =====
+            assert exit_probs.shape == (padded_batch_size, NUM_EXITS, padded_classes), \
+                f"Exit probs shape {exit_probs.shape} ≠ ({padded_batch_size}, {NUM_EXITS}, {padded_classes})"
+            valid_probs = exit_probs[:actual_batch_size, :, :OUTPUT_CLASSES]
+
+            ensemble = np.mean(valid_probs, axis=1)
+            batch_correct = np.sum(np.argmax(ensemble, axis=1) == np.argmax(valid_y[:,:OUTPUT_CLASSES], axis=1))
+            correct_predictions += batch_correct
+
+            losses = np.empty(padded_batch_size * NUM_EXITS, dtype=np.float32)
+            cl.enqueue_copy(queue, losses, buffers['losses'],
+                size=padded_batch_size*NUM_EXITS*4).wait()
+            epoch_loss += np.mean(losses[:actual_batch_size*NUM_EXITS])
+
         # Epoch statistics
-        train_acc = correct_predictions / len(indices)
-        num_batches = (len(indices) + BATCH_SIZE - 1) // BATCH_SIZE
+        train_acc = correct_predictions / num_samples
         avg_loss = epoch_loss / num_batches
         print(f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | Acc: {train_acc:.1%}")
-
 
 if __name__ == "__main__":
     main()
