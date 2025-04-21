@@ -4,7 +4,6 @@ import numpy as np
 import math
 from math import gcd
 from sklearn.datasets import load_iris
-from sklearn.preprocessing import OneHotEncoder
 
 # Network Configuration
 INPUT_DIM = 4
@@ -165,7 +164,7 @@ def main():
     # Data preparation
     iris = load_iris()
     X = iris.data.astype(np.float32)
-    y_true = iris.target.astype(np.int32).reshape(-1,1)
+    y_true = iris.target.astype(np.int32)
 
     # OpenCL context setup
     ctx = cl.create_some_context()
@@ -182,10 +181,9 @@ def main():
             next_pow2(HIDDEN_DIM//simd_width) * simd_width)
     )
 
-    # Create and align one-hot targets only once
-    y_onehot = OneHotEncoder(sparse_output=False).fit_transform(y_true)
-    y_targets = pad_to_multiple(y_onehot, simd_width, axis=1)
-    output_classes_padded = y_targets.shape[1]  # Actual padded size from encoding
+    # Targets
+    output_classes_padded = ((OUTPUT_CLASSES + simd_width -1) // simd_width) * simd_width
+    y_targets = pad_to_multiple(y_true.reshape(-1), batch_multiple, axis=0)
 
     # Workgroup optimization
     wg_config = {
@@ -268,7 +266,7 @@ def main():
         'exit_weights': create_aligned_buffer(ctx, exit_weights, simd_width, 'rw'),
         'exit_biases': create_aligned_buffer(ctx, exit_biases, simd_width, 'rw'),
         'hidden': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * hidden_dim_padded * 4),
-        'targets': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * output_classes_padded *4),
+        'targets': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * 4),  # int32 labels
         'exit_probs': cl.Buffer(ctx, cl.mem_flags.READ_WRITE,
             max_padded_batch * NUM_EXITS * output_classes_padded *4),
         'losses': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * NUM_EXITS *4)
