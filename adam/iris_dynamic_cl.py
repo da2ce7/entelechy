@@ -13,6 +13,9 @@ OUTPUT_CLASSES = 3
 NUM_EXITS = 3
 EPOCHS = 100
 BATCH_SIZE = 128
+ADAM_BETA1 = 0.9
+ADAM_BETA2 = 0.999
+learning_rate = 0.001 
 CL_KERNEL_FILES = [
     'kernel_forward_pass.cl',
     'kernel_backpropagation.cl',
@@ -170,13 +173,9 @@ def main():
             kernel_src.append(f.read())
 
     build_opts = [
+        f"-D VECTOR_TYPE={'float'+str(simd_width) if simd_width>1 else 'float'}",
         f"-D SIMD_WIDTH={simd_width}",
-        f"-D FLOATV={'float'+str(simd_width) if simd_width>1 else 'float'}",
-        f"-D BATCH_SIZE={BATCH_SIZE}",
-        f"-D HIDDEN_DIM={HIDDEN_DIM}",
-        f"-D OUTPUT_CLASSES={OUTPUT_CLASSES}",
-        f"-D NUM_EXITS={NUM_EXITS}",
-        "-cl-mad-enable -cl-fast-relaxed-math"
+        f"-D USE_FAST_MATH=1"
     ]
 
     # Mobile GPU optimizations
@@ -284,7 +283,8 @@ def main():
             # Get pre-padded batch data
             X_batch = shuffled_X_padded[batch_start:batch_end]
             y_batch = shuffled_y_padded[batch_start:batch_end]  # 1. Padded inputs
-            valid_y = shuffled_y[batch_start:batch_end]         # 2. Original targets
+            valid_y_indices = shuffled_indices[batch_start:batch_end] # 2. Original targets
+            valid_y = y_onehot[valid_y_indices]           # Directly access original one-hot         
             actual_batch_size = batch_end - batch_start  # True sample count
             padded_batch_size = X_batch.shape[0]         # With padding
 
@@ -309,62 +309,93 @@ def main():
             local_forward_x = max_wg_x if padded_batch_size % max_wg_x ==0 \
                             else next_pow2(math.gcd(padded_batch_size, max_wg_x))
             compute_units = device.max_compute_units
-            local_forward_x_limited = min(local_forward_x, compute_units * 64)
-            local_forward = (local_forward_x_limited, simd_width)
-            validate_workgroup(global_forward, local_forward, device,
-                             local_forward[0]*local_forward[1]*4)
+            
+            wg_forward = min(local_forward_x, compute_units * 64)
+            validate_workgroup(global_forward, (wg_forward, simd_width), device,
+                             wg_forward*simd_width*4)
 
             forward_event = program.forward_pass(
-                queue, global_forward, local_forward,
-                buffers['input'], buffers['weights'], buffers['biases'],
+                queue,
+                (padded_batch_size, HIDDEN_DIM//simd_width),  # global_size
+                (wg_forward,simd_width),  # local_size
+                buffers['input'],
+                buffers['weights'],
+                buffers['biases'],
                 buffers['hidden'],
-                np.int32(input_dim), np.int32(hidden_dim),
-                cl.LocalMemory(local_forward[0] * simd_width * 16)  # 4 floats * 4 bytes
+                np.int32(padded_batch_size),
+                np.int32(input_dim),
+                np.int32(HIDDEN_DIM),
+                cl.LocalMemory(wg_forward * simd_width * 4),
+                np.int32(wg_forward)
             )
+
             forward_event.wait()
 
             # ============ Early Exits ===========
             exit_events = []
             for exit_idx in range(NUM_EXITS):
-                local_exit = (min(device.max_work_group_size,
-                                next_pow2(padded_batch_size)),)
-                global_exit = ( (padded_batch_size + local_exit[0] -1) // local_exit[0] ) * local_exit[0]
+                max_local = min(device.max_work_group_size,
+                        next_pow2(padded_batch_size))
 
-                validate_workgroup(global_exit, local_exit, device,
-                                local_exit[0]*simd_width*4)
+                wg_exit = max_local if padded_batch_size % max_local == 0 \
+                        else next_pow2(math.gcd(padded_batch_size, max_local))
+                global_exit = ( (padded_batch_size + wg_exit -1) // wg_exit ) * wg_exit
+
+                validate_workgroup((global_exit,), (wg_exit,), device,
+                     wg_exit*4*simd_width)  # 4 floats per item
 
                 exit_event = program.compute_exit_probabilities(
-                    queue, global_exit, local_exit,
+                    queue,
+                    (global_exit,),  # global_size
+                    (wg_exit,),      # local_size
                     buffers['hidden'],
                     buffers['exit_weights'],
                     buffers['exit_biases'],
                     buffers['targets'],
                     buffers['exit_probs'],
                     buffers['losses'],
-                    cl.LocalMemory(local_exit[0]*simd_width*4),
-                    np.int32(exit_idx), np.int32(padded_batch_size)
+                    np.int32(padded_batch_size),
+                    np.int32(HIDDEN_DIM),
+                    np.int32(OUTPUT_CLASSES),
+                    np.int32(NUM_EXITS),
+                    np.int32(exit_idx),
+                    cl.LocalMemory(wg_exit * 4)  # reduction_buffer
                 )
+
                 exit_events.append(exit_event)
             cl.wait_for_events(exit_events)
 
             # ========== Backpropagation ==========
-            global_grad = (X_batch.shape[1]//simd_width, HIDDEN_DIM)
-            local_grad = (
-                min(32, device.max_work_group_size//8),
-                min(8, device.max_work_group_size//32)
-            )
-            validate_workgroup(global_grad, local_grad, device,
-                             np.prod(local_grad)*simd_width*4)
+            
+            wg_grad_x = min(32, device.max_work_group_size//8)
+            wg_grad_y = min(8, device.max_work_group_size//32)
+
+            input_chunks = X_batch.shape[1] // simd_width
+            global_grad = (input_chunks, HIDDEN_DIM)
+
+            validate_workgroup(global_grad, (wg_grad_x, wg_grad_y), device,
+                  (wg_grad_x * wg_grad_y) * simd_width * 4)
 
             grad_event = program.compute_gradients(
-                queue, global_grad, local_grad,
-                buffers['input'], buffers['hidden'], buffers['exit_probs'],
-                buffers['targets'], buffers['exit_weights'],
-                buffers['grad_weights'], buffers['grad_biases'],
-                cl.LocalMemory(np.prod(local_grad)*simd_width*4),
-                np.int32(OUTPUT_CLASSES), np.int32(NUM_EXITS),
-                np.int32(X_batch.shape[1]), np.int32(padded_batch_size)
+                queue,
+                (input_chunks, HIDDEN_DIM),  # global_size
+                (wg_grad_x, wg_grad_y),      # local_size
+                buffers['input'],
+                buffers['hidden'],
+                buffers['exit_probs'],
+                buffers['targets'],
+                buffers['exit_weights'],
+                buffers['grad_weights'],
+                buffers['grad_biases'],
+                np.int32(padded_batch_size),
+                np.int32(input_dim),
+                np.int32(HIDDEN_DIM),
+                np.int32(OUTPUT_CLASSES),
+                np.int32(NUM_EXITS),
+                cl.LocalMemory(wg_grad_x * wg_grad_y * simd_width * 4),
+                cl.LocalMemory(wg_grad_x * wg_grad_y * 4)
             )
+
             grad_event.wait()
 
             # ============ Adam Update ============
@@ -374,17 +405,25 @@ def main():
 
             for param in ['weights', 'biases', 'exit_weights', 'exit_biases']:
                 total_params = buffers[param].size // 4
-                global_size = ((total_params + wg_config['adam'] -1) // wg_config['adam']) * wg_config['adam']
-                vector_stride = max(1, global_size // wg_config['adam'])
+                wg_adam = min(wg_config['adam'], device.max_work_group_size)
+                global_size = ((total_params + wg_adam -1) // wg_adam) * wg_adam
 
                 update_event = program.adam_update(
-                    queue, (global_size,), (wg_config['adam'],),
-                    buffers[f'grad_{param}'], buffers[param],
-                    buffers[f'm1_{param}'], buffers[f'm2_{param}'],
-                    np.float32(0.001), np.float32(0.9), np.float32(0.999),
-                    np.float32(beta1_t), np.float32(beta2_t),
+                    queue,
+                    (global_size,),  # global_size
+                    (wg_adam,),      # local_size
+                    buffers[f'grad_{param}'],
+                    buffers[param],
+                    buffers[f'm1_{param}'],
+                    buffers[f'm2_{param}'],
+                    np.float32(learning_rate),
+                    np.float32(ADAM_BETA1),
+                    np.float32(ADAM_BETA2),
+                    np.float32(beta1_t),
+                    np.float32(beta2_t),
                     np.int32(total_params)
                 )
+
                 update_events.append(update_event)
 
             global_step += 1
@@ -403,7 +442,7 @@ def main():
             valid_probs = exit_probs[:actual_batch_size, :, :OUTPUT_CLASSES]
 
             ensemble = np.mean(valid_probs, axis=1)
-            batch_correct = np.sum(np.argmax(ensemble, axis=1) == np.argmax(valid_y[:,:OUTPUT_CLASSES], axis=1))
+            batch_correct = np.sum(np.argmax(ensemble, axis=1) == np.argmax(valid_y, axis=1)) # y_onehot is unpadded on axis=1
             correct_predictions += batch_correct
 
             losses = np.empty(padded_batch_size * NUM_EXITS, dtype=np.float32)
