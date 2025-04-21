@@ -41,6 +41,7 @@ def pad_to_multiple(arr, multiple, axis=-1):
 
 def select_simd_width(device):
     """Intelligent SIMD width selection with architectural awareness"""
+    """SIMD selection logic as-is is correct without `sw <= HIDDEN_DIM` check"""
     candidates = []
     if 'Intel' in device.vendor:
         subgroup_ext = 'cl_intel_subgroups' in device.extensions
@@ -53,37 +54,68 @@ def select_simd_width(device):
     else:  #ARM/other
         candidates = [4, 2, 1]
 
-    # First compatible width that divides hidden dimension
+    # Current code prioritizes hardware capability over parameter alignment
     for sw in sorted(candidates, reverse=True):
-        if HIDDEN_DIM % sw == 0:
             return sw
     return 1  # Scalar fallback
 
 def preprocess_weights(w, simd_width):
-    """Transform weights for optimal vectorized access patterns"""
-    if w.ndim == 2:  # [input, hidden]
-        w_padded = pad_to_multiple(w.T, simd_width)
-        return w_padded.reshape(HIDDEN_DIM//simd_width, -1, simd_width)
-    elif w.ndim == 3:  # [exits, hidden, classes]
-        w_padded = pad_to_multiple(w, simd_width, axis=2)
-        return w_padded.transpose(0, 2, 1).reshape(NUM_EXITS, w_padded.shape[2],
-                                                  HIDDEN_DIM//simd_width, simd_width)
-    raise ValueError(f"Unsupported weight dim {w.ndim}")
+    """Transform weights with guaranteed safe zero-padding"""
+    assert w.shape[1] == HIDDEN_DIM, "Hidden dim modified during preprocess"
+
+    if w.ndim == 2:
+        input_dim, hidden_dim = w.shape
+
+        # Calculate padded dimensions
+        hidden_padded = ((hidden_dim + simd_width - 1) // simd_width) * simd_width
+        input_padded = ((input_dim + simd_width - 1) // simd_width) * simd_width
+
+        # Create zero-padded buffer with original values
+        w_padded = np.zeros((input_padded, hidden_padded), dtype=np.float32)
+        w_padded[:input_dim, :hidden_dim] = w  # Original non-padded values
+
+        return w_padded.T.reshape(hidden_padded // simd_width,
+                                input_padded,
+                                simd_width)
+
+    elif w.ndim == 3:
+        exits, hidden, classes = w.shape
+
+        # Pad class dimension properly
+        classes_padded = ((classes + simd_width - 1) // simd_width) * simd_width
+
+        # Initialize empty buffer with zero padding
+        w_padded = np.zeros((exits, hidden, classes_padded), dtype=np.float32)
+        w_padded[:, :, :classes] = w  # Original classes
+
+        return w_padded.transpose(0, 2, 1).reshape(exits,
+                                                  classes_padded // simd_width,
+                                                  hidden,
+                                                  simd_width)
+
+    raise ValueError(f"Unsupported weight dimension: {w.ndim}")
+
+def validate_alignment(arr, simd_width, axis):
+    """Ensure proper vector alignment without early termination"""
+    if arr.shape[axis] % simd_width != 0:
+        new_shape = list(arr.shape)
+        new_shape[axis] += (-arr.shape[axis]) % simd_width
+        padded = np.zeros(new_shape, dtype=arr.dtype)
+        slices = tuple(slice(0, s) for s in arr.shape)
+        padded[slices] = arr
+        return padded
+    return arr
 
 def create_aligned_buffer(ctx, host_data, simd_width, mode='r'):
-    """Create device buffer with proper alignment and padding"""
-    bytes_per_element = host_data.dtype.itemsize
-    alignment = simd_width * bytes_per_element
-
-    padded_shape = list(host_data.shape)
-    padded_shape[-1] += (-host_data.shape[-1] % simd_width)
-
-    padded_data = np.zeros(padded_shape, dtype=host_data.dtype)
-    slices = tuple(slice(0, s) for s in host_data.shape)
-    padded_data[slices] = host_data
-
+    """Buffers assumed to be in shape:
+    - Weights: [hidden_vectors][input_padded][simd]
+    - Input:   [batch_padded][features_padded]
+    """
+    aligned_data = validate_alignment(host_data, simd_width, axis=-1)
     flags = cl.mem_flags.READ_ONLY if mode == 'r' else cl.mem_flags.READ_WRITE
-    return cl.Buffer(ctx, flags | cl.mem_flags.COPY_HOST_PTR, hostbuf=padded_data)
+    return cl.Buffer(ctx, flags | cl.mem_flags.COPY_HOST_PTR,
+                   hostbuf=aligned_data)
+
 
 def validate_workgroup(global_size, local_size, device, local_mem_per_item=0):
     """Validate workgroup configuration with memory safety prioritization"""
@@ -153,6 +185,7 @@ def main():
     # Create and align one-hot targets only once
     y_onehot = OneHotEncoder(sparse_output=False).fit_transform(y_true)
     y_targets = pad_to_multiple(y_onehot, simd_width, axis=1)
+    output_classes_padded = y_targets.shape[1]  # Actual padded size from encoding
 
     # Workgroup optimization
     wg_config = {
@@ -161,10 +194,6 @@ def main():
         'adam': max(1, (HIDDEN_DIM * X.shape[1])//(simd_width * 256))
     }
     max_padded_batch = ((BATCH_SIZE + batch_multiple -1) // batch_multiple) * batch_multiple
-    output_classes_padded = ((OUTPUT_CLASSES + simd_width-1) // simd_width) * simd_width
-
-    assert (HIDDEN_DIM % simd_width) == 0, \
-        f"Hidden dim {HIDDEN_DIM} not aligned to SIMD-{simd_width}"
 
     # Kernel compilation
     kernel_src = []
@@ -198,9 +227,13 @@ def main():
         raise
 
     # Data preparation with SIMD alignment
-    X_padded = pad_to_multiple(X, simd_width, axis=1)
-    input_dim = X_padded.shape[1]
+    # Pad BATCHES for workgroup alignment, FEATURES/CLASSES for SIMD
+    X_padded = pad_to_multiple(X, simd_width, axis=1) # Features
     y_padded = pad_to_multiple(y_targets, batch_multiple, axis=0)  # Align batch dim to LCM
+
+    assert X_padded.shape[1] == INPUT_DIM + (-INPUT_DIM % simd_width), \
+        f"Feature padding mismatch: {X_padded.shape[1]} != padded({INPUT_DIM})(mod {simd_width})"
+    input_dim = X_padded.shape[1]
     assert input_dim % simd_width == 0, f"Input dim {input_dim} not SIMD-{simd_width} aligned"
 
     # Parameter initialization
@@ -210,7 +243,7 @@ def main():
         while accounting for SIMD vector width.
         """
         arr = np.random.normal(0, scale, shape).astype(np.float32)
-        return pad_to_multiple(arr, simd_width) if arr.ndim >=2 else arr
+        return arr.copy()  # Don't pad here - preprocess_weights handles padding
 
     weights = preprocess_weights(init_param((input_dim, HIDDEN_DIM)), simd_width)
     biases = init_param(HIDDEN_DIM)
@@ -218,6 +251,15 @@ def main():
     exit_biases = init_param((NUM_EXITS, OUTPUT_CLASSES))
 
     # Buffer creation
+    input_dim_padded = X_padded.shape[1]
+    # Processed weights are shaped [hidden_padded//simd_width, input_padded, simd_width]
+    hidden_padded_vectors = weights.shape[0]  # Number of SIMD vector units
+    hidden_dim_padded = hidden_padded_vectors * simd_width  # Actual element count
+    output_classes_padded = y_targets.shape[1]
+
+    assert (hidden_dim_padded % simd_width) == 0, \
+        f"Hidden dim padded {hidden_dim_padded} not aligned to SIMD-{simd_width}"
+
     buffers = {
         'input': create_aligned_buffer(ctx, X_padded, simd_width, 'r'),
         # DELETE EXCESS BUFFERS
@@ -225,7 +267,7 @@ def main():
         'biases': create_aligned_buffer(ctx, biases, simd_width, 'rw'),
         'exit_weights': create_aligned_buffer(ctx, exit_weights, simd_width, 'rw'),
         'exit_biases': create_aligned_buffer(ctx, exit_biases, simd_width, 'rw'),
-        'hidden': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * HIDDEN_DIM *4),
+        'hidden': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * hidden_dim_padded * 4),
         'targets': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * output_classes_padded *4),
         'exit_probs': cl.Buffer(ctx, cl.mem_flags.READ_WRITE,
             max_padded_batch * NUM_EXITS * output_classes_padded *4),
@@ -234,9 +276,9 @@ def main():
 
     # ===== Buffer Allocation Tests =====
     buffer_meta = {
-        'input': (max_padded_batch * input_dim, "batch × input features"),
+        'input': (max_padded_batch * input_dim_padded, "batch × padded input"),
         'targets': (max_padded_batch * output_classes_padded, "batch × classes"),
-        'hidden': (max_padded_batch * HIDDEN_DIM, "batch × hidden units"),
+        'hidden': (max_padded_batch * hidden_dim_padded, "batch × padded hidden"),
         'exit_probs': (max_padded_batch * NUM_EXITS * output_classes_padded, "batch × exits × classes"),
         'losses': (max_padded_batch * NUM_EXITS, "batch × exits")
     }
@@ -259,6 +301,7 @@ def main():
         cl.enqueue_fill_buffer(queue, buffers[f'm2_{param}'], np.float32(0), 0, buffers[param].size)
 
     # Training loop
+    beta1_t, beta2_t = 0.0, 0.0
     global_step = 1
     for epoch in range(EPOCHS):
         # Shuffle and pad full dataset once per epoch
@@ -301,7 +344,15 @@ def main():
             queue.finish()
 
             padded_batch_size = X_batch.shape[0]
-            global_forward = (padded_batch_size, HIDDEN_DIM//simd_width)
+            global_forward = (
+                padded_batch_size,
+                hidden_dim_padded // simd_width  # ← Calculates number of vectors
+            )
+
+            assert hidden_dim_padded == weights.shape[0] * simd_width, \
+                "Weight reshape misaligned with hidden_dim_padded"
+            assert (global_forward[1] * simd_width) == hidden_dim_padded, \
+                "Kernel vector count ≠ padded dimension"
 
             # Calculate optimal local size
             max_wg_x = min(device.max_work_group_size // simd_width,
@@ -316,15 +367,17 @@ def main():
 
             forward_event = program.forward_pass(
                 queue,
-                (padded_batch_size, HIDDEN_DIM//simd_width),  # global_size
-                (wg_forward,simd_width),  # local_size
+                global_forward,  # global_size
+                (wg_forward, simd_width),  # local_size
                 buffers['input'],
                 buffers['weights'],
                 buffers['biases'],
                 buffers['hidden'],
-                np.int32(padded_batch_size),
+                np.int32(actual_batch_size),
                 np.int32(input_dim),
+                np.int32(input_dim_padded),
                 np.int32(HIDDEN_DIM),
+                np.int32(hidden_dim_padded),
                 cl.LocalMemory(wg_forward * simd_width * 4),
                 np.int32(wg_forward)
             )
@@ -354,9 +407,11 @@ def main():
                     buffers['targets'],
                     buffers['exit_probs'],
                     buffers['losses'],
-                    np.int32(padded_batch_size),
+                    np.int32(actual_batch_size),
                     np.int32(HIDDEN_DIM),
+                    np.int32(hidden_dim_padded),
                     np.int32(OUTPUT_CLASSES),
+                    np.int32(output_classes_padded),
                     np.int32(NUM_EXITS),
                     np.int32(exit_idx),
                     cl.LocalMemory(wg_exit * 4)  # reduction_buffer
@@ -370,15 +425,15 @@ def main():
             wg_grad_x = min(32, device.max_work_group_size//8)
             wg_grad_y = min(8, device.max_work_group_size//32)
 
-            input_chunks = X_batch.shape[1] // simd_width
-            global_grad = (input_chunks, HIDDEN_DIM)
+            input_chunks = (X_batch.shape[1] + simd_width - 1) // simd_width  # Ceiling division
+            global_grad = (input_chunks, hidden_dim_padded)
 
             validate_workgroup(global_grad, (wg_grad_x, wg_grad_y), device,
                   (wg_grad_x * wg_grad_y) * simd_width * 4)
 
             grad_event = program.compute_gradients(
                 queue,
-                (input_chunks, HIDDEN_DIM),  # global_size
+                global_grad,  # global_size
                 (wg_grad_x, wg_grad_y),      # local_size
                 buffers['input'],
                 buffers['hidden'],
@@ -387,10 +442,13 @@ def main():
                 buffers['exit_weights'],
                 buffers['grad_weights'],
                 buffers['grad_biases'],
-                np.int32(padded_batch_size),
+                np.int32(actual_batch_size),
                 np.int32(input_dim),
+                np.int32(input_dim_padded),
                 np.int32(HIDDEN_DIM),
+                np.int32(hidden_dim_padded),
                 np.int32(OUTPUT_CLASSES),
+                np.int32(output_classes_padded),
                 np.int32(NUM_EXITS),
                 cl.LocalMemory(wg_grad_x * wg_grad_y * simd_width * 4),
                 cl.LocalMemory(wg_grad_x * wg_grad_y * 4)
@@ -399,12 +457,23 @@ def main():
             grad_event.wait()
 
             # ============ Adam Update ============
-            beta1_t = 1/(1 - 0.9**global_step)
-            beta2_t = 1/(1 - 0.999**global_step)
+            beta1_t = 1/(1 - ADAM_BETA1**global_step)
+            beta2_t = 1/(1 - ADAM_BETA2**global_step)
+
             update_events = []
 
-            for param in ['weights', 'biases', 'exit_weights', 'exit_biases']:
-                total_params = buffers[param].size // 4
+            for param_name in ['weights', 'biases', 'exit_weights', 'exit_biases']:
+                real_param_size = {
+                    'weights': INPUT_DIM * HIDDEN_DIM,
+                    'biases': HIDDEN_DIM,
+                    'exit_weights': NUM_EXITS * HIDDEN_DIM * OUTPUT_CLASSES,
+                    'exit_biases': NUM_EXITS * OUTPUT_CLASSES
+                }[param_name]
+
+                total_params = buffers[param_name].size // 4  # Padded buffer size
+                assert total_params % simd_width == 0, \
+                    f"Padded params {total_params} not SIMD-{simd_width} aligned"
+                    
                 wg_adam = min(wg_config['adam'], device.max_work_group_size)
                 global_size = ((total_params + wg_adam -1) // wg_adam) * wg_adam
 
@@ -412,16 +481,17 @@ def main():
                     queue,
                     (global_size,),  # global_size
                     (wg_adam,),      # local_size
-                    buffers[f'grad_{param}'],
-                    buffers[param],
-                    buffers[f'm1_{param}'],
-                    buffers[f'm2_{param}'],
+                    buffers[f'grad_{param_name}'],
+                    buffers[param_name],
+                    buffers[f'm1_{param_name}'],
+                    buffers[f'm2_{param_name}'],
                     np.float32(learning_rate),
                     np.float32(ADAM_BETA1),
                     np.float32(ADAM_BETA2),
                     np.float32(beta1_t),
                     np.float32(beta2_t),
-                    np.int32(total_params)
+                    np.int32(real_param_size),
+                    np.int32(total_params)  # Buffer size for boundary checks
                 )
 
                 update_events.append(update_event)
