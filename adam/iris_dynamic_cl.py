@@ -15,16 +15,17 @@ BATCH_SIZE = 128
 ADAM_BETA1 = 0.9
 ADAM_BETA2 = 0.999
 LEARNING_RATE = 0.001
+MIN_TEMP = 1e-3
+MAX_TEMP = 10.0
 EPSILON = 1.0e-8
 
-# OpenCL kernel files (assumed to exist)
+# OpenCL kernels files
 CL_KERNEL_FILES = [
     'kernel_forward_pass.cl',
     'kernel_backpropagation.cl',
     'kernel_adam_update.cl',
     'kernel_multi_exit.cl'
 ]
-
 
 # Utility Functions
 def lcm(a, b):
@@ -47,8 +48,14 @@ def pad_to_multiple(arr, multiple, axis):
     return np.pad(arr, padding, mode='constant', constant_values=0) if pad_size != 0 else arr
 
 def he_init(shape):
-    fan_in = shape[0] if len(shape) == 2 else np.prod(shape[:-1])
-    return np.random.randn(*shape).astype(np.float32) * np.sqrt(2.0 / fan_in)
+    if len(shape) == 2:  # For 2D layers (e.g., fully connected)
+        fan_in = shape[0]
+    elif len(shape) == 3:  # For 3D exit weights (Exits, In, Out)
+        fan_in = shape[1]  # Use input dimension for fan_in
+    else:
+        raise ValueError("Unsupported shape for He initialization")
+    scale = np.sqrt(2.0 / fan_in)
+    return np.random.normal(0, scale, shape).astype(np.float32)
 
 def preprocess_weights(w, simd_width):
     if w.ndim == 2:
@@ -88,19 +95,24 @@ class KernelWrapper:
         self.program = program
         self.queue = queue
         self.mask_buf = None
+        self.temps_buf = None
 
     def set_mask(self, mask):
         self.mask_buf = mask
         return self
 
+    def set_temps(self, temps):
+        self.temps_buf = temps
+        return self
+
     def forward_pass(self, global_size, local_size, *args):
-        self.program.forward_pass(self.queue, global_size, local_size, *args, self.mask_buf)
+        self.program.forward_pass(self.queue, global_size, local_size, *args, self.mask_buf, self.temps_buf)
 
     def compute_exit_probabilities(self, global_size, local_size, *args):
-        self.program.compute_exit_probabilities(self.queue, global_size, local_size, *args, self.mask_buf)
+        self.program.compute_exit_probabilities(self.queue, global_size, local_size, *args, self.mask_buf, self.temps_buf)
 
     def compute_gradients(self, global_size, local_size, *args):
-        self.program.compute_gradients(self.queue, global_size, local_size, *args, self.mask_buf)
+        self.program.compute_gradients(self.queue, global_size, local_size, *args, self.mask_buf, self.temps_buf)
 
     def adam_update(self, global_size, local_size, *args):
         self.program.adam_update(self.queue, global_size, local_size, *args)
@@ -166,6 +178,9 @@ exit_weights_padded = preprocess_weights(exit_weights, simd_width)
 biases_padded = pad_1d(biases, simd_width)
 exit_biases_padded = np.array([pad_1d(exit_biases[i], simd_width) for i in range(NUM_EXITS)])
 
+# Temperature Initialization
+exit_temperatures = np.ones(NUM_EXITS, dtype=np.float32)  # Learnable temperatures
+
 # Kernel compilation
 kernel_src = []
 for fname in CL_KERNEL_FILES:
@@ -189,7 +204,11 @@ buffers = {
     'exit_biases': cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=exit_biases_padded),
     'hidden': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * hidden_dim_padded * 4),
     'exit_probs': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * NUM_EXITS * output_classes_padded * 4),
-    'losses': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * NUM_EXITS * 4)
+    'losses': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * NUM_EXITS * 4),
+    'temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=exit_temperatures),
+    'grad_temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, NUM_EXITS * 4),
+    'm1_temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, NUM_EXITS * 4),
+    'm2_temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, NUM_EXITS * 4)
 }
 
 for param in ['weights', 'biases', 'exit_weights', 'exit_biases']:
@@ -318,8 +337,8 @@ for epoch in range(EPOCHS):
             is_blocking=False
         )
 
-        # Set mask for kernels
-        kernel_wrapper = KernelWrapper(program, compute_queue).set_mask(current_set['mask_dev'])
+        # Set mask and temperatures for kernels
+        kernel_wrapper = KernelWrapper(program, compute_queue).set_mask(current_set['mask_dev']).set_temps(buffers['temps'])
 
         # Forward pass
         global_forward = (padded_batch_size, hidden_dim_padded // simd_width)
@@ -383,7 +402,7 @@ for epoch in range(EPOCHS):
             np.int32(NUM_EXITS)
         )
 
-        # Adam update
+        # Adam update for network parameters
         beta1_t = 1 / (1 - ADAM_BETA1 ** global_step)
         beta2_t = 1 / (1 - ADAM_BETA2 ** global_step)
         update_events = []
@@ -403,10 +422,35 @@ for epoch in range(EPOCHS):
                 np.float32(ADAM_BETA2),
                 np.float32(beta1_t),
                 np.float32(beta2_t),
+                np.float32(MIN_TEMP),
+                np.float32(MAX_TEMP),
                 np.float32(EPSILON),
                 np.int32(total_params)
             )
             update_events.append(update_event)
+
+        # Adam update for temperatures
+        global_adam_temps = (NUM_EXITS,)
+        local_adam_temps = (optimal_local_size(global_adam_temps, device_limits),)
+        update_event_temps = kernel_wrapper.adam_update(
+            global_adam_temps,
+            local_adam_temps,
+            buffers['grad_temps'],
+            buffers['temps'],
+            buffers['m1_temps'],
+            buffers['m2_temps'],
+            np.float32(LEARNING_RATE),
+            np.float32(ADAM_BETA1),
+            np.float32(ADAM_BETA2),
+            np.float32(beta1_t),
+            np.float32(beta2_t),
+            np.float32(MIN_TEMP),
+            np.float32(MAX_TEMP),
+            np.float32(EPSILON),
+            np.int32(NUM_EXITS)
+        )
+        update_events.append(update_event_temps)
+
         global_step += 1
 
         # Collect compute events
@@ -427,8 +471,12 @@ for epoch in range(EPOCHS):
         valid_probs = exit_probs_host[:actual_batch_size, :, :OUTPUT_CLASSES]
         batch_loss = np.mean(valid_losses)
         epoch_loss += batch_loss * actual_batch_size
-        ensemble = np.mean(valid_probs, axis=1)
-        predicted_classes = np.argmax(ensemble, axis=1)
+
+        # Temperature-weighted ensemble for predictions
+        confidences = np.array([valid_probs[:, i, :].max(axis=1) ** (1 / exit_temperatures[i]) for i in range(NUM_EXITS)])
+        weights = np.exp(confidences) / np.sum(np.exp(confidences), axis=0)
+        weighted_probs = np.einsum('ijk,j->ik', valid_probs, weights)
+        predicted_classes = np.argmax(weighted_probs, axis=1)
         batch_correct = np.sum(predicted_classes == y_batch)
         correct_predictions += batch_correct
 
@@ -497,3 +545,11 @@ for epoch in range(EPOCHS):
     avg_loss = epoch_loss / len(X)
     train_acc = correct_predictions / len(X)
     print(f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | Acc: {train_acc:.1%}")
+
+    # Temperature Monitoring
+    temps_host = np.empty(NUM_EXITS, dtype=np.float32)
+    cl.enqueue_copy(compute_queue, temps_host, buffers['temps'])
+    print(f"Temperatures: {temps_host}")
+
+if __name__ == "__main__":
+    main()
