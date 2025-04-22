@@ -253,6 +253,9 @@ device_limits = {
     'max_work_item_sizes': device.max_work_item_sizes,
 }
 
+cache_line_size = device.get_info(cl.device_info.GLOBAL_MEM_CACHELINE_SIZE)
+loss_alignment = cache_line_size // 4
+
 simd_width = select_simd_width(device)
 print(f"Training on {device.name} with SIMD-{simd_width}")
 
@@ -276,6 +279,9 @@ exit_biases_padded = np.array([pad_1d(exit_biases[i], simd_width) for i in range
 # Temperature Initialization
 exit_temperatures = np.ones(NUM_EXITS, dtype=np.float32)
 
+# Calculate loss_elements_per_exit
+loss_elements_per_exit = ((max_padded_batch + loss_alignment - 1) // loss_alignment) * loss_alignment
+
 # Kernel Compilation
 kernel_src = []
 for fname in CL_KERNEL_FILES:
@@ -284,6 +290,7 @@ for fname in CL_KERNEL_FILES:
 build_opts = [
     f"-D VECTOR_TYPE={'float' + str(simd_width) if simd_width > 1 else 'float'}",
     f"-D SIMD_WIDTH={simd_width}",
+    f"-D LOSS_STRIDE={loss_elements_per_exit}"
     f"-D USE_FAST_MATH=1"
 ]
 program = cl.Program(ctx, "\n".join(kernel_src)).build(options=" ".join(build_opts))
