@@ -7,6 +7,10 @@ from sklearn.preprocessing import StandardScaler
 import networkx as nx
 import re
 
+# Define data type sizes
+FLOAT_SIZE = np.float32().itemsize
+INT_SIZE = np.int32().itemsize
+
 # Network Configuration
 INPUT_DIM = 4
 HIDDEN_DIM = 64
@@ -157,7 +161,6 @@ class KernelDAGBuilder:
         self.node_events[node_id] = event
         return event
 
-# Enhanced KernelWrapper Class
 class KernelWrapper:
     def __init__(self, program, dag_builder):
         self.program = program
@@ -254,7 +257,7 @@ device_limits = {
 }
 
 cache_line_size = device.get_info(cl.device_info.GLOBAL_MEM_CACHELINE_SIZE)
-loss_alignment = cache_line_size // 4
+loss_alignment = cache_line_size // FLOAT_SIZE
 
 simd_width = select_simd_width(device)
 print(f"Training on {device.name} with SIMD-{simd_width}")
@@ -290,7 +293,7 @@ for fname in CL_KERNEL_FILES:
 build_opts = [
     f"-D VECTOR_TYPE={'float' + str(simd_width) if simd_width > 1 else 'float'}",
     f"-D SIMD_WIDTH={simd_width}",
-    f"-D LOSS_STRIDE={loss_elements_per_exit}"
+    f"-D LOSS_STRIDE={loss_elements_per_exit}",
     f"-D USE_FAST_MATH=1"
 ]
 program = cl.Program(ctx, "\n".join(kernel_src)).build(options=" ".join(build_opts))
@@ -304,13 +307,13 @@ buffers = {
     'biases': cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=biases_padded),
     'exit_weights': cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=exit_weights_padded),
     'exit_biases': cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=exit_biases_padded),
-    'hidden': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * hidden_dim_padded * 4),
-    'exit_probs': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * NUM_EXITS * output_classes_padded * 4),
-    'losses': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * NUM_EXITS * 4),
+    'hidden': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * hidden_dim_padded * FLOAT_SIZE),
+    'exit_probs': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, max_padded_batch * NUM_EXITS * output_classes_padded * FLOAT_SIZE),
+    'losses': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, NUM_EXITS * loss_elements_per_exit * FLOAT_SIZE),
     'temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=exit_temperatures),
-    'grad_temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, NUM_EXITS * 4),
-    'm1_temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, NUM_EXITS * 4),
-    'm2_temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, NUM_EXITS * 4)
+    'grad_temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, NUM_EXITS * FLOAT_SIZE),
+    'm1_temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, NUM_EXITS * FLOAT_SIZE),
+    'm2_temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, NUM_EXITS * FLOAT_SIZE)
 }
 
 for param in ['weights', 'biases', 'exit_weights', 'exit_biases']:
@@ -321,9 +324,9 @@ for param in ['weights', 'biases', 'exit_weights', 'exit_biases']:
     cl.enqueue_fill_buffer(compute_queue, buffers[f'm2_{param}'], np.float32(0), 0, buffers[param].size)
 
 # Double Buffering Setup
-input_buf_size = max_padded_batch * input_dim_padded * 4
-targets_buf_size = max_padded_batch * 4
-mask_buf_size = max_padded_batch * 4
+input_buf_size = max_padded_batch * input_dim_padded * FLOAT_SIZE
+targets_buf_size = max_padded_batch * INT_SIZE
+mask_buf_size = max_padded_batch * FLOAT_SIZE
 
 staging_input_A = cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.ALLOC_HOST_PTR, size=input_buf_size)
 staging_targets_A = cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.ALLOC_HOST_PTR, size=targets_buf_size)
@@ -367,6 +370,9 @@ for epoch in range(EPOCHS):
         X_batch = X_padded[batch_indices]
         y_batch = y_true[batch_indices]
         X_pad, y_pad, mask_pad, padded_batch_size = pad_batch(X_batch, y_batch, batch_multiple, simd_width)
+
+        assert loss_elements_per_exit >= padded_batch_size, \
+        f"Loss stride {loss_elements_per_exit} < padded batch {padded_batch_size}"
 
         # Map staging buffers
         host_input, map_event_input = cl.enqueue_map_buffer(
@@ -433,9 +439,9 @@ for epoch in range(EPOCHS):
         # Zero gradients
         for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
             grad_buffer = buffers[f'grad_{param}']
-            enqueue_fn_zero = lambda wait_for: cl.enqueue_fill_buffer(
-                compute_queue, grad_buffer, np.float32(0), 0, grad_buffer.size, wait_for=wait_for
-            )
+            enqueue_fn_zero = (lambda gb: lambda wait_for: cl.enqueue_fill_buffer(
+                compute_queue, gb, np.float32(0), 0, gb.size, wait_for=wait_for
+            ))(grad_buffer)  # <-- Capture grad_buffer now
             zero_node = dag_builder.add_operation(enqueue_fn_zero, {grad_buffer: 'W'})
             zero_event = dag_builder.enqueue_with_dependencies(zero_node)
 
@@ -482,6 +488,18 @@ for epoch in range(EPOCHS):
             )
             exit_events.append(exit_event)
 
+        losses_host = np.empty(NUM_EXITS * loss_elements_per_exit, dtype=np.float32)
+        cl.enqueue_copy(compute_queue, losses_host, buffers['losses'], wait_for=batch_events)
+
+        # Process per-exit losses for logging/monitoring
+        exit_losses = []
+        for exit_idx in range(NUM_EXITS):
+            start = exit_idx * loss_elements_per_exit
+            end = start + actual_batch_size
+            exit_loss = losses_host[start:end].mean()
+            exit_losses.append(exit_loss)
+        print(f"Per-exit Losses: {batch_idx}:{exit_losses}")
+
         # Backpropagation
         global_grad = (input_dim_padded // simd_width, HIDDEN_DIM)
         local_grad = optimal_local_size(global_grad, device_limits)
@@ -513,7 +531,7 @@ for epoch in range(EPOCHS):
             param_buffer = buffers[param]
             m1_param = buffers[f'm1_{param}']
             m2_param = buffers[f'm2_{param}']
-            total_params = param_buffer.size // 4
+            total_params = param_buffer.size // FLOAT_SIZE
             global_adam = (total_params,)
             local_adam = optimal_local_size(global_adam, device_limits)
             update_event = kernel_wrapper.adam_update(
@@ -541,21 +559,24 @@ for epoch in range(EPOCHS):
         batch_events = [transfer_event_input, transfer_event_targets, transfer_event_mask, forward_event] + exit_events + [grad_event] + update_events
 
         # Read losses and exit probabilities
-        losses_host = np.empty(padded_batch_size * NUM_EXITS, dtype=np.float32)
         exit_probs_host = np.empty((padded_batch_size, NUM_EXITS, output_classes_padded), dtype=np.float32)
-        cl.enqueue_copy(compute_queue, losses_host, buffers['losses'], wait_for=batch_events)
         cl.enqueue_copy(compute_queue, exit_probs_host, buffers['exit_probs'], wait_for=batch_events)
 
         # Read temperatures
         temps_host = np.empty(NUM_EXITS, dtype=np.float32)
         cl.enqueue_copy(compute_queue, temps_host, buffers['temps'], wait_for=batch_events)
+        if not (np.all(temps_host >= MIN_TEMP) and np.all(temps_host <= MAX_TEMP)):
+            raise RuntimeError(f"Temp violation: {temps_host}")
 
         # Extract valid probabilities
         valid_probs = exit_probs_host[:actual_batch_size].reshape(actual_batch_size, NUM_EXITS, OUTPUT_CLASSES)
 
         # Compute temperature-weighted ensemble
-        confidences = np.array([valid_probs[:, i, :].max(axis=1) ** (1 / (temps_host[i] + 1e-8)) 
-                                for i in range(NUM_EXITS)])
+        valid_mask = mask_pad[:actual_batch_size].astype(bool)
+        confidences = np.array([
+            valid_probs[valid_mask, i, :].max(axis=1) ** (1 / (temps_host[i] + 1e-8))
+            for i in range(NUM_EXITS)
+        ])
         weights = np.exp(confidences) / np.sum(np.exp(confidences), axis=0)
         ensemble_probs = np.einsum('ijk,j->ik', valid_probs, weights)
         ensemble_probs /= np.sum(ensemble_probs, axis=1, keepdims=True) + 1e-8
@@ -602,15 +623,15 @@ for epoch in range(EPOCHS):
             # Transfer next batch to device
             cl.enqueue_copy_buffer(
                 transfer_queue, next_set['staging_input'], next_set['input_dev'],
-                src_offset=0, dst_offset=0, size=next_padded_size * input_dim_padded * 4, is_blocking=False
+                src_offset=0, dst_offset=0, size=next_padded_size * input_dim_padded * FLOAT_SIZE, is_blocking=False
             )
             cl.enqueue_copy_buffer(
                 transfer_queue, next_set['staging_targets'], next_set['targets_dev'],
-                src_offset=0, dst_offset=0, size=next_padded_size * 4, is_blocking=False
+                src_offset=0, dst_offset=0, size=next_padded_size * INT_SIZE, is_blocking=False
             )
             cl.enqueue_copy_buffer(
                 transfer_queue, next_set['staging_mask'], next_set['mask_dev'],
-                src_offset=0, dst_offset=0, size=next_padded_size * 4, is_blocking=False
+                src_offset=0, dst_offset=0, size=next_padded_size * FLOAT_SIZE, is_blocking=False
             )
 
     # Compute and print epoch metrics
