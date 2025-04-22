@@ -466,17 +466,27 @@ for epoch in range(EPOCHS):
         cl.enqueue_copy(compute_queue, losses_host, buffers['losses'], wait_for=current_set['compute_events'])
         cl.enqueue_copy(compute_queue, exit_probs_host, buffers['exit_probs'], wait_for=current_set['compute_events'])
 
-        # Compute batch metrics
-        valid_losses = losses_host[:actual_batch_size * NUM_EXITS]
-        valid_probs = exit_probs_host[:actual_batch_size, :, :OUTPUT_CLASSES]
-        batch_loss = np.mean(valid_losses)
+        # Read temperatures from the device
+        temps_host = np.empty(NUM_EXITS, dtype=np.float32)
+        cl.enqueue_copy(compute_queue, temps_host, buffers['temps'], wait_for=current_set['compute_events'])
+
+        # Extract valid probabilities
+        valid_probs = exit_probs_host[:actual_batch_size * NUM_EXITS].reshape(actual_batch_size, NUM_EXITS, OUTPUT_CLASSES)
+
+        # Compute temperature-weighted ensemble
+        confidences = np.array([valid_probs[:, i, :].max(axis=1) ** (1 / (temps_host[i] + 1e-8)) 
+                                for i in range(NUM_EXITS)])
+        weights = np.exp(confidences) / np.sum(np.exp(confidences), axis=0)
+        ensemble_probs = np.einsum('ijk,j->ik', valid_probs, weights)
+        ensemble_probs /= np.sum(ensemble_probs, axis=1, keepdims=True) + 1e-8  # Normalize to sum to 1
+
+        # Compute cross-entropy loss
+        log_probs = np.log(ensemble_probs + 1e-8)  # Small epsilon for stability
+        batch_loss = -np.mean(log_probs[np.arange(actual_batch_size), y_batch])
         epoch_loss += batch_loss * actual_batch_size
 
-        # Temperature-weighted ensemble for predictions
-        confidences = np.array([valid_probs[:, i, :].max(axis=1) ** (1 / exit_temperatures[i]) for i in range(NUM_EXITS)])
-        weights = np.exp(confidences) / np.sum(np.exp(confidences), axis=0)
-        weighted_probs = np.einsum('ijk,j->ik', valid_probs, weights)
-        predicted_classes = np.argmax(weighted_probs, axis=1)
+        # For accuracy calculation
+        predicted_classes = np.argmax(ensemble_probs, axis=1)
         batch_correct = np.sum(predicted_classes == y_batch)
         correct_predictions += batch_correct
 
