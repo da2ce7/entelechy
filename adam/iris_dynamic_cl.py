@@ -4,6 +4,8 @@ import math
 from math import gcd
 from sklearn.datasets import load_iris
 from sklearn.preprocessing import StandardScaler
+import networkx as nx
+import re
 
 # Network Configuration
 INPUT_DIM = 4
@@ -19,7 +21,7 @@ MIN_TEMP = 1e-3
 MAX_TEMP = 10.0
 EPSILON = 1.0e-8
 
-# OpenCL kernels files
+# OpenCL kernel files (assumed to exist)
 CL_KERNEL_FILES = [
     'kernel_forward_pass.cl',
     'kernel_backpropagation.cl',
@@ -48,10 +50,10 @@ def pad_to_multiple(arr, multiple, axis):
     return np.pad(arr, padding, mode='constant', constant_values=0) if pad_size != 0 else arr
 
 def he_init(shape):
-    if len(shape) == 2:  # For 2D layers (e.g., fully connected)
+    if len(shape) == 2:
         fan_in = shape[0]
-    elif len(shape) == 3:  # For 3D exit weights (Exits, In, Out)
-        fan_in = shape[1]  # Use input dimension for fan_in
+    elif len(shape) == 3:
+        fan_in = shape[1]
     else:
         raise ValueError("Unsupported shape for He initialization")
     scale = np.sqrt(2.0 / fan_in)
@@ -90,10 +92,76 @@ def pad_batch(X_batch, y_batch, batch_multiple, simd_width):
     mask[:orig_size] = 1.0
     return X_pad, y_pad, mask, padded_size
 
-class KernelWrapper:
-    def __init__(self, program, queue):
-        self.program = program
+def optimal_local_size(global_size, device_limits):
+    max_wg = device_limits['max_work_group_size']
+    max_dims = device_limits['max_work_item_sizes']
+    if isinstance(global_size, int) or len(global_size) == 1:
+        global_size = global_size[0] if isinstance(global_size, tuple) else global_size
+        valid = [s for s in range(1, min(max_wg, max_dims[0])+1) if global_size % s == 0]
+        return (max(valid, key=lambda x: x, default=1),)
+    else:
+        gx, gy = global_size
+        valid_x = [s for s in range(1, min(gx, max_dims[0])+1) if gx % s == 0]
+        valid_y = [s for s in range(1, min(gy, max_dims[1])+1) if gy % s == 0]
+        candidates = [(lx, ly) for lx in valid_x for ly in valid_y if lx * ly <= max_wg]
+        return max(candidates, key=lambda x: x[0]*x[1], default=(1,1))
+
+def select_simd_width(device):
+    if 'Intel' in device.vendor and 'cl_intel_subgroups' in device.extensions:
+        return 16
+    elif 'AMD' in device.vendor:
+        if re.search(r'(?i)CDNA|RDNA', device.name):
+            return 8
+        else:
+            return 4
+    elif 'NVIDIA' in device.vendor:
+        return 4
+    return 1
+
+# KernelDAGBuilder Class
+class KernelDAGBuilder:
+    def __init__(self, queue, device_limits):
+        self.dependency_graph = nx.DiGraph()
+        self.buffer_states = {}  # {buffer: (version, last_writer_node)}
+        self.node_events = {}
         self.queue = queue
+        self.device_limits = device_limits
+
+    def add_operation(self, enqueue_fn, buffers_accessed):
+        node_id = len(self.dependency_graph.nodes)
+        self.dependency_graph.add_node(node_id, enqueue_fn=enqueue_fn, buffers=buffers_accessed.copy())
+
+        for buffer, mode in buffers_accessed.items():
+            if mode == 'W':
+                readers = [n for n, data in self.dependency_graph.nodes(data=True) 
+                           if buffer in data.get('buffers', {}) and data['buffers'][buffer] == 'R']
+                for reader in readers:
+                    self.dependency_graph.add_edge(reader, node_id)
+                last_writer = self.buffer_states.get(buffer, (0, None))[1]
+                if last_writer is not None:
+                    self.dependency_graph.add_edge(last_writer, node_id)
+                self.buffer_states[buffer] = (self.buffer_states.get(buffer, (0, None))[0] + 1, node_id)
+            elif mode == 'R':
+                last_writer = self.buffer_states.get(buffer, (0, None))[1]
+                if last_writer is not None:
+                    self.dependency_graph.add_edge(last_writer, node_id)
+
+        return node_id
+
+    def enqueue_with_dependencies(self, node_id):
+        parents = list(self.dependency_graph.predecessors(node_id))
+        wait_for = [self.node_events[p] for p in parents if p in self.node_events]
+
+        enqueue_fn = self.dependency_graph.nodes[node_id]['enqueue_fn']
+        event = enqueue_fn(wait_for=wait_for)
+        self.node_events[node_id] = event
+        return event
+
+# Enhanced KernelWrapper Class
+class KernelWrapper:
+    def __init__(self, program, dag_builder):
+        self.program = program
+        self.dag = dag_builder
         self.mask_buf = None
         self.temps_buf = None
 
@@ -105,39 +173,66 @@ class KernelWrapper:
         self.temps_buf = temps
         return self
 
-    def forward_pass(self, global_size, local_size, *args):
-        self.program.forward_pass(self.queue, global_size, local_size, *args, self.mask_buf, self.temps_buf)
+    def forward_pass(self, global_size, local_size, input_dev, weights, biases, hidden, *args):
+        buffer_modes = {
+            input_dev: 'R',
+            weights: 'R',
+            biases: 'R',
+            hidden: 'W'
+        }
+        enqueue_fn = lambda wait_for: self.program.forward_pass(
+            self.dag.queue, global_size, local_size,
+            input_dev, weights, biases, hidden, *args, self.mask_buf, self.temps_buf, wait_for=wait_for
+        )
+        node_id = self.dag.add_operation(enqueue_fn, buffer_modes)
+        return self.dag.enqueue_with_dependencies(node_id)
 
-    def compute_exit_probabilities(self, global_size, local_size, *args):
-        self.program.compute_exit_probabilities(self.queue, global_size, local_size, *args, self.mask_buf, self.temps_buf)
+    def compute_exit_probabilities(self, global_size, local_size, hidden, exit_weights, exit_biases, exit_probs, losses, targets_dev, *args):
+        buffer_modes = {
+            hidden: 'R',
+            exit_weights: 'R',
+            exit_biases: 'R',
+            exit_probs: 'W',
+            losses: 'W',
+            targets_dev: 'R'
+        }
+        enqueue_fn = lambda wait_for: self.program.compute_exit_probabilities(
+            self.dag.queue, global_size, local_size,
+            hidden, exit_weights, exit_biases, exit_probs, losses, targets_dev, *args, self.mask_buf, self.temps_buf, wait_for=wait_for
+        )
+        node_id = self.dag.add_operation(enqueue_fn, buffer_modes)
+        return self.dag.enqueue_with_dependencies(node_id)
 
-    def compute_gradients(self, global_size, local_size, *args):
-        self.program.compute_gradients(self.queue, global_size, local_size, *args, self.mask_buf, self.temps_buf)
+    def compute_gradients(self, global_size, local_size, input_dev, hidden, exit_probs, exit_weights, grad_weights, grad_biases, targets_dev, *args):
+        buffer_modes = {
+            input_dev: 'R',
+            hidden: 'R',
+            exit_probs: 'R',
+            exit_weights: 'R',
+            grad_weights: 'W',
+            grad_biases: 'W',
+            targets_dev: 'R'
+        }
+        enqueue_fn = lambda wait_for: self.program.compute_gradients(
+            self.dag.queue, global_size, local_size,
+            input_dev, hidden, exit_probs, exit_weights, grad_weights, grad_biases, targets_dev, *args, self.mask_buf, self.temps_buf, wait_for=wait_for
+        )
+        node_id = self.dag.add_operation(enqueue_fn, buffer_modes)
+        return self.dag.enqueue_with_dependencies(node_id)
 
-    def adam_update(self, global_size, local_size, *args):
-        self.program.adam_update(self.queue, global_size, local_size, *args)
-
-def optimal_local_size(global_size, device_limits):
-    max_wg = device_limits['max_work_group_size']
-    max_dims = device_limits['max_work_item_sizes']
-    if isinstance(global_size, int):
-        valid = [s for s in range(1, min(max_wg, max_dims[0])+1) if global_size % s == 0]
-        return max(valid, key=lambda x: x, default=1)
-    else:
-        gx, gy = global_size
-        valid_x = [s for s in divisors(gx) if s <= max_dims[0]]
-        valid_y = [s for s in divisors(gy) if s <= max_dims[1]]
-        candidates = [(lx, ly) for lx in valid_x for ly in valid_y if lx * ly <= max_wg]
-        return max(candidates, key=lambda x: x[0]*x[1], default=(1,1))
-
-def select_simd_width(device):
-    if 'Intel' in device.vendor and 'cl_intel_subgroups' in device.extensions:
-        return 16
-    elif 'AMD' in device.vendor:
-        return 8 if any(s in device.name for s in ['CDNA', 'RDNA']) else 4
-    elif 'NVIDIA' in device.vendor:
-        return 4
-    return 1
+    def adam_update(self, global_size, local_size, grad_param, param, m1_param, m2_param, *args):
+        buffer_modes = {
+            grad_param: 'R',
+            param: 'W',
+            m1_param: 'W',
+            m2_param: 'W'
+        }
+        enqueue_fn = lambda wait_for: self.program.adam_update(
+            self.dag.queue, global_size, local_size,
+            grad_param, param, m1_param, m2_param, *args, wait_for=wait_for
+        )
+        node_id = self.dag.add_operation(enqueue_fn, buffer_modes)
+        return self.dag.enqueue_with_dependencies(node_id)
 
 # Data Preparation
 iris = load_iris()
@@ -179,9 +274,9 @@ biases_padded = pad_1d(biases, simd_width)
 exit_biases_padded = np.array([pad_1d(exit_biases[i], simd_width) for i in range(NUM_EXITS)])
 
 # Temperature Initialization
-exit_temperatures = np.ones(NUM_EXITS, dtype=np.float32)  # Learnable temperatures
+exit_temperatures = np.ones(NUM_EXITS, dtype=np.float32)
 
-# Kernel compilation
+# Kernel Compilation
 kernel_src = []
 for fname in CL_KERNEL_FILES:
     with open(fname) as f:
@@ -239,12 +334,13 @@ mask_dev_B = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, size=mask_buf_size)
 
 sets = [
     {'staging_input': staging_input_A, 'staging_targets': staging_targets_A, 'staging_mask': staging_mask_A,
-     'input_dev': input_dev_A, 'targets_dev': targets_dev_A, 'mask_dev': mask_dev_A, 'compute_events': []},
+     'input_dev': input_dev_A, 'targets_dev': targets_dev_A, 'mask_dev': mask_dev_A},
     {'staging_input': staging_input_B, 'staging_targets': staging_targets_B, 'staging_mask': staging_mask_B,
-     'input_dev': input_dev_B, 'targets_dev': targets_dev_B, 'mask_dev': mask_dev_B, 'compute_events': []}
+     'input_dev': input_dev_B, 'targets_dev': targets_dev_B, 'mask_dev': mask_dev_B}
 ]
 
 # Training Loop
+dag_builder = KernelDAGBuilder(compute_queue, device_limits)
 global_step = 1
 for epoch in range(EPOCHS):
     shuffled_indices = np.random.permutation(len(X))
@@ -305,40 +401,39 @@ for epoch in range(EPOCHS):
         unmap_event_targets = cl.enqueue_unmap_mem_object(transfer_queue, current_set['staging_targets'], host_targets)
         unmap_event_mask = cl.enqueue_unmap_mem_object(transfer_queue, current_set['staging_mask'], host_mask)
 
-        # Transfer to device
-        transfer_event_input = cl.enqueue_copy_buffer(
-            transfer_queue,
-            current_set['staging_input'],
-            current_set['input_dev'],
-            src_offset=0,
-            dst_offset=0,
-            size=padded_batch_size * input_dim_padded * 4,
-            wait_for=[unmap_event_input],
-            is_blocking=False
+        # Transfer to device with DAG
+        enqueue_fn_input = lambda wait_for: cl.enqueue_copy_buffer(
+            transfer_queue, current_set['staging_input'], current_set['input_dev'],
+            0, 0, input_buf_size, wait_for=wait_for
         )
-        transfer_event_targets = cl.enqueue_copy_buffer(
-            transfer_queue,
-            current_set['staging_targets'],
-            current_set['targets_dev'],
-            src_offset=0,
-            dst_offset=0,
-            size=padded_batch_size * 4,
-            wait_for=[unmap_event_targets],
-            is_blocking=False
-        )
-        transfer_event_mask = cl.enqueue_copy_buffer(
-            transfer_queue,
-            current_set['staging_mask'],
-            current_set['mask_dev'],
-            src_offset=0,
-            dst_offset=0,
-            size=padded_batch_size * 4,
-            wait_for=[unmap_event_mask],
-            is_blocking=False
-        )
+        transfer_node_input = dag_builder.add_operation(enqueue_fn_input, {current_set['input_dev']: 'W'})
+        transfer_event_input = dag_builder.enqueue_with_dependencies(transfer_node_input)
 
-        # Set mask and temperatures for kernels
-        kernel_wrapper = KernelWrapper(program, compute_queue).set_mask(current_set['mask_dev']).set_temps(buffers['temps'])
+        enqueue_fn_targets = lambda wait_for: cl.enqueue_copy_buffer(
+            transfer_queue, current_set['staging_targets'], current_set['targets_dev'],
+            0, 0, targets_buf_size, wait_for=wait_for
+        )
+        transfer_node_targets = dag_builder.add_operation(enqueue_fn_targets, {current_set['targets_dev']: 'W'})
+        transfer_event_targets = dag_builder.enqueue_with_dependencies(transfer_node_targets)
+
+        enqueue_fn_mask = lambda wait_for: cl.enqueue_copy_buffer(
+            transfer_queue, current_set['staging_mask'], current_set['mask_dev'],
+            0, 0, mask_buf_size, wait_for=wait_for
+        )
+        transfer_node_mask = dag_builder.add_operation(enqueue_fn_mask, {current_set['mask_dev']: 'W'})
+        transfer_event_mask = dag_builder.enqueue_with_dependencies(transfer_node_mask)
+
+        # Zero gradients
+        for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
+            grad_buffer = buffers[f'grad_{param}']
+            enqueue_fn_zero = lambda wait_for: cl.enqueue_fill_buffer(
+                compute_queue, grad_buffer, np.float32(0), 0, grad_buffer.size, wait_for=wait_for
+            )
+            zero_node = dag_builder.add_operation(enqueue_fn_zero, {grad_buffer: 'W'})
+            zero_event = dag_builder.enqueue_with_dependencies(zero_node)
+
+        # Kernel execution with DAG
+        kernel_wrapper = KernelWrapper(program, dag_builder).set_mask(current_set['mask_dev']).set_temps(buffers['temps'])
 
         # Forward pass
         global_forward = (padded_batch_size, hidden_dim_padded // simd_width)
@@ -360,7 +455,7 @@ for epoch in range(EPOCHS):
         exit_events = []
         for exit_idx in range(NUM_EXITS):
             global_exit = (padded_batch_size,)
-            local_exit = (optimal_local_size(global_exit, device_limits),)
+            local_exit = optimal_local_size(global_exit, device_limits)
             exit_event = kernel_wrapper.compute_exit_probabilities(
                 global_exit,
                 local_exit,
@@ -402,21 +497,25 @@ for epoch in range(EPOCHS):
             np.int32(NUM_EXITS)
         )
 
-        # Adam update for network parameters
+        # Adam update
         beta1_t = 1 / (1 - ADAM_BETA1 ** global_step)
         beta2_t = 1 / (1 - ADAM_BETA2 ** global_step)
         update_events = []
-        for param in ['weights', 'biases', 'exit_weights', 'exit_biases']:
-            total_params = buffers[param].size // 4
+        for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
+            grad_param = buffers[f'grad_{param}']
+            param_buffer = buffers[param]
+            m1_param = buffers[f'm1_{param}']
+            m2_param = buffers[f'm2_{param}']
+            total_params = param_buffer.size // 4
             global_adam = (total_params,)
-            local_adam = (optimal_local_size(global_adam, device_limits),)
+            local_adam = optimal_local_size(global_adam, device_limits)
             update_event = kernel_wrapper.adam_update(
                 global_adam,
                 local_adam,
-                buffers[f'grad_{param}'],
-                buffers[param],
-                buffers[f'm1_{param}'],
-                buffers[f'm2_{param}'],
+                grad_param,
+                param_buffer,
+                m1_param,
+                m2_param,
                 np.float32(LEARNING_RATE),
                 np.float32(ADAM_BETA1),
                 np.float32(ADAM_BETA2),
@@ -429,68 +528,40 @@ for epoch in range(EPOCHS):
             )
             update_events.append(update_event)
 
-        # Adam update for temperatures
-        global_adam_temps = (NUM_EXITS,)
-        local_adam_temps = (optimal_local_size(global_adam_temps, device_limits),)
-        update_event_temps = kernel_wrapper.adam_update(
-            global_adam_temps,
-            local_adam_temps,
-            buffers['grad_temps'],
-            buffers['temps'],
-            buffers['m1_temps'],
-            buffers['m2_temps'],
-            np.float32(LEARNING_RATE),
-            np.float32(ADAM_BETA1),
-            np.float32(ADAM_BETA2),
-            np.float32(beta1_t),
-            np.float32(beta2_t),
-            np.float32(MIN_TEMP),
-            np.float32(MAX_TEMP),
-            np.float32(EPSILON),
-            np.int32(NUM_EXITS)
-        )
-        update_events.append(update_event_temps)
-
         global_step += 1
 
-        # Collect compute events
-        compute_events = [forward_event] + exit_events + [grad_event] + update_events
-        current_set['compute_events'] = compute_events
-
-        # Wait for compute events
-        cl.wait_for_events(current_set['compute_events'])
+        # Collect all events for this batch
+        batch_events = [transfer_event_input, transfer_event_targets, transfer_event_mask, forward_event] + exit_events + [grad_event] + update_events
 
         # Read losses and exit probabilities
         losses_host = np.empty(padded_batch_size * NUM_EXITS, dtype=np.float32)
         exit_probs_host = np.empty((padded_batch_size, NUM_EXITS, output_classes_padded), dtype=np.float32)
-        cl.enqueue_copy(compute_queue, losses_host, buffers['losses'], wait_for=current_set['compute_events'])
-        cl.enqueue_copy(compute_queue, exit_probs_host, buffers['exit_probs'], wait_for=current_set['compute_events'])
+        cl.enqueue_copy(compute_queue, losses_host, buffers['losses'], wait_for=batch_events)
+        cl.enqueue_copy(compute_queue, exit_probs_host, buffers['exit_probs'], wait_for=batch_events)
 
-        # Read temperatures from the device
+        # Read temperatures
         temps_host = np.empty(NUM_EXITS, dtype=np.float32)
-        cl.enqueue_copy(compute_queue, temps_host, buffers['temps'], wait_for=current_set['compute_events'])
+        cl.enqueue_copy(compute_queue, temps_host, buffers['temps'], wait_for=batch_events)
 
         # Extract valid probabilities
-        valid_probs = exit_probs_host[:actual_batch_size * NUM_EXITS].reshape(actual_batch_size, NUM_EXITS, OUTPUT_CLASSES)
+        valid_probs = exit_probs_host[:actual_batch_size].reshape(actual_batch_size, NUM_EXITS, OUTPUT_CLASSES)
 
         # Compute temperature-weighted ensemble
         confidences = np.array([valid_probs[:, i, :].max(axis=1) ** (1 / (temps_host[i] + 1e-8)) 
                                 for i in range(NUM_EXITS)])
         weights = np.exp(confidences) / np.sum(np.exp(confidences), axis=0)
         ensemble_probs = np.einsum('ijk,j->ik', valid_probs, weights)
-        ensemble_probs /= np.sum(ensemble_probs, axis=1, keepdims=True) + 1e-8  # Normalize to sum to 1
+        ensemble_probs /= np.sum(ensemble_probs, axis=1, keepdims=True) + 1e-8
 
-        # Compute cross-entropy loss
-        log_probs = np.log(ensemble_probs + 1e-8)  # Small epsilon for stability
+        # Compute loss and accuracy
+        log_probs = np.log(ensemble_probs + 1e-8)
         batch_loss = -np.mean(log_probs[np.arange(actual_batch_size), y_batch])
         epoch_loss += batch_loss * actual_batch_size
-
-        # For accuracy calculation
         predicted_classes = np.argmax(ensemble_probs, axis=1)
         batch_correct = np.sum(predicted_classes == y_batch)
         correct_predictions += batch_correct
 
-        # Prefetch next batch
+        # Prefetch next batch if needed
         if next_set:
             next_batch_start = (batch_idx + 1) * BATCH_SIZE
             next_batch_end = min(next_batch_start + BATCH_SIZE, len(X))
@@ -500,6 +571,7 @@ for epoch in range(EPOCHS):
             y_next = y_true[next_indices]
             X_next_pad, y_next_pad, mask_next_pad, next_padded_size = pad_batch(X_next, y_next, batch_multiple, simd_width)
 
+            # Map next staging buffers
             next_input, next_map_input = cl.enqueue_map_buffer(
                 transfer_queue, next_set['staging_input'], cl.map_flags.WRITE | cl.map_flags.INVALIDATE_REGION, 0,
                 (next_padded_size, input_dim_padded), np.float32, is_blocking=False
@@ -520,46 +592,25 @@ for epoch in range(EPOCHS):
             with next_mask:
                 next_mask[:next_padded_size] = mask_next_pad
 
+            # Transfer next batch to device
             cl.enqueue_copy_buffer(
-                transfer_queue,
-                next_set['staging_input'],
-                next_set['input_dev'],
-                src_offset=0,
-                dst_offset=0,
-                size=next_padded_size * input_dim_padded * 4,
-                wait_for=[next_map_input],
-                is_blocking=False
+                transfer_queue, next_set['staging_input'], next_set['input_dev'],
+                src_offset=0, dst_offset=0, size=next_padded_size * input_dim_padded * 4, is_blocking=False
             )
             cl.enqueue_copy_buffer(
-                transfer_queue,
-                next_set['staging_targets'],
-                next_set['targets_dev'],
-                src_offset=0,
-                dst_offset=0,
-                size=next_padded_size * 4,
-                wait_for=[next_map_targets],
-                is_blocking=False
+                transfer_queue, next_set['staging_targets'], next_set['targets_dev'],
+                src_offset=0, dst_offset=0, size=next_padded_size * 4, is_blocking=False
             )
             cl.enqueue_copy_buffer(
-                transfer_queue,
-                next_set['staging_mask'],
-                next_set['mask_dev'],
-                src_offset=0,
-                dst_offset=0,
-                size=next_padded_size * 4,
-                wait_for=[next_map_mask],
-                is_blocking=False
+                transfer_queue, next_set['staging_mask'], next_set['mask_dev'],
+                src_offset=0, dst_offset=0, size=next_padded_size * 4, is_blocking=False
             )
 
     # Compute and print epoch metrics
     avg_loss = epoch_loss / len(X)
     train_acc = correct_predictions / len(X)
     print(f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | Acc: {train_acc:.1%}")
-
-    # Temperature Monitoring
-    temps_host = np.empty(NUM_EXITS, dtype=np.float32)
-    cl.enqueue_copy(compute_queue, temps_host, buffers['temps'])
     print(f"Temperatures: {temps_host}")
 
 if __name__ == "__main__":
-    main()
+    pass
