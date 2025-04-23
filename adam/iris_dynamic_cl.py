@@ -33,7 +33,7 @@ CL_KERNEL_FILES = [
     'kernel_multi_exit.cl'
 ]
 
-# Utility Functions (unchanged)
+# Utility Functions
 def lcm(a, b):
     return a * b // gcd(a, b)
 
@@ -122,350 +122,235 @@ def select_simd_width(device):
         return 4
     return 1
 
-class KernelDAGBuilder:
-    def __init__(self):
-        self.dag = nx.DiGraph()
-        self.node_counter = 0
-        self.constant_buffers = {}
-        self.buffer_versions = {}
-        self.buffer_writers = {}
-        self.node_data = {}
-        self.buffer_last_access = {}
+# WorkManager Definition with reset_graph method
+class WorkManager:
+    """Coordinates all work across queues through logical resource tracking"""
+    def __init__(self, context):
+        self.context = context
+        self.execution_graph = nx.MultiDiGraph()
+        self.logical_resources = {}  # {"input": (current_phys_buf, version)}
+        self.hardware_queues = {}  # {'xfer': queue, 'compute': queue}
+        self.node_id_counter = 0
 
-    class OperationNode:
-        __slots__ = ['node_id', 'enqueue_fn', 'buffers', 'queue', 'event', 'callbacks']
+    class ExecutionNode:
+        __slots__ = ['uid', 'queue_type', 'execute', 'resources', 'dependencies']
+        def __init__(self, uid):
+            self.uid = uid
+            self.queue_type = None
+            self.execute = None  # (queue, deps) → cl.Event
+            self.resources = {'R': set(), 'W': set()}
+            self.dependencies = set()
 
-        def __init__(self, node_id):
-            self.node_id = node_id
-            self.enqueue_fn = None
-            self.buffers = {}
-            self.queue = None
-            self.event = None
-            self.callbacks = []
+    def create_node(self, queue_type, resource_access, operation_fn):
+        """Register operation with cross-queue dependency resolution"""
+        node = self.ExecutionNode(self.node_id_counter)
+        node.queue_type = queue_type
+        node.execute = operation_fn
+        node.resources = resource_access
 
-    def add_operation(self, enqueue_fn, buffers_accessed, queue):
-        """Add operation to DAG with automatic dependency resolution"""
-        node = self.OperationNode(self.node_counter)
-        node.enqueue_fn = enqueue_fn
-        node.buffers = buffers_accessed.copy()
-        node.queue = queue
+        # Cross-queue dependency detection
+        for res in resource_access['R'] | resource_access['W']:
+            for existing in self.execution_graph.nodes.values():
+                if (res in existing.resources['W'] or
+                   (res in existing.resources['R'] and res in resource_access['W'])):
+                    node.dependencies.add(existing.uid)
 
-        dependencies = self._calculate_dependencies(buffers_accessed)
-        self.dag.add_node(node.node_id)
-        self.node_data[node.node_id] = node
+        self.execution_graph.add_node(node.uid, node=node)
+        self.node_id_counter += 1
+        return node.uid
 
-        for dep in dependencies:
-            self.dag.add_edge(dep, node.node_id)
+    def commit_workload(self):
+        """Generate execution chains with automatic inter-queue sync"""
+        ordered_nodes = list(nx.lexicographical_topological_sort(
+            self.execution_graph,
+            key=lambda x: self.execution_graph.nodes[x]['node'].queue_type
+        ))
 
-        self._update_buffer_state(node.node_id, buffers_accessed)
-        self.node_counter += 1
-        return node.node_id
+        schedule = {qt: [] for qt in self.hardware_queues}
+        completion_events = {}
 
-    def register_constant_buffer(self, name, cl_buffer):
-        """Mark buffers that persist across DAG executions"""
-        self.constant_buffers[name] = cl_buffer
+        for uid in ordered_nodes:
+            node = self.execution_graph.nodes[uid]['node']
+            queue = self.hardware_queues[node.queue_type]
 
-    def register_node_callback(self, node_id, callback_fn):
-        """Associate buffer callback with specific operation node"""
-        if node_id in self.node_data:
-            self.node_data[node_id].callbacks.append(callback_fn)
+            # Collect cross-queue dependencies
+            wait_for = [
+                completion_events[d] for d in node.dependencies
+                if self.execution_graph.nodes[d]['node'].queue_type != node.queue_type
+            ]
 
-    def _calculate_dependencies(self, buffers_accessed):
-        """Find all necessary dependencies based on buffer access modes"""
-        dependencies = set()
-        for buffer, mode in buffers_accessed.items():
-            current_version = self.buffer_versions.get(buffer, 0)
+            # Execute with proper fencing
+            event = node.execute(queue, wait_for=wait_for)
+            completion_events[uid] = event
+            schedule[node.queue_type].append(event)
 
-            if mode == 'W':
-                # RAW: Find all readers since last write
-                readers = [n for n, v in self.buffer_last_access.get(buffer, [])
-                           if v == 'R' and n < self.node_counter]
-                dependencies.update(readers)
+            # Maintain resource versions
+            for res in node.resources['W']:
+                self.logical_resources[res] = (
+                    self.logical_resources[res][0],
+                    self.logical_resources[res][1] + 1
+                )
 
-                # WAW: Find last writer
-                if buffer in self.buffer_writers:
-                    dependencies.add(self.buffer_writers[buffer])
-            elif mode == 'R':
-                # WAR: Find the last writer
-                if buffer in self.buffer_writers:
-                    dependencies.add(self.buffer_writers[buffer])
+        return schedule
 
-        return dependencies
-
-    def _update_buffer_state(self, node_id, buffers_accessed):
-        """Update global buffer state tracking"""
-        for buffer, mode in buffers_accessed.items():
-            # Track buffer access pattern
-            if buffer not in self.buffer_last_access:
-                self.buffer_last_access[buffer] = []
-            self.buffer_last_access[buffer].append((node_id, mode))
-
-            if mode == 'W':
-                self.buffer_writers[buffer] = node_id
-                self.buffer_versions[buffer] = self.buffer_versions.get(buffer, 0) + 1
-
-    def build_execution_order(self):
-        """Validate and return topologically sorted execution order"""
-        if not nx.is_directed_acyclic_graph(self.dag):
-            raise ValueError("DAG contains cycles")
-        return list(nx.topological_sort(self.dag))
-
-    def execute(self):
-        """Execute all operations in dependency order with proper synchronization"""
-        ordered_nodes = self.build_execution_order()
-        event_graph = {}
-
-        for node_id in ordered_nodes:
-            node = self.node_data[node_id]
-            predecessors = list(self.dag.predecessors(node_id))
-            wait_events = [event_graph[p] for p in predecessors if p in event_graph]
-
-            # Execute operation with OpenCL event chaining
-            node.event = node.enqueue_fn(
-                queue=node.queue,
-                wait_for=wait_events
-            )
-
-            # Add callback callbacks
-            if node.callbacks:
-                # Need to closure-capture individual callbacks
-                def make_callback(fn):
-                    def callback(event, status):
-                        if status == cl.command_execution_status.COMPLETE:
-                            fn()
-                    return callback
-
-                for callback_fn in node.callbacks:
-                    cb = make_callback(callback_fn)
-                    node.event.set_callback(cl.command_execution_status.COMPLETE, cb)
-
-            event_graph[node_id] = node.event
-
-        return event_graph
-
-    def reset(self):
-        """Reset DAG state for new computation graph"""
-        self.dag.clear()
-        self.node_counter = 0
-        self.buffer_versions.clear()
-        self.buffer_writers.clear()
-        self.node_data.clear()
-        self.buffer_last_access.clear()
+    def reset_graph(self):
+        """Reset the execution graph while preserving logical resources"""
+        self.execution_graph.clear()
+        self.node_id_counter = 0
 
 class TransferWrapper:
-    def __init__(self, context, buffer_name, buffer_size, dtype=np.float32):
-        """
-        Initialize the TransferWrapper for managing host-device data transfers.
-        
-        Args:
-            context: OpenCL context
-            buffer_name: Logical name for the buffer
-            buffer_size: Size of the buffer in bytes
-            dtype: NumPy data type for the buffer elements
-        """
+    def __init__(self, context, buffer_name, buffer_size, dtype=np.float32, device_buf=None):
         self.ctx = context
         self.logical_name = buffer_name
         self.dtype = dtype
         self.element_size = np.dtype(dtype).itemsize
         self.buffer_size = buffer_size
-
-        # Create staging buffers for double buffering
         self.staging_bufs = [
             self._create_staging_buffer(buffer_size),
             self._create_staging_buffer(buffer_size)
         ]
         self.current_staging = 0
-
-        # Device buffer storage
-        self.device_buf = cl.Buffer(
-            self.ctx,
-            cl.mem_flags.READ_WRITE,
-            size=buffer_size
+        self.device_buf = device_buf if device_buf is not None else cl.Buffer(
+            self.ctx, cl.mem_flags.READ_WRITE, size=buffer_size
         )
-
-        # Track transfer operations
-        self.last_transfer_node = None
+        self.staging_resources = [
+            f"{buffer_name}_staging0",
+            f"{buffer_name}_staging1"
+        ]
+        self.active_ops = {0: set(), 1: set()}  # Track operations per buffer
 
     def _create_staging_buffer(self, size):
-        """Create host-mapped staging buffer"""
         return cl.Buffer(
             self.ctx,
             cl.mem_flags.READ_WRITE | cl.mem_flags.ALLOC_HOST_PTR,
             size=size
         )
 
-    def host_to_device(self, dag, host_data, transfer_queue):
-        """
-        Enqueue host-to-device transfer with DAG integration.
-        
-        Args:
-            dag: DAG builder for scheduling operations
-            host_data: NumPy array of data to transfer to device
-            transfer_queue: OpenCL queue for transfer operations
-        
-        Returns:
-            Tuple of (transfer_node, transfer_complete)
-            - transfer_node: Final DAG node for the transfer
-            - transfer_complete: User event signaling transfer completion
-        """
+    def host_to_device(self, manager, host_data, transfer_queue):
         if host_data.nbytes > self.staging_bufs[0].size:
             raise ValueError(f"Data size {host_data.nbytes} exceeds buffer capacity {self.staging_bufs[0].size}")
 
-        # Select staging buffer using double buffering
-        staging_buf = self.staging_bufs[self.current_staging]
-        self.current_staging = 1 - self.current_staging  # Toggle buffer index
+        staging_idx = self.current_staging
+        staging_res = self.staging_resources[staging_idx]
+        staging_buf = self.staging_bufs[staging_idx]
 
-        transfer_complete = cl.UserEvent(self.ctx)
-
-        # 1. Map and copy to staging
-        def map_and_copy(queue, wait_for):
+        def enqueue_transfer(queue, wait_for):
+            # Map and copy to staging buffer
             host_ptr, map_event = cl.enqueue_map_buffer(
                 queue, staging_buf, cl.map_flags.WRITE,
                 0, host_data.shape, self.dtype,
                 wait_for=wait_for
             )
             np.copyto(host_ptr, host_data)
-            return map_event
 
-        map_node = dag.add_operation(
-            enqueue_fn=map_and_copy,
-            buffers_accessed={self.logical_name: 'W'},
-            queue=transfer_queue
-        )
-
-        # 2. Unmap staging buffer
-        def unmap(queue, wait_for):
+            # Unmap and copy to device buffer
             unmap_event = cl.enqueue_unmap_mem_object(
-                queue, staging_buf, staging_buf.get_host_array(),
-                wait_for=wait_for
+                queue, staging_buf, host_ptr,
+                wait_for=[map_event]
             )
-            return unmap_event
-
-        unmap_node = dag.add_operation(
-            enqueue_fn=unmap,
-            buffers_accessed={self.logical_name: 'W'},
-            queue=transfer_queue
-        )
-        dag.dag.add_edge(map_node, unmap_node)
-
-        # 3. Copy to device buffer with callback
-        def transfer_to_device(queue, wait_for):
             copy_event = cl.enqueue_copy_buffer(
                 queue, staging_buf, self.device_buf,
-                wait_for=wait_for
+                wait_for=[unmap_event]
             )
-            # Set transfer_complete when copy is done
+
+            # Register completion callback
+            def completion_callback(event, status):
+                if status == cl.command_execution_status.COMPLETE:
+                    self.active_ops[staging_idx].discard(event)
+
             copy_event.set_callback(
                 cl.command_execution_status.COMPLETE,
-                lambda event, status: transfer_complete.set_status(status)
+                completion_callback
             )
+            self.active_ops[staging_idx].add(copy_event)
             return copy_event
 
-        transfer_node = dag.add_operation(
-            enqueue_fn=transfer_to_device,
-            buffers_accessed={self.logical_name: 'W'},
-            queue=transfer_queue
+        # Update staging index only after operation is registered
+        transfer_node = manager.create_node(
+            queue_type='xfer',
+            resource_access={
+                'W': {self.logical_name, staging_res}
+            },
+            operation_fn=enqueue_transfer
         )
-        dag.dag.add_edge(unmap_node, transfer_node)
+        self.current_staging = 1 - staging_idx
+        return transfer_node
 
-        self.last_transfer_node = transfer_node
-        return transfer_node, transfer_complete
+    def device_to_host(self, manager, transfer_queue, host_processing_event):
+        staging_idx = self.current_staging
+        staging_res = self.staging_resources[staging_idx]
+        staging_buf = self.staging_bufs[staging_idx]
+        transfer_data = {}
 
-    def device_to_host(self, dag, transfer_queue, compute_queue, host_processing_event):
-        """
-        Enqueue device-to-host transfer with DAG integration, including unmapping.
-        
-        Args:
-            dag: DAG builder for scheduling operations
-            transfer_queue: OpenCL queue for transfer operations
-            compute_queue: OpenCL queue for compute operations
-            host_processing_event: User event signaling when host processing is complete
-        
-        Returns:
-            Tuple (map_node, host_ptr, data_ready)
-            - map_node: DAG node for mapping operation
-            - host_ptr: Mapped host pointer for reading data
-            - data_ready: User event signaling when data is ready on the host
-        """
-        staging_buf = self.staging_bufs[self.current_staging]
-        data_ready = cl.UserEvent(self.ctx)
-
-        # Step 1: Copy from device buffer to staging buffer
-        def device_to_staging(queue, wait_for):
-            return cl.enqueue_copy_buffer(
+        def enqueue_transfer(queue, wait_for):
+            # Copy from device to staging
+            copy_event = cl.enqueue_copy_buffer(
                 queue, self.device_buf, staging_buf,
                 wait_for=wait_for
             )
 
-        copy_node = dag.add_operation(
-            enqueue_fn=device_to_staging,
-            buffers_accessed={self.logical_name: 'R'},
-            queue=transfer_queue
-        )
-
-        # Step 2: Map the staging buffer to host memory with a callback
-        def map_staging(queue, wait_for):
+            # Map buffer for host access
             host_ptr, map_event = cl.enqueue_map_buffer(
                 queue, staging_buf, cl.map_flags.READ,
                 0, (self.buffer_size // self.element_size,), self.dtype,
-                wait_for=wait_for
+                wait_for=[copy_event]
             )
-            # Set data_ready when the map operation completes
+
+            # Register data ready event
+            data_ready = cl.UserEvent(self.ctx)
             map_event.set_callback(
                 cl.command_execution_status.COMPLETE,
-                lambda event, status: data_ready.set_status(status)
+                lambda e, s: data_ready.set_status(s)
+            )
+            transfer_data[self.logical_name] = (host_ptr, data_ready)
+
+            # Track operation completion
+            self.active_ops[staging_idx].add(map_event)
+            def map_completion(e, s):
+                self.active_ops[staging_idx].discard(e)
+            map_event.set_callback(
+                cl.command_execution_status.COMPLETE,
+                map_completion
             )
             return map_event
 
-        map_node = dag.add_operation(
-            enqueue_fn=map_staging,
-            buffers_accessed={self.logical_name: 'R'},
-            queue=transfer_queue
+        transfer_node = manager.create_node(
+            queue_type='xfer',
+            resource_access={'R': {self.logical_name, staging_res}},
+            operation_fn=enqueue_transfer
         )
-        dag.dag.add_edge(copy_node, map_node)
 
-        # Step 3: Unmap the staging buffer after host processing is complete
-        def unmap_staging(queue, wait_for):
-            # Wait for host_processing_event
+        def enqueue_unmap(queue, wait_for):
             cl.wait_for_events([host_processing_event])
             unmap_event = cl.enqueue_unmap_mem_object(
-                queue, staging_buf, host_ptr,
+                queue, staging_buf,
+                transfer_data[self.logical_name][0],
                 wait_for=wait_for
             )
             return unmap_event
 
-        unmap_node = dag.add_operation(
-            enqueue_fn=unmap_staging,
-            buffers_accessed={self.logical_name: 'W'},
-            queue=transfer_queue
+        unmap_node = manager.create_node(
+            queue_type='xfer',
+            resource_access={'W': {staging_res}},
+            operation_fn=enqueue_unmap
         )
-        dag.dag.add_edge(map_node, unmap_node)
+        manager.execution_graph.add_edge(transfer_node, unmap_node)
 
-        return map_node, host_ptr, data_ready
+        return transfer_node, transfer_data
 
     @property
     def device_buffer(self):
-        """Get the device buffer reference"""
         return self.device_buf
 
     def release(self):
-        """Release OpenCL resources"""
         for buf in self.staging_bufs:
             buf.release()
         self.device_buf.release()
 
 class KernelWrapper:
-    def __init__(self, program, dag_builder, compute_queue, padded_input_dim, padded_hidden_dim, padded_output_classes, padded_batch_size):
-        """
-        Initialize the KernelWrapper with an OpenCL program and DAG builder.
-        
-        Args:
-            program: Compiled OpenCL program containing kernel functions.
-            dag_builder: Instance of KernelDAGBuilder for operation registration.
-            padded_: Dictionary or object containing padded dimensions (assumed to provide padded values).
-        """
+    def __init__(self, program, manager, compute_queue, padded_input_dim, padded_hidden_dim, padded_output_classes, padded_batch_size):
         self.program = program
-        self.dag = dag_builder
+        self.manager = manager
         self.queue = compute_queue
         self.mask = None
         self.temperatures = None
@@ -487,232 +372,77 @@ class KernelWrapper:
         self.epsilon = np.float32(EPSILON)
 
     def set_mask(self, mask):
-        """Set the mask buffer and return self for chaining."""
         self.mask = mask
         return self
 
     def set_temps(self, temps):
-        """Set the temperatures buffer and return self for chaining."""
         self.temperatures = temps
         return self
 
     def forward_pass(self, global_sizes, local_sizes, input_buf, weights_buf, biases_buf, hidden_buf):
-        """
-        Register a forward propagation operation in the DAG.
-        
-        Args:
-            global_sizes: Tuple of global work sizes.
-            local_sizes: Tuple of local work sizes.
-            input_buf: Input data buffer.
-            weights_buf: Weights buffer.
-            biases_buf: Biases buffer.
-            hidden_buf: Hidden layer output buffer.
-            padded_batch_size: Number of samples in the batch (int32).
-        
-        Returns:
-            Node ID of the registered operation in the DAG.
-        """
         def _enqueue_forward(queue, wait_for):
             return self.program.forward_pass(
-                queue,
-                global_sizes,
-                local_sizes,
-                input_buf,
-                weights_buf,
-                biases_buf,
-                hidden_buf,
-                self.mask,
-                self.input_dim,
-                self.hidden_dim,
-                self.padded_hidden_dim,
-                self.padded_batch_size,
+                queue, global_sizes, local_sizes, input_buf, weights_buf, biases_buf, hidden_buf,
+                self.mask, self.input_dim, self.hidden_dim, self.padded_hidden_dim, self.padded_batch_size,
                 wait_for=wait_for
             )
 
-        buffers_accessed = {
-            input_buf: 'R',
-            weights_buf: 'R',
-            biases_buf: 'R',
-            hidden_buf: 'W',
-            self.mask: 'R'
-        }
-        return self.dag.add_operation(
-            enqueue_fn=_enqueue_forward,
-            buffers_accessed=buffers_accessed,
-            queue=self.queue
+        return self.manager.create_node(
+            queue_type='compute',
+            resource_access={'R': {'input', 'weights', 'biases', 'mask'}, 'W': {'hidden'}},
+            operation_fn=_enqueue_forward
         )
 
     def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_buf, exit_weights_buf, 
-                                    exit_biases_buf, exit_probs_buf, losses_buf, targets_buf, 
-                                    exit_idx):
-        """
-        Register an exit probability calculation operation for a specific exit index.
-        
-        Args:
-            global_sizes: Tuple of global work sizes.
-            local_sizes: Tuple of local work sizes.
-            hidden_buf: Hidden layer activations buffer.
-            exit_weights_buf: Exit classifier weights buffer.
-            exit_biases_buf: Exit classifier biases buffer.
-            exit_probs_buf: Exit probabilities output buffer.
-            losses_buf: Per-exit loss output buffer.
-            targets_buf: Target labels buffer.
-            padded_batch_size: Number of samples in the batch (int32).
-            exit_idx: Index of the current exit (int32).
-        
-        Returns:
-            Node ID of the registered operation in the DAG.
-        """
+                                   exit_biases_buf, exit_probs_buf, losses_buf, targets_buf, exit_idx):
         def _enqueue_exit(queue, wait_for):
             return self.program.compute_exit_probabilities(
-                queue,
-                global_sizes,
-                local_sizes,
-                hidden_buf,
-                exit_weights_buf,
-                exit_biases_buf,
-                exit_probs_buf,
-                losses_buf,
-                targets_buf,
-                self.mask,
-                self.temperatures,
-                self.hidden_dim,
-                self.padded_hidden_dim,
-                self.output_classes,
-                self.padded_output_classes,
-                self.num_exits,
-                self.padded_batch_size,
-                exit_idx,
-                wait_for=wait_for
+                queue, global_sizes, local_sizes, hidden_buf, exit_weights_buf, exit_biases_buf,
+                exit_probs_buf, losses_buf, targets_buf, self.mask, self.temperatures,
+                self.hidden_dim, self.padded_hidden_dim, self.output_classes, self.padded_output_classes,
+                self.num_exits, self.padded_batch_size, exit_idx, wait_for=wait_for
             )
 
-        buffers_accessed = {
-            hidden_buf: 'R',
-            exit_weights_buf: 'R',
-            exit_biases_buf: 'R',
-            targets_buf: 'R',
-            exit_probs_buf: 'W',
-            losses_buf: 'W',
-            self.mask: 'R',
-            self.temperatures: 'R'
-        }
-        return self.dag.add_operation(
-            enqueue_fn=_enqueue_exit,
-            buffers_accessed=buffers_accessed,
-            queue=self.queue
+        return self.manager.create_node(
+            queue_type='compute',
+            resource_access={'R': {'hidden', 'exit_weights', 'exit_biases', 'targets', 'mask', 'temps'},
+                            'W': {'exit_probs', 'losses'}},
+            operation_fn=_enqueue_exit
         )
 
     def compute_gradients(self, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, 
                           exit_weights_buf, grad_weights_buf, grad_biases_buf, targets_buf):
-        """
-        Register a gradient computation operation in the DAG.
-        
-        Args:
-            global_sizes: Tuple of global work sizes.
-            local_sizes: Tuple of local work sizes.
-            input_buf: Input data buffer.
-            hidden_buf: Hidden layer activations buffer.
-            exit_probs_buf: Exit probabilities buffer.
-            exit_weights_buf: Exit classifier weights buffer.
-            grad_weights_buf: Gradient buffer for weights.
-            grad_biases_buf: Gradient buffer for biases.
-            targets_buf: Target labels buffer.
-            padded_batch_size: Number of samples in the batch (int32).
-        
-        Returns:
-            Node ID of the registered operation in the DAG.
-        """
         def _enqueue_grad(queue, wait_for):
             return self.program.compute_gradients(
-                queue,
-                global_sizes,
-                local_sizes,
-                input_buf,
-                hidden_buf,
-                exit_probs_buf,
-                exit_weights_buf,
-                grad_weights_buf,
-                grad_biases_buf,
-                targets_buf,
-                self.mask,
-                self.temperatures,
-                self.input_dim,
-                self.hidden_dim,
-                self.padded_hidden_dim,
-                self.output_classes,
-                self.padded_output_classes,
-                self.num_exits,
-                self.padded_batch_size,
-                wait_for=wait_for
+                queue, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf,
+                grad_weights_buf, grad_biases_buf, targets_buf, self.mask, self.temperatures,
+                self.input_dim, self.hidden_dim, self.padded_hidden_dim, self.output_classes,
+                self.padded_output_classes, self.num_exits, self.padded_batch_size, wait_for=wait_for
             )
 
-        buffers_accessed = {
-            input_buf: 'R',
-            hidden_buf: 'R',
-            exit_probs_buf: 'R',
-            exit_weights_buf: 'R',
-            targets_buf: 'R',
-            grad_weights_buf: 'W',
-            grad_biases_buf: 'W',
-            self.mask: 'R',
-            self.temperatures: 'R'
-        }
-        return self.dag.add_operation(
-            enqueue_fn=_enqueue_grad,
-            buffers_accessed=buffers_accessed,
-            queue=self.queue
+        return self.manager.create_node(
+            queue_type='compute',
+            resource_access={'R': {'input', 'hidden', 'exit_probs', 'exit_weights', 'targets', 'mask', 'temps'},
+                            'W': {'grad_weights', 'grad_biases'}},
+            operation_fn=_enqueue_grad
         )
 
     def adam_update(self, global_sizes, local_sizes, grad_param, param_buffer, m1_param, m2_param, 
                     beta1_t, beta2_t, total_params):
-        """
-        Register an Adam optimization update operation for a given parameter.
-        
-        Args:
-            global_sizes: Tuple of global work sizes.
-            local_sizes: Tuple of local work sizes.
-            grad_param: Gradient buffer for the parameter.
-            param_buffer: Parameter buffer to update.
-            m1_param: First moment estimate buffer.
-            m2_param: Second moment estimate buffer.
-            beta1_t: Bias-corrected beta1 (float32).
-            beta2_t: Bias-corrected beta2 (float32).
-            total_params: Total number of parameters (int32).
-        
-        Returns:
-            Node ID of the registered operation in the DAG.
-        """
         def _enqueue_update(queue, wait_for):
             return self.program.adam_update(
-                queue,
-                global_sizes,
-                local_sizes,
-                grad_param,
-                param_buffer,
-                m1_param,
-                m2_param,
-                beta1_t,
-                beta2_t,
-                self.learning_rate,
-                self.adam_beta1,
-                self.adam_beta2,
-                self.min_temp,
-                self.max_temp,
-                self.epsilon,
-                total_params,
-                wait_for=wait_for
+                queue, global_sizes, local_sizes, grad_param, param_buffer, m1_param, m2_param,
+                beta1_t, beta2_t, self.learning_rate, self.adam_beta1, self.adam_beta2,
+                self.min_temp, self.max_temp, self.epsilon, total_params, wait_for=wait_for
             )
 
-        buffers_accessed = {
-            grad_param: 'R',
-            param_buffer: 'W',
-            m1_param: 'W',
-            m2_param: 'W'
-        }
-        return self.dag.add_operation(
-            enqueue_fn=_enqueue_update,
-            buffers_accessed=buffers_accessed,
-            queue=self.queue
+        param_name = {buffers['weights']: 'weights', buffers['biases']: 'biases',
+                      buffers['exit_weights']: 'exit_weights', buffers['exit_biases']: 'exit_biases',
+                      buffers['temps']: 'temps'}[param_buffer]
+        return self.manager.create_node(
+            queue_type='compute',
+            resource_access={'R': {f'grad_{param_name}'}, 'W': {param_name, f'm1_{param_name}', f'm2_{param_name}'}},
+            operation_fn=_enqueue_update
         )
 
 # Data Preparation
@@ -808,6 +538,40 @@ losses_wrapper = TransferWrapper(ctx, "losses", losses_buf_size, dtype=np.float3
 exit_probs_wrapper = TransferWrapper(ctx, "exit_probs", exit_probs_buf_size, dtype=np.float32, device_buf=buffers['exit_probs'])
 temps_wrapper = TransferWrapper(ctx, "temps", temps_buf_size, dtype=np.float32, device_buf=buffers['temps'])
 
+# Initialize WorkManager once before training loop
+manager = WorkManager(ctx)
+manager.hardware_queues = {'xfer': transfer_queue, 'compute': compute_queue}
+
+# Initialize logical resources once with version 0
+manager.logical_resources = {
+    "input": (input_wrapper.device_buffer, 0),
+    "targets": (targets_wrapper.device_buffer, 0),
+    "mask": (mask_wrapper.device_buffer, 0),
+    "losses": (losses_wrapper.device_buffer, 0),
+    "exit_probs": (exit_probs_wrapper.device_buffer, 0),
+    "temps": (temps_wrapper.device_buffer, 0),
+    "weights": (buffers['weights'], 0),
+    "biases": (buffers['biases'], 0),
+    "exit_weights": (buffers['exit_weights'], 0),
+    "exit_biases": (buffers['exit_biases'], 0),
+    "hidden": (buffers['hidden'], 0),
+    "grad_weights": (buffers['grad_weights'], 0),
+    "grad_biases": (buffers['grad_biases'], 0),
+    "grad_exit_weights": (buffers['grad_exit_weights'], 0),
+    "grad_exit_biases": (buffers['grad_exit_biases'], 0),
+    "grad_temps": (buffers['grad_temps'], 0),
+    "m1_weights": (buffers['m1_weights'], 0),
+    "m1_biases": (buffers['m1_biases'], 0),
+    "m1_exit_weights": (buffers['m1_exit_weights'], 0),
+    "m1_exit_biases": (buffers['m1_exit_biases'], 0),
+    "m1_temps": (buffers['m1_temps'], 0),
+    "m2_weights": (buffers['m2_weights'], 0),
+    "m2_biases": (buffers['m2_biases'], 0),
+    "m2_exit_weights": (buffers['m2_exit_weights'], 0),
+    "m2_exit_biases": (buffers['m2_exit_biases'], 0),
+    "m2_temps": (buffers['m2_temps'], 0)
+}
+
 # Training Loop
 global_step = 1
 for epoch in range(EPOCHS):
@@ -817,7 +581,7 @@ for epoch in range(EPOCHS):
     correct_predictions = 0
 
     for batch_idx in range(num_batches):
-        dag_builder = KernelDAGBuilder()  # New DAG per batch
+        manager.reset_graph()
 
         # Prepare batch
         batch_start = batch_idx * BATCH_SIZE
@@ -829,20 +593,24 @@ for epoch in range(EPOCHS):
         X_pad, y_pad, mask_pad, padded_batch_size = pad_batch(X_batch, y_batch, batch_multiple, simd_width)
 
         # Host-to-device transfers
-        input_wrapper.host_to_device(dag_builder, X_pad, transfer_queue)
-        targets_wrapper.host_to_device(dag_builder, y_pad, transfer_queue)
-        mask_wrapper.host_to_device(dag_builder, mask_pad, transfer_queue)
+        input_wrapper.host_to_device(manager, X_pad, transfer_queue)
+        targets_wrapper.host_to_device(manager, y_pad, transfer_queue)
+        mask_wrapper.host_to_device(manager, mask_pad, transfer_queue)
 
         # Zero gradients
         for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
             grad_buffer = buffers[f'grad_{param}']
-            def enqueue_fn_zero(queue, wait_for):
+            def enqueue_zero(queue, wait_for):
                 return cl.enqueue_fill_buffer(queue, grad_buffer, np.float32(0), 0, grad_buffer.size, wait_for=wait_for)
-            dag_builder.add_operation(enqueue_fn_zero, {grad_buffer: 'W'}, compute_queue)
+            manager.create_node(
+                queue_type='compute',
+                resource_access={'W': {f'grad_{param}'}},
+                operation_fn=enqueue_zero
+            )
 
         # Kernel wrapper
         kernel_wrapper = KernelWrapper(
-            program, dag_builder, compute_queue, padded_input_dim, padded_hidden_dim,
+            program, manager, compute_queue, padded_input_dim, padded_hidden_dim,
             padded_output_classes, padded_batch_size
         ).set_mask(mask_wrapper.device_buffer).set_temps(buffers['temps'])
 
@@ -850,7 +618,8 @@ for epoch in range(EPOCHS):
         global_forward = (padded_batch_size, padded_hidden_dim // simd_width)
         local_forward = optimal_local_sizes(global_forward, device_limits)
         kernel_wrapper.forward_pass(
-            global_forward, local_forward, input_wrapper.device_buffer, buffers['weights'], buffers['biases'], buffers['hidden']
+            global_forward, local_forward, input_wrapper.device_buffer, buffers['weights'],
+            buffers['biases'], buffers['hidden']
         )
 
         # Early exits
@@ -887,17 +656,26 @@ for epoch in range(EPOCHS):
 
         # Device-to-host transfers
         host_processing_event = cl.UserEvent(ctx)
-        _, losses_host, losses_ready = losses_wrapper.device_to_host(dag_builder, transfer_queue, compute_queue, host_processing_event)
-        _, exit_probs_host, exit_probs_ready = exit_probs_wrapper.device_to_host(dag_builder, transfer_queue, compute_queue, host_processing_event)
-        _, temps_host, temps_ready = temps_wrapper.device_to_host(dag_builder, transfer_queue, compute_queue, host_processing_event)
+        transfer_data = {}
+        losses_node, losses_data = losses_wrapper.device_to_host(manager, transfer_queue, host_processing_event)
+        transfer_data.update(losses_data)
+        exit_probs_node, exit_probs_data = exit_probs_wrapper.device_to_host(manager, transfer_queue, host_processing_event)
+        transfer_data.update(exit_probs_data)
+        temps_node, temps_data = temps_wrapper.device_to_host(manager, transfer_queue, host_processing_event)
+        transfer_data.update(temps_data)
 
-        # Execute DAG
-        dag_builder.execute()
+        # Execute workload
+        schedule = manager.commit_workload()
 
         # Wait for transfers
-        cl.wait_for_events([losses_ready, exit_probs_ready, temps_ready])
+        data_ready_events = [transfer_data[key][1] for key in transfer_data]
+        cl.wait_for_events(data_ready_events)
 
         # Process results
+        losses_host = transfer_data['losses'][0]
+        exit_probs_host = transfer_data['exit_probs'][0]
+        temps_host = transfer_data['temps'][0]
+
         exit_losses = []
         for exit_idx in range(NUM_EXITS):
             start = exit_idx * loss_elements_per_exit
