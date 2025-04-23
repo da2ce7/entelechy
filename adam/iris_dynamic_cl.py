@@ -372,22 +372,22 @@ class TransferWrapper:
         self.last_transfer_node = transfer_node
         return transfer_node, transfer_complete
 
-    def device_to_host(self, dag, transfer_queue, compute_queue):
+    def device_to_host(self, dag, transfer_queue, compute_queue, host_processing_event):
         """
-        Enqueue device-to-host transfer with DAG integration.
+        Enqueue device-to-host transfer with DAG integration, including unmapping.
         
         Args:
             dag: DAG builder for scheduling operations
             transfer_queue: OpenCL queue for transfer operations
             compute_queue: OpenCL queue for compute operations
+            host_processing_event: User event signaling when host processing is complete
         
         Returns:
-            Tuple (retrieve_node, staging_buf, data_ready)
-            - retrieve_node: Final DAG node
-            - staging_buf: Buffer containing the transferred data
+            Tuple (map_node, host_ptr, data_ready)
+            - map_node: DAG node for mapping operation
+            - host_ptr: Mapped host pointer for reading data
             - data_ready: User event signaling when data is ready on the host
         """
-        # Select the current staging buffer
         staging_buf = self.staging_bufs[self.current_staging]
         data_ready = cl.UserEvent(self.ctx)
 
@@ -425,18 +425,24 @@ class TransferWrapper:
         )
         dag.dag.add_edge(copy_node, map_node)
 
-        # Step 3: Placeholder for finalization (unmapping handled separately)
-        def finalize(queue, wait_for):
-            return cl.UserEvent(self.ctx)  # Placeholder event
+        # Step 3: Unmap the staging buffer after host processing is complete
+        def unmap_staging(queue, wait_for):
+            # Wait for host_processing_event
+            cl.wait_for_events([host_processing_event])
+            unmap_event = cl.enqueue_unmap_mem_object(
+                queue, staging_buf, host_ptr,
+                wait_for=wait_for
+            )
+            return unmap_event
 
-        final_node = dag.add_operation(
-            enqueue_fn=finalize,
-            buffers_accessed={},
-            queue=compute_queue
+        unmap_node = dag.add_operation(
+            enqueue_fn=unmap_staging,
+            buffers_accessed={self.logical_name: 'W'},
+            queue=transfer_queue
         )
-        dag.dag.add_edge(map_node, final_node)
+        dag.dag.add_edge(map_node, unmap_node)
 
-        return final_node, staging_buf, data_ready
+        return map_node, host_ptr, data_ready
 
     @property
     def device_buffer(self):
@@ -801,7 +807,6 @@ targets_buf_size = max_padded_batch * INT_SIZE
 mask_buf_size = max_padded_batch * FLOAT_SIZE
 losses_buf_size = NUM_EXITS * loss_elements_per_exit * FLOAT_SIZE
 
-
 input_wrapper = TransferWrapper(ctx, "input", input_buf_size, dtype=np.float32)
 targets_wrapper = TransferWrapper(ctx, "targets", targets_buf_size, dtype=np.int32)
 mask_wrapper = TransferWrapper(ctx, "mask", mask_buf_size, dtype=np.float32)
@@ -816,7 +821,6 @@ for epoch in range(EPOCHS):
     num_batches = (len(X) + BATCH_SIZE - 1) // BATCH_SIZE
     epoch_loss = 0.0
     correct_predictions = 0
-    buffer_set = 0  # For double buffering
 
     for batch_idx in range(num_batches):
         # Prepare batch
@@ -828,33 +832,35 @@ for epoch in range(EPOCHS):
         y_batch = y_true[batch_indices]
         X_pad, y_pad, mask_pad, padded_batch_size = pad_batch(X_batch, y_batch, batch_multiple, simd_width)
 
-        # Set active buffer for double buffering
-        input_wrapper.set_active_buffer(buffer_set)
-        targets_wrapper.set_active_buffer(buffer_set)
-        mask_wrapper.set_active_buffer(buffer_set)
+        # Reset DAG for this batch
+        dag_builder.reset()
 
-        # Enqueue host-to-device transfers
-        input_transfer_node = input_wrapper.host_to_device(dag_builder, X_pad, transfer_queue)
-        targets_transfer_node = targets_wrapper.host_to_device(dag_builder, y_pad, transfer_queue)
-        mask_transfer_node = mask_wrapper.host_to_device(dag_builder, mask_pad, transfer_queue)
+        # Step 1: Host-to-device transfers
+        input_transfer_node, _ = input_wrapper.host_to_device(dag_builder, X_pad, transfer_queue)
+        targets_transfer_node, _ = targets_wrapper.host_to_device(dag_builder, y_pad, transfer_queue)
+        mask_transfer_node, _ = mask_wrapper.host_to_device(dag_builder, mask_pad, transfer_queue)
 
-        # Zero gradients
+        # Step 2: Zero gradients
         for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
             grad_buffer = buffers[f'grad_{param}']
-            enqueue_fn_zero = lambda wait_for: cl.enqueue_fill_buffer(
-                compute_queue, grad_buffer, np.float32(0), 0, grad_buffer.size, wait_for=wait_for
+            def enqueue_fn_zero(queue, wait_for):
+                return cl.enqueue_fill_buffer(
+                    queue, grad_buffer, np.float32(0), 0, grad_buffer.size, wait_for=wait_for
+                )
+            dag_builder.add_operation(
+                enqueue_fn=enqueue_fn_zero,
+                buffers_accessed={grad_buffer: 'W'},
+                queue=compute_queue
             )
-            zero_node = dag_builder.add_operation(enqueue_fn_zero, {grad_buffer: 'W'})
-            dag_builder.enqueue_with_dependencies(zero_node)
 
-        # Kernel execution with DAG
+        # Step 3: Initialize kernel wrapper
         kernel_wrapper = KernelWrapper(
             program, dag_builder,
             padded_input_dim, padded_hidden_dim,
             padded_output_classes, padded_batch_size
         ).set_mask(mask_wrapper.device_buffer).set_temps(buffers['temps'])
 
-        # Forward pass
+        # Step 4: Forward pass
         global_forward = (padded_batch_size, padded_hidden_dim // simd_width)
         local_forward = optimal_local_sizes(global_forward, device_limits)
         forward_event = kernel_wrapper.forward_pass(
@@ -866,7 +872,7 @@ for epoch in range(EPOCHS):
             buffers['hidden'],
         )
 
-        # Early exits
+        # Step 5: Early exits
         exit_events = []
         for exit_idx in range(NUM_EXITS):
             global_exit = (padded_batch_size,)
@@ -878,26 +884,13 @@ for epoch in range(EPOCHS):
                 buffers['exit_weights'],
                 buffers['exit_biases'],
                 buffers['exit_probs'],
-                losses_wrapper.device_buffer,
+                buffers['losses'],  # Use the existing device buffer directly
                 targets_wrapper.device_buffer,
                 np.int32(exit_idx),
             )
             exit_events.append(exit_event)
 
-        # Retrieve losses from device to host
-        retrieve_node, losses_future = losses_wrapper.device_to_host(dag_builder, transfer_queue, compute_queue)
-        losses_host = losses_future.get()  # Wait for transfer to complete
-
-        # Process per-exit losses
-        exit_losses = []
-        for exit_idx in range(NUM_EXITS):
-            start = exit_idx * loss_elements_per_exit
-            end = start + actual_batch_size
-            exit_loss = losses_host[start:end].mean()
-            exit_losses.append(exit_loss)
-        print(f"Per-exit Losses: {batch_idx}:{exit_losses}")
-
-        # Backpropagation
+        # Step 6: Backpropagation
         global_grad = (padded_input_dim // simd_width, HIDDEN_DIM)
         local_grad = optimal_local_sizes(global_grad, device_limits)
         grad_event = kernel_wrapper.compute_gradients(
@@ -912,9 +905,9 @@ for epoch in range(EPOCHS):
             targets_wrapper.device_buffer,
         )
 
-        # Adam update
-        beta1_t = 1 / (1 - ADAM_BETA1 ** global_step)
-        beta2_t = 1 / (1 - ADAM_BETA2 ** global_step)
+        # Step 7: Adam update
+        beta1_t = np.float32(1 / (1 - ADAM_BETA1 ** global_step))
+        beta2_t = np.float32(1 / (1 - ADAM_BETA2 ** global_step))
         update_events = []
         for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
             grad_param = buffers[f'grad_{param}']
@@ -931,28 +924,54 @@ for epoch in range(EPOCHS):
                 param_buffer,
                 m1_param,
                 m2_param,
-                np.float32(beta1_t),
-                np.float32(beta2_t),
+                beta1_t,
+                beta2_t,
                 np.int32(total_params)
             )
             update_events.append(update_event)
 
-        global_step += 1
+        # Step 8: Additional TransferWrapper setup for exit_probs and temps
+        exit_probs_wrapper = TransferWrapper(
+            ctx, "exit_probs", max_padded_batch * NUM_EXITS * padded_output_classes * FLOAT_SIZE,
+            dtype=np.float32, device_buf=buffers['exit_probs']
+        )
+        temps_wrapper = TransferWrapper(
+            ctx, "temps", NUM_EXITS * FLOAT_SIZE,
+            dtype=np.float32, device_buf=buffers['temps']
+        )
+        losses_wrapper = TransferWrapper(
+            ctx, "losses", NUM_EXITS * loss_elements_per_exit * FLOAT_SIZE,
+            dtype=np.float32, device_buf=buffers['losses']
+        )
 
-        # Collect all events for this batch
-        batch_events = [forward_event] + exit_events + [grad_event] + update_events
+        # Step 9: Device-to-host transfers
+        host_processing_event = cl.UserEvent(ctx)
+        losses_map_node, losses_host, losses_ready = losses_wrapper.device_to_host(
+            dag_builder, transfer_queue, compute_queue, host_processing_event
+        )
+        exit_probs_map_node, exit_probs_host, exit_probs_ready = exit_probs_wrapper.device_to_host(
+            dag_builder, transfer_queue, compute_queue, host_processing_event
+        )
+        temps_map_node, temps_host, temps_ready = temps_wrapper.device_to_host(
+            dag_builder, transfer_queue, compute_queue, host_processing_event
+        )
 
-        # Read exit probabilities and temperatures
-        exit_probs_host = np.empty((padded_batch_size, NUM_EXITS, padded_output_classes), dtype=np.float32)
-        cl.enqueue_copy(compute_queue, exit_probs_host, buffers['exit_probs'], wait_for=batch_events)
+        # Step 10: Execute the DAG
+        dag_builder.execute()
 
-        temps_host = np.empty(NUM_EXITS, dtype=np.float32)
-        cl.enqueue_copy(compute_queue, temps_host, buffers['temps'], wait_for=batch_events)
+        # Step 11: Wait for transfers to complete
+        cl.wait_for_events([losses_ready, exit_probs_ready, temps_ready])
 
-        # Extract valid probabilities
-        valid_probs = exit_probs_host[:actual_batch_size].reshape(actual_batch_size, NUM_EXITS, OUTPUT_CLASSES)
+        # Step 12: Process results
+        exit_losses = []
+        for exit_idx in range(NUM_EXITS):
+            start = exit_idx * loss_elements_per_exit
+            end = start + actual_batch_size
+            exit_loss = losses_host[start:end].mean()
+            exit_losses.append(float(exit_loss))
+        print(f"Batch {batch_idx}: Per-exit Losses: {exit_losses}")
 
-        # Compute temperature-weighted ensemble
+        valid_probs = exit_probs_host[:actual_batch_size].reshape(actual_batch_size, NUM_EXITS, padded_output_classes)[:, :, :OUTPUT_CLASSES]
         valid_mask = mask_pad[:actual_batch_size].astype(bool)
         confidences = np.array([
             valid_probs[valid_mask, i, :].max(axis=1) ** (1 / (temps_host[i] + 1e-8))
@@ -962,18 +981,24 @@ for epoch in range(EPOCHS):
         ensemble_probs = np.einsum('ijk,j->ik', valid_probs, weights)
         ensemble_probs /= np.sum(ensemble_probs, axis=1, keepdims=True) + 1e-8
 
-        # Compute loss and accuracy
         log_probs = np.log(ensemble_probs + 1e-8)
         batch_loss = -np.mean(log_probs[np.arange(actual_batch_size), y_batch])
         epoch_loss += batch_loss * actual_batch_size
         predicted_classes = np.argmax(ensemble_probs, axis=1)
-        batch_correct = np.sum(predicted_classes == y_batch)
-        correct_predictions += batch_correct
+        correct_predictions += np.sum(predicted_classes == y_batch)
 
-        # Toggle buffer set for double buffering
-        buffer_set = 1 - buffer_set
+        # Step 13: Signal host processing complete
+        host_processing_event.set_status(cl.command_execution_status.COMPLETE)
 
-    # Compute and print epoch metrics
+        # Increment global step
+        global_step += 1
+
+        # Cleanup temporary wrappers (if not reused)
+        exit_probs_wrapper.release()
+        temps_wrapper.release()
+        losses_wrapper.release()
+
+    # Epoch metrics
     avg_loss = epoch_loss / len(X)
     train_acc = correct_predictions / len(X)
     print(f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | Acc: {train_acc:.1%}")
