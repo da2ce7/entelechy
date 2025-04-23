@@ -33,7 +33,7 @@ CL_KERNEL_FILES = [
     'kernel_multi_exit.cl'
 ]
 
-# Utility Functions
+# Utility Functions (unchanged)
 def lcm(a, b):
     return a * b // gcd(a, b)
 
@@ -121,7 +121,6 @@ def select_simd_width(device):
     elif 'NVIDIA' in device.vendor:
         return 4
     return 1
-
 
 class KernelDAGBuilder:
     def __init__(self):
@@ -456,7 +455,7 @@ class TransferWrapper:
         self.device_buf.release()
 
 class KernelWrapper:
-    def __init__(self, program, dag_builder, padded_input_dim, padded_hidden_dim, padded_output_classes, padded_batch_size):
+    def __init__(self, program, dag_builder, compute_queue, padded_input_dim, padded_hidden_dim, padded_output_classes, padded_batch_size):
         """
         Initialize the KernelWrapper with an OpenCL program and DAG builder.
         
@@ -467,6 +466,7 @@ class KernelWrapper:
         """
         self.program = program
         self.dag = dag_builder
+        self.queue = compute_queue
         self.mask = None
         self.temperatures = None
 
@@ -539,7 +539,7 @@ class KernelWrapper:
         return self.dag.add_operation(
             enqueue_fn=_enqueue_forward,
             buffers_accessed=buffers_accessed,
-            queue=self.dag.compute_queue
+            queue=self.queue
         )
 
     def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_buf, exit_weights_buf, 
@@ -599,7 +599,7 @@ class KernelWrapper:
         return self.dag.add_operation(
             enqueue_fn=_enqueue_exit,
             buffers_accessed=buffers_accessed,
-            queue=self.dag.compute_queue
+            queue=self.queue
         )
 
     def compute_gradients(self, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, 
@@ -660,7 +660,7 @@ class KernelWrapper:
         return self.dag.add_operation(
             enqueue_fn=_enqueue_grad,
             buffers_accessed=buffers_accessed,
-            queue=self.dag.compute_queue
+            queue=self.queue
         )
 
     def adam_update(self, global_sizes, local_sizes, grad_param, param_buffer, m1_param, m2_param, 
@@ -712,7 +712,7 @@ class KernelWrapper:
         return self.dag.add_operation(
             enqueue_fn=_enqueue_update,
             buffers_accessed=buffers_accessed,
-            queue=self.dag.compute_queue
+            queue=self.queue
         )
 
 # Data Preparation
@@ -733,16 +733,11 @@ device_limits = {
     'max_work_group_size': device.max_work_group_size,
     'max_work_item_sizes': device.max_work_item_sizes,
 }
-
-cache_line_size = device.get_info(cl.device_info.GLOBAL_MEM_CACHELINE_SIZE)
-loss_alignment = cache_line_size // FLOAT_SIZE
-
 simd_width = select_simd_width(device)
 print(f"Training on {device.name} with SIMD-{simd_width}")
 
 X_padded = pad_to_multiple(X_normalized, simd_width, axis=1)
 padded_input_dim = X_padded.shape[1]
-
 batch_multiple = lcm(simd_width, min(device_limits['max_work_group_size'], next_pow2(HIDDEN_DIM // simd_width) * simd_width))
 max_padded_batch = ((BATCH_SIZE + batch_multiple - 1) // batch_multiple) * batch_multiple
 
@@ -751,16 +746,15 @@ weights = he_init((INPUT_DIM, HIDDEN_DIM))
 biases = np.zeros(HIDDEN_DIM, dtype=np.float32)
 exit_weights = he_init((NUM_EXITS, HIDDEN_DIM, OUTPUT_CLASSES))
 exit_biases = np.zeros((NUM_EXITS, OUTPUT_CLASSES), dtype=np.float32)
-
 weights_padded = preprocess_weights(weights, simd_width)
 exit_weights_padded = preprocess_weights(exit_weights, simd_width)
 biases_padded = pad_1d(biases, simd_width)
 exit_biases_padded = np.array([pad_1d(exit_biases[i], simd_width) for i in range(NUM_EXITS)])
-
-# Temperature Initialization
 exit_temperatures = np.ones(NUM_EXITS, dtype=np.float32)
 
 # Calculate loss_elements_per_exit
+wavefront_size = 64 if "AMD" in device.vendor else 32
+loss_alignment = wavefront_size * FLOAT_SIZE
 loss_elements_per_exit = ((max_padded_batch + loss_alignment - 1) // loss_alignment) * loss_alignment
 
 # Kernel Compilation
@@ -779,7 +773,6 @@ program = cl.Program(ctx, "\n".join(kernel_src)).build(options=" ".join(build_op
 # Buffer Creation
 padded_hidden_dim = weights_padded.shape[0] * simd_width
 padded_output_classes = ((OUTPUT_CLASSES + simd_width - 1) // simd_width) * simd_width
-
 buffers = {
     'weights': cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=weights_padded),
     'biases': cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=biases_padded),
@@ -793,7 +786,6 @@ buffers = {
     'm1_temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, NUM_EXITS * FLOAT_SIZE),
     'm2_temps': cl.Buffer(ctx, cl.mem_flags.READ_WRITE, NUM_EXITS * FLOAT_SIZE)
 }
-
 for param in ['weights', 'biases', 'exit_weights', 'exit_biases']:
     buffers[f'grad_{param}'] = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, buffers[param].size)
     buffers[f'm1_{param}'] = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, buffers[param].size)
@@ -806,13 +798,15 @@ input_buf_size = max_padded_batch * padded_input_dim * FLOAT_SIZE
 targets_buf_size = max_padded_batch * INT_SIZE
 mask_buf_size = max_padded_batch * FLOAT_SIZE
 losses_buf_size = NUM_EXITS * loss_elements_per_exit * FLOAT_SIZE
+exit_probs_buf_size = max_padded_batch * NUM_EXITS * padded_output_classes * FLOAT_SIZE
+temps_buf_size = NUM_EXITS * FLOAT_SIZE
 
 input_wrapper = TransferWrapper(ctx, "input", input_buf_size, dtype=np.float32)
 targets_wrapper = TransferWrapper(ctx, "targets", targets_buf_size, dtype=np.int32)
 mask_wrapper = TransferWrapper(ctx, "mask", mask_buf_size, dtype=np.float32)
-losses_wrapper = TransferWrapper(ctx, "losses", losses_buf_size, dtype=np.float32)
-
-dag_builder = KernelDAGBuilder()
+losses_wrapper = TransferWrapper(ctx, "losses", losses_buf_size, dtype=np.float32, device_buf=buffers['losses'])
+exit_probs_wrapper = TransferWrapper(ctx, "exit_probs", exit_probs_buf_size, dtype=np.float32, device_buf=buffers['exit_probs'])
+temps_wrapper = TransferWrapper(ctx, "temps", temps_buf_size, dtype=np.float32, device_buf=buffers['temps'])
 
 # Training Loop
 global_step = 1
@@ -823,6 +817,8 @@ for epoch in range(EPOCHS):
     correct_predictions = 0
 
     for batch_idx in range(num_batches):
+        dag_builder = KernelDAGBuilder()  # New DAG per batch
+
         # Prepare batch
         batch_start = batch_idx * BATCH_SIZE
         batch_end = min(batch_start + BATCH_SIZE, len(X))
@@ -832,83 +828,51 @@ for epoch in range(EPOCHS):
         y_batch = y_true[batch_indices]
         X_pad, y_pad, mask_pad, padded_batch_size = pad_batch(X_batch, y_batch, batch_multiple, simd_width)
 
-        # Reset DAG for this batch
-        dag_builder.reset()
+        # Host-to-device transfers
+        input_wrapper.host_to_device(dag_builder, X_pad, transfer_queue)
+        targets_wrapper.host_to_device(dag_builder, y_pad, transfer_queue)
+        mask_wrapper.host_to_device(dag_builder, mask_pad, transfer_queue)
 
-        # Step 1: Host-to-device transfers
-        input_transfer_node, _ = input_wrapper.host_to_device(dag_builder, X_pad, transfer_queue)
-        targets_transfer_node, _ = targets_wrapper.host_to_device(dag_builder, y_pad, transfer_queue)
-        mask_transfer_node, _ = mask_wrapper.host_to_device(dag_builder, mask_pad, transfer_queue)
-
-        # Step 2: Zero gradients
+        # Zero gradients
         for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
             grad_buffer = buffers[f'grad_{param}']
             def enqueue_fn_zero(queue, wait_for):
-                return cl.enqueue_fill_buffer(
-                    queue, grad_buffer, np.float32(0), 0, grad_buffer.size, wait_for=wait_for
-                )
-            dag_builder.add_operation(
-                enqueue_fn=enqueue_fn_zero,
-                buffers_accessed={grad_buffer: 'W'},
-                queue=compute_queue
-            )
+                return cl.enqueue_fill_buffer(queue, grad_buffer, np.float32(0), 0, grad_buffer.size, wait_for=wait_for)
+            dag_builder.add_operation(enqueue_fn_zero, {grad_buffer: 'W'}, compute_queue)
 
-        # Step 3: Initialize kernel wrapper
+        # Kernel wrapper
         kernel_wrapper = KernelWrapper(
-            program, dag_builder,
-            padded_input_dim, padded_hidden_dim,
+            program, dag_builder, compute_queue, padded_input_dim, padded_hidden_dim,
             padded_output_classes, padded_batch_size
         ).set_mask(mask_wrapper.device_buffer).set_temps(buffers['temps'])
 
-        # Step 4: Forward pass
+        # Forward pass
         global_forward = (padded_batch_size, padded_hidden_dim // simd_width)
         local_forward = optimal_local_sizes(global_forward, device_limits)
-        forward_event = kernel_wrapper.forward_pass(
-            global_forward,
-            local_forward,
-            input_wrapper.device_buffer,
-            buffers['weights'],
-            buffers['biases'],
-            buffers['hidden'],
+        kernel_wrapper.forward_pass(
+            global_forward, local_forward, input_wrapper.device_buffer, buffers['weights'], buffers['biases'], buffers['hidden']
         )
 
-        # Step 5: Early exits
-        exit_events = []
+        # Early exits
         for exit_idx in range(NUM_EXITS):
             global_exit = (padded_batch_size,)
             local_exit = optimal_local_sizes(global_exit, device_limits)
-            exit_event = kernel_wrapper.compute_exit_probabilities(
-                global_exit,
-                local_exit,
-                buffers['hidden'],
-                buffers['exit_weights'],
-                buffers['exit_biases'],
-                buffers['exit_probs'],
-                buffers['losses'],  # Use the existing device buffer directly
-                targets_wrapper.device_buffer,
-                np.int32(exit_idx),
+            kernel_wrapper.compute_exit_probabilities(
+                global_exit, local_exit, buffers['hidden'], buffers['exit_weights'], buffers['exit_biases'],
+                buffers['exit_probs'], buffers['losses'], targets_wrapper.device_buffer, np.int32(exit_idx)
             )
-            exit_events.append(exit_event)
 
-        # Step 6: Backpropagation
+        # Backpropagation
         global_grad = (padded_input_dim // simd_width, HIDDEN_DIM)
         local_grad = optimal_local_sizes(global_grad, device_limits)
-        grad_event = kernel_wrapper.compute_gradients(
-            global_grad,
-            local_grad,
-            input_wrapper.device_buffer,
-            buffers['hidden'],
-            buffers['exit_probs'],
-            buffers['exit_weights'],
-            buffers['grad_weights'],
-            buffers['grad_biases'],
-            targets_wrapper.device_buffer,
+        kernel_wrapper.compute_gradients(
+            global_grad, local_grad, input_wrapper.device_buffer, buffers['hidden'], buffers['exit_probs'],
+            buffers['exit_weights'], buffers['grad_weights'], buffers['grad_biases'], targets_wrapper.device_buffer
         )
 
-        # Step 7: Adam update
+        # Adam update
         beta1_t = np.float32(1 / (1 - ADAM_BETA1 ** global_step))
         beta2_t = np.float32(1 / (1 - ADAM_BETA2 ** global_step))
-        update_events = []
         for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
             grad_param = buffers[f'grad_{param}']
             param_buffer = buffers[param]
@@ -917,52 +881,23 @@ for epoch in range(EPOCHS):
             total_params = param_buffer.size // FLOAT_SIZE
             global_adam = (total_params,)
             local_adam = optimal_local_sizes(global_adam, device_limits)
-            update_event = kernel_wrapper.adam_update(
-                global_adam,
-                local_adam,
-                grad_param,
-                param_buffer,
-                m1_param,
-                m2_param,
-                beta1_t,
-                beta2_t,
-                np.int32(total_params)
+            kernel_wrapper.adam_update(
+                global_adam, local_adam, grad_param, param_buffer, m1_param, m2_param, beta1_t, beta2_t, np.int32(total_params)
             )
-            update_events.append(update_event)
 
-        # Step 8: Additional TransferWrapper setup for exit_probs and temps
-        exit_probs_wrapper = TransferWrapper(
-            ctx, "exit_probs", max_padded_batch * NUM_EXITS * padded_output_classes * FLOAT_SIZE,
-            dtype=np.float32, device_buf=buffers['exit_probs']
-        )
-        temps_wrapper = TransferWrapper(
-            ctx, "temps", NUM_EXITS * FLOAT_SIZE,
-            dtype=np.float32, device_buf=buffers['temps']
-        )
-        losses_wrapper = TransferWrapper(
-            ctx, "losses", NUM_EXITS * loss_elements_per_exit * FLOAT_SIZE,
-            dtype=np.float32, device_buf=buffers['losses']
-        )
-
-        # Step 9: Device-to-host transfers
+        # Device-to-host transfers
         host_processing_event = cl.UserEvent(ctx)
-        losses_map_node, losses_host, losses_ready = losses_wrapper.device_to_host(
-            dag_builder, transfer_queue, compute_queue, host_processing_event
-        )
-        exit_probs_map_node, exit_probs_host, exit_probs_ready = exit_probs_wrapper.device_to_host(
-            dag_builder, transfer_queue, compute_queue, host_processing_event
-        )
-        temps_map_node, temps_host, temps_ready = temps_wrapper.device_to_host(
-            dag_builder, transfer_queue, compute_queue, host_processing_event
-        )
+        _, losses_host, losses_ready = losses_wrapper.device_to_host(dag_builder, transfer_queue, compute_queue, host_processing_event)
+        _, exit_probs_host, exit_probs_ready = exit_probs_wrapper.device_to_host(dag_builder, transfer_queue, compute_queue, host_processing_event)
+        _, temps_host, temps_ready = temps_wrapper.device_to_host(dag_builder, transfer_queue, compute_queue, host_processing_event)
 
-        # Step 10: Execute the DAG
+        # Execute DAG
         dag_builder.execute()
 
-        # Step 11: Wait for transfers to complete
+        # Wait for transfers
         cl.wait_for_events([losses_ready, exit_probs_ready, temps_ready])
 
-        # Step 12: Process results
+        # Process results
         exit_losses = []
         for exit_idx in range(NUM_EXITS):
             start = exit_idx * loss_elements_per_exit
@@ -987,16 +922,9 @@ for epoch in range(EPOCHS):
         predicted_classes = np.argmax(ensemble_probs, axis=1)
         correct_predictions += np.sum(predicted_classes == y_batch)
 
-        # Step 13: Signal host processing complete
+        # Signal host processing complete
         host_processing_event.set_status(cl.command_execution_status.COMPLETE)
-
-        # Increment global step
         global_step += 1
-
-        # Cleanup temporary wrappers (if not reused)
-        exit_probs_wrapper.release()
-        temps_wrapper.release()
-        losses_wrapper.release()
 
     # Epoch metrics
     avg_loss = epoch_loss / len(X)
@@ -1009,6 +937,8 @@ input_wrapper.release()
 targets_wrapper.release()
 mask_wrapper.release()
 losses_wrapper.release()
+exit_probs_wrapper.release()
+temps_wrapper.release()
 
 if __name__ == "__main__":
     pass
