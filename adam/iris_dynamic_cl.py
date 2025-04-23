@@ -380,9 +380,11 @@ class KernelWrapper:
         return self
 
     def forward_pass(self, global_sizes, local_sizes, input_buf, weights_buf, biases_buf, hidden_buf):
+        local_mem = cl.LocalMemory(local_sizes[0] * FLOAT_SIZE)
+
         def _enqueue_forward(queue, wait_for):
             return self.program.forward_pass(
-                queue, global_sizes, local_sizes, input_buf, weights_buf, biases_buf, hidden_buf,
+                queue, global_sizes, local_sizes, local_mem, input_buf, weights_buf, biases_buf, hidden_buf,
                 self.mask, self.input_dim, self.hidden_dim, self.padded_hidden_dim, self.padded_batch_size,
                 wait_for=wait_for
             )
@@ -395,6 +397,8 @@ class KernelWrapper:
 
     def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_buf, exit_weights_buf, 
                                    exit_biases_buf, exit_probs_buf, losses_buf, targets_buf, exit_idx):
+        local_mem = cl.LocalMemory(local_sizes[0] * FLOAT_SIZE)
+
         def _enqueue_exit(queue, wait_for):
             return self.program.compute_exit_probabilities(
                 queue, global_sizes, local_sizes, hidden_buf, exit_weights_buf, exit_biases_buf,
@@ -412,9 +416,11 @@ class KernelWrapper:
 
     def compute_gradients(self, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, 
                           exit_weights_buf, grad_weights_buf, grad_biases_buf, targets_buf):
+        local_mem = cl.LocalMemory(local_sizes[0] * FLOAT_SIZE)
+
         def _enqueue_grad(queue, wait_for):
             return self.program.compute_gradients(
-                queue, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf,
+                queue, global_sizes, local_sizes, local_mem, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf,
                 grad_weights_buf, grad_biases_buf, targets_buf, self.mask, self.temperatures,
                 self.input_dim, self.hidden_dim, self.padded_hidden_dim, self.output_classes,
                 self.padded_output_classes, self.num_exits, self.padded_batch_size, wait_for=wait_for
