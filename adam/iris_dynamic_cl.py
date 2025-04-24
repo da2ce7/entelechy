@@ -100,8 +100,9 @@ def pad_batch(X_batch, y_batch, buffer_mgr):
     X_padded[:actual_batch_size] = X_batch
     y_padded[:actual_batch_size] = y_batch
     mask[:actual_batch_size] = 1.0
-    if not np.all(mask[:actual_batch_size] == 1.0) or not np.all(mask[actual_batch_size:] == 0.0):
-        raise ValueError("Invalid mask generated during batch padding")
+    assert padded_batch_size == buffer_mgr.buffer_metadata['input_batch']['padded_shape'][0], \
+           "Padded batch size mismatch with buffer"
+    assert mask.sum() == actual_batch_size, f"Mask sum ({mask.sum()}) does not match batch size ({actual_batch_size})"
     return X_padded, y_padded, mask
 
 def optimal_local_sizes(global_sizes, device):
@@ -149,6 +150,10 @@ class WorkManager:
 
         self.execution_graph.add_node(node.uid, node=node)
         self.node_id_counter += 1
+        for res in resource_access['W']:
+            if res in self.logical_resources:
+                buffer, version = self.logical_resources[res]
+                self.logical_resources[res] = (buffer, version + 1)
         return node.uid
 
     def commit_workload(self):
@@ -173,22 +178,22 @@ class WorkManager:
             completion_events[uid] = event
             schedule[node.queue_type].append(event)
 
-            for res in node.resources['W']:
-                if res in self.logical_resources:
-                    buffer, version = self.logical_resources[res]
-                    self.logical_resources[res] = (buffer, version + 1)
-
         return schedule
 
     def reset_graph(self):
         self.execution_graph.clear()
         self.node_id_counter = 0
 
+class TrainingContext:
+    def __init__(self):
+        self.cached_params = {}  # {name: (data, version)}
+
 class BufferManager:
     def __init__(self, context, device, work_manager):
         self.ctx = context
         self.device = device
         self.work_manager = work_manager
+        self.training_context = TrainingContext()
         self.simd_width = select_simd_width(device)
         self.wavefront_size = 64 if "AMD" in device.vendor else 32
         self.min_alignment = max(device.min_data_type_align_size, self.simd_width * np.float32().itemsize)
@@ -199,6 +204,7 @@ class BufferManager:
         self.buffer_versions = {}
         self.buffers = {}
         self.active_allocations = set()
+        self.buffer_pools = defaultdict(deque)  # Pool for buffer reuse
         work_manager.logical_resources.update(self.buffer_versions)
 
     def register_pad_strategy(self, name, callback):
@@ -207,75 +213,75 @@ class BufferManager:
     def acquire_buffer(self, name, real_shape, dtype, pad_strategy=None, mode='device'):
         strategy = self.pad_strategies[pad_strategy or self.default_pad_strategy]
         padded_shape = strategy(real_shape, dtype)
-        buffer = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, size=np.prod(padded_shape) * dtype().itemsize)
-        self.buffer_metadata[name] = {
-            'real_shape': real_shape,
-            'padded_shape': padded_shape,
-            'dtype': dtype,
-            'strategy': pad_strategy or self.default_pad_strategy,
-            'buffer': buffer
-        }
-        if name in self.buffer_versions:
-            self.work_manager.logical_resources[name] = (buffer, self.buffer_versions[name][1] + 1)
-        else:
-            self.work_manager.logical_resources[name] = (buffer, 0)
-        self.buffer_versions[name] = (buffer, self.work_manager.logical_resources[name][1])
+        key = (padded_shape, dtype)
+        size = np.prod(padded_shape) * dtype().itemsize
+
+        # Reuse from pool if available
+        if self.buffer_pools[key]:
+            buffer = self.buffer_pools[key].popleft()
+            if buffer.size >= size:
+                self.buffers[name] = buffer
+                self.active_allocations.add(buffer)
+                self.buffer_metadata[name] = {
+                    'real_shape': real_shape, 'padded_shape': padded_shape,
+                    'dtype': dtype, 'strategy': pad_strategy or self.default_pad_strategy,
+                    'buffer': buffer
+                }
+                self._update_version(name, buffer)
+                return buffer
+
+        # Allocate new buffer
+        buffer = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, size=size)
+        self.buffer_pools[key].append(buffer)
         self.buffers[name] = buffer
         self.active_allocations.add(buffer)
+        self.buffer_metadata[name] = {
+            'real_shape': real_shape, 'padded_shape': padded_shape,
+            'dtype': dtype, 'strategy': pad_strategy or self.default_pad_strategy,
+            'buffer': buffer
+        }
+        self._update_version(name, buffer)
         return buffer
+
+    def _update_version(self, name, buffer):
+        if name in self.buffer_versions:
+            self.buffer_versions[name] = (buffer, self.buffer_versions[name][1] + 1)
+        else:
+            self.buffer_versions[name] = (buffer, 0)
+        self.work_manager.logical_resources[name] = self.buffer_versions[name]
 
     def _default_pad_strategy(self, real_shape, dtype):
         item_size = np.dtype(dtype).itemsize
         alignment = lcm(self.min_alignment, item_size)
         return tuple((dim + alignment - 1) // alignment * alignment for dim in real_shape)
 
-    def get_dimensions(self, name):
-        return (self.buffer_metadata[name]['real_shape'], self.buffer_metadata[name]['padded_shape'])
+    def get_shape_info(self, name):
+        meta = self.buffer_metadata[name]
+        return {
+            'strides': tuple(np.prod(meta['padded_shape'][i+1:], dtype=int) * meta['dtype']().itemsize
+                           for i in range(len(meta['padded_shape']))),
+            'real_elements': np.prod(meta['real_shape']),
+            'padded_elements': np.prod(meta['padded_shape'])
+        }
 
     def staged_transfer(self, host_data, buffer_name, is_device_to_host=False, callback=None):
-        metadata = self.buffer_metadata[buffer_name]
-        buffer = metadata['buffer']
-        padded_shape = metadata['padded_shape']
-        real_shape = metadata['real_shape']
-        dtype = metadata['dtype']
-
-        staging_buf = self._get_staging_buffer(np.prod(padded_shape) * dtype().itemsize)
-        if not is_device_to_host:
-            padded_data = np.zeros(padded_shape, dtype=dtype)
-            slices = tuple(slice(0, r) for r in real_shape)
-            padded_data[slices] = host_data
-            cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], staging_buf, padded_data)
-            event = cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], buffer, staging_buf)
-            if callback:
-                event.set_callback(cl.command_execution_status.COMPLETE, callback)
-            return event
+        if not is_device_to_host and buffer_name in self.training_context.cached_params:
+            cached_data, cached_version = self.training_context.cached_params[buffer_name]
+            if np.array_equal(host_data, cached_data):
+                return  # Skip transfer
+        buffer = self.buffers[buffer_name]
+        queue = self.work_manager.hardware_queues['xfer']
+        if is_device_to_host:
+            cl.enqueue_copy(queue, host_data, buffer, callback=callback)
         else:
-            host_array = np.empty(padded_shape, dtype=dtype)
-            cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], staging_buf, buffer)
-            event = cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], host_array, staging_buf)
-            if callback:
-                event.set_callback(cl.command_execution_status.COMPLETE, callback)
-            slices = tuple(slice(0, r) for r in real_shape)
-            return host_array[slices]
-
-    def _get_staging_buffer(self, size):
-        for buf in self.staging_pool:
-            if buf.size >= size:
-                return buf
-        buf = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.ALLOC_HOST_PTR, size=size)
-        self.staging_pool.append(buf)
-        return buf
-
-    def validate_memory(self):
-        total_alloc = sum(b.size for b in self.active_allocations) + sum(b.size for b in self.staging_pool)
-        device_max = self.device.global_mem_size
-        if total_alloc / device_max > 0.8:
-            raise MemoryError(f"Used {total_alloc / 1024**2:.2f}MB of {device_max / 1024**2:.2f}MB device memory")
+            cl.enqueue_copy(queue, buffer, host_data, callback=callback)
+            self.training_context.cached_params[buffer_name] = (host_data.copy(), self.buffer_versions[buffer_name][1])
 
     def release_buffer(self, name):
         if name in self.buffers:
             buffer = self.buffers[name]
-            buffer.release()
+            key = (self.buffer_metadata[name]['padded_shape'], self.buffer_metadata[name]['dtype'])
+            self.buffer_pools[key].append(buffer)  # Return to pool
             self.active_allocations.remove(buffer)
             del self.buffers[name]
             del self.buffer_metadata[name]
@@ -388,18 +394,34 @@ class KernelWrapper:
         self.temperatures = temps
         return self
 
+    def _validate_launch_params(self, global_sizes, local_sizes):
+        if not all(g % l == 0 for g, l in zip(global_sizes, local_sizes)):
+            raise ValueError(f"Global sizes {global_sizes} must be multiples of local sizes {local_sizes}")
+        if np.prod(local_sizes) > self.buffer_manager.device.max_work_group_size:
+            raise ValueError(f"Local size product {np.prod(local_sizes)} exceeds device max {self.buffer_manager.device.max_work_group_size}")
+
+    def _validate_kernel_args(self, kernel, args):
+        expected_size = kernel.get_work_group_info(
+            cl.kernel_work_group_info.PRIVATE_MEM_SIZE, self.buffer_manager.device)
+        actual_size = sum(a.nbytes if hasattr(a, 'nbytes') else 4 for a in args)
+        if actual_size > expected_size:
+            raise ValueError(f"Kernel args size {actual_size} exceeds expected {expected_size}")
+
+    def select_kernel_variant(self, base_name, padding_ratio_threshold=1.5):
+        pad_ratio = self.padded_batch_size / BATCH_SIZE
+        kernel_name = f"{base_name}_largepad" if pad_ratio > padding_ratio_threshold else base_name
+        return getattr(self.program, kernel_name)
+
     def forward_pass(self, global_sizes, local_sizes, input_buf, weights_buf, biases_buf, hidden_buf, actual_batch_size):
-        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
-            raise ValueError(f"Invalid global sizes: {global_sizes}")
-        local_mem = cl.LocalMemory(local_sizes[0] * FLOAT_SIZE)
-        def _enqueue_forward(queue, wait_for):
-            return self.program.forward_pass(
-                queue, global_sizes, local_sizes, local_mem, input_buf, weights_buf, biases_buf, hidden_buf,
-                self.mask, np.int32(self.input_dim), np.int32(self.hidden_dim),
+        self._validate_launch_params(global_sizes, local_sizes)
+        kernel = self.select_kernel_variant('forward_pass')
+        args = (input_buf, weights_buf, biases_buf, hidden_buf, self.mask,
+                np.int32(self.input_dim), np.int32(self.hidden_dim),
                 np.int32(self.padded_input_dim), np.int32(self.padded_hidden_dim),
-                np.int32(self.padded_batch_size), np.int32(actual_batch_size),
-                wait_for=wait_for
-            )
+                np.int32(self.padded_batch_size), np.int32(actual_batch_size))
+        self._validate_kernel_args(kernel, args)
+        def _enqueue_forward(queue, wait_for):
+            return kernel(queue, global_sizes, local_sizes, *args, wait_for=wait_for)
         return self.manager.create_node(
             queue_type='compute',
             resource_access={'R': ['input_batch', 'weights', 'biases', 'mask_batch'], 'W': ['hidden']},
@@ -407,15 +429,16 @@ class KernelWrapper:
         )
 
     def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_buf, exit_weights_buf, exit_biases_buf, exit_probs_buf, losses_buf, targets_buf, exit_idx, actual_batch_size):
-        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
-            raise ValueError(f"Invalid global sizes: {global_sizes}")
+        self._validate_launch_params(global_sizes, local_sizes)
+        kernel = self.select_kernel_variant('compute_exit_probabilities')
+        args = (hidden_buf, exit_weights_buf, exit_biases_buf, exit_probs_buf, losses_buf, targets_buf,
+                np.int32(exit_idx), self.temperatures, np.int32(self.hidden_dim),
+                np.int32(self.output_classes), np.int32(self.padded_hidden_dim),
+                np.int32(self.padded_output_classes), np.int32(self.padded_batch_size),
+                np.int32(actual_batch_size))
+        self._validate_kernel_args(kernel, args)
         def _enqueue_exit(queue, wait_for):
-            return self.program.compute_exit_probabilities(
-                queue, global_sizes, local_sizes, hidden_buf, exit_weights_buf, exit_biases_buf, exit_probs_buf,
-                losses_buf, targets_buf, np.int32(exit_idx), self.temperatures, np.int32(self.hidden_dim),
-                np.int32(self.output_classes), np.int32(self.padded_hidden_dim), np.int32(self.padded_output_classes),
-                np.int32(self.padded_batch_size), np.int32(actual_batch_size), wait_for=wait_for
-            )
+            return kernel(queue, global_sizes, local_sizes, *args, wait_for=wait_for)
         return self.manager.create_node(
             queue_type='compute',
             resource_access={'R': ['hidden', 'exit_weights', 'exit_biases', 'targets_batch', 'temps'], 'W': ['exit_probs', 'losses']},
@@ -423,16 +446,17 @@ class KernelWrapper:
         )
 
     def compute_gradients(self, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf, grad_weights_buf, grad_biases_buf, grad_exit_weights_buf, grad_exit_biases_buf, targets_buf, actual_batch_size):
-        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
-            raise ValueError(f"Invalid global sizes: {global_sizes}")
+        self._validate_launch_params(global_sizes, local_sizes)
+        kernel = self.select_kernel_variant('compute_gradients')
+        args = (input_buf, hidden_buf, exit_probs_buf, exit_weights_buf, grad_weights_buf, grad_biases_buf,
+                grad_exit_weights_buf, grad_exit_biases_buf, targets_buf, self.temperatures,
+                np.int32(self.input_dim), np.int32(self.hidden_dim), np.int32(self.output_classes),
+                np.int32(self.padded_input_dim), np.int32(self.padded_hidden_dim),
+                np.int32(self.padded_output_classes), np.int32(self.padded_batch_size),
+                np.int32(actual_batch_size), np.int32(self.num_exits))
+        self._validate_kernel_args(kernel, args)
         def _enqueue_grad(queue, wait_for):
-            return self.program.compute_gradients(
-                queue, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf,
-                grad_weights_buf, grad_biases_buf, grad_exit_weights_buf, grad_exit_biases_buf, targets_buf,
-                self.temperatures, np.int32(self.input_dim), np.int32(self.hidden_dim), np.int32(self.output_classes),
-                np.int32(self.padded_input_dim), np.int32(self.padded_hidden_dim), np.int32(self.padded_output_classes),
-                np.int32(self.padded_batch_size), np.int32(actual_batch_size), np.int32(self.num_exits), wait_for=wait_for
-            )
+            return kernel(queue, global_sizes, local_sizes, *args, wait_for=wait_for)
         return self.manager.create_node(
             queue_type='compute',
             resource_access={'R': ['input_batch', 'hidden', 'exit_probs', 'exit_weights', 'targets_batch', 'temps'],
@@ -441,14 +465,14 @@ class KernelWrapper:
         )
 
     def compute_temp_gradients(self, global_sizes, local_sizes, exit_probs_buf, targets_buf, grad_temps_buf, actual_batch_size):
-        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
-            raise ValueError(f"Invalid global sizes: {global_sizes}")
+        self._validate_launch_params(global_sizes, local_sizes)
+        kernel = self.select_kernel_variant('compute_temp_gradients')
+        args = (exit_probs_buf, targets_buf, grad_temps_buf, self.temperatures,
+                np.int32(self.output_classes), np.int32(self.padded_output_classes),
+                np.int32(self.padded_batch_size), np.int32(actual_batch_size), np.int32(self.num_exits))
+        self._validate_kernel_args(kernel, args)
         def _enqueue_temp_grad(queue, wait_for):
-            return self.program.compute_temp_gradients(
-                queue, global_sizes, local_sizes, exit_probs_buf, targets_buf, grad_temps_buf, self.temperatures,
-                np.int32(self.output_classes), np.int32(self.padded_output_classes), np.int32(self.padded_batch_size),
-                np.int32(actual_batch_size), np.int32(self.num_exits), wait_for=wait_for
-            )
+            return kernel(queue, global_sizes, local_sizes, *args, wait_for=wait_for)
         return self.manager.create_node(
             queue_type='compute',
             resource_access={'R': ['exit_probs', 'targets_batch', 'temps'], 'W': ['grad_temps']},
@@ -456,14 +480,13 @@ class KernelWrapper:
         )
 
     def adam_update(self, global_sizes, local_sizes, grad_buf, param_buf, m1_buf, m2_buf, total_params):
-        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
-            raise ValueError(f"Invalid global sizes: {global_sizes}")
+        self._validate_launch_params(global_sizes, local_sizes)
+        kernel = self.select_kernel_variant('adam_update')
+        args = (grad_buf, param_buf, m1_buf, m2_buf, self.adam_beta1, self.adam_beta2,
+                self.beta1_t, self.beta2_t, self.learning_rate, self.epsilon, np.int32(total_params))
+        self._validate_kernel_args(kernel, args)
         def _enqueue_adam(queue, wait_for):
-            return self.program.adam_update(
-                queue, global_sizes, local_sizes, grad_buf, param_buf, m1_buf, m2_buf, self.adam_beta1,
-                self.adam_beta2, self.beta1_t, self.beta2_t, self.learning_rate, self.epsilon, np.int32(total_params),
-                wait_for=wait_for
-            )
+            return kernel(queue, global_sizes, local_sizes, *args, wait_for=wait_for)
         return self.manager.create_node(
             queue_type='compute',
             resource_access={'R': [grad_buf, param_buf, m1_buf, m2_buf], 'W': [param_buf, m1_buf, m2_buf]},
