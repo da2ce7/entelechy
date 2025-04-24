@@ -348,7 +348,7 @@ class TransferWrapper:
         self.device_buf.release()
 
 class KernelWrapper:
-    def __init__(self, program, manager, compute_queue, padded_input_dim, padded_hidden_dim, padded_output_classes, padded_batch_size):
+    def __init__(self, program, manager, global_step, compute_queue, padded_input_dim, padded_hidden_dim, padded_output_classes, padded_batch_size):
         self.program = program
         self.manager = manager
         self.queue = compute_queue
@@ -371,6 +371,9 @@ class KernelWrapper:
         self.max_temp = np.float32(MAX_TEMP)
         self.epsilon = np.float32(EPSILON)
 
+        self.beta1_t = np.float32(1 / (1 - ADAM_BETA1 ** global_step))
+        self.beta2_t = np.float32(1 / (1 - ADAM_BETA2 ** global_step))
+
     def set_mask(self, mask):
         self.mask = mask
         return self
@@ -378,6 +381,33 @@ class KernelWrapper:
     def set_temps(self, temps):
         self.temperatures = temps
         return self
+
+    def zero_gradients(self, grad_param):
+        param_name_map = {
+            buffers['weights']: 'weights',
+            buffers['biases']: 'biases',
+            buffers['exit_weights']: 'exit_weights',
+            buffers['exit_biases']: 'exit_biases',
+            buffers['temps']: 'temps'
+        }
+
+        """Enqueue zeroing of gradient buffers"""
+        param_name = param_name_map.get(
+            grad_param,
+            next((k for k,v in self.param_name_map.items() if v in str(grad_param)), 'unknown')
+        ).rsplit('_', 1)[-1]
+
+        def _enqueue_zero(queue, wait_for):
+            return cl.enqueue_fill_buffer(
+                queue, grad_param, np.float32(0),
+                0, grad_param.size, wait_for=wait_for
+            )
+
+        return self.manager.create_node(
+            queue_type='compute',
+            resource_access={'W': {f'grad_{param_name}'}},
+            operation_fn=_enqueue_zero
+        )
 
     def forward_pass(self, global_sizes, local_sizes, input_buf, weights_buf, biases_buf, hidden_buf):
         local_mem = cl.LocalMemory(local_sizes[0] * FLOAT_SIZE)
@@ -415,13 +445,13 @@ class KernelWrapper:
         )
 
     def compute_gradients(self, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, 
-                          exit_weights_buf, grad_weights_buf, grad_biases_buf, targets_buf):
+                          exit_weights_buf, grad_weights_buf, grad_biases_buf, grad_temps_buf, targets_buf):
         local_mem = cl.LocalMemory(local_sizes[0] * FLOAT_SIZE)
 
         def _enqueue_grad(queue, wait_for):
             return self.program.compute_gradients(
                 queue, global_sizes, local_sizes, local_mem, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf,
-                grad_weights_buf, grad_biases_buf, targets_buf, self.mask, self.temperatures,
+                grad_weights_buf, grad_biases_buf, grad_temps_buf, targets_buf, self.mask, self.temperatures,
                 self.input_dim, self.hidden_dim, self.padded_hidden_dim, self.output_classes,
                 self.padded_output_classes, self.num_exits, self.padded_batch_size, wait_for=wait_for
             )
@@ -429,16 +459,15 @@ class KernelWrapper:
         return self.manager.create_node(
             queue_type='compute',
             resource_access={'R': {'input', 'hidden', 'exit_probs', 'exit_weights', 'targets', 'mask', 'temps'},
-                            'W': {'grad_weights', 'grad_biases'}},
+                            'W': {'grad_weights', 'grad_biases', 'grad_temps'}},
             operation_fn=_enqueue_grad
         )
 
-    def adam_update(self, global_sizes, local_sizes, grad_param, param_buffer, m1_param, m2_param, 
-                    beta1_t, beta2_t, total_params):
+    def adam_update(self, global_sizes, local_sizes, grad_param, param_buffer, m1_param, m2_param, total_params):
         def _enqueue_update(queue, wait_for):
             return self.program.adam_update(
                 queue, global_sizes, local_sizes, grad_param, param_buffer, m1_param, m2_param,
-                beta1_t, beta2_t, self.learning_rate, self.adam_beta1, self.adam_beta2,
+                self.learning_rate, self.adam_beta1, self.adam_beta2, self.beta1_t, self.beta2_t,
                 self.min_temp, self.max_temp, self.epsilon, total_params, wait_for=wait_for
             )
 
@@ -603,22 +632,15 @@ for epoch in range(EPOCHS):
         targets_wrapper.host_to_device(manager, y_pad, transfer_queue)
         mask_wrapper.host_to_device(manager, mask_pad, transfer_queue)
 
-        # Zero gradients
-        for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
-            grad_buffer = buffers[f'grad_{param}']
-            def enqueue_zero(queue, wait_for):
-                return cl.enqueue_fill_buffer(queue, grad_buffer, np.float32(0), 0, grad_buffer.size, wait_for=wait_for)
-            manager.create_node(
-                queue_type='compute',
-                resource_access={'W': {f'grad_{param}'}},
-                operation_fn=enqueue_zero
-            )
-
         # Kernel wrapper
         kernel_wrapper = KernelWrapper(
-            program, manager, compute_queue, padded_input_dim, padded_hidden_dim,
+            program, manager, global_step, compute_queue, padded_input_dim, padded_hidden_dim,
             padded_output_classes, padded_batch_size
         ).set_mask(mask_wrapper.device_buffer).set_temps(buffers['temps'])
+
+        # Zero gradients
+        for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
+            kernel_wrapper.zero_gradients(buffers[f'grad_{param}'])
 
         # Forward pass
         global_forward = (padded_batch_size, padded_hidden_dim // simd_width)
@@ -646,8 +668,7 @@ for epoch in range(EPOCHS):
         )
 
         # Adam update
-        beta1_t = np.float32(1 / (1 - ADAM_BETA1 ** global_step))
-        beta2_t = np.float32(1 / (1 - ADAM_BETA2 ** global_step))
+        
         for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
             grad_param = buffers[f'grad_{param}']
             param_buffer = buffers[param]
