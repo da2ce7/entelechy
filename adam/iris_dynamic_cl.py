@@ -125,28 +125,32 @@ class WorkManager:
         self.node_id_counter = 0
 
     class ExecutionNode:
-        __slots__ = ['uid', 'queue_type', 'execute', 'resources', 'dependencies']
+        __slots__ = ['uid', 'queue_type', 'execute', 'resources', 'dependencies', 'expected_versions']
         def __init__(self, uid):
             self.uid = uid
             self.queue_type = None
             self.execute = None
             self.resources = {'R': set(), 'W': set()}
             self.dependencies = set()
+            self.expected_versions = {}
 
     def create_node(self, queue_type, resource_access, operation_fn):
         node = self.ExecutionNode(self.node_id_counter)
         node.queue_type = queue_type
         node.execute = operation_fn
         node.resources = resource_access
-
+        for res in resource_access['R']:
+            if res in self.logical_resources:
+                node.expected_versions[res] = self.logical_resources[res][1]
+            else:
+                node.expected_versions[res] = 0
         for res in resource_access['R'] | resource_access['W']:
             if res in self.logical_resources:
-                for existing in self.execution_graph.nodes.values():
-                    existing_node = existing['node']
+                for existing_uid in self.execution_graph.nodes:
+                    existing_node = self.execution_graph.nodes[existing_uid]['node']
                     if (res in existing_node.resources['W'] or
                         (res in existing_node.resources['R'] and res in resource_access['W'])):
-                        node.dependencies.add(existing_node.uid)
-
+                        node.dependencies.add(existing_uid)
         self.execution_graph.add_node(node.uid, node=node)
         self.node_id_counter += 1
         return node.uid
@@ -156,37 +160,28 @@ class WorkManager:
             self.execution_graph,
             key=lambda x: self.execution_graph.nodes[x]['node'].queue_type
         ))
-
         schedule = {qt: [] for qt in self.hardware_queues}
         completion_events = {}
-
         for uid in ordered_nodes:
             node = self.execution_graph.nodes[uid]['node']
             queue = self.hardware_queues[node.queue_type]
-
-            # Check for version conflicts
             for res in node.resources['R']:
                 if res in self.logical_resources:
                     current_version = self.logical_resources[res][1]
-                    # Assuming node.resources['R'] stores expected version
-                    expected_version = node.resources['R'].get(res, -1)
-                    if expected_version < current_version:
-                        raise ConcurrentModificationError(f"Resource {res} has been modified since node {uid} was scheduled")
-
+                    expected_version = node.expected_versions.get(res, 0)
+                    if expected_version != current_version:
+                        raise ConcurrentModificationError(f"Resource {res} has been modified unexpectedly for node {uid}")
             wait_for = [
                 completion_events[d] for d in node.dependencies
                 if d in completion_events
             ]
-
             event = node.execute(queue, wait_for=wait_for)
             completion_events[uid] = event
             schedule[node.queue_type].append(event)
-
             for res in node.resources['W']:
                 if res in self.logical_resources:
                     buffer, version = self.logical_resources[res]
                     self.logical_resources[res] = (buffer, version + 1)
-
         return schedule
 
     def reset_graph(self):
@@ -208,7 +203,7 @@ class BufferManager:
         self.buffer_versions = {}
         self.buffers = {}
         self.active_allocations = set()
-        self.current_events = []  # Added for event chaining
+        self.current_events = []
         work_manager.logical_resources.update(self.buffer_versions)
 
     def register_pad_strategy(self, name, callback):
@@ -248,7 +243,6 @@ class BufferManager:
         padded_shape = metadata['padded_shape']
         real_shape = metadata['real_shape']
         dtype = metadata['dtype']
-
         staging_buf = self._get_staging_buffer(np.prod(padded_shape) * dtype().itemsize)
         if not is_device_to_host:
             padded_data = np.zeros(padded_shape, dtype=dtype)
@@ -281,10 +275,26 @@ class BufferManager:
         return buf
 
     def validate_memory(self):
-        total_alloc = sum(b.size for b in self.active_allocations) + sum(b.size for b in self.staging_pool)
+        # Calculate memory usage for padded buffers
+        padded_sizes = [
+            np.prod(meta['padded_shape']) * np.dtype(meta['dtype']).itemsize
+            for meta in self.buffer_metadata.values()
+        ]
+        total_buffer_alloc = sum(padded_sizes)
+
+        # Include staging pool memory
+        staging_pool_alloc = sum(buf.size for buf in self.staging_pool)
+
+        # Total allocated memory
+        total_alloc = total_buffer_alloc + staging_pool_alloc
+
+        # Compare against device memory limit
         device_max = self.device.global_mem_size
         if total_alloc / device_max > 0.8:
-            raise MemoryError(f"Used {total_alloc / 1024**2:.2f}MB of {device_max / 1024**2:.2f}MB device memory")
+            raise MemoryError(
+                f"Used {total_alloc / 1024**2:.2f}MB of {device_max / 1024**2:.2f}MB device memory"
+            )
+
 
     def release_buffer(self, name):
         if name in self.buffers:
@@ -376,12 +386,10 @@ class KernelWrapper:
         self.buffer_manager = buffer_manager
         self.mask = None
         self.temperatures = None
-
         self.padded_input_dim = self.buffer_manager.buffer_metadata['input_batch']['padded_shape'][1]
         self.padded_hidden_dim = self.buffer_manager.buffer_metadata['hidden']['padded_shape'][0]
         self.padded_output_classes = ((OUTPUT_CLASSES + self.buffer_manager.simd_width - 1) // self.buffer_manager.simd_width) * self.buffer_manager.simd_width
         self.padded_batch_size = self.buffer_manager.buffer_metadata['input_batch']['padded_shape'][0]
-
         self.input_dim = INPUT_DIM
         self.hidden_dim = HIDDEN_DIM
         self.output_classes = OUTPUT_CLASSES
@@ -392,7 +400,6 @@ class KernelWrapper:
         self.min_temp = np.float32(MIN_TEMP)
         self.max_temp = np.float32(MAX_TEMP)
         self.epsilon = np.float32(EPSILON)
-
         self.beta1_t = np.float32(ADAM_BETA1 ** global_step)
         self.beta2_t = np.float32(ADAM_BETA2 ** global_step)
 
@@ -471,7 +478,7 @@ class KernelWrapper:
             operation_fn=_enqueue_temp_grad
         )
 
-    def adam_update(self, global_sizes, local_sizes, grad_buf, param_buf, m1_buf, m2_buf, total_params):
+    def adam_update(self, global_sizes, local_sizes, grad_buf, param_buf, m1_buf, m2_buf, grad_name, param_name, m1_name, m2_name, total_params):
         if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
             raise ValueError(f"Invalid global sizes: {global_sizes}")
         def _enqueue_adam(queue, wait_for):
@@ -482,8 +489,24 @@ class KernelWrapper:
             )
         return self.manager.create_node(
             queue_type='compute',
-            resource_access={'R': [grad_buf, param_buf, m1_buf, m2_buf], 'W': [param_buf, m1_buf, m2_buf]},
+            resource_access={'R': [grad_name, param_name, m1_name, m2_name], 'W': [param_name, m1_name, m2_name]},
             operation_fn=_enqueue_adam
+        )
+
+    def clamp_temperatures(self, global_sizes, local_sizes, temps_buf):
+        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
+            raise ValueError(f"Invalid global sizes: {global_sizes}")
+        def _enqueue_clamp(queue, wait_for):
+            return self.program.clamp_temperatures(
+                queue, global_sizes, local_sizes,
+                temps_buf, self.min_temp, self.max_temp,
+                np.int32(self.num_exits),
+                wait_for=wait_for
+            )
+        return self.manager.create_node(
+            queue_type='compute',
+            resource_access={'R': ['temps'], 'W': ['temps']},
+            operation_fn=_enqueue_clamp
         )
 
 # OpenCL Setup
@@ -550,66 +573,60 @@ for epoch in range(EPOCHS):
     num_batches = (len(X) + BATCH_SIZE - 1) // BATCH_SIZE
     epoch_loss = 0.0
     correct_predictions = 0
-
     for batch_idx in range(num_batches):
         manager.reset_graph()
-
         batch_start = batch_idx * BATCH_SIZE
         batch_end = min(batch_start + BATCH_SIZE, len(X))
         actual_batch_size = batch_end - batch_start
         batch_indices = shuffled_indices[batch_start:batch_end]
         X_batch = X_normalized[batch_indices]
         y_batch = y_true[batch_indices]
-
         X_padded, y_padded, mask = pad_batch(X_batch, y_batch, buffer_mgr)
         buffer_mgr.staged_transfer(X_padded, 'input_batch')
         buffer_mgr.staged_transfer(y_padded, 'targets_batch')
         buffer_mgr.staged_transfer(mask, 'mask_batch')
-
         kernel_wrapper = KernelWrapper(program, manager, global_step, compute_queue, buffer_mgr)
         kernel_wrapper.set_mask(buffer_mgr.buffer_versions['mask_batch'][0]).set_temps(pm.buffers['temps'])
-
         pm.zero_gradients(manager)
-
         global_forward = (buffer_mgr.buffer_metadata['input_batch']['padded_shape'][0], HIDDEN_DIM)
         local_forward = optimal_local_sizes(global_forward, device_limits)
         kernel_wrapper.forward_pass(global_forward, local_forward, buffer_mgr.buffers['input_batch'], pm.buffers['weights'], pm.buffers['biases'], buffer_mgr.buffers['hidden'], actual_batch_size)
-
         for exit_idx in range(NUM_EXITS):
             global_exit = (buffer_mgr.buffer_metadata['input_batch']['padded_shape'][0],)
             local_exit = optimal_local_sizes(global_exit, device_limits)
             kernel_wrapper.compute_exit_probabilities(global_exit, local_exit, buffer_mgr.buffers['hidden'], pm.buffers['exit_weights'], pm.buffers['exit_biases'], buffer_mgr.buffers['exit_probs'], buffer_mgr.buffers['losses'], buffer_mgr.buffers['targets_batch'], exit_idx, actual_batch_size)
-
         global_grad = (INPUT_DIM, HIDDEN_DIM)
         local_grad = optimal_local_sizes(global_grad, device_limits)
         kernel_wrapper.compute_gradients(global_grad, local_grad, buffer_mgr.buffers['input_batch'], buffer_mgr.buffers['hidden'], buffer_mgr.buffers['exit_probs'], pm.buffers['exit_weights'], pm.grad_buffers['weights'], pm.grad_buffers['biases'], pm.grad_buffers['exit_weights'], pm.grad_buffers['exit_biases'], buffer_mgr.buffers['targets_batch'], actual_batch_size)
-
         global_temp_grad = (NUM_EXITS,)
         local_temp_grad = optimal_local_sizes(global_temp_grad, device_limits)
         kernel_wrapper.compute_temp_gradients(global_temp_grad, local_temp_grad, buffer_mgr.buffers['exit_probs'], buffer_mgr.buffers['targets_batch'], pm.grad_buffers['temps'], actual_batch_size)
-
         for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
             if param in pm.params and pm.params[param]['requires_grad']:
-                grad_param = pm.grad_buffers[param]
-                param_buffer = pm.buffers[param]
-                m1_param = pm.m1_buffers[param]
-                m2_param = pm.m2_buffers[param]
+                grad_buf = pm.grad_buffers[param]
+                param_buf = pm.buffers[param]
+                m1_buf = pm.m1_buffers[param]
+                m2_buf = pm.m2_buffers[param]
+                grad_name = f'grad_{param}'
+                param_name = param
+                m1_name = f'm1_{param}'
+                m2_name = f'm2_{param}'
                 total_params = int(np.prod(buffer_mgr.buffer_metadata[param]['padded_shape']))
                 global_adam = (total_params,)
                 local_adam = optimal_local_sizes(global_adam, device_limits)
-                kernel_wrapper.adam_update(global_adam, local_adam, grad_param, param_buffer, m1_param, m2_param, total_params)
-
+                kernel_wrapper.adam_update(global_adam, local_adam, grad_buf, param_buf, m1_buf, m2_buf, grad_name, param_name, m1_name, m2_name, total_params)
+                if param == 'temps':
+                    global_clamp = (NUM_EXITS,)
+                    local_clamp = optimal_local_sizes(global_clamp, device_limits)
+                    kernel_wrapper.clamp_temperatures(global_clamp, local_clamp, param_buf)
         host_processing_event = cl.UserEvent(ctx)
         def set_event_complete(_):
             host_processing_event.set_status(cl.command_execution_status.COMPLETE)
         losses_host = buffer_mgr.staged_transfer(None, 'losses', is_device_to_host=True, callback=set_event_complete)
         exit_probs_host = buffer_mgr.staged_transfer(None, 'exit_probs', is_device_to_host=True)
         temps_host = buffer_mgr.staged_transfer(None, 'temps', is_device_to_host=True)
-
         schedule = manager.commit_workload()
-
         cl.wait_for_events([host_processing_event])
-
         exit_losses = []
         for exit_idx in range(NUM_EXITS):
             start = exit_idx * loss_elements_per_exit
@@ -618,21 +635,18 @@ for epoch in range(EPOCHS):
                 exit_loss = losses_host[start:end].mean()
                 exit_losses.append(float(exit_loss))
         print(f"Batch {batch_idx}: Per-exit Losses: {exit_losses}")
-
+        buffer_mgr.validate_memory()
         valid_probs = exit_probs_host[:actual_batch_size].reshape(actual_batch_size, NUM_EXITS, OUTPUT_CLASSES)
         confidences = np.array([valid_probs[:, i, :].max(axis=1) ** (1 / (temps_host[i] + 1e-8)) for i in range(NUM_EXITS)])
         weights = np.exp(confidences) / np.sum(np.exp(confidences), axis=0)
         ensemble_probs = np.einsum('ijk,j->ik', valid_probs, weights)
         ensemble_probs /= np.sum(ensemble_probs, axis=1, keepdims=True) + 1e-8
-
         log_probs = np.log(ensemble_probs + 1e-8)
         batch_loss = -np.mean(log_probs[np.arange(actual_batch_size), y_batch])
         epoch_loss += batch_loss * actual_batch_size
         predicted_classes = np.argmax(ensemble_probs, axis=1)
         correct_predictions += np.sum(predicted_classes == y_batch)
-
         global_step += 1
-
     avg_loss = epoch_loss / len(X)
     train_acc = correct_predictions / len(X)
     print(f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | Acc: {train_acc:.1%}")
