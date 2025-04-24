@@ -34,7 +34,6 @@ CL_KERNEL_FILES = [
     'kernel_multi_exit.cl'
 ]
 
-# Utility Functions
 def lcm(a, b):
     return a * b // gcd(a, b)
 
@@ -101,26 +100,22 @@ def pad_batch(X_batch, y_batch, buffer_mgr):
     X_padded[:actual_batch_size] = X_batch
     y_padded[:actual_batch_size] = y_batch
     mask[:actual_batch_size] = 1.0
+    if not np.all(mask[:actual_batch_size] == 1.0) or not np.all(mask[actual_batch_size:] == 0.0):
+        raise ValueError("Invalid mask generated during batch padding")
     return X_padded, y_padded, mask
 
-def optimal_local_sizes(global_sizes, device_limits):
-    max_work_group_size = device_limits.max_work_group_size
-    max_work_item_sizes = device_limits.max_work_item_sizes
+def optimal_local_sizes(global_sizes, device):
+    max_work_group_size = device.max_work_group_size
+    max_work_item_sizes = device.max_work_item_sizes
     local_sizes = []
-    for i, gsize in enumerate(global_sizes):
-        candidates = divisors(gsize)
-        for cand in candidates:
-            if cand <= max_work_group_size and cand <= max_work_item_sizes[i]:
-                local_sizes.append(cand)
-                break
-        else:
-            local_sizes.append(1)
-    total_local_size = np.prod(local_sizes)
-    if total_local_size > max_work_group_size:
-        local_sizes = [min(ls, max_work_group_size // (total_local_size // ls)) for ls in local_sizes[:len(global_sizes)]]
+    for g, m in zip(global_sizes, max_work_item_sizes[:len(global_sizes)]):
+        candidates = [d for d in divisors(g) if d <= min(m, max_work_group_size)]
+        local_sizes.append(candidates[0] if candidates else 1)
+    total_local = np.prod(local_sizes)
+    if total_local > max_work_group_size:
+        local_sizes = [min(l, max_work_group_size // (total_local // l)) for l in local_sizes]
     return tuple(local_sizes)
 
-# WorkManager Definition
 class WorkManager:
     def __init__(self, context):
         self.context = context
@@ -189,7 +184,6 @@ class WorkManager:
         self.execution_graph.clear()
         self.node_id_counter = 0
 
-# BufferManager Definition
 class BufferManager:
     def __init__(self, context, device, work_manager):
         self.ctx = context
@@ -204,6 +198,7 @@ class BufferManager:
         self.staging_pool = deque(maxlen=8)
         self.buffer_versions = {}
         self.buffers = {}
+        self.active_allocations = set()
         work_manager.logical_resources.update(self.buffer_versions)
 
     def register_pad_strategy(self, name, callback):
@@ -220,8 +215,13 @@ class BufferManager:
             'strategy': pad_strategy or self.default_pad_strategy,
             'buffer': buffer
         }
-        self.buffer_versions[name] = (buffer, 0)
+        if name in self.buffer_versions:
+            self.work_manager.logical_resources[name] = (buffer, self.buffer_versions[name][1] + 1)
+        else:
+            self.work_manager.logical_resources[name] = (buffer, 0)
+        self.buffer_versions[name] = (buffer, self.work_manager.logical_resources[name][1])
         self.buffers[name] = buffer
+        self.active_allocations.add(buffer)
         return buffer
 
     def _default_pad_strategy(self, real_shape, dtype):
@@ -239,29 +239,49 @@ class BufferManager:
         real_shape = metadata['real_shape']
         dtype = metadata['dtype']
 
+        staging_buf = self._get_staging_buffer(np.prod(padded_shape) * dtype().itemsize)
         if not is_device_to_host:
             padded_data = np.zeros(padded_shape, dtype=dtype)
             slices = tuple(slice(0, r) for r in real_shape)
             padded_data[slices] = host_data
-            event = cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], buffer, padded_data)
+            cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], staging_buf, padded_data)
+            event = cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], buffer, staging_buf)
             if callback:
                 event.set_callback(cl.command_execution_status.COMPLETE, callback)
             return event
         else:
             host_array = np.empty(padded_shape, dtype=dtype)
-            event = cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], host_array, buffer, wait_for=[event] if 'event' in locals() else None)
+            cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], staging_buf, buffer)
+            event = cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], host_array, staging_buf)
             if callback:
                 event.set_callback(cl.command_execution_status.COMPLETE, callback)
             slices = tuple(slice(0, r) for r in real_shape)
             return host_array[slices]
 
+    def _get_staging_buffer(self, size):
+        for buf in self.staging_pool:
+            if buf.size >= size:
+                return buf
+        buf = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.ALLOC_HOST_PTR, size=size)
+        self.staging_pool.append(buf)
+        return buf
+
     def validate_memory(self):
-        total_alloc = sum(b.size for b, _ in self.buffer_versions.values())
+        total_alloc = sum(b.size for b in self.active_allocations) + sum(b.size for b in self.staging_pool)
         device_max = self.device.global_mem_size
         if total_alloc / device_max > 0.8:
             raise MemoryError(f"Used {total_alloc / 1024**2:.2f}MB of {device_max / 1024**2:.2f}MB device memory")
 
-# ParamManager Definition
+    def release_buffer(self, name):
+        if name in self.buffers:
+            buffer = self.buffers[name]
+            buffer.release()
+            self.active_allocations.remove(buffer)
+            del self.buffers[name]
+            del self.buffer_metadata[name]
+            del self.buffer_versions[name]
+            del self.work_manager.logical_resources[name]
+
 class ParamManager:
     PARAM_TYPES = {
         'dense_weight': {
@@ -295,6 +315,8 @@ class ParamManager:
         self.m2_buffers = {}
 
     def register_parameter(self, name, shape, ptype, requires_grad=True):
+        if name in self.buffers:
+            raise ValueError(f"Parameter {name} already registered")
         self.params[name] = {
             'shape': shape,
             'ptype': ptype,
@@ -330,7 +352,6 @@ class ParamManager:
                     operation_fn=_zero_fn
                 )
 
-# KernelWrapper Definition
 class KernelWrapper:
     def __init__(self, program, manager, global_step, compute_queue, buffer_manager):
         self.program = program
@@ -368,6 +389,8 @@ class KernelWrapper:
         return self
 
     def forward_pass(self, global_sizes, local_sizes, input_buf, weights_buf, biases_buf, hidden_buf, actual_batch_size):
+        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
+            raise ValueError(f"Invalid global sizes: {global_sizes}")
         local_mem = cl.LocalMemory(local_sizes[0] * FLOAT_SIZE)
         def _enqueue_forward(queue, wait_for):
             return self.program.forward_pass(
@@ -384,65 +407,67 @@ class KernelWrapper:
         )
 
     def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_buf, exit_weights_buf, exit_biases_buf, exit_probs_buf, losses_buf, targets_buf, exit_idx, actual_batch_size):
-        local_mem = cl.LocalMemory(local_sizes[0] * FLOAT_SIZE)
+        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
+            raise ValueError(f"Invalid global sizes: {global_sizes}")
         def _enqueue_exit(queue, wait_for):
             return self.program.compute_exit_probabilities(
-                queue, global_sizes, local_sizes, hidden_buf, exit_weights_buf, exit_biases_buf, exit_probs_buf, losses_buf, targets_buf,
-                self.mask, self.temperatures, np.int32(self.hidden_dim), np.int32(self.padded_hidden_dim),
-                np.int32(self.output_classes), np.int32(self.padded_output_classes), np.int32(self.num_exits),
-                np.int32(self.padded_batch_size), np.int32(exit_idx), np.int32(actual_batch_size),
-                wait_for=wait_for
+                queue, global_sizes, local_sizes, hidden_buf, exit_weights_buf, exit_biases_buf, exit_probs_buf,
+                losses_buf, targets_buf, np.int32(exit_idx), self.temperatures, np.int32(self.hidden_dim),
+                np.int32(self.output_classes), np.int32(self.padded_hidden_dim), np.int32(self.padded_output_classes),
+                np.int32(self.padded_batch_size), np.int32(actual_batch_size), wait_for=wait_for
             )
         return self.manager.create_node(
             queue_type='compute',
-            resource_access={'R': ['hidden', 'exit_weights', 'exit_biases', 'targets_batch', 'mask_batch', 'temps'], 'W': ['exit_probs', 'losses']},
+            resource_access={'R': ['hidden', 'exit_weights', 'exit_biases', 'targets_batch', 'temps'], 'W': ['exit_probs', 'losses']},
             operation_fn=_enqueue_exit
         )
 
     def compute_gradients(self, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf, grad_weights_buf, grad_biases_buf, grad_exit_weights_buf, grad_exit_biases_buf, targets_buf, actual_batch_size):
-        local_mem = cl.LocalMemory(local_sizes[0] * FLOAT_SIZE)
+        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
+            raise ValueError(f"Invalid global sizes: {global_sizes}")
         def _enqueue_grad(queue, wait_for):
             return self.program.compute_gradients(
-                queue, global_sizes, local_sizes, local_mem, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf,
+                queue, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf,
                 grad_weights_buf, grad_biases_buf, grad_exit_weights_buf, grad_exit_biases_buf, targets_buf,
-                self.mask, self.temperatures, np.int32(self.input_dim), np.int32(self.hidden_dim), np.int32(self.padded_hidden_dim),
-                np.int32(self.output_classes), np.int32(self.padded_output_classes), np.int32(self.num_exits),
-                np.int32(self.padded_batch_size), np.int32(actual_batch_size),
-                wait_for=wait_for
+                self.temperatures, np.int32(self.input_dim), np.int32(self.hidden_dim), np.int32(self.output_classes),
+                np.int32(self.padded_input_dim), np.int32(self.padded_hidden_dim), np.int32(self.padded_output_classes),
+                np.int32(self.padded_batch_size), np.int32(actual_batch_size), np.int32(self.num_exits), wait_for=wait_for
             )
         return self.manager.create_node(
             queue_type='compute',
-            resource_access={'R': ['input_batch', 'hidden', 'exit_probs', 'exit_weights', 'targets_batch', 'mask_batch', 'temps'],
-                             'W': ['grad_weights', 'grad_biases', 'grad_exit_weights', 'grad_exit_biases']},
+            resource_access={'R': ['input_batch', 'hidden', 'exit_probs', 'exit_weights', 'targets_batch', 'temps'],
+                            'W': ['grad_weights', 'grad_biases', 'grad_exit_weights', 'grad_exit_biases']},
             operation_fn=_enqueue_grad
         )
 
     def compute_temp_gradients(self, global_sizes, local_sizes, exit_probs_buf, targets_buf, grad_temps_buf, actual_batch_size):
+        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
+            raise ValueError(f"Invalid global sizes: {global_sizes}")
         def _enqueue_temp_grad(queue, wait_for):
             return self.program.compute_temp_gradients(
-                queue, global_sizes, local_sizes, exit_probs_buf, targets_buf, grad_temps_buf,
-                self.mask, self.temperatures, np.int32(self.num_exits), np.int32(self.padded_batch_size), np.int32(actual_batch_size),
-                wait_for=wait_for
+                queue, global_sizes, local_sizes, exit_probs_buf, targets_buf, grad_temps_buf, self.temperatures,
+                np.int32(self.output_classes), np.int32(self.padded_output_classes), np.int32(self.padded_batch_size),
+                np.int32(actual_batch_size), np.int32(self.num_exits), wait_for=wait_for
             )
         return self.manager.create_node(
             queue_type='compute',
-            resource_access={'R': ['exit_probs', 'targets_batch', 'mask_batch', 'temps'], 'W': ['grad_temps']},
+            resource_access={'R': ['exit_probs', 'targets_batch', 'temps'], 'W': ['grad_temps']},
             operation_fn=_enqueue_temp_grad
         )
 
-    def adam_update(self, global_sizes, local_sizes, grad_param, param_buffer, m1_param, m2_param, total_params):
-        param_name = next(k for k, v in pm.buffers.items() if v == param_buffer)
-        def _enqueue_update(queue, wait_for):
+    def adam_update(self, global_sizes, local_sizes, grad_buf, param_buf, m1_buf, m2_buf, total_params):
+        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
+            raise ValueError(f"Invalid global sizes: {global_sizes}")
+        def _enqueue_adam(queue, wait_for):
             return self.program.adam_update(
-                queue, global_sizes, local_sizes, grad_param, param_buffer, m1_param, m2_param,
-                self.learning_rate, self.adam_beta1, self.adam_beta2, self.beta1_t, self.beta2_t,
-                self.min_temp, self.max_temp, self.epsilon, np.int32(total_params),
+                queue, global_sizes, local_sizes, grad_buf, param_buf, m1_buf, m2_buf, self.adam_beta1,
+                self.adam_beta2, self.beta1_t, self.beta2_t, self.learning_rate, self.epsilon, np.int32(total_params),
                 wait_for=wait_for
             )
         return self.manager.create_node(
             queue_type='compute',
-            resource_access={'R': [f'grad_{param_name}'], 'W': [param_name, f'm1_{param_name}', f'm2_{param_name}']},
-            operation_fn=_enqueue_update
+            resource_access={'R': [grad_buf, param_buf, m1_buf, m2_buf], 'W': [param_buf, m1_buf, m2_buf]},
+            operation_fn=_enqueue_adam
         )
 
 # OpenCL Setup
@@ -598,8 +623,8 @@ for epoch in range(EPOCHS):
     print(f"Temperatures: {temps_host}")
 
 # Cleanup
-for buf in buffer_mgr.buffers.values():
-    buf.release()
+for name in list(buffer_mgr.buffers.keys()):
+    buffer_mgr.release_buffer(name)
 
 if __name__ == "__main__":
     pass
