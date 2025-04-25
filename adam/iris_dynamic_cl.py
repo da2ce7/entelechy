@@ -117,6 +117,10 @@ def optimal_local_sizes(global_sizes, device):
         local_sizes = [min(l, max_work_group_size // (total_local // l)) for l in local_sizes]
     return tuple(local_sizes)
 
+class TransferDirection(Enum):
+    H2D = 1  # Host to Device
+    D2H = 2  # Device to Host
+
 class NodeType(Enum):
     MEMORY = 1
     COMPUTE = 2
@@ -151,6 +155,15 @@ class WorkManager:
     def create_node(self, node_type, queue_type, resource_access, operation_fn, params):
         node = self.ExecutionNode(self.node_id_counter, node_type, queue_type, resource_access, set(), params)
         node.execute = operation_fn
+        if node_type == NodeType.TRANSFER:
+            buffer_name = list(resource_access['W'])[0] if params['direction'] == TransferDirection.H2D else list(resource_access['R'])[0]
+            alloc_node = self.buffer_tracker[buffer_name]['alloc_node']
+            node.dependencies.add(alloc_node)
+            if params['direction'] == TransferDirection.D2H:
+                for uid in self.execution_graph.nodes:
+                    existing_node = self.execution_graph.nodes[uid]['node']
+                    if buffer_name in existing_node.resources['W']:
+                        node.dependencies.add(uid)
         for res in resource_access['R']:
             if res in self.logical_resources:
                 node.expected_versions[res] = self.logical_resources[res][1]
@@ -185,7 +198,6 @@ class WorkManager:
                 return None
             node = self.ExecutionNode(self.node_id_counter, NodeType.MEMORY, 'compute', {'R': [name]}, set(), {'op_type': op_type})
             node.execute = _free_fn
-            # Add dependencies on all nodes that write to this buffer
             for existing_uid in self.execution_graph.nodes:
                 existing_node = self.execution_graph.nodes[existing_uid]['node']
                 if name in existing_node.resources['W']:
@@ -229,12 +241,10 @@ class WorkManager:
         node.execute(self.hardware_queues[node.queue_type], wait_for=wait_for)
 
     def _dispatch_transfer(self, node, wait_for):
-        # Placeholder for transfer operations
-        pass
+        node.execute(self.hardware_queues[node.queue_type], wait_for=wait_for)
 
     def _dispatch_sync(self, node, wait_for):
-        # Placeholder for sync operations
-        pass
+        pass  # Placeholder for sync operations
 
     def reset_graph(self):
         self.execution_graph.clear()
@@ -294,28 +304,64 @@ class BufferManager:
         padded_shape = metadata['padded_shape']
         real_shape = metadata['real_shape']
         dtype = metadata['dtype']
-        staging_buf = self._get_staging_buffer(np.prod(padded_shape) * dtype().itemsize)
+        size = np.prod(padded_shape) * dtype().itemsize
+        staging_buf = self._get_staging_buffer(size)
+        
         if not is_device_to_host:
+            # Host-to-Device (H2D)
             padded_data = np.zeros(padded_shape, dtype=dtype)
             slices = tuple(slice(0, r) for r in real_shape)
             padded_data[slices] = host_data
-            event = cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], staging_buf, padded_data, wait_for=self.current_events)
-            self.current_events = [event]
-            event = cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], buffer, staging_buf, wait_for=self.current_events)
-            self.current_events = [event]
-            if callback:
-                event.set_callback(cl.command_execution_status.COMPLETE, callback)
-            return event
+            params = {
+                'direction': TransferDirection.H2D,
+                'source': padded_data,
+                'destination': buffer,
+                'size': size,
+                'staging_buffer': staging_buf
+            }
+            node_id = self.work_manager.create_node(
+                node_type=NodeType.TRANSFER,
+                queue_type='xfer',
+                resource_access={'W': [buffer_name]},
+                operation_fn=self._execute_transfer,
+                params=params
+            )
+            return node_id
         else:
+            # Device-to-Host (D2H)
             host_array = np.empty(padded_shape, dtype=dtype)
-            event = cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], staging_buf, buffer, wait_for=self.current_events)
-            self.current_events = [event]
-            event = cl.enqueue_copy(self.work_manager.hardware_queues['xfer'], host_array, staging_buf, wait_for=self.current_events)
-            self.current_events = [event]
+            params = {
+                'direction': TransferDirection.D2H,
+                'source': buffer,
+                'destination': host_array,
+                'size': size,
+                'staging_buffer': staging_buf
+            }
+            node_id = self.work_manager.create_node(
+                node_type=NodeType.TRANSFER,
+                queue_type='xfer',
+                resource_access={'R': [buffer_name]},
+                operation_fn=self._execute_transfer,
+                params=params
+            )
             if callback:
-                event.set_callback(cl.command_execution_status.COMPLETE, callback)
-            slices = tuple(slice(0, r) for r in real_shape)
-            return host_array[slices]
+                self.work_manager.execution_graph.nodes[node_id]['node'].params['callback'] = callback
+            return node_id
+
+    def _execute_transfer(self, queue, wait_for):
+        params = self.params
+        staging_buf = params['staging_buffer']
+        
+        if params['direction'] == TransferDirection.H2D:
+            event1 = cl.enqueue_copy(queue, staging_buf, params['source'], wait_for=wait_for)
+            event2 = cl.enqueue_copy(queue, params['destination'], staging_buf, wait_for=[event1])
+            self.event = event2
+        elif params['direction'] == TransferDirection.D2H:
+            event1 = cl.enqueue_copy(queue, staging_buf, params['source'], wait_for=wait_for)
+            event2 = cl.enqueue_copy(queue, params['destination'], staging_buf, wait_for=[event1])
+            self.event = event2
+            if 'callback' in params:
+                self.event.set_callback(cl.command_execution_status.COMPLETE, params['callback'])
 
     def _get_staging_buffer(self, size):
         for buf in self.staging_pool:
@@ -396,9 +442,7 @@ class ParamManager:
             if spec['requires_grad']:
                 self.grad_buffers[name] = self.buffer_manager.acquire_buffer(f"grad_{name}", spec['shape'], np.float32)
                 self.m1_buffers[name] = self.buffer_manager.acquire_buffer(f"m1_{name}", spec['shape'], np.float32)
-                self.m2_buffers[name] = self.buffer_manager.acquire_buffer(f"m2_{name}", spec['shape'], np.float32)
-
-    def zero_gradients(self, work_manager):
+                self.m2_buffers[name] =-    def zero_gradients(self, work_manager):
         for name, spec in self.params.items():
             if spec['requires_grad']:
                 grad_buffer = self.grad_buffers[name]
@@ -628,25 +672,63 @@ for epoch in range(EPOCHS):
         X_batch = X_normalized[batch_indices]
         y_batch = y_true[batch_indices]
         X_padded, y_padded, mask = pad_batch(X_batch, y_batch, buffer_mgr)
-        buffer_mgr.staged_transfer(X_padded, 'input_batch')
-        buffer_mgr.staged_transfer(y_padded, 'targets_batch')
-        buffer_mgr.staged_transfer(mask, 'mask_batch')
+
+        # Transfer nodes for input data
+        input_transfer = buffer_mgr.staged_transfer(X_padded, 'input_batch')
+        targets_transfer = buffer_mgr.staged_transfer(y_padded, 'targets_batch')
+        mask_transfer = buffer_mgr.staged_transfer(mask, 'mask_batch')
+
         kernel_wrapper = KernelWrapper(program, manager, global_step, compute_queue, buffer_mgr)
-        kernel_wrapper.set_mask(buffer_mgr.buffer_versions['mask_batch'][0]).set_temps(pm.buffers['temps'])
+        kernel_wrapper.set_mask(buffer_mgr.buffers['mask_batch']).set_temps(pm.buffers['temps'])
         pm.zero_gradients(manager)
+
+        # Forward pass node with dependencies
         global_forward = (buffer_mgr.buffer_metadata['input_batch']['padded_shape'][0], HIDDEN_DIM)
         local_forward = optimal_local_sizes(global_forward, device_limits)
-        kernel_wrapper.forward_pass(global_forward, local_forward, buffer_mgr.buffers['input_batch'], pm.buffers['weights'], pm.buffers['biases'], buffer_mgr.buffers['hidden'], actual_batch_size)
+        forward_node = kernel_wrapper.forward_pass(
+            global_forward, local_forward,
+            buffer_mgr.buffers['input_batch'], pm.buffers['weights'],
+            pm.buffers['biases'], buffer_mgr.buffers['hidden'], actual_batch_size
+        )
+        manager.execution_graph.add_edge(input_transfer, forward_node)
+        manager.execution_graph.add_edge(mask_transfer, forward_node)
+
         for exit_idx in range(NUM_EXITS):
             global_exit = (buffer_mgr.buffer_metadata['input_batch']['padded_shape'][0],)
             local_exit = optimal_local_sizes(global_exit, device_limits)
-            kernel_wrapper.compute_exit_probabilities(global_exit, local_exit, buffer_mgr.buffers['hidden'], pm.buffers['exit_weights'], pm.buffers['exit_biases'], buffer_mgr.buffers['exit_probs'], buffer_mgr.buffers['losses'], buffer_mgr.buffers['targets_batch'], exit_idx, actual_batch_size)
+            exit_node = kernel_wrapper.compute_exit_probabilities(
+                global_exit, local_exit,
+                buffer_mgr.buffers['hidden'], pm.buffers['exit_weights'],
+                pm.buffers['exit_biases'], buffer_mgr.buffers['exit_probs'],
+                buffer_mgr.buffers['losses'], buffer_mgr.buffers['targets_batch'],
+                exit_idx, actual_batch_size
+            )
+            manager.execution_graph.add_edge(forward_node, exit_node)
+            manager.execution_graph.add_edge(targets_transfer, exit_node)
+
         global_grad = (INPUT_DIM, HIDDEN_DIM)
         local_grad = optimal_local_sizes(global_grad, device_limits)
-        kernel_wrapper.compute_gradients(global_grad, local_grad, buffer_mgr.buffers['input_batch'], buffer_mgr.buffers['hidden'], buffer_mgr.buffers['exit_probs'], pm.buffers['exit_weights'], pm.grad_buffers['weights'], pm.grad_buffers['biases'], pm.grad_buffers['exit_weights'], pm.grad_buffers['exit_biases'], buffer_mgr.buffers['targets_batch'], actual_batch_size)
+        grad_node = kernel_wrapper.compute_gradients(
+            global_grad, local_grad,
+            buffer_mgr.buffers['input_batch'], buffer_mgr.buffers['hidden'],
+            buffer_mgr.buffers['exit_probs'], pm.buffers['exit_weights'],
+            pm.grad_buffers['weights'], pm.grad_buffers['biases'],
+            pm.grad_buffers['exit_weights'], pm.grad_buffers['exit_biases'],
+            buffer_mgr.buffers['targets_batch'], actual_batch_size
+        )
+        manager.execution_graph.add_edge(input_transfer, grad_node)
+        manager.execution_graph.add_edge(forward_node, grad_node)
+        manager.execution_graph.add_edge(targets_transfer, grad_node)
+
         global_temp_grad = (NUM_EXITS,)
         local_temp_grad = optimal_local_sizes(global_temp_grad, device_limits)
-        kernel_wrapper.compute_temp_gradients(global_temp_grad, local_temp_grad, buffer_mgr.buffers['exit_probs'], buffer_mgr.buffers['targets_batch'], pm.grad_buffers['temps'], actual_batch_size)
+        temp_grad_node = kernel_wrapper.compute_temp_gradients(
+            global_temp_grad, local_temp_grad,
+            buffer_mgr.buffers['exit_probs'], buffer_mgr.buffers['targets_batch'],
+            pm.grad_buffers['temps'], actual_batch_size
+        )
+        manager.execution_graph.add_edge(targets_transfer, temp_grad_node)
+
         for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
             if param in pm.params and pm.params[param]['requires_grad']:
                 grad_buf = pm.grad_buffers[param]
@@ -660,19 +742,40 @@ for epoch in range(EPOCHS):
                 total_params = int(np.prod(buffer_mgr.buffer_metadata[param]['padded_shape']))
                 global_adam = (total_params,)
                 local_adam = optimal_local_sizes(global_adam, device_limits)
-                kernel_wrapper.adam_update(global_adam, local_adam, grad_buf, param_buf, m1_buf, m2_buf, grad_name, param_name, m1_name, m2_name, total_params)
+                adam_node = kernel_wrapper.adam_update(
+                    global_adam, local_adam,
+                    grad_buf, param_buf, m1_buf, m2_buf,
+                    grad_name, param_name, m1_name, m2_name, total_params
+                )
+                manager.execution_graph.add_edge(grad_node if param != 'temps' else temp_grad_node, adam_node)
                 if param == 'temps':
                     global_clamp = (NUM_EXITS,)
                     local_clamp = optimal_local_sizes(global_clamp, device_limits)
-                    kernel_wrapper.clamp_temperatures(global_clamp, local_clamp, param_buf)
+                    clamp_node = kernel_wrapper.clamp_temperatures(global_clamp, local_clamp, param_buf)
+                    manager.execution_graph.add_edge(adam_node, clamp_node)
+
+        # Device-to-host transfers for results
         host_processing_event = cl.UserEvent(ctx)
         def set_event_complete(_):
             host_processing_event.set_status(cl.command_execution_status.COMPLETE)
-        losses_host = buffer_mgr.staged_transfer(None, 'losses', is_device_to_host=True, callback=set_event_complete)
-        exit_probs_host = buffer_mgr.staged_transfer(None, 'exit_probs', is_device_to_host=True)
-        temps_host = buffer_mgr.staged_transfer(None, 'temps', is_device_to_host=True)
+        losses_transfer = buffer_mgr.staged_transfer(None, 'losses', is_device_to_host=True, callback=set_event_complete)
+        exit_probs_transfer = buffer_mgr.staged_transfer(None, 'exit_probs', is_device_to_host=True)
+        temps_transfer = buffer_mgr.staged_transfer(None, 'temps', is_device_to_host=True)
+
         manager.commit_workload()
-        cl.wait_for_events([host_processing_event])
+
+        # Wait for transfers to complete
+        cl.wait_for_events([
+            manager.execution_graph.nodes[losses_transfer]['node'].event,
+            manager.execution_graph.nodes[exit_probs_transfer]['node'].event,
+            manager.execution_graph.nodes[temps_transfer]['node'].event
+        ])
+
+        # Access results
+        losses_host = manager.execution_graph.nodes[losses_transfer]['node'].params['destination']
+        exit_probs_host = manager.execution_graph.nodes[exit_probs_transfer]['node'].params['destination']
+        temps_host = manager.execution_graph.nodes[temps_transfer]['node'].params['destination']
+
         exit_losses = []
         for exit_idx in range(NUM_EXITS):
             start = exit_idx * loss_elements_per_exit
