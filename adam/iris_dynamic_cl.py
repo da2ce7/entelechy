@@ -7,6 +7,7 @@ from sklearn.preprocessing import StandardScaler
 import networkx as nx
 import re
 from collections import deque, defaultdict
+from enum import Enum
 
 # Define data type sizes
 FLOAT_SIZE = np.float32().itemsize
@@ -116,6 +117,12 @@ def optimal_local_sizes(global_sizes, device):
         local_sizes = [min(l, max_work_group_size // (total_local // l)) for l in local_sizes]
     return tuple(local_sizes)
 
+class NodeType(Enum):
+    MEMORY = 1
+    COMPUTE = 2
+    TRANSFER = 3
+    SYNC = 4
+
 class WorkManager:
     def __init__(self, context):
         self.context = context
@@ -125,20 +132,20 @@ class WorkManager:
         self.node_id_counter = 0
 
     class ExecutionNode:
-        __slots__ = ['uid', 'queue_type', 'execute', 'resources', 'dependencies', 'expected_versions']
-        def __init__(self, uid):
+        __slots__ = ['uid', 'node_type', 'queue_type', 'resources', 'dependencies', 'expected_versions', 'params', 'event']
+        def __init__(self, uid, node_type, queue_type, resources, dependencies, params):
             self.uid = uid
-            self.queue_type = None
-            self.execute = None
-            self.resources = {'R': set(), 'W': set()}
-            self.dependencies = set()
+            self.node_type = node_type
+            self.queue_type = queue_type
+            self.resources = resources
+            self.dependencies = dependencies
             self.expected_versions = {}
+            self.params = params
+            self.event = None
 
-    def create_node(self, queue_type, resource_access, operation_fn):
-        node = self.ExecutionNode(self.node_id_counter)
-        node.queue_type = queue_type
+    def create_node(self, node_type, queue_type, resource_access, operation_fn, params):
+        node = self.ExecutionNode(self.node_id_counter, node_type, queue_type, resource_access, set(), params)
         node.execute = operation_fn
-        node.resources = resource_access
         for res in resource_access['R']:
             if res in self.logical_resources:
                 node.expected_versions[res] = self.logical_resources[res][1]
@@ -156,11 +163,7 @@ class WorkManager:
         return node.uid
 
     def commit_workload(self):
-        ordered_nodes = list(nx.lexicographical_topological_sort(
-            self.execution_graph,
-            key=lambda x: self.execution_graph.nodes[x]['node'].queue_type
-        ))
-        schedule = {qt: [] for qt in self.hardware_queues}
+        ordered_nodes = list(nx.topological_sort(self.execution_graph))
         completion_events = {}
         for uid in ordered_nodes:
             node = self.execution_graph.nodes[uid]['node']
@@ -171,18 +174,36 @@ class WorkManager:
                     expected_version = node.expected_versions.get(res, 0)
                     if expected_version != current_version:
                         raise ConcurrentModificationError(f"Resource {res} has been modified unexpectedly for node {uid}")
-            wait_for = [
-                completion_events[d] for d in node.dependencies
-                if d in completion_events
-            ]
-            event = node.execute(queue, wait_for=wait_for)
-            completion_events[uid] = event
-            schedule[node.queue_type].append(event)
+            wait_for = [completion_events[d] for d in node.dependencies if d in completion_events]
+            if node.node_type == NodeType.COMPUTE:
+                self._dispatch_compute(node, wait_for)
+            elif node.node_type == NodeType.MEMORY:
+                self._dispatch_memory(node, wait_for)
+            elif node.node_type == NodeType.TRANSFER:
+                self._dispatch_transfer(node, wait_for)
+            elif node.node_type == NodeType.SYNC:
+                self._dispatch_sync(node, wait_for)
+            completion_events[uid] = node.event
             for res in node.resources['W']:
                 if res in self.logical_resources:
                     buffer, version = self.logical_resources[res]
                     self.logical_resources[res] = (buffer, version + 1)
-        return schedule
+
+    def _dispatch_compute(self, node, wait_for):
+        queue = self.hardware_queues[node.queue_type]
+        node.event = node.execute(queue, wait_for=wait_for)
+
+    def _dispatch_memory(self, node, wait_for):
+        # Placeholder for memory operations
+        pass
+
+    def _dispatch_transfer(self, node, wait_for):
+        # Placeholder for transfer operations
+        pass
+
+    def _dispatch_sync(self, node, wait_for):
+        # Placeholder for sync operations
+        pass
 
     def reset_graph(self):
         self.execution_graph.clear()
@@ -275,26 +296,18 @@ class BufferManager:
         return buf
 
     def validate_memory(self):
-        # Calculate memory usage for padded buffers
         padded_sizes = [
             np.prod(meta['padded_shape']) * np.dtype(meta['dtype']).itemsize
             for meta in self.buffer_metadata.values()
         ]
         total_buffer_alloc = sum(padded_sizes)
-
-        # Include staging pool memory
         staging_pool_alloc = sum(buf.size for buf in self.staging_pool)
-
-        # Total allocated memory
         total_alloc = total_buffer_alloc + staging_pool_alloc
-
-        # Compare against device memory limit
         device_max = self.device.global_mem_size
         if total_alloc / device_max > 0.8:
             raise MemoryError(
                 f"Used {total_alloc / 1024**2:.2f}MB of {device_max / 1024**2:.2f}MB device memory"
             )
-
 
     def release_buffer(self, name):
         if name in self.buffers:
@@ -373,9 +386,11 @@ class ParamManager:
                 def _zero_fn(queue, wait_for):
                     return cl.enqueue_fill_buffer(queue, grad_buffer, np.float32(0), 0, grad_buffer.size, wait_for=wait_for)
                 work_manager.create_node(
+                    node_type=NodeType.COMPUTE,
                     queue_type='compute',
                     resource_access={'W': [f'grad_{name}']},
-                    operation_fn=_zero_fn
+                    operation_fn=_zero_fn,
+                    params={}
                 )
 
 class KernelWrapper:
@@ -424,9 +439,11 @@ class KernelWrapper:
                 wait_for=wait_for
             )
         return self.manager.create_node(
+            node_type=NodeType.COMPUTE,
             queue_type='compute',
             resource_access={'R': ['input_batch', 'weights', 'biases', 'mask_batch'], 'W': ['hidden']},
-            operation_fn=_enqueue_forward
+            operation_fn=_enqueue_forward,
+            params={}
         )
 
     def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_buf, exit_weights_buf, exit_biases_buf, exit_probs_buf, losses_buf, targets_buf, exit_idx, actual_batch_size):
@@ -440,9 +457,11 @@ class KernelWrapper:
                 np.int32(self.padded_batch_size), np.int32(actual_batch_size), wait_for=wait_for
             )
         return self.manager.create_node(
+            node_type=NodeType.COMPUTE,
             queue_type='compute',
             resource_access={'R': ['hidden', 'exit_weights', 'exit_biases', 'targets_batch', 'temps'], 'W': ['exit_probs', 'losses']},
-            operation_fn=_enqueue_exit
+            operation_fn=_enqueue_exit,
+            params={}
         )
 
     def compute_gradients(self, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf, grad_weights_buf, grad_biases_buf, grad_exit_weights_buf, grad_exit_biases_buf, targets_buf, actual_batch_size):
@@ -457,10 +476,12 @@ class KernelWrapper:
                 np.int32(self.padded_batch_size), np.int32(actual_batch_size), np.int32(self.num_exits), wait_for=wait_for
             )
         return self.manager.create_node(
+            node_type=NodeType.COMPUTE,
             queue_type='compute',
             resource_access={'R': ['input_batch', 'hidden', 'exit_probs', 'exit_weights', 'targets_batch', 'temps'],
                             'W': ['grad_weights', 'grad_biases', 'grad_exit_weights', 'grad_exit_biases']},
-            operation_fn=_enqueue_grad
+            operation_fn=_enqueue_grad,
+            params={}
         )
 
     def compute_temp_gradients(self, global_sizes, local_sizes, exit_probs_buf, targets_buf, grad_temps_buf, actual_batch_size):
@@ -473,9 +494,11 @@ class KernelWrapper:
                 np.int32(actual_batch_size), np.int32(self.num_exits), wait_for=wait_for
             )
         return self.manager.create_node(
+            node_type=NodeType.COMPUTE,
             queue_type='compute',
             resource_access={'R': ['exit_probs', 'targets_batch', 'temps'], 'W': ['grad_temps']},
-            operation_fn=_enqueue_temp_grad
+            operation_fn=_enqueue_temp_grad,
+            params={}
         )
 
     def adam_update(self, global_sizes, local_sizes, grad_buf, param_buf, m1_buf, m2_buf, grad_name, param_name, m1_name, m2_name, total_params):
@@ -488,9 +511,11 @@ class KernelWrapper:
                 wait_for=wait_for
             )
         return self.manager.create_node(
+            node_type=NodeType.COMPUTE,
             queue_type='compute',
             resource_access={'R': [grad_name, param_name, m1_name, m2_name], 'W': [param_name, m1_name, m2_name]},
-            operation_fn=_enqueue_adam
+            operation_fn=_enqueue_adam,
+            params={}
         )
 
     def clamp_temperatures(self, global_sizes, local_sizes, temps_buf):
@@ -504,9 +529,11 @@ class KernelWrapper:
                 wait_for=wait_for
             )
         return self.manager.create_node(
+            node_type=NodeType.COMPUTE,
             queue_type='compute',
             resource_access={'R': ['temps'], 'W': ['temps']},
-            operation_fn=_enqueue_clamp
+            operation_fn=_enqueue_clamp,
+            params={}
         )
 
 # OpenCL Setup
@@ -625,7 +652,7 @@ for epoch in range(EPOCHS):
         losses_host = buffer_mgr.staged_transfer(None, 'losses', is_device_to_host=True, callback=set_event_complete)
         exit_probs_host = buffer_mgr.staged_transfer(None, 'exit_probs', is_device_to_host=True)
         temps_host = buffer_mgr.staged_transfer(None, 'temps', is_device_to_host=True)
-        schedule = manager.commit_workload()
+        manager.commit_workload()
         cl.wait_for_events([host_processing_event])
         exit_losses = []
         for exit_idx in range(NUM_EXITS):
