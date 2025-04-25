@@ -123,6 +123,10 @@ class NodeType(Enum):
     TRANSFER = 3
     SYNC = 4
 
+class MemOpType(Enum):
+    ALLOC = 1
+    FREE = 2
+
 class WorkManager:
     def __init__(self, context):
         self.context = context
@@ -130,6 +134,7 @@ class WorkManager:
         self.logical_resources = {}
         self.hardware_queues = {}
         self.node_id_counter = 0
+        self.buffer_tracker = defaultdict(lambda: {'version': 0, 'alloc_node': None, 'free_node': None})
 
     class ExecutionNode:
         __slots__ = ['uid', 'node_type', 'queue_type', 'resources', 'dependencies', 'expected_versions', 'params', 'event']
@@ -158,6 +163,33 @@ class WorkManager:
                     if (res in existing_node.resources['W'] or
                         (res in existing_node.resources['R'] and res in resource_access['W'])):
                         node.dependencies.add(existing_uid)
+        self.execution_graph.add_node(node.uid, node=node)
+        self.node_id_counter += 1
+        return node.uid
+
+    def create_mem_node(self, name, op_type, size=None, buffer=None):
+        if op_type == MemOpType.ALLOC:
+            def _alloc_fn(queue, wait_for):
+                buffer = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=size)
+                self.logical_resources[name] = (buffer, 0)
+                self.buffer_tracker[name]['alloc_node'] = self.node_id_counter
+                return None  # No event for memory operations
+            node = self.ExecutionNode(self.node_id_counter, NodeType.MEMORY, 'compute', {'W': [name]}, set(), {'op_type': op_type, 'size': size})
+            node.execute = _alloc_fn
+        elif op_type == MemOpType.FREE:
+            def _free_fn(queue, wait_for):
+                buffer = self.logical_resources[name][0]
+                buffer.release()
+                del self.logical_resources[name]
+                self.buffer_tracker[name]['free_node'] = self.node_id_counter
+                return None
+            node = self.ExecutionNode(self.node_id_counter, NodeType.MEMORY, 'compute', {'R': [name]}, set(), {'op_type': op_type})
+            node.execute = _free_fn
+            # Add dependencies on all nodes that write to this buffer
+            for existing_uid in self.execution_graph.nodes:
+                existing_node = self.execution_graph.nodes[existing_uid]['node']
+                if name in existing_node.resources['W']:
+                    node.dependencies.add(existing_uid)
         self.execution_graph.add_node(node.uid, node=node)
         self.node_id_counter += 1
         return node.uid
@@ -194,8 +226,7 @@ class WorkManager:
         node.event = node.execute(queue, wait_for=wait_for)
 
     def _dispatch_memory(self, node, wait_for):
-        # Placeholder for memory operations
-        pass
+        node.execute(self.hardware_queues[node.queue_type], wait_for=wait_for)
 
     def _dispatch_transfer(self, node, wait_for):
         # Placeholder for transfer operations
@@ -233,22 +264,21 @@ class BufferManager:
     def acquire_buffer(self, name, real_shape, dtype, pad_strategy=None, mode='device'):
         strategy = self.pad_strategies[pad_strategy or self.default_pad_strategy]
         padded_shape = strategy(real_shape, dtype)
-        buffer = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, size=np.prod(padded_shape) * dtype().itemsize)
+        size = np.prod(padded_shape) * dtype().itemsize
+        alloc_node = self.work_manager.create_mem_node(name, MemOpType.ALLOC, size=size)
         self.buffer_metadata[name] = {
             'real_shape': real_shape,
             'padded_shape': padded_shape,
             'dtype': dtype,
             'strategy': pad_strategy or self.default_pad_strategy,
-            'buffer': buffer
+            'alloc_node': alloc_node
         }
-        if name in self.buffer_versions:
-            self.work_manager.logical_resources[name] = (buffer, self.buffer_versions[name][1] + 1)
-        else:
-            self.work_manager.logical_resources[name] = (buffer, 0)
-        self.buffer_versions[name] = (buffer, self.work_manager.logical_resources[name][1])
-        self.buffers[name] = buffer
-        self.active_allocations.add(buffer)
-        return buffer
+        return None  # Buffer is not yet allocated
+
+    def release_buffer(self, name):
+        if name in self.buffer_metadata:
+            free_node = self.work_manager.create_mem_node(name, MemOpType.FREE)
+            del self.buffer_metadata[name]
 
     def _default_pad_strategy(self, real_shape, dtype):
         item_size = np.dtype(dtype).itemsize
@@ -260,7 +290,7 @@ class BufferManager:
 
     def staged_transfer(self, host_data, buffer_name, is_device_to_host=False, callback=None):
         metadata = self.buffer_metadata[buffer_name]
-        buffer = metadata['buffer']
+        buffer = self.work_manager.logical_resources[buffer_name][0]
         padded_shape = metadata['padded_shape']
         real_shape = metadata['real_shape']
         dtype = metadata['dtype']
@@ -308,16 +338,6 @@ class BufferManager:
             raise MemoryError(
                 f"Used {total_alloc / 1024**2:.2f}MB of {device_max / 1024**2:.2f}MB device memory"
             )
-
-    def release_buffer(self, name):
-        if name in self.buffers:
-            buffer = self.buffers[name]
-            buffer.release()
-            self.active_allocations.remove(buffer)
-            del self.buffers[name]
-            del self.buffer_metadata[name]
-            del self.buffer_versions[name]
-            del self.work_manager.logical_resources[name]
 
 class ParamManager:
     PARAM_TYPES = {
@@ -371,9 +391,8 @@ class ParamManager:
             handler = self.PARAM_TYPES[ptype]
             init_values = handler['init'](spec['shape'])
             processed = handler['preprocess'](init_values, self.buffer_manager.simd_width)
-            buffer = self.buffer_manager.acquire_buffer(name, spec['shape'], np.float32)
-            self.buffer_manager.staged_transfer(processed, name)
-            self.buffers[name] = buffer
+            self.buffer_manager.acquire_buffer(name, spec['shape'], np.float32)
+            self.buffers[name] = self.buffer_manager.logical_resources[name][0]
             if spec['requires_grad']:
                 self.grad_buffers[name] = self.buffer_manager.acquire_buffer(f"grad_{name}", spec['shape'], np.float32)
                 self.m1_buffers[name] = self.buffer_manager.acquire_buffer(f"m1_{name}", spec['shape'], np.float32)
@@ -680,7 +699,7 @@ for epoch in range(EPOCHS):
     print(f"Temperatures: {temps_host}")
 
 # Cleanup
-for name in list(buffer_mgr.buffers.keys()):
+for name in list(buffer_mgr.buffer_metadata.keys()):
     buffer_mgr.release_buffer(name)
 
 if __name__ == "__main__":
