@@ -142,7 +142,7 @@ class WorkManager:
         self.logical_resources = {}
         self.hardware_queues = {}
         self.node_id_counter = 0
-        self.buffer_tracker = defaultdict(lambda: {'version': 0, 'alloc_node': None, 'free_node': None})
+        self.buffer_tracker = defaultdict(lambda: {'version': 0, 'alloc_node': None, 'free_node': None, 'metadata': None})
 
     class ExecutionNode:
         __slots__ = ['uid', 'node_type', 'queue_type', 'resources', 'dependencies', 'expected_versions', 'params', 'event']
@@ -184,12 +184,13 @@ class WorkManager:
         self.node_id_counter += 1
         return node.uid
 
-    def create_mem_node(self, name, op_type, size=None, buffer=None):
+    def create_mem_node(self, name, op_type, size=None, buffer=None, metadata=None):
         if op_type == MemOpType.ALLOC:
             def _alloc_fn(queue, wait_for):
                 buffer = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=size)
                 self.logical_resources[name] = (buffer, 0)
                 self.buffer_tracker[name]['alloc_node'] = self.node_id_counter
+                self.buffer_tracker[name]['metadata'] = metadata
                 return None
             node = self.ExecutionNode(self.node_id_counter, NodeType.MEMORY, 'compute', {'W': [name]}, set(), {'op_type': op_type, 'size': size})
             node.execute = _alloc_fn
@@ -199,6 +200,7 @@ class WorkManager:
                 buffer.release()
                 del self.logical_resources[name]
                 self.buffer_tracker[name]['free_node'] = self.node_id_counter
+                self.buffer_tracker[name]['metadata'] = None  # Clear metadata after free
                 return None
             node = self.ExecutionNode(self.node_id_counter, NodeType.MEMORY, 'compute', {'R': [name]}, set(), {'op_type': op_type})
             node.execute = _free_fn
@@ -233,7 +235,7 @@ class WorkManager:
                     current_version = self.logical_resources[res][1]
                     expected_version = node.expected_versions.get(res, 0)
                     if expected_version != current_version:
-                        raise ConcurrentModificationError(f"Resource {res} has been modified unexpectedly for node {uid}")
+                        raise RuntimeError(f"Resource {res} has been modified unexpectedly for node {uid}")
             wait_for = [completion_events[d] for d in node.dependencies if d in completion_events]
             if node.node_type == NodeType.COMPUTE:
                 self._dispatch_compute(node, wait_for)
@@ -257,7 +259,7 @@ class WorkManager:
         node.execute(self.hardware_queues[node.queue_type], wait_for=wait_for)
 
     def _dispatch_transfer(self, node, wait_for):
-        node.execute(self.hardware_queues[node.queue_type], wait_for=wait_for)
+        node.event = node.execute(self.hardware_queues[node.queue_type], wait_for=wait_for, node_params=node.params)
 
     def _dispatch_sync(self, node, wait_for):
         queue = self.hardware_queues[node.queue_type]
@@ -289,6 +291,7 @@ class BufferManager:
         self.staging_pool = deque(maxlen=8)
         self.buffers = {}
         self.work_manager.logical_resources.update(self.buffers)
+        self.staging_buffer_ownership = {}  # Track ownership of staging buffers
 
     def register_pad_strategy(self, name, callback):
         self.pad_strategies[name] = callback
@@ -297,20 +300,19 @@ class BufferManager:
         strategy = self.pad_strategies[pad_strategy or self.default_pad_strategy]
         padded_shape = strategy(real_shape, dtype)
         size = np.prod(padded_shape) * dtype().itemsize
-        alloc_node = self.work_manager.create_mem_node(name, MemOpType.ALLOC, size=size)
-        self.buffer_metadata[name] = {
+        metadata = {
             'real_shape': real_shape,
             'padded_shape': padded_shape,
             'dtype': dtype,
-            'strategy': pad_strategy or self.default_pad_strategy,
-            'alloc_node': alloc_node
+            'strategy': pad_strategy or self.default_pad_strategy
         }
+        alloc_node = self.work_manager.create_mem_node(name, MemOpType.ALLOC, size=size, metadata=metadata)
+        self.buffer_metadata[name] = metadata
         return alloc_node
 
     def release_buffer(self, name):
         if name in self.buffer_metadata:
-            free_node = self.work_manager.create_mem_node(name, MemOpType.FREE)
-            del self.buffer_metadata[name]
+            self.work_manager.create_mem_node(name, MemOpType.FREE)
 
     def _default_pad_strategy(self, real_shape, dtype):
         item_size = np.dtype(dtype).itemsize
@@ -346,6 +348,7 @@ class BufferManager:
                 operation_fn=self._execute_transfer,
                 params=params
             )
+            self.staging_buffer_ownership[staging_buf] = node_id
             return node_id
         else:
             host_array = np.empty(padded_shape, dtype=dtype)
@@ -363,11 +366,14 @@ class BufferManager:
                 operation_fn=self._execute_transfer,
                 params=params
             )
+            self.staging_buffer_ownership[staging_buf] = node_id
             return node_id, host_array
 
     def _execute_transfer(self, queue, wait_for, node_params):
         params = node_params
         staging_buf = params['staging_buffer']
+        if staging_buf in self.staging_buffer_ownership and self.staging_buffer_ownership[staging_buf] != params.get('node_id', self.work_manager.node_id_counter - 1):
+            raise RuntimeError("Staging buffer is already in use by another transfer")
         if params['direction'] == TransferDirection.H2D:
             buffer = self.work_manager.logical_resources[params['destination']][0]
             event1 = cl.enqueue_copy(queue, staging_buf, params['source'], wait_for=wait_for)
@@ -381,7 +387,7 @@ class BufferManager:
 
     def _get_staging_buffer(self, size):
         for buf in self.staging_pool:
-            if buf.size >= size:
+            if buf.size >= size and buf not in self.staging_buffer_ownership:
                 return buf
         buf = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.ALLOC_HOST_PTR, size=size)
         self.staging_pool.append(buf)
