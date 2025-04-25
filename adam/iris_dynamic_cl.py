@@ -131,6 +131,10 @@ class MemOpType(Enum):
     ALLOC = 1
     FREE = 2
 
+class SyncType(Enum):
+    HOST_SIGNAL = 1
+    DEVICE_WAIT = 2
+
 class WorkManager:
     def __init__(self, context):
         self.context = context
@@ -186,7 +190,7 @@ class WorkManager:
                 buffer = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=size)
                 self.logical_resources[name] = (buffer, 0)
                 self.buffer_tracker[name]['alloc_node'] = self.node_id_counter
-                return None  # No event for memory operations
+                return None
             node = self.ExecutionNode(self.node_id_counter, NodeType.MEMORY, 'compute', {'W': [name]}, set(), {'op_type': op_type, 'size': size})
             node.execute = _alloc_fn
         elif op_type == MemOpType.FREE:
@@ -200,8 +204,20 @@ class WorkManager:
             node.execute = _free_fn
             for existing_uid in self.execution_graph.nodes:
                 existing_node = self.execution_graph.nodes[existing_uid]['node']
-                if name in existing_node.resources['W']:
+                if name in existing_node.resources.get('R', []) or name in existing_node.resources.get('W', []):
                     node.dependencies.add(existing_uid)
+        self.execution_graph.add_node(node.uid, node=node)
+        self.node_id_counter += 1
+        return node.uid
+
+    def create_sync_node(self, sync_type, user_event=None, dependencies=[]):
+        if sync_type == SyncType.HOST_SIGNAL:
+            if user_event is None:
+                user_event = cl.UserEvent(self.context)
+        elif sync_type == SyncType.DEVICE_WAIT:
+            if user_event is None:
+                raise ValueError("user_event must be provided for DEVICE_WAIT")
+        node = self.ExecutionNode(self.node_id_counter, NodeType.SYNC, 'compute', {}, set(dependencies), {'sync_type': sync_type, 'user_event': user_event})
         self.execution_graph.add_node(node.uid, node=node)
         self.node_id_counter += 1
         return node.uid
@@ -212,7 +228,7 @@ class WorkManager:
         for uid in ordered_nodes:
             node = self.execution_graph.nodes[uid]['node']
             queue = self.hardware_queues[node.queue_type]
-            for res in node.resources['R']:
+            for res in node.resources.get('R', []):
                 if res in self.logical_resources:
                     current_version = self.logical_resources[res][1]
                     expected_version = node.expected_versions.get(res, 0)
@@ -228,7 +244,7 @@ class WorkManager:
             elif node.node_type == NodeType.SYNC:
                 self._dispatch_sync(node, wait_for)
             completion_events[uid] = node.event
-            for res in node.resources['W']:
+            for res in node.resources.get('W', []):
                 if res in self.logical_resources:
                     buffer, version = self.logical_resources[res]
                     self.logical_resources[res] = (buffer, version + 1)
@@ -244,7 +260,16 @@ class WorkManager:
         node.execute(self.hardware_queues[node.queue_type], wait_for=wait_for)
 
     def _dispatch_sync(self, node, wait_for):
-        pass  # Placeholder for sync operations
+        queue = self.hardware_queues[node.queue_type]
+        if node.params['sync_type'] == SyncType.DEVICE_WAIT:
+            all_wait_for = wait_for + [node.params['user_event']]
+            node.event = cl.enqueue_marker(queue, wait_for=all_wait_for)
+        elif node.params['sync_type'] == SyncType.HOST_SIGNAL:
+            node.event = cl.enqueue_marker(queue, wait_for=wait_for)
+            def callback(event, status):
+                if status == cl.command_execution_status.COMPLETE:
+                    node.params['user_event'].set_status(cl.command_execution_status.COMPLETE)
+            node.event.set_callback(cl.command_execution_status.COMPLETE, callback)
 
     def reset_graph(self):
         self.execution_graph.clear()
@@ -262,11 +287,8 @@ class BufferManager:
         self.pad_strategies = {'opencl_optimal': self._default_pad_strategy}
         self.default_pad_strategy = 'opencl_optimal'
         self.staging_pool = deque(maxlen=8)
-        self.buffer_versions = {}
         self.buffers = {}
-        self.active_allocations = set()
-        self.current_events = []
-        work_manager.logical_resources.update(self.buffer_versions)
+        self.work_manager.logical_resources.update(self.buffers)
 
     def register_pad_strategy(self, name, callback):
         self.pad_strategies[name] = callback
@@ -283,7 +305,7 @@ class BufferManager:
             'strategy': pad_strategy or self.default_pad_strategy,
             'alloc_node': alloc_node
         }
-        return None  # Buffer is not yet allocated
+        return alloc_node
 
     def release_buffer(self, name):
         if name in self.buffer_metadata:
@@ -298,24 +320,22 @@ class BufferManager:
     def get_dimensions(self, name):
         return (self.buffer_metadata[name]['real_shape'], self.buffer_metadata[name]['padded_shape'])
 
-    def staged_transfer(self, host_data, buffer_name, is_device_to_host=False, callback=None):
+    def staged_transfer(self, host_data, buffer_name, is_device_to_host=False):
         metadata = self.buffer_metadata[buffer_name]
-        buffer = self.work_manager.logical_resources[buffer_name][0]
         padded_shape = metadata['padded_shape']
         real_shape = metadata['real_shape']
         dtype = metadata['dtype']
         size = np.prod(padded_shape) * dtype().itemsize
         staging_buf = self._get_staging_buffer(size)
-        
+
         if not is_device_to_host:
-            # Host-to-Device (H2D)
             padded_data = np.zeros(padded_shape, dtype=dtype)
             slices = tuple(slice(0, r) for r in real_shape)
             padded_data[slices] = host_data
             params = {
                 'direction': TransferDirection.H2D,
                 'source': padded_data,
-                'destination': buffer,
+                'destination': buffer_name,
                 'size': size,
                 'staging_buffer': staging_buf
             }
@@ -328,11 +348,10 @@ class BufferManager:
             )
             return node_id
         else:
-            # Device-to-Host (D2H)
             host_array = np.empty(padded_shape, dtype=dtype)
             params = {
                 'direction': TransferDirection.D2H,
-                'source': buffer,
+                'source': buffer_name,
                 'destination': host_array,
                 'size': size,
                 'staging_buffer': staging_buf
@@ -344,24 +363,21 @@ class BufferManager:
                 operation_fn=self._execute_transfer,
                 params=params
             )
-            if callback:
-                self.work_manager.execution_graph.nodes[node_id]['node'].params['callback'] = callback
-            return node_id
+            return node_id, host_array
 
-    def _execute_transfer(self, queue, wait_for):
-        params = self.params
+    def _execute_transfer(self, queue, wait_for, node_params):
+        params = node_params
         staging_buf = params['staging_buffer']
-        
         if params['direction'] == TransferDirection.H2D:
+            buffer = self.work_manager.logical_resources[params['destination']][0]
             event1 = cl.enqueue_copy(queue, staging_buf, params['source'], wait_for=wait_for)
-            event2 = cl.enqueue_copy(queue, params['destination'], staging_buf, wait_for=[event1])
-            self.event = event2
+            event2 = cl.enqueue_copy(queue, buffer, staging_buf, wait_for=[event1])
+            return event2
         elif params['direction'] == TransferDirection.D2H:
-            event1 = cl.enqueue_copy(queue, staging_buf, params['source'], wait_for=wait_for)
+            buffer = self.work_manager.logical_resources[params['source']][0]
+            event1 = cl.enqueue_copy(queue, staging_buf, buffer, wait_for=wait_for)
             event2 = cl.enqueue_copy(queue, params['destination'], staging_buf, wait_for=[event1])
-            self.event = event2
-            if 'callback' in params:
-                self.event.set_callback(cl.command_execution_status.COMPLETE, params['callback'])
+            return event2
 
     def _get_staging_buffer(self, size):
         for buf in self.staging_pool:
@@ -428,9 +444,6 @@ class ParamManager:
             'requires_grad': requires_grad
         }
 
-    def __getitem__(self, name):
-        return self.buffers[name]
-
     def _create_buffers(self):
         for name, spec in self.params.items():
             ptype = spec['ptype']
@@ -438,11 +451,21 @@ class ParamManager:
             init_values = handler['init'](spec['shape'])
             processed = handler['preprocess'](init_values, self.buffer_manager.simd_width)
             self.buffer_manager.acquire_buffer(name, spec['shape'], np.float32)
-            self.buffers[name] = self.buffer_manager.logical_resources[name][0]
+            self.buffer_manager.staged_transfer(processed, name, is_device_to_host=False)
             if spec['requires_grad']:
-                self.grad_buffers[name] = self.buffer_manager.acquire_buffer(f"grad_{name}", spec['shape'], np.float32)
-                self.m1_buffers[name] = self.buffer_manager.acquire_buffer(f"m1_{name}", spec['shape'], np.float32)
-                self.m2_buffers[name] =-    def zero_gradients(self, work_manager):
+                self.buffer_manager.acquire_buffer(f"grad_{name}", spec['shape'], np.float32)
+                self.buffer_manager.acquire_buffer(f"m1_{name}", spec['shape'], np.float32)
+                self.buffer_manager.acquire_buffer(f"m2_{name}", spec['shape'], np.float32)
+
+    def set_buffers(self, logical_resources):
+        for name in self.params:
+            self.buffers[name] = logical_resources[name][0]
+            if self.params[name]['requires_grad']:
+                self.grad_buffers[name] = logical_resources[f"grad_{name}"][0]
+                self.m1_buffers[name] = logical_resources[f"m1_{name}"][0]
+                self.m2_buffers[name] = logical_resources[f"m2_{name}"][0]
+
+    def zero_gradients(self, work_manager):
         for name, spec in self.params.items():
             if spec['requires_grad']:
                 grad_buffer = self.grad_buffers[name]
@@ -628,8 +651,16 @@ buffer_mgr.acquire_buffer('exit_probs', (BATCH_SIZE, NUM_EXITS, OUTPUT_CLASSES),
 buffer_mgr.acquire_buffer('losses', (NUM_EXITS * BATCH_SIZE,), np.float32)
 buffer_mgr.acquire_buffer('targets_batch', (BATCH_SIZE,), np.int32)
 buffer_mgr.acquire_buffer('mask_batch', (BATCH_SIZE,), np.float32)
-loss_elements_per_exit = buffer_mgr.buffer_metadata['losses']['padded_shape'][0] // NUM_EXITS
+
 pm._create_buffers()
+
+# Commit initialization workload
+manager.commit_workload()
+
+# Set buffer references
+pm.set_buffers(manager.logical_resources)
+for name in buffer_mgr.buffer_metadata:
+    buffer_mgr.buffers[name] = manager.logical_resources[name][0]
 
 # Data Preparation
 iris = load_iris()
@@ -651,7 +682,7 @@ simd_width = buffer_mgr.simd_width
 build_opts = [
     f"-D VECTOR_TYPE={'float' + str(simd_width) if simd_width > 1 else 'float'}",
     f"-D SIMD_WIDTH={simd_width}",
-    f"-D LOSS_STRIDE={loss_elements_per_exit}",
+    f"-D LOSS_STRIDE={buffer_mgr.buffer_metadata['losses']['padded_shape'][0] // NUM_EXITS}",
     f"-D USE_FAST_MATH=1"
 ]
 program = cl.Program(ctx, "\n".join(kernel_src)).build(options=" ".join(build_opts))
@@ -755,30 +786,23 @@ for epoch in range(EPOCHS):
                     manager.execution_graph.add_edge(adam_node, clamp_node)
 
         # Device-to-host transfers for results
+        losses_transfer, losses_host = buffer_mgr.staged_transfer(None, 'losses', is_device_to_host=True)
+        exit_probs_transfer, exit_probs_host = buffer_mgr.staged_transfer(None, 'exit_probs', is_device_to_host=True)
+        temps_transfer, temps_host = buffer_mgr.staged_transfer(None, 'temps', is_device_to_host=True)
+
+        # Create SYNC node for HOST_SIGNAL
         host_processing_event = cl.UserEvent(ctx)
-        def set_event_complete(_):
-            host_processing_event.set_status(cl.command_execution_status.COMPLETE)
-        losses_transfer = buffer_mgr.staged_transfer(None, 'losses', is_device_to_host=True, callback=set_event_complete)
-        exit_probs_transfer = buffer_mgr.staged_transfer(None, 'exit_probs', is_device_to_host=True)
-        temps_transfer = buffer_mgr.staged_transfer(None, 'temps', is_device_to_host=True)
+        sync_node = manager.create_sync_node(SyncType.HOST_SIGNAL, user_event=host_processing_event, dependencies=[losses_transfer, exit_probs_transfer, temps_transfer])
 
         manager.commit_workload()
 
-        # Wait for transfers to complete
-        cl.wait_for_events([
-            manager.execution_graph.nodes[losses_transfer]['node'].event,
-            manager.execution_graph.nodes[exit_probs_transfer]['node'].event,
-            manager.execution_graph.nodes[temps_transfer]['node'].event
-        ])
+        # Wait for host_processing_event
+        cl.wait_for_events([host_processing_event])
 
         # Access results
-        losses_host = manager.execution_graph.nodes[losses_transfer]['node'].params['destination']
-        exit_probs_host = manager.execution_graph.nodes[exit_probs_transfer]['node'].params['destination']
-        temps_host = manager.execution_graph.nodes[temps_transfer]['node'].params['destination']
-
         exit_losses = []
         for exit_idx in range(NUM_EXITS):
-            start = exit_idx * loss_elements_per_exit
+            start = exit_idx * (buffer_mgr.buffer_metadata['losses']['padded_shape'][0] // NUM_EXITS)
             end = min(start + actual_batch_size, len(losses_host))
             if end > start:
                 exit_loss = losses_host[start:end].mean()
@@ -804,6 +828,7 @@ for epoch in range(EPOCHS):
 # Cleanup
 for name in list(buffer_mgr.buffer_metadata.keys()):
     buffer_mgr.release_buffer(name)
+manager.commit_workload()
 
 if __name__ == "__main__":
     pass
