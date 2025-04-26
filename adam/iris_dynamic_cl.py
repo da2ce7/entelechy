@@ -8,6 +8,7 @@ import networkx as nx
 import re
 from collections import deque, defaultdict
 from enum import Enum
+from dataclasses import dataclass
 
 # Define data type sizes
 FLOAT_SIZE = np.float32().itemsize
@@ -59,27 +60,6 @@ def he_init(shape):
     scale = np.sqrt(2.0 / fan_in)
     return np.random.normal(0, scale, shape).astype(np.float32)
 
-def preprocess_weights(w, simd_width):
-    if w.ndim == 2:
-        input_dim, hidden_dim = w.shape
-        hidden_padded = ((hidden_dim + simd_width - 1) // simd_width) * simd_width
-        input_padded = ((input_dim + simd_width - 1) // simd_width) * simd_width
-        w_padded = np.zeros((input_padded, hidden_padded), dtype=np.float32)
-        w_padded[:input_dim, :hidden_dim] = w
-        return w_padded.T.reshape(hidden_padded // simd_width, input_padded, simd_width)
-    elif w.ndim == 3:
-        exits, hidden, classes = w.shape
-        classes_padded = ((classes + simd_width - 1) // simd_width) * simd_width
-        w_padded = np.zeros((exits, hidden, classes_padded), dtype=np.float32)
-        w_padded[:, :, :classes] = w
-        return w_padded.transpose(0, 2, 1).reshape(exits, classes_padded // simd_width, hidden, simd_width)
-
-def pad_1d(arr, simd_width):
-    padded_size = ((arr.shape[0] + simd_width - 1) // simd_width) * simd_width
-    arr_padded = np.zeros(padded_size, dtype=arr.dtype)
-    arr_padded[:arr.shape[0]] = arr
-    return arr_padded
-
 def select_simd_width(device):
     if 'Intel' in device.vendor and 'cl_intel_subgroups' in device.extensions:
         return 16
@@ -92,19 +72,6 @@ def select_simd_width(device):
         return 4
     return 1
 
-def pad_batch(X_batch, y_batch, buffer_mgr):
-    actual_batch_size = X_batch.shape[0]
-    padded_batch_size = buffer_mgr.buffer_metadata['input_batch']['padded_shape'][0]
-    X_padded = np.zeros((padded_batch_size, INPUT_DIM), dtype=np.float32)
-    y_padded = np.zeros(padded_batch_size, dtype=np.int32)
-    mask = np.zeros(padded_batch_size, dtype=np.float32)
-    X_padded[:actual_batch_size] = X_batch
-    y_padded[:actual_batch_size] = y_batch
-    mask[:actual_batch_size] = 1.0
-    if not np.all(mask[:actual_batch_size] == 1.0) or not np.all(mask[actual_batch_size:] == 0.0):
-        raise ValueError("Invalid mask generated during batch padding")
-    return X_padded, y_padded, mask
-
 def optimal_local_sizes(global_sizes, device):
     max_work_group_size = device.max_work_group_size
     max_work_item_sizes = device.max_work_item_sizes
@@ -116,6 +83,59 @@ def optimal_local_sizes(global_sizes, device):
     if total_local > max_work_group_size:
         local_sizes = [min(l, max_work_group_size // (total_local // l)) for l in local_sizes]
     return tuple(local_sizes)
+
+@dataclass
+class PaddingContext:
+    simd_width: int
+    min_alignment: int
+    device: cl.Device
+    padding_mode: str = 'simd_aware'
+
+    @classmethod
+    def from_device(cls, device):
+        return cls(
+            simd_width=select_simd_width(device),
+            min_alignment=max(device.min_data_type_align_size, 16),
+            device=device
+        )
+
+class PaddingStrategy:
+    _strategies = {}
+
+    @classmethod
+    def register(cls, name):
+        def decorator(func):
+            cls._strategies[name] = func
+            return func
+        return decorator
+
+    @classmethod
+    def apply(cls, context, shape, dtype=np.float32):
+        return cls._strategies[context.padding_mode](context, shape, dtype)
+
+@PaddingStrategy.register('simd_aware')
+def _simd_strategy(ctx, shape, dtype):
+    item_size = np.dtype(dtype).itemsize
+    alignment = lcm(ctx.min_alignment, ctx.simd_width * item_size)
+    return tuple((dim + alignment - 1) // alignment * alignment for dim in shape)
+
+def pad_tensor(data, context: PaddingContext, strategy='simd_aware'):
+    orig_shape = data.shape
+    padded_shape = PaddingStrategy.apply(context, orig_shape, data.dtype)
+    padded = np.zeros(padded_shape, dtype=data.dtype)
+    slices = tuple(slice(0, d) for d in orig_shape)
+    padded[slices] = data
+    return padded  # Only padding, no reshaping or permutation
+
+class BatchPadder:
+    def __init__(self, context):
+        self.ctx = context
+
+    def pad_batch(self, X, y):
+        X_padded = pad_tensor(X, self.ctx)
+        y_padded = pad_tensor(y, self.ctx, strategy='simd_aware')
+        mask = pad_tensor(np.ones(len(X), dtype=np.float32), self.ctx)
+        return X_padded, y_padded, mask
 
 class TransferDirection(Enum):
     H2D = 1  # Host to Device
@@ -298,29 +318,22 @@ class BufferManager:
         self.ctx = context
         self.device = device
         self.work_manager = work_manager
-        self.simd_width = select_simd_width(device)
-        self.wavefront_size = 64 if "AMD" in device.vendor else 32
-        self.min_alignment = max(device.min_data_type_align_size, self.simd_width * np.float32().itemsize)
+        self.padding_ctx = PaddingContext.from_device(device)
         self.buffer_metadata = {}
-        self.pad_strategies = {'opencl_optimal': self._default_pad_strategy}
-        self.default_pad_strategy = 'opencl_optimal'
         self.staging_pool = deque(maxlen=8)
         self.buffers = {}
         self.work_manager.logical_resources.update(self.buffers)
         self.staging_buffer_ownership = {}  # Track ownership of staging buffers
 
-    def register_pad_strategy(self, name, callback):
-        self.pad_strategies[name] = callback
-
     def acquire_buffer(self, name, real_shape, dtype, pad_strategy=None, mode='device'):
-        strategy = self.pad_strategies[pad_strategy or self.default_pad_strategy]
-        padded_shape = strategy(real_shape, dtype)
+        strategy = pad_strategy or self.padding_ctx.padding_mode
+        padded_shape = PaddingStrategy.apply(self.padding_ctx, real_shape, dtype)
         size = np.prod(padded_shape) * dtype().itemsize
         metadata = {
             'real_shape': real_shape,
             'padded_shape': padded_shape,
             'dtype': dtype,
-            'strategy': pad_strategy or self.default_pad_strategy
+            'strategy': strategy
         }
         alloc_node = self.work_manager.create_mem_node(name, MemOpType.ALLOC, size=size, metadata=metadata)
         self.buffer_metadata[name] = metadata
@@ -329,11 +342,6 @@ class BufferManager:
     def release_buffer(self, name):
         if name in self.buffer_metadata:
             self.work_manager.create_mem_node(name, MemOpType.FREE)
-
-    def _default_pad_strategy(self, real_shape, dtype):
-        item_size = np.dtype(dtype).itemsize
-        alignment = lcm(self.min_alignment, item_size)
-        return tuple((dim + alignment - 1) // alignment * alignment for dim in real_shape)
 
     def get_dimensions(self, name):
         return (self.buffer_metadata[name]['real_shape'], self.buffer_metadata[name]['padded_shape'])
@@ -347,12 +355,10 @@ class BufferManager:
         staging_buf = self._get_staging_buffer(size)
 
         if not is_device_to_host:
-            padded_data = np.zeros(padded_shape, dtype=dtype)
-            slices = tuple(slice(0, r) for r in real_shape)
-            padded_data[slices] = host_data
+            # Assuming host_data is already padded and processed
             params = {
                 'direction': TransferDirection.H2D,
-                'source': padded_data,
+                'source': host_data,
                 'destination': buffer_name,
                 'size': size,
                 'staging_buffer': staging_buf
@@ -427,28 +433,27 @@ class ParamManager:
     PARAM_TYPES = {
         'dense_weight': {
             'init': he_init,
-            'preprocess': lambda w, sw: preprocess_weights(w, sw),
-            'shape_transform': lambda s, sw: (((s[1] + sw - 1) // sw) * sw, ((s[0] + sw - 1) // sw) * sw)
+            'post_pad_fn': lambda padded, sw: padded.T.reshape(padded.shape[1] // sw, padded.shape[0], sw)
         },
         'exit_weight': {
             'init': he_init,
-            'preprocess': lambda w, sw: preprocess_weights(w, sw),
-            'shape_transform': lambda s, sw: (s[0], ((s[2] + sw - 1) // sw) * sw, s[1])
+            'post_pad_fn': lambda padded, sw: padded.transpose(0, 2, 1).reshape(padded.shape[0], padded.shape[2] // sw, padded.shape[1], sw)
         },
         'temperature': {
             'init': lambda s: np.ones(s, dtype=np.float32) * (MAX_TEMP + MIN_TEMP) / 2,
-            'constraint': (MIN_TEMP, MAX_TEMP)
+            'constraint': (MIN_TEMP, MAX_TEMP),
+            'post_pad_fn': lambda padded, sw: padded
         },
         'bias_vector': {
             'init': lambda s: np.zeros(s, dtype=np.float32),
-            'preprocess': lambda b, sw: pad_1d(b, sw),
-            'shape_transform': lambda s, sw: ((s[0] + sw - 1) // sw) * sw
+            'post_pad_fn': lambda padded, sw: padded
         }
     }
 
     def __init__(self, context, buffer_manager):
         self.ctx = context
         self.buffer_manager = buffer_manager
+        self.padding_ctx = PaddingContext.from_device(buffer_manager.device)
         self.params = {}
         self.buffers = {}
         self.grad_buffers = {}
@@ -471,7 +476,9 @@ class ParamManager:
             ptype = spec['ptype']
             handler = self.PARAM_TYPES[ptype]
             init_values = handler['init'](spec['shape'])
-            processed = handler['preprocess'](init_values, self.buffer_manager.simd_width)
+            padded = pad_tensor(init_values, self.padding_ctx)
+            post_pad_fn = handler.get('post_pad_fn', lambda x, sw: x)
+            processed = post_pad_fn(padded, self.padding_ctx.simd_width)
             self.buffer_manager.acquire_buffer(name, spec['shape'], np.float32)
             self.buffer_manager.staged_transfer(processed, name, is_device_to_host=False)
             if spec['requires_grad']:
@@ -511,7 +518,7 @@ class KernelWrapper:
         self.temperatures = None
         self.padded_input_dim = self.buffer_manager.buffer_metadata['input_batch']['padded_shape'][1]
         self.padded_hidden_dim = self.buffer_manager.buffer_metadata['hidden']['padded_shape'][0]
-        self.padded_output_classes = ((OUTPUT_CLASSES + self.buffer_manager.simd_width - 1) // self.buffer_manager.simd_width) * self.buffer_manager.simd_width
+        self.padded_output_classes = ((OUTPUT_CLASSES + self.buffer_manager.padding_ctx.simd_width - 1) // self.buffer_manager.padding_ctx.simd_width) * self.buffer_manager.padding_ctx.simd_width
         self.padded_batch_size = self.buffer_manager.buffer_metadata['input_batch']['padded_shape'][0]
         self.input_dim = INPUT_DIM
         self.hidden_dim = HIDDEN_DIM
@@ -700,7 +707,7 @@ for fname in CL_KERNEL_FILES:
     except FileNotFoundError:
         print(f"Warning: Kernel file {fname} not found. Please ensure all kernel files are present.")
         kernel_src.append("")
-simd_width = buffer_mgr.simd_width
+simd_width = buffer_mgr.padding_ctx.simd_width
 build_opts = [
     f"-D VECTOR_TYPE={'float' + str(simd_width) if simd_width > 1 else 'float'}",
     f"-D SIMD_WIDTH={simd_width}",
@@ -711,6 +718,7 @@ program = cl.Program(ctx, "\n".join(kernel_src)).build(options=" ".join(build_op
 
 # Training Loop
 global_step = 1
+batch_padder = BatchPadder(buffer_mgr.padding_ctx)
 for epoch in range(EPOCHS):
     shuffled_indices = np.random.permutation(len(X))
     num_batches = (len(X) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -724,7 +732,7 @@ for epoch in range(EPOCHS):
         batch_indices = shuffled_indices[batch_start:batch_end]
         X_batch = X_normalized[batch_indices]
         y_batch = y_true[batch_indices]
-        X_padded, y_padded, mask = pad_batch(X_batch, y_batch, buffer_mgr)
+        X_padded, y_padded, mask = batch_padder.pad_batch(X_batch, y_batch)
 
         # Transfer nodes for input data
         input_transfer = buffer_mgr.staged_transfer(X_padded, 'input_batch')
