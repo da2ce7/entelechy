@@ -143,6 +143,7 @@ class WorkManager:
         self.hardware_queues = {}
         self.node_id_counter = 0
         self.buffer_tracker = defaultdict(lambda: {'version': 0, 'alloc_node': None, 'free_node': None, 'metadata': None})
+        self.user_events = {}  # {node_uid: cl.UserEvent}
 
     class ExecutionNode:
         __slots__ = ['uid', 'node_type', 'queue_type', 'resources', 'dependencies', 'expected_versions', 'params', 'event']
@@ -200,7 +201,7 @@ class WorkManager:
                 buffer.release()
                 del self.logical_resources[name]
                 self.buffer_tracker[name]['free_node'] = self.node_id_counter
-                self.buffer_tracker[name]['metadata'] = None  # Clear metadata after free
+                self.buffer_tracker[name]['metadata'] = None
                 return None
             node = self.ExecutionNode(self.node_id_counter, NodeType.MEMORY, 'compute', {'R': [name]}, set(), {'op_type': op_type})
             node.execute = _free_fn
@@ -212,17 +213,31 @@ class WorkManager:
         self.node_id_counter += 1
         return node.uid
 
-    def create_sync_node(self, sync_type, user_event=None, dependencies=[]):
+    def create_sync_node(self, sync_type, dependencies=[]):
+        """Create sync node & return its UID. Generates UserEvent if HOST_SIGNAL."""
+        user_event = None
         if sync_type == SyncType.HOST_SIGNAL:
-            if user_event is None:
-                user_event = cl.UserEvent(self.context)
+            user_event = cl.UserEvent(self.context)
         elif sync_type == SyncType.DEVICE_WAIT:
-            if user_event is None:
-                raise ValueError("user_event must be provided for DEVICE_WAIT")
+            raise ValueError("DEVICE_WAIT requires a user_event, which should be handled differently.")
         node = self.ExecutionNode(self.node_id_counter, NodeType.SYNC, 'compute', {}, set(dependencies), {'sync_type': sync_type, 'user_event': user_event})
         self.execution_graph.add_node(node.uid, node=node)
+        if user_event:
+            self.user_events[node.uid] = user_event
         self.node_id_counter += 1
         return node.uid
+
+    def get_sync_event(self, node_uid):
+        """Retrieve UserEvent for HOST_SIGNAL nodes."""
+        return self.user_events.get(node_uid, None)
+
+    def wait_for_sync(self, node_uid):
+        """Host calls to block until sync node completes."""
+        if node_uid in self.user_events:
+            event = self.user_events.pop(node_uid)
+            cl.wait_for_events([event])
+        else:
+            raise KeyError(f"No UserEvent found for node UID {node_uid}")
 
     def commit_workload(self):
         ordered_nodes = list(nx.topological_sort(self.execution_graph))
@@ -276,6 +291,7 @@ class WorkManager:
     def reset_graph(self):
         self.execution_graph.clear()
         self.node_id_counter = 0
+        self.user_events.clear()  # Clear any remaining user events
 
 class BufferManager:
     def __init__(self, context, device, work_manager):
@@ -797,13 +813,11 @@ for epoch in range(EPOCHS):
         temps_transfer, temps_host = buffer_mgr.staged_transfer(None, 'temps', is_device_to_host=True)
 
         # Create SYNC node for HOST_SIGNAL
-        host_processing_event = cl.UserEvent(ctx)
-        sync_node = manager.create_sync_node(SyncType.HOST_SIGNAL, user_event=host_processing_event, dependencies=[losses_transfer, exit_probs_transfer, temps_transfer])
-
+        sync_uid = manager.create_sync_node(SyncType.HOST_SIGNAL, dependencies=[losses_transfer, exit_probs_transfer, temps_transfer])
         manager.commit_workload()
 
-        # Wait for host_processing_event
-        cl.wait_for_events([host_processing_event])
+        # Wait for sync
+        manager.wait_for_sync(sync_uid)
 
         # Access results
         exit_losses = []
