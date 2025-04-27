@@ -28,7 +28,7 @@ MIN_TEMP = 1.0e-3
 MAX_TEMP = 10.0
 EPSILON = 1.0e-8
 
-# OpenCL kernel files (assumed to exist)
+# OpenCL kernel files (assumed to exist and updated to use masks)
 CL_KERNEL_FILES = [
     'kernel_forward_pass.cl',
     'kernel_backpropagation.cl',
@@ -125,7 +125,7 @@ def pad_tensor(data, context: PaddingContext, strategy='simd_aware'):
     padded = np.zeros(padded_shape, dtype=data.dtype)
     slices = tuple(slice(0, d) for d in orig_shape)
     padded[slices] = data
-    return padded  # Only padding, no reshaping or permutation
+    return padded
 
 class BatchPadder:
     def __init__(self, context):
@@ -138,8 +138,8 @@ class BatchPadder:
         return X_padded, y_padded, mask
 
 class TransferDirection(Enum):
-    H2D = 1  # Host to Device
-    D2H = 2  # Device to Host
+    H2D = 1
+    D2H = 2
 
 class NodeType(Enum):
     MEMORY = 1
@@ -156,13 +156,29 @@ class SyncType(Enum):
     DEVICE_WAIT = 2
 
 class AccessMode(Enum):
-    LOCAL = 1          # Temporary, undefined content
-    SHARED_READ = 2    # Read-only, concurrent access OK
-    EXCLUSIVE_WRITE_OVER = 3  # Overwrite, no dependency on prev writes
-    EXCLUSIVE_ZERO = 4 # Must be zero-initialized
-    EXCLUSIVE_UPDATE = 5 # Read-modify-write
+    LOCAL = 1
+    SHARED_READ = 2
+    EXCLUSIVE_WRITE_OVER = 3
+    EXCLUSIVE_ZERO = 4
+    EXCLUSIVE_UPDATE = 5
 
 ACCESS_WRITE_MODES = {AccessMode.EXCLUSIVE_WRITE_OVER, AccessMode.EXCLUSIVE_ZERO, AccessMode.EXCLUSIVE_UPDATE}
+
+@dataclass
+class MaskedBuffer:
+    data: str
+    mask: str
+    real_shape: tuple
+    padded_shape: tuple
+    mask_real_shape: tuple
+    mask_padded_shape: tuple
+    dtype: np.dtype
+    const_mask: bool = False
+
+    def __post_init__(self):
+        if not self.const_mask:
+            if self.padded_shape[0] != self.mask_padded_shape[0]:
+                raise ValueError("Batch dimension mismatch between data and mask")
 
 class WorkManager:
     def __init__(self, context):
@@ -172,7 +188,7 @@ class WorkManager:
         self.hardware_queues = {}
         self.node_id_counter = 0
         self.buffer_tracker = defaultdict(lambda: {'version': 0, 'alloc_node': None, 'free_node': None, 'metadata': None})
-        self.user_events = {}  # {node_uid: cl.UserEvent}
+        self.user_events = {}
         self.last_writer = {}
         self.pending_readers = defaultdict(set)
 
@@ -182,7 +198,7 @@ class WorkManager:
         uid: int
         node_type: NodeType
         queue_type: str
-        access_map: dict  # {resource: set[AccessMode]}
+        access_map: dict
         dependencies: set
         expected_versions: dict
         params: dict
@@ -224,7 +240,7 @@ class WorkManager:
                 node.expected_versions[res] = self.logical_resources.get(res, (None, 0))[1]
 
         if node_type == NodeType.TRANSFER:
-            buffer_name = list(access_map.keys())[0]  # Assuming single resource per transfer
+            buffer_name = list(access_map.keys())[0]
             alloc_node = self.buffer_tracker[buffer_name]['alloc_node']
             node.dependencies.add(alloc_node)
 
@@ -349,6 +365,7 @@ class BufferManager:
         self.buffer_metadata = {}
         self.staging_pool = deque(maxlen=8)
         self.buffers = {}
+        self.masked_buffers = {}
         self.work_manager.logical_resources.update(self.buffers)
         self.staging_buffer_ownership = {}
 
@@ -369,7 +386,45 @@ class BufferManager:
             zero_node = self._enqueue_zero_init(name)
             self.work_manager.execution_graph.add_edge(alloc_node, zero_node)
 
-        return alloc_node
+        # Create mask buffer
+        if len(real_shape) > 0 and real_shape[0] == BATCH_SIZE:
+            mask_real_shape = (BATCH_SIZE,)
+            mask_padded_shape = (padded_shape[0],)
+            const_mask = False
+        else:
+            mask_real_shape = (1,)
+            mask_padded_shape = (1,)
+            const_mask = True
+
+        mask_name = f"mask_{name}"
+        mask_size = np.prod(mask_padded_shape) * np.float32().itemsize
+        mask_metadata = {'real_shape': mask_real_shape, 'padded_shape': mask_padded_shape, 'dtype': np.float32, 'strategy': 'none'}
+        mask_alloc_node = self.work_manager.create_mem_node(mask_name, MemOpType.ALLOC, size=mask_size, metadata=mask_metadata)
+        self.buffer_metadata[mask_name] = mask_metadata
+
+        if const_mask:
+            def init_mask_fn(queue, wait_for):
+                buffer = self.work_manager.logical_resources[mask_name][0]
+                return cl.enqueue_fill_buffer(queue, buffer, np.float32(1.0), 0, mask_size, wait_for=wait_for)
+            init_mask_node = self.work_manager.create_node(
+                NodeType.COMPUTE, 'compute',
+                {mask_name: {AccessMode.EXCLUSIVE_WRITE_OVER}},
+                init_mask_fn, {}
+            )
+            self.work_manager.execution_graph.add_edge(mask_alloc_node, init_mask_node)
+
+        mbuf = MaskedBuffer(
+            data=name,
+            mask=mask_name,
+            real_shape=real_shape,
+            padded_shape=padded_shape,
+            mask_real_shape=mask_real_shape,
+            mask_padded_shape=mask_padded_shape,
+            dtype=dtype,
+            const_mask=const_mask
+        )
+        self.masked_buffers[name] = mbuf
+        return mbuf
 
     def _enqueue_zero_init(self, name):
         def zero_op(queue, wait_for):
@@ -383,79 +438,56 @@ class BufferManager:
         return zero_node
 
     def release_buffer(self, name):
-        if name in self.buffer_metadata:
-            self.work_manager.create_mem_node(name, MemOpType.FREE)
+        if name in self.masked_buffers:
+            mbuf = self.masked_buffers[name]
+            self.work_manager.create_mem_node(mbuf.data, MemOpType.FREE)
+            self.work_manager.create_mem_node(mbuf.mask, MemOpType.FREE)
+            del self.masked_buffers[name]
+            del self.buffer_metadata[mbuf.data]
+            del self.buffer_metadata[mbuf.mask]
 
     def get_dimensions(self, name):
         return (self.buffer_metadata[name]['real_shape'], self.buffer_metadata[name]['padded_shape'])
 
-    def staged_transfer(self, host_data, buffer_name, is_device_to_host=False):
-        metadata = self.buffer_metadata[buffer_name]
-        padded_shape = metadata['padded_shape']
-        real_shape = metadata['real_shape']
-        dtype = metadata['dtype']
-        size = np.prod(padded_shape) * dtype().itemsize
-        staging_buf = self._get_staging_buffer(size)
-
-        if not is_device_to_host:
-            params = {
-                'direction': TransferDirection.H2D,
-                'source': host_data,
-                'destination': buffer_name,
-                'size': size,
-                'staging_buffer': staging_buf
-            }
-            node_id = self.work_manager.create_node(
-                node_type=NodeType.TRANSFER,
-                queue_type='xfer',
-                access_map={buffer_name: {AccessMode.EXCLUSIVE_WRITE_OVER}},
-                operation_fn=self._execute_transfer,
-                params=params
+    def staged_transfer(self, host_data, mbuf: MaskedBuffer, is_device_to_host=False):
+        if is_device_to_host:
+            data_host = np.empty(mbuf.padded_shape, dtype=mbuf.dtype)
+            mask_host = np.empty(mbuf.mask_padded_shape, dtype=np.float32)
+            def transfer_data_fn(queue, wait_for):
+                buffer = self.work_manager.logical_resources[mbuf.data][0]
+                return cl.enqueue_copy(queue, data_host, buffer, wait_for=wait_for)
+            def transfer_mask_fn(queue, wait_for):
+                buffer = self.work_manager.logical_resources[mbuf.mask][0]
+                return cl.enqueue_copy(queue, mask_host, buffer, wait_for=wait_for)
+            data_node = self.work_manager.create_node(
+                NodeType.TRANSFER, 'xfer',
+                {mbuf.data: {AccessMode.SHARED_READ}},
+                transfer_data_fn, {}
             )
-            self.staging_buffer_ownership[staging_buf] = node_id
-            return node_id
+            mask_node = self.work_manager.create_node(
+                NodeType.TRANSFER, 'xfer',
+                {mbuf.mask: {AccessMode.SHARED_READ}},
+                transfer_mask_fn, {}
+            )
+            return data_node, data_host, mask_node, mask_host
         else:
-            host_array = np.empty(padded_shape, dtype=dtype)
-            params = {
-                'direction': TransferDirection.D2H,
-                'source': buffer_name,
-                'destination': host_array,
-                'size': size,
-                'staging_buffer': staging_buf
-            }
-            node_id = self.work_manager.create_node(
-                node_type=NodeType.TRANSFER,
-                queue_type='xfer',
-                access_map={buffer_name: {AccessMode.SHARED_READ}},
-                operation_fn=self._execute_transfer,
-                params=params
+            def transfer_data_fn(queue, wait_for):
+                buffer = self.work_manager.logical_resources[mbuf.data][0]
+                return cl.enqueue_copy(queue, buffer, host_data['data'], wait_for=wait_for)
+            def transfer_mask_fn(queue, wait_for):
+                buffer = self.work_manager.logical_resources[mbuf.mask][0]
+                return cl.enqueue_copy(queue, buffer, host_data['mask'], wait_for=wait_for)
+            data_node = self.work_manager.create_node(
+                NodeType.TRANSFER, 'xfer',
+                {mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER}},
+                transfer_data_fn, {}
             )
-            self.staging_buffer_ownership[staging_buf] = node_id
-            return node_id, host_array
-
-    def _execute_transfer(self, queue, wait_for, node_params):
-        params = node_params
-        staging_buf = params['staging_buffer']
-        if staging_buf in self.staging_buffer_ownership and self.staging_buffer_ownership[staging_buf] != params.get('node_id', self.work_manager.node_id_counter - 1):
-            raise RuntimeError("Staging buffer is already in use by another transfer")
-        if params['direction'] == TransferDirection.H2D:
-            buffer = self.work_manager.logical_resources[params['destination']][0]
-            event1 = cl.enqueue_copy(queue, staging_buf, params['source'], wait_for=wait_for)
-            event2 = cl.enqueue_copy(queue, buffer, staging_buf, wait_for=[event1])
-            return event2
-        elif params['direction'] == TransferDirection.D2H:
-            buffer = self.work_manager.logical_resources[params['source']][0]
-            event1 = cl.enqueue_copy(queue, staging_buf, buffer, wait_for=wait_for)
-            event2 = cl.enqueue_copy(queue, params['destination'], staging_buf, wait_for=[event1])
-            return event2
-
-    def _get_staging_buffer(self, size):
-        for buf in self.staging_pool:
-            if buf.size >= size and buf not in self.staging_buffer_ownership:
-                return buf
-        buf = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.ALLOC_HOST_PTR, size=size)
-        self.staging_pool.append(buf)
-        return buf
+            mask_node = self.work_manager.create_node(
+                NodeType.TRANSFER, 'xfer',
+                {mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER}},
+                transfer_mask_fn, {}
+            )
+            return data_node, mask_node
 
     def validate_memory(self):
         padded_sizes = [
@@ -521,20 +553,27 @@ class ParamManager:
             padded = pad_tensor(init_values, self.padding_ctx)
             post_pad_fn = handler.get('post_pad_fn', lambda x, sw: x)
             processed = post_pad_fn(padded, self.padding_ctx.simd_width)
-            self.buffer_manager.acquire_buffer(name, spec['shape'], np.float32)
-            self.buffer_manager.staged_transfer(processed, name, is_device_to_host=False)
+            mbuf = self.buffer_manager.acquire_buffer(name, spec['shape'], np.float32)
+            self.buffer_manager.staged_transfer({'data': processed, 'mask': np.ones((1,), dtype=np.float32)}, mbuf)
             if spec['requires_grad']:
-                self.buffer_manager.acquire_buffer(f"grad_{name}", spec['shape'], np.float32, access_mode=AccessMode.EXCLUSIVE_ZERO)
-                self.buffer_manager.acquire_buffer(f"m1_{name}", spec['shape'], np.float32, access_mode=AccessMode.EXCLUSIVE_ZERO)
-                self.buffer_manager.acquire_buffer(f"m2_{name}", spec['shape'], np.float32, access_mode=AccessMode.EXCLUSIVE_ZERO)
+                grad_mbuf = self.buffer_manager.acquire_buffer(f"grad_{name}", spec['shape'], np.float32, access_mode=AccessMode.EXCLUSIVE_ZERO)
+                m1_mbuf = self.buffer_manager.acquire_buffer(f"m1_{name}", spec['shape'], np.float32, access_mode=AccessMode.EXCLUSIVE_ZERO)
+                m2_mbuf = self.buffer_manager.acquire_buffer(f"m2_{name}", spec['shape'], np.float32, access_mode=AccessMode.EXCLUSIVE_ZERO)
+                self.params[name]['grad_mbuf'] = grad_mbuf
+                self.params[name]['m1_mbuf'] = m1_mbuf
+                self.params[name]['m2_mbuf'] = m2_mbuf
 
     def set_buffers(self, logical_resources):
         for name in self.params:
-            self.buffers[name] = logical_resources[name][0]
+            mbuf = self.buffer_manager.masked_buffers[name]
+            self.buffers[name] = logical_resources[mbuf.data][0]
             if self.params[name]['requires_grad']:
-                self.grad_buffers[name] = logical_resources[f"grad_{name}"][0]
-                self.m1_buffers[name] = logical_resources[f"m1_{name}"][0]
-                self.m2_buffers[name] = logical_resources[f"m2_{name}"][0]
+                grad_mbuf = self.params[name]['grad_mbuf']
+                m1_mbuf = self.params[name]['m1_mbuf']
+                m2_mbuf = self.params[name]['m2_mbuf']
+                self.grad_buffers[name] = logical_resources[grad_mbuf.data][0]
+                self.m1_buffers[name] = logical_resources[m1_mbuf.data][0]
+                self.m2_buffers[name] = logical_resources[m2_mbuf.data][0]
 
     def zero_gradients(self, work_manager):
         for name, spec in self.params.items():
@@ -556,7 +595,7 @@ class KernelExecutionRequest:
         self.kernel = getattr(program, kernel_name)
         self.global_sizes = global_sizes
         self.local_sizes = local_sizes
-        self.local_mem_reqs = {}  # {arg_index: (size_bytes, access_mode)}
+        self.local_mem_reqs = {}
         self.argument_bindings = {}
 
     def set_local_mem_argument(self, arg_index, size_bytes, access=AccessMode.LOCAL):
@@ -598,160 +637,221 @@ class KernelWrapper:
         self.temperatures = temps
         return self
 
-    def forward_pass(self, global_sizes, local_sizes, input_buf, weights_buf, biases_buf, hidden_buf, actual_batch_size):
+    def forward_pass(self, global_sizes, local_sizes, input_mbuf, weights_mbuf, biases_mbuf, hidden_mbuf, actual_batch_size):
         req = KernelExecutionRequest(self.program, 'forward_pass', global_sizes, local_sizes)
         req.set_local_mem_argument(0, local_sizes[0] * FLOAT_SIZE, AccessMode.LOCAL)
-        req.bind_argument(1, input_buf)
-        req.bind_argument(2, weights_buf)
-        req.bind_argument(3, biases_buf)
-        req.bind_argument(4, hidden_buf)
-        req.bind_argument(5, np.int32(actual_batch_size))
+        req.bind_argument(1, self.buffer_manager.buffers[input_mbuf.data])
+        req.bind_argument(2, self.buffer_manager.buffers[input_mbuf.mask])
+        req.bind_argument(3, self.buffer_manager.buffers[weights_mbuf.data])
+        req.bind_argument(4, self.buffer_manager.buffers[weights_mbuf.mask])
+        req.bind_argument(5, self.buffer_manager.buffers[biases_mbuf.data])
+        req.bind_argument(6, self.buffer_manager.buffers[biases_mbuf.mask])
+        req.bind_argument(7, self.buffer_manager.buffers[hidden_mbuf.data])
+        req.bind_argument(8, self.buffer_manager.buffers[hidden_mbuf.mask])
+        req.bind_argument(9, np.int32(actual_batch_size))
+        access_map = {
+            input_mbuf.data: {AccessMode.SHARED_READ},
+            input_mbuf.mask: {AccessMode.SHARED_READ},
+            weights_mbuf.data: {AccessMode.SHARED_READ},
+            weights_mbuf.mask: {AccessMode.SHARED_READ},
+            biases_mbuf.data: {AccessMode.SHARED_READ},
+            biases_mbuf.mask: {AccessMode.SHARED_READ},
+            hidden_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            hidden_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER},
+        }
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
-            access_map={
-                'input_batch': {AccessMode.SHARED_READ},
-                'weights': {AccessMode.SHARED_READ},
-                'biases': {AccessMode.SHARED_READ},
-                'mask_batch': {AccessMode.SHARED_READ},
-                'hidden': {AccessMode.EXCLUSIVE_WRITE_OVER}
-            },
+            access_map=access_map,
             operation_fn=self._enqueue_kernel,
             params={'exec_req': req}
         )
 
-    def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_buf, exit_weights_buf, exit_biases_buf, exit_probs_buf, losses_buf, targets_buf, exit_idx, actual_batch_size):
+    def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_mbuf, exit_weights_mbuf, exit_biases_mbuf, exit_probs_mbuf, losses_mbuf, targets_mbuf, exit_idx, actual_batch_size):
         req = KernelExecutionRequest(self.program, 'compute_exit_probabilities', global_sizes, local_sizes)
-        req.bind_argument(0, hidden_buf)
-        req.bind_argument(1, exit_weights_buf)
-        req.bind_argument(2, exit_biases_buf)
-        req.bind_argument(3, exit_probs_buf)
-        req.bind_argument(4, losses_buf)
-        req.bind_argument(5, targets_buf)
-        req.bind_argument(6, np.int32(exit_idx))
-        req.bind_argument(7, self.temperatures)
-        req.bind_argument(8, np.int32(self.hidden_dim))
-        req.bind_argument(9, np.int32(self.output_classes))
-        req.bind_argument(10, np.int32(self.padded_hidden_dim))
-        req.bind_argument(11, np.int32(self.padded_output_classes))
-        req.bind_argument(12, np.int32(self.padded_batch_size))
-        req.bind_argument(13, np.int32(actual_batch_size))
+        req.bind_argument(0, self.buffer_manager.buffers[hidden_mbuf.data])
+        req.bind_argument(1, self.buffer_manager.buffers[hidden_mbuf.mask])
+        req.bind_argument(2, self.buffer_manager.buffers[exit_weights_mbuf.data])
+        req.bind_argument(3, self.buffer_manager.buffers[exit_weights_mbuf.mask])
+        req.bind_argument(4, self.buffer_manager.buffers[exit_biases_mbuf.data])
+        req.bind_argument(5, self.buffer_manager.buffers[exit_biases_mbuf.mask])
+        req.bind_argument(6, self.buffer_manager.buffers[exit_probs_mbuf.data])
+        req.bind_argument(7, self.buffer_manager.buffers[exit_probs_mbuf.mask])
+        req.bind_argument(8, self.buffer_manager.buffers[losses_mbuf.data])
+        req.bind_argument(9, self.buffer_manager.buffers[losses_mbuf.mask])
+        req.bind_argument(10, self.buffer_manager.buffers[targets_mbuf.data])
+        req.bind_argument(11, self.buffer_manager.buffers[targets_mbuf.mask])
+        req.bind_argument(12, np.int32(exit_idx))
+        req.bind_argument(13, self.temperatures)
+        req.bind_argument(14, np.int32(self.hidden_dim))
+        req.bind_argument(15, np.int32(self.output_classes))
+        req.bind_argument(16, np.int32(self.padded_hidden_dim))
+        req.bind_argument(17, np.int32(self.padded_output_classes))
+        req.bind_argument(18, np.int32(self.padded_batch_size))
+        req.bind_argument(19, np.int32(actual_batch_size))
+        access_map = {
+            hidden_mbuf.data: {AccessMode.SHARED_READ},
+            hidden_mbuf.mask: {AccessMode.SHARED_READ},
+            exit_weights_mbuf.data: {AccessMode.SHARED_READ},
+            exit_weights_mbuf.mask: {AccessMode.SHARED_READ},
+            exit_biases_mbuf.data: {AccessMode.SHARED_READ},
+            exit_biases_mbuf.mask: {AccessMode.SHARED_READ},
+            targets_mbuf.data: {AccessMode.SHARED_READ},
+            targets_mbuf.mask: {AccessMode.SHARED_READ},
+            'temps': {AccessMode.SHARED_READ},
+            exit_probs_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            exit_probs_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            losses_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            losses_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER}
+        }
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
-            access_map={
-                'hidden': {AccessMode.SHARED_READ},
-                'exit_weights': {AccessMode.SHARED_READ},
-                'exit_biases': {AccessMode.SHARED_READ},
-                'targets_batch': {AccessMode.SHARED_READ},
-                'temps': {AccessMode.SHARED_READ},
-                'exit_probs': {AccessMode.EXCLUSIVE_WRITE_OVER},
-                'losses': {AccessMode.EXCLUSIVE_WRITE_OVER}
-            },
+            access_map=access_map,
             operation_fn=self._enqueue_kernel,
             params={'exec_req': req}
         )
 
-    def compute_gradients(self, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf, grad_weights_buf, grad_biases_buf, grad_exit_weights_buf, grad_exit_biases_buf, targets_buf, actual_batch_size):
+    def compute_gradients(self, global_sizes, local_sizes, input_mbuf, hidden_mbuf, exit_probs_mbuf, exit_weights_mbuf, grad_weights_mbuf, grad_biases_mbuf, grad_exit_weights_mbuf, grad_exit_biases_mbuf, targets_mbuf, actual_batch_size):
         req = KernelExecutionRequest(self.program, 'compute_gradients', global_sizes, local_sizes)
-        req.bind_argument(0, input_buf)
-        req.bind_argument(1, hidden_buf)
-        req.bind_argument(2, exit_probs_buf)
-        req.bind_argument(3, exit_weights_buf)
-        req.bind_argument(4, grad_weights_buf)
-        req.bind_argument(5, grad_biases_buf)
-        req.bind_argument(6, grad_exit_weights_buf)
-        req.bind_argument(7, grad_exit_biases_buf)
-        req.bind_argument(8, targets_buf)
-        req.bind_argument(9, self.temperatures)
-        req.bind_argument(10, np.int32(self.input_dim))
-        req.bind_argument(11, np.int32(self.hidden_dim))
-        req.bind_argument(12, np.int32(self.output_classes))
-        req.bind_argument(13, np.int32(self.padded_input_dim))
-        req.bind_argument(14, np.int32(self.padded_hidden_dim))
-        req.bind_argument(15, np.int32(self.padded_output_classes))
-        req.bind_argument(16, np.int32(self.padded_batch_size))
-        req.bind_argument(17, np.int32(actual_batch_size))
-        req.bind_argument(18, np.int32(self.num_exits))
+        req.bind_argument(0, self.buffer_manager.buffers[input_mbuf.data])
+        req.bind_argument(1, self.buffer_manager.buffers[input_mbuf.mask])
+        req.bind_argument(2, self.buffer_manager.buffers[hidden_mbuf.data])
+        req.bind_argument(3, self.buffer_manager.buffers[hidden_mbuf.mask])
+        req.bind_argument(4, self.buffer_manager.buffers[exit_probs_mbuf.data])
+        req.bind_argument(5, self.buffer_manager.buffers[exit_probs_mbuf.mask])
+        req.bind_argument(6, self.buffer_manager.buffers[exit_weights_mbuf.data])
+        req.bind_argument(7, self.buffer_manager.buffers[exit_weights_mbuf.mask])
+        req.bind_argument(8, self.buffer_manager.buffers[grad_weights_mbuf.data])
+        req.bind_argument(9, self.buffer_manager.buffers[grad_weights_mbuf.mask])
+        req.bind_argument(10, self.buffer_manager.buffers[grad_biases_mbuf.data])
+        req.bind_argument(11, self.buffer_manager.buffers[grad_biases_mbuf.mask])
+        req.bind_argument(12, self.buffer_manager.buffers[grad_exit_weights_mbuf.data])
+        req.bind_argument(13, self.buffer_manager.buffers[grad_exit_weights_mbuf.mask])
+        req.bind_argument(14, self.buffer_manager.buffers[grad_exit_biases_mbuf.data])
+        req.bind_argument(15, self.buffer_manager.buffers[grad_exit_biases_mbuf.mask])
+        req.bind_argument(16, self.buffer_manager.buffers[targets_mbuf.data])
+        req.bind_argument(17, self.buffer_manager.buffers[targets_mbuf.mask])
+        req.bind_argument(18, self.temperatures)
+        req.bind_argument(19, np.int32(self.input_dim))
+        req.bind_argument(20, np.int32(self.hidden_dim))
+        req.bind_argument(21, np.int32(self.output_classes))
+        req.bind_argument(22, np.int32(self.padded_input_dim))
+        req.bind_argument(23, np.int32(self.padded_hidden_dim))
+        req.bind_argument(24, np.int32(self.padded_output_classes))
+        req.bind_argument(25, np.int32(self.padded_batch_size))
+        req.bind_argument(26, np.int32(actual_batch_size))
+        req.bind_argument(27, np.int32(self.num_exits))
+        access_map = {
+            input_mbuf.data: {AccessMode.SHARED_READ},
+            input_mbuf.mask: {AccessMode.SHARED_READ},
+            hidden_mbuf.data: {AccessMode.SHARED_READ},
+            hidden_mbuf.mask: {AccessMode.SHARED_READ},
+            exit_probs_mbuf.data: {AccessMode.SHARED_READ},
+            exit_probs_mbuf.mask: {AccessMode.SHARED_READ},
+            exit_weights_mbuf.data: {AccessMode.SHARED_READ},
+            exit_weights_mbuf.mask: {AccessMode.SHARED_READ},
+            targets_mbuf.data: {AccessMode.SHARED_READ},
+            targets_mbuf.mask: {AccessMode.SHARED_READ},
+            'temps': {AccessMode.SHARED_READ},
+            grad_weights_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            grad_weights_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            grad_biases_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            grad_biases_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            grad_exit_weights_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            grad_exit_weights_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            grad_exit_biases_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            grad_exit_biases_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER}
+        }
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
-            access_map={
-                'input_batch': {AccessMode.SHARED_READ},
-                'hidden': {AccessMode.SHARED_READ},
-                'exit_probs': {AccessMode.SHARED_READ},
-                'exit_weights': {AccessMode.SHARED_READ},
-                'targets_batch': {AccessMode.SHARED_READ},
-                'temps': {AccessMode.SHARED_READ},
-                'grad_weights': {AccessMode.EXCLUSIVE_WRITE_OVER},
-                'grad_biases': {AccessMode.EXCLUSIVE_WRITE_OVER},
-                'grad_exit_weights': {AccessMode.EXCLUSIVE_WRITE_OVER},
-                'grad_exit_biases': {AccessMode.EXCLUSIVE_WRITE_OVER}
-            },
+            access_map=access_map,
             operation_fn=self._enqueue_kernel,
             params={'exec_req': req}
         )
 
-    def compute_temp_gradients(self, global_sizes, local_sizes, exit_probs_buf, targets_buf, grad_temps_buf, actual_batch_size):
+    def compute_temp_gradients(self, global_sizes, local_sizes, exit_probs_mbuf, targets_mbuf, grad_temps_mbuf, actual_batch_size):
         req = KernelExecutionRequest(self.program, 'compute_temp_gradients', global_sizes, local_sizes)
-        req.bind_argument(0, exit_probs_buf)
-        req.bind_argument(1, targets_buf)
-        req.bind_argument(2, grad_temps_buf)
-        req.bind_argument(3, self.temperatures)
-        req.bind_argument(4, np.int32(self.output_classes))
-        req.bind_argument(5, np.int32(self.padded_output_classes))
-        req.bind_argument(6, np.int32(self.padded_batch_size))
-        req.bind_argument(7, np.int32(actual_batch_size))
-        req.bind_argument(8, np.int32(self.num_exits))
+        req.bind_argument(0, self.buffer_manager.buffers[exit_probs_mbuf.data])
+        req.bind_argument(1, self.buffer_manager.buffers[exit_probs_mbuf.mask])
+        req.bind_argument(2, self.buffer_manager.buffers[targets_mbuf.data])
+        req.bind_argument(3, self.buffer_manager.buffers[targets_mbuf.mask])
+        req.bind_argument(4, self.buffer_manager.buffers[grad_temps_mbuf.data])
+        req.bind_argument(5, self.buffer_manager.buffers[grad_temps_mbuf.mask])
+        req.bind_argument(6, self.temperatures)
+        req.bind_argument(7, np.int32(self.output_classes))
+        req.bind_argument(8, np.int32(self.padded_output_classes))
+        req.bind_argument(9, np.int32(self.padded_batch_size))
+        req.bind_argument(10, np.int32(actual_batch_size))
+        req.bind_argument(11, np.int32(self.num_exits))
+        access_map = {
+            exit_probs_mbuf.data: {AccessMode.SHARED_READ},
+            exit_probs_mbuf.mask: {AccessMode.SHARED_READ},
+            targets_mbuf.data: {AccessMode.SHARED_READ},
+            targets_mbuf.mask: {AccessMode.SHARED_READ},
+            'temps': {AccessMode.SHARED_READ},
+            grad_temps_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            grad_temps_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER}
+        }
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
-            access_map={
-                'exit_probs': {AccessMode.SHARED_READ},
-                'targets_batch': {AccessMode.SHARED_READ},
-                'temps': {AccessMode.SHARED_READ},
-                'grad_temps': {AccessMode.EXCLUSIVE_WRITE_OVER}
-            },
+            access_map=access_map,
             operation_fn=self._enqueue_kernel,
             params={'exec_req': req}
         )
 
-    def adam_update(self, global_sizes, local_sizes, grad_buf, param_buf, m1_buf, m2_buf, grad_name, param_name, m1_name, m2_name, total_params):
+    def adam_update(self, global_sizes, local_sizes, grad_mbuf, param_mbuf, m1_mbuf, m2_mbuf, grad_name, param_name, m1_name, m2_name, total_params):
         req = KernelExecutionRequest(self.program, 'adam_update', global_sizes, local_sizes)
-        req.bind_argument(0, grad_buf)
-        req.bind_argument(1, param_buf)
-        req.bind_argument(2, m1_buf)
-        req.bind_argument(3, m2_buf)
-        req.bind_argument(4, self.adam_beta1)
-        req.bind_argument(5, self.adam_beta2)
-        req.bind_argument(6, self.beta1_t)
-        req.bind_argument(7, self.beta2_t)
-        req.bind_argument(8, self.learning_rate)
-        req.bind_argument(9, self.epsilon)
-        req.bind_argument(10, np.int32(total_params))
+        req.bind_argument(0, self.buffer_manager.buffers[grad_mbuf.data])
+        req.bind_argument(1, self.buffer_manager.buffers[grad_mbuf.mask])
+        req.bind_argument(2, self.buffer_manager.buffers[param_mbuf.data])
+        req.bind_argument(3, self.buffer_manager.buffers[param_mbuf.mask])
+        req.bind_argument(4, self.buffer_manager.buffers[m1_mbuf.data])
+        req.bind_argument(5, self.buffer_manager.buffers[m1_mbuf.mask])
+        req.bind_argument(6, self.buffer_manager.buffers[m2_mbuf.data])
+        req.bind_argument(7, self.buffer_manager.buffers[m2_mbuf.mask])
+        req.bind_argument(8, self.adam_beta1)
+        req.bind_argument(9, self.adam_beta2)
+        req.bind_argument(10, self.beta1_t)
+        req.bind_argument(11, self.beta2_t)
+        req.bind_argument(12, self.learning_rate)
+        req.bind_argument(13, self.epsilon)
+        req.bind_argument(14, np.int32(total_params))
+        access_map = {
+            grad_mbuf.data: {AccessMode.SHARED_READ},
+            grad_mbuf.mask: {AccessMode.SHARED_READ},
+            param_mbuf.data: {AccessMode.EXCLUSIVE_UPDATE},
+            param_mbuf.mask: {AccessMode.EXCLUSIVE_UPDATE},
+            m1_mbuf.data: {AccessMode.EXCLUSIVE_UPDATE},
+            m1_mbuf.mask: {AccessMode.EXCLUSIVE_UPDATE},
+            m2_mbuf.data: {AccessMode.EXCLUSIVE_UPDATE},
+            m2_mbuf.mask: {AccessMode.EXCLUSIVE_UPDATE}
+        }
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
-            access_map={
-                grad_name: {AccessMode.SHARED_READ},
-                param_name: {AccessMode.EXCLUSIVE_UPDATE},
-                m1_name: {AccessMode.EXCLUSIVE_UPDATE},
-                m2_name: {AccessMode.EXCLUSIVE_UPDATE}
-            },
+            access_map=access_map,
             operation_fn=self._enqueue_kernel,
             params={'exec_req': req}
         )
 
-    def clamp_temperatures(self, global_sizes, local_sizes, temps_buf):
+    def clamp_temperatures(self, global_sizes, local_sizes, temps_mbuf):
         req = KernelExecutionRequest(self.program, 'clamp_temperatures', global_sizes, local_sizes)
-        req.bind_argument(0, temps_buf)
-        req.bind_argument(1, self.min_temp)
-        req.bind_argument(2, self.max_temp)
-        req.bind_argument(3, np.int32(self.num_exits))
+        req.bind_argument(0, self.buffer_manager.buffers[temps_mbuf.data])
+        req.bind_argument(1, self.buffer_manager.buffers[temps_mbuf.mask])
+        req.bind_argument(2, self.min_temp)
+        req.bind_argument(3, self.max_temp)
+        req.bind_argument(4, np.int32(self.num_exits))
+        access_map = {
+            temps_mbuf.data: {AccessMode.EXCLUSIVE_UPDATE},
+            temps_mbuf.mask: {AccessMode.EXCLUSIVE_UPDATE}
+        }
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
-            access_map={'temps': {AccessMode.EXCLUSIVE_UPDATE}},
+            access_map=access_map,
             operation_fn=self._enqueue_kernel,
             params={'exec_req': req}
         )
@@ -848,12 +948,15 @@ for epoch in range(EPOCHS):
         X_padded, y_padded, mask = batch_padder.pad_batch(X_batch, y_batch)
 
         # Transfer nodes for input data
-        input_transfer = buffer_mgr.staged_transfer(X_padded, 'input_batch')
-        targets_transfer = buffer_mgr.staged_transfer(y_padded, 'targets_batch')
-        mask_transfer = buffer_mgr.staged_transfer(mask, 'mask_batch')
+        input_mbuf = buffer_mgr.masked_buffers['input_batch']
+        targets_mbuf = buffer_mgr.masked_buffers['targets_batch']
+        mask_mbuf = buffer_mgr.masked_buffers['mask_batch']
+        input_transfer_data, input_transfer_mask = buffer_mgr.staged_transfer({'data': X_padded, 'mask': mask}, input_mbuf)
+        targets_transfer_data, targets_transfer_mask = buffer_mgr.staged_transfer({'data': y_padded, 'mask': mask}, targets_mbuf)
+        mask_transfer_data, mask_transfer_mask = buffer_mgr.staged_transfer({'data': mask, 'mask': np.ones_like(mask)}, mask_mbuf)
 
         kernel_wrapper = KernelWrapper(program, manager, global_step, compute_queue, buffer_mgr)
-        kernel_wrapper.set_mask(buffer_mgr.buffers['mask_batch']).set_temps(pm.buffers['temps'])
+        kernel_wrapper.set_mask(buffer_mgr.buffers[mask_mbuf.data]).set_temps(buffer_mgr.buffers[buffer_mgr.masked_buffers['temps'].data])
         pm.zero_gradients(manager)
 
         # Forward pass node with dependencies
@@ -861,54 +964,60 @@ for epoch in range(EPOCHS):
         local_forward = optimal_local_sizes(global_forward, device_limits)
         forward_node = kernel_wrapper.forward_pass(
             global_forward, local_forward,
-            buffer_mgr.buffers['input_batch'], pm.buffers['weights'],
-            pm.buffers['biases'], buffer_mgr.buffers['hidden'], actual_batch_size
+            input_mbuf, buffer_mgr.masked_buffers['weights'],
+            buffer_mgr.masked_buffers['biases'], buffer_mgr.masked_buffers['hidden'], actual_batch_size
         )
-        manager.execution_graph.add_edge(input_transfer, forward_node)
-        manager.execution_graph.add_edge(mask_transfer, forward_node)
+        manager.execution_graph.add_edge(input_transfer_data, forward_node)
+        manager.execution_graph.add_edge(input_transfer_mask, forward_node)
+        manager.execution_graph.add_edge(mask_transfer_data, forward_node)
+        manager.execution_graph.add_edge(mask_transfer_mask, forward_node)
 
         for exit_idx in range(NUM_EXITS):
             global_exit = (buffer_mgr.buffer_metadata['input_batch']['padded_shape'][0],)
             local_exit = optimal_local_sizes(global_exit, device_limits)
             exit_node = kernel_wrapper.compute_exit_probabilities(
                 global_exit, local_exit,
-                buffer_mgr.buffers['hidden'], pm.buffers['exit_weights'],
-                pm.buffers['exit_biases'], buffer_mgr.buffers['exit_probs'],
-                buffer_mgr.buffers['losses'], buffer_mgr.buffers['targets_batch'],
+                buffer_mgr.masked_buffers['hidden'], buffer_mgr.masked_buffers['exit_weights'],
+                buffer_mgr.masked_buffers['exit_biases'], buffer_mgr.masked_buffers['exit_probs'],
+                buffer_mgr.masked_buffers['losses'], buffer_mgr.masked_buffers['targets_batch'],
                 exit_idx, actual_batch_size
             )
             manager.execution_graph.add_edge(forward_node, exit_node)
-            manager.execution_graph.add_edge(targets_transfer, exit_node)
+            manager.execution_graph.add_edge(targets_transfer_data, exit_node)
+            manager.execution_graph.add_edge(targets_transfer_mask, exit_node)
 
         global_grad = (INPUT_DIM, HIDDEN_DIM)
         local_grad = optimal_local_sizes(global_grad, device_limits)
         grad_node = kernel_wrapper.compute_gradients(
             global_grad, local_grad,
-            buffer_mgr.buffers['input_batch'], buffer_mgr.buffers['hidden'],
-            buffer_mgr.buffers['exit_probs'], pm.buffers['exit_weights'],
-            pm.grad_buffers['weights'], pm.grad_buffers['biases'],
-            pm.grad_buffers['exit_weights'], pm.grad_buffers['exit_biases'],
-            buffer_mgr.buffers['targets_batch'], actual_batch_size
+            input_mbuf, buffer_mgr.masked_buffers['hidden'],
+            buffer_mgr.masked_buffers['exit_probs'], buffer_mgr.masked_buffers['exit_weights'],
+            buffer_mgr.masked_buffers['grad_weights'], buffer_mgr.masked_buffers['grad_biases'],
+            buffer_mgr.masked_buffers['grad_exit_weights'], buffer_mgr.masked_buffers['grad_exit_biases'],
+            targets_mbuf, actual_batch_size
         )
-        manager.execution_graph.add_edge(input_transfer, grad_node)
+        manager.execution_graph.add_edge(input_transfer_data, grad_node)
+        manager.execution_graph.add_edge(input_transfer_mask, grad_node)
         manager.execution_graph.add_edge(forward_node, grad_node)
-        manager.execution_graph.add_edge(targets_transfer, grad_node)
+        manager.execution_graph.add_edge(targets_transfer_data, grad_node)
+        manager.execution_graph.add_edge(targets_transfer_mask, grad_node)
 
         global_temp_grad = (NUM_EXITS,)
         local_temp_grad = optimal_local_sizes(global_temp_grad, device_limits)
         temp_grad_node = kernel_wrapper.compute_temp_gradients(
             global_temp_grad, local_temp_grad,
-            buffer_mgr.buffers['exit_probs'], buffer_mgr.buffers['targets_batch'],
-            pm.grad_buffers['temps'], actual_batch_size
+            buffer_mgr.masked_buffers['exit_probs'], targets_mbuf,
+            buffer_mgr.masked_buffers['grad_temps'], actual_batch_size
         )
-        manager.execution_graph.add_edge(targets_transfer, temp_grad_node)
+        manager.execution_graph.add_edge(targets_transfer_data, temp_grad_node)
+        manager.execution_graph.add_edge(targets_transfer_mask, temp_grad_node)
 
         for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
             if param in pm.params and pm.params[param]['requires_grad']:
-                grad_buf = pm.grad_buffers[param]
-                param_buf = pm.buffers[param]
-                m1_buf = pm.m1_buffers[param]
-                m2_buf = pm.m2_buffers[param]
+                grad_mbuf = pm.params[param]['grad_mbuf']
+                param_mbuf = buffer_mgr.masked_buffers[param]
+                m1_mbuf = pm.params[param]['m1_mbuf']
+                m2_mbuf = pm.params[param]['m2_mbuf']
                 grad_name = f'grad_{param}'
                 param_name = param
                 m1_name = f'm1_{param}'
@@ -918,29 +1027,32 @@ for epoch in range(EPOCHS):
                 local_adam = optimal_local_sizes(global_adam, device_limits)
                 adam_node = kernel_wrapper.adam_update(
                     global_adam, local_adam,
-                    grad_buf, param_buf, m1_buf, m2_buf,
+                    grad_mbuf, param_mbuf, m1_mbuf, m2_mbuf,
                     grad_name, param_name, m1_name, m2_name, total_params
                 )
                 manager.execution_graph.add_edge(grad_node if param != 'temps' else temp_grad_node, adam_node)
                 if param == 'temps':
                     global_clamp = (NUM_EXITS,)
                     local_clamp = optimal_local_sizes(global_clamp, device_limits)
-                    clamp_node = kernel_wrapper.clamp_temperatures(global_clamp, local_clamp, param_buf)
+                    clamp_node = kernel_wrapper.clamp_temperatures(global_clamp, local_clamp, param_mbuf)
                     manager.execution_graph.add_edge(adam_node, clamp_node)
 
         # Device-to-host transfers for results
-        losses_transfer, losses_host = buffer_mgr.staged_transfer(None, 'losses', is_device_to_host=True)
-        exit_probs_transfer, exit_probs_host = buffer_mgr.staged_transfer(None, 'exit_probs', is_device_to_host=True)
-        temps_transfer, temps_host = buffer_mgr.staged_transfer(None, 'temps', is_device_to_host=True)
+        losses_mbuf = buffer_mgr.masked_buffers['losses']
+        exit_probs_mbuf = buffer_mgr.masked_buffers['exit_probs']
+        temps_mbuf = buffer_mgr.masked_buffers['temps']
+        losses_transfer_data, losses_host, losses_transfer_mask, losses_mask_host = buffer_mgr.staged_transfer(None, losses_mbuf, is_device_to_host=True)
+        exit_probs_transfer_data, exit_probs_host, exit_probs_transfer_mask, exit_probs_mask_host = buffer_mgr.staged_transfer(None, exit_probs_mbuf, is_device_to_host=True)
+        temps_transfer_data, temps_host, temps_transfer_mask, temps_mask_host = buffer_mgr.staged_transfer(None, temps_mbuf, is_device_to_host=True)
 
         # Create SYNC node for HOST_SIGNAL
-        sync_uid = manager.create_sync_node(SyncType.HOST_SIGNAL, dependencies=[losses_transfer, exit_probs_transfer, temps_transfer])
+        sync_uid = manager.create_sync_node(SyncType.HOST_SIGNAL, dependencies=[losses_transfer_data, exit_probs_transfer_data, temps_transfer_data])
         manager.commit_workload()
 
         # Wait for sync
         manager.wait_for_sync(sync_uid)
 
-        # Access results
+        # Access results with masking
         exit_losses = []
         for exit_idx in range(NUM_EXITS):
             start = exit_idx * (buffer_mgr.buffer_metadata['losses']['padded_shape'][0] // NUM_EXITS)
@@ -967,7 +1079,7 @@ for epoch in range(EPOCHS):
     print(f"Temperatures: {temps_host}")
 
 # Cleanup
-for name in list(buffer_mgr.buffer_metadata.keys()):
+for name in list(buffer_mgr.masked_buffers.keys()):
     buffer_mgr.release_buffer(name)
 manager.commit_workload()
 
