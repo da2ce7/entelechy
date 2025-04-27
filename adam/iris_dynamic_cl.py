@@ -155,6 +155,15 @@ class SyncType(Enum):
     HOST_SIGNAL = 1
     DEVICE_WAIT = 2
 
+class AccessMode(Enum):
+    LOCAL = 1          # Temporary, undefined content
+    SHARED_READ = 2    # Read-only, concurrent access OK
+    EXCLUSIVE_WRITE_OVER = 3  # Overwrite, no dependency on prev writes
+    EXCLUSIVE_ZERO = 4 # Must be zero-initialized
+    EXCLUSIVE_UPDATE = 5 # Read-modify-write
+
+ACCESS_WRITE_MODES = {AccessMode.EXCLUSIVE_WRITE_OVER, AccessMode.EXCLUSIVE_ZERO, AccessMode.EXCLUSIVE_UPDATE}
+
 class WorkManager:
     def __init__(self, context):
         self.context = context
@@ -164,43 +173,61 @@ class WorkManager:
         self.node_id_counter = 0
         self.buffer_tracker = defaultdict(lambda: {'version': 0, 'alloc_node': None, 'free_node': None, 'metadata': None})
         self.user_events = {}  # {node_uid: cl.UserEvent}
+        self.last_writer = {}
+        self.pending_readers = defaultdict(set)
 
+    @dataclass
     class ExecutionNode:
-        __slots__ = ['uid', 'node_type', 'queue_type', 'resources', 'dependencies', 'expected_versions', 'params', 'event']
-        def __init__(self, uid, node_type, queue_type, resources, dependencies, params):
-            self.uid = uid
-            self.node_type = node_type
-            self.queue_type = queue_type
-            self.resources = resources
-            self.dependencies = dependencies
-            self.expected_versions = {}
-            self.params = params
-            self.event = None
+        __slots__ = ['uid', 'node_type', 'queue_type', 'access_map', 'dependencies', 'expected_versions', 'params', 'event']
+        uid: int
+        node_type: NodeType
+        queue_type: str
+        access_map: dict  # {resource: set[AccessMode]}
+        dependencies: set
+        expected_versions: dict
+        params: dict
+        event: cl.Event = None
 
-    def create_node(self, node_type, queue_type, resource_access, operation_fn, params):
-        node = self.ExecutionNode(self.node_id_counter, node_type, queue_type, resource_access, set(), params)
+    def validate_access_modes(self, modes):
+        write_count = sum(1 for m in modes if m in ACCESS_WRITE_MODES)
+        if write_count > 1:
+            raise ValueError(f"Conflicting write modes: {modes}")
+        if AccessMode.SHARED_READ in modes and modes & ACCESS_WRITE_MODES:
+            raise ValueError("Cannot combine SHARED_READ with write modes")
+
+    def create_node(self, node_type, queue_type, access_map, operation_fn, params):
+        node = self.ExecutionNode(self.node_id_counter, node_type, queue_type, access_map, set(), {}, params)
         node.execute = operation_fn
+
+        for res, modes in access_map.items():
+            self.validate_access_modes(modes)
+            write_modes = modes & ACCESS_WRITE_MODES
+            read_modes = modes - write_modes
+
+            if write_modes:
+                if res in self.last_writer:
+                    last_writer_modes = self.execution_graph.nodes[self.last_writer[res]]['node'].access_map[res]
+                    if not (AccessMode.EXCLUSIVE_WRITE_OVER in write_modes and 
+                            AccessMode.EXCLUSIVE_WRITE_OVER in last_writer_modes):
+                        node.dependencies.add(self.last_writer[res])
+                for reader_uid in self.pending_readers[res]:
+                    node.dependencies.add(reader_uid)
+                self.pending_readers[res].clear()
+                self.last_writer[res] = node.uid
+
+            if AccessMode.SHARED_READ in read_modes or AccessMode.EXCLUSIVE_UPDATE in read_modes:
+                if res in self.last_writer:
+                    node.dependencies.add(self.last_writer[res])
+                self.pending_readers[res].add(node.uid)
+
+            if AccessMode.SHARED_READ in read_modes or AccessMode.EXCLUSIVE_UPDATE in read_modes:
+                node.expected_versions[res] = self.logical_resources.get(res, (None, 0))[1]
+
         if node_type == NodeType.TRANSFER:
-            buffer_name = list(resource_access['W'])[0] if params['direction'] == TransferDirection.H2D else list(resource_access['R'])[0]
+            buffer_name = list(access_map.keys())[0]  # Assuming single resource per transfer
             alloc_node = self.buffer_tracker[buffer_name]['alloc_node']
             node.dependencies.add(alloc_node)
-            if params['direction'] == TransferDirection.D2H:
-                for uid in self.execution_graph.nodes:
-                    existing_node = self.execution_graph.nodes[uid]['node']
-                    if buffer_name in existing_node.resources['W']:
-                        node.dependencies.add(uid)
-        for res in resource_access['R']:
-            if res in self.logical_resources:
-                node.expected_versions[res] = self.logical_resources[res][1]
-            else:
-                node.expected_versions[res] = 0
-        for res in resource_access['R'] | resource_access['W']:
-            if res in self.logical_resources:
-                for existing_uid in self.execution_graph.nodes:
-                    existing_node = self.execution_graph.nodes[existing_uid]['node']
-                    if (res in existing_node.resources['W'] or
-                        (res in existing_node.resources['R'] and res in resource_access['W'])):
-                        node.dependencies.add(existing_uid)
+
         self.execution_graph.add_node(node.uid, node=node)
         self.node_id_counter += 1
         return node.uid
@@ -213,7 +240,7 @@ class WorkManager:
                 self.buffer_tracker[name]['alloc_node'] = self.node_id_counter
                 self.buffer_tracker[name]['metadata'] = metadata
                 return None
-            node = self.ExecutionNode(self.node_id_counter, NodeType.MEMORY, 'compute', {'W': [name]}, set(), {'op_type': op_type, 'size': size})
+            node = self.ExecutionNode(self.node_id_counter, NodeType.MEMORY, 'compute', {name: {AccessMode.EXCLUSIVE_WRITE_OVER}}, set(), {'op_type': op_type, 'size': size})
             node.execute = _alloc_fn
         elif op_type == MemOpType.FREE:
             def _free_fn(queue, wait_for):
@@ -223,18 +250,17 @@ class WorkManager:
                 self.buffer_tracker[name]['free_node'] = self.node_id_counter
                 self.buffer_tracker[name]['metadata'] = None
                 return None
-            node = self.ExecutionNode(self.node_id_counter, NodeType.MEMORY, 'compute', {'R': [name]}, set(), {'op_type': op_type})
+            node = self.ExecutionNode(self.node_id_counter, NodeType.MEMORY, 'compute', {name: {AccessMode.SHARED_READ}}, set(), {'op_type': op_type})
             node.execute = _free_fn
             for existing_uid in self.execution_graph.nodes:
                 existing_node = self.execution_graph.nodes[existing_uid]['node']
-                if name in existing_node.resources.get('R', []) or name in existing_node.resources.get('W', []):
+                if name in existing_node.access_map:
                     node.dependencies.add(existing_uid)
         self.execution_graph.add_node(node.uid, node=node)
         self.node_id_counter += 1
         return node.uid
 
     def create_sync_node(self, sync_type, dependencies=[]):
-        """Create sync node & return its UID. Generates UserEvent if HOST_SIGNAL."""
         user_event = None
         if sync_type == SyncType.HOST_SIGNAL:
             user_event = cl.UserEvent(self.context)
@@ -248,11 +274,9 @@ class WorkManager:
         return node.uid
 
     def get_sync_event(self, node_uid):
-        """Retrieve UserEvent for HOST_SIGNAL nodes."""
         return self.user_events.get(node_uid, None)
 
     def wait_for_sync(self, node_uid):
-        """Host calls to block until sync node completes."""
         if node_uid in self.user_events:
             event = self.user_events.pop(node_uid)
             cl.wait_for_events([event])
@@ -265,12 +289,14 @@ class WorkManager:
         for uid in ordered_nodes:
             node = self.execution_graph.nodes[uid]['node']
             queue = self.hardware_queues[node.queue_type]
-            for res in node.resources.get('R', []):
-                if res in self.logical_resources:
+
+            for res, modes in node.access_map.items():
+                if res in self.logical_resources and (AccessMode.SHARED_READ in modes or AccessMode.EXCLUSIVE_UPDATE in modes):
                     current_version = self.logical_resources[res][1]
                     expected_version = node.expected_versions.get(res, 0)
                     if expected_version != current_version:
-                        raise RuntimeError(f"Resource {res} has been modified unexpectedly for node {uid}")
+                        raise RuntimeError(f"Resource {res} version mismatch for node {uid}")
+
             wait_for = [completion_events[d] for d in node.dependencies if d in completion_events]
             if node.node_type == NodeType.COMPUTE:
                 self._dispatch_compute(node, wait_for)
@@ -281,8 +307,9 @@ class WorkManager:
             elif node.node_type == NodeType.SYNC:
                 self._dispatch_sync(node, wait_for)
             completion_events[uid] = node.event
-            for res in node.resources.get('W', []):
-                if res in self.logical_resources:
+
+            for res, modes in node.access_map.items():
+                if res in self.logical_resources and modes & ACCESS_WRITE_MODES:
                     buffer, version = self.logical_resources[res]
                     self.logical_resources[res] = (buffer, version + 1)
 
@@ -311,7 +338,7 @@ class WorkManager:
     def reset_graph(self):
         self.execution_graph.clear()
         self.node_id_counter = 0
-        self.user_events.clear()  # Clear any remaining user events
+        self.user_events.clear()
 
 class BufferManager:
     def __init__(self, context, device, work_manager):
@@ -323,9 +350,9 @@ class BufferManager:
         self.staging_pool = deque(maxlen=8)
         self.buffers = {}
         self.work_manager.logical_resources.update(self.buffers)
-        self.staging_buffer_ownership = {}  # Track ownership of staging buffers
+        self.staging_buffer_ownership = {}
 
-    def acquire_buffer(self, name, real_shape, dtype, pad_strategy=None, mode='device'):
+    def acquire_buffer(self, name, real_shape, dtype, pad_strategy=None, access_mode=AccessMode.EXCLUSIVE_WRITE_OVER):
         strategy = pad_strategy or self.padding_ctx.padding_mode
         padded_shape = PaddingStrategy.apply(self.padding_ctx, real_shape, dtype)
         size = np.prod(padded_shape) * dtype().itemsize
@@ -337,7 +364,23 @@ class BufferManager:
         }
         alloc_node = self.work_manager.create_mem_node(name, MemOpType.ALLOC, size=size, metadata=metadata)
         self.buffer_metadata[name] = metadata
+
+        if access_mode == AccessMode.EXCLUSIVE_ZERO:
+            zero_node = self._enqueue_zero_init(name)
+            self.work_manager.execution_graph.add_edge(alloc_node, zero_node)
+
         return alloc_node
+
+    def _enqueue_zero_init(self, name):
+        def zero_op(queue, wait_for):
+            buffer = self.work_manager.logical_resources[name][0]
+            return cl.enqueue_fill_buffer(queue, buffer, np.float32(0), 0, buffer.size, wait_for=wait_for)
+        zero_node = self.work_manager.create_node(
+            NodeType.COMPUTE, 'compute',
+            {name: {AccessMode.EXCLUSIVE_WRITE_OVER}},
+            zero_op, {}
+        )
+        return zero_node
 
     def release_buffer(self, name):
         if name in self.buffer_metadata:
@@ -355,7 +398,6 @@ class BufferManager:
         staging_buf = self._get_staging_buffer(size)
 
         if not is_device_to_host:
-            # Assuming host_data is already padded and processed
             params = {
                 'direction': TransferDirection.H2D,
                 'source': host_data,
@@ -366,7 +408,7 @@ class BufferManager:
             node_id = self.work_manager.create_node(
                 node_type=NodeType.TRANSFER,
                 queue_type='xfer',
-                resource_access={'W': [buffer_name]},
+                access_map={buffer_name: {AccessMode.EXCLUSIVE_WRITE_OVER}},
                 operation_fn=self._execute_transfer,
                 params=params
             )
@@ -384,7 +426,7 @@ class BufferManager:
             node_id = self.work_manager.create_node(
                 node_type=NodeType.TRANSFER,
                 queue_type='xfer',
-                resource_access={'R': [buffer_name]},
+                access_map={buffer_name: {AccessMode.SHARED_READ}},
                 operation_fn=self._execute_transfer,
                 params=params
             )
@@ -482,9 +524,9 @@ class ParamManager:
             self.buffer_manager.acquire_buffer(name, spec['shape'], np.float32)
             self.buffer_manager.staged_transfer(processed, name, is_device_to_host=False)
             if spec['requires_grad']:
-                self.buffer_manager.acquire_buffer(f"grad_{name}", spec['shape'], np.float32)
-                self.buffer_manager.acquire_buffer(f"m1_{name}", spec['shape'], np.float32)
-                self.buffer_manager.acquire_buffer(f"m2_{name}", spec['shape'], np.float32)
+                self.buffer_manager.acquire_buffer(f"grad_{name}", spec['shape'], np.float32, access_mode=AccessMode.EXCLUSIVE_ZERO)
+                self.buffer_manager.acquire_buffer(f"m1_{name}", spec['shape'], np.float32, access_mode=AccessMode.EXCLUSIVE_ZERO)
+                self.buffer_manager.acquire_buffer(f"m2_{name}", spec['shape'], np.float32, access_mode=AccessMode.EXCLUSIVE_ZERO)
 
     def set_buffers(self, logical_resources):
         for name in self.params:
@@ -503,10 +545,25 @@ class ParamManager:
                 work_manager.create_node(
                     node_type=NodeType.COMPUTE,
                     queue_type='compute',
-                    resource_access={'W': [f'grad_{name}']},
+                    access_map={f'grad_{name}': {AccessMode.EXCLUSIVE_WRITE_OVER}},
                     operation_fn=_zero_fn,
                     params={}
                 )
+
+class KernelExecutionRequest:
+    def __init__(self, program, kernel_name, global_sizes, local_sizes):
+        self.program = program
+        self.kernel = getattr(program, kernel_name)
+        self.global_sizes = global_sizes
+        self.local_sizes = local_sizes
+        self.local_mem_reqs = {}  # {arg_index: (size_bytes, access_mode)}
+        self.argument_bindings = {}
+
+    def set_local_mem_argument(self, arg_index, size_bytes, access=AccessMode.LOCAL):
+        self.local_mem_reqs[arg_index] = (size_bytes, access)
+
+    def bind_argument(self, arg_index, arg):
+        self.argument_bindings[arg_index] = arg
 
 class KernelWrapper:
     def __init__(self, program, manager, global_step, compute_queue, buffer_manager):
@@ -542,114 +599,170 @@ class KernelWrapper:
         return self
 
     def forward_pass(self, global_sizes, local_sizes, input_buf, weights_buf, biases_buf, hidden_buf, actual_batch_size):
-        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
-            raise ValueError(f"Invalid global sizes: {global_sizes}")
-        local_mem = cl.LocalMemory(local_sizes[0] * FLOAT_SIZE)
-        def _enqueue_forward(queue, wait_for):
-            return self.program.forward_pass(
-                queue, global_sizes, local_sizes, local_mem, input_buf, weights_buf, biases_buf, hidden_buf,
-                self.mask, np.int32(self.input_dim), np.int32(self.hidden_dim),
-                np.int32(self.padded_input_dim), np.int32(self.padded_hidden_dim),
-                np.int32(self.padded_batch_size), np.int32(actual_batch_size),
-                wait_for=wait_for
-            )
+        req = KernelExecutionRequest(self.program, 'forward_pass', global_sizes, local_sizes)
+        req.set_local_mem_argument(0, local_sizes[0] * FLOAT_SIZE, AccessMode.LOCAL)
+        req.bind_argument(1, input_buf)
+        req.bind_argument(2, weights_buf)
+        req.bind_argument(3, biases_buf)
+        req.bind_argument(4, hidden_buf)
+        req.bind_argument(5, np.int32(actual_batch_size))
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
-            resource_access={'R': ['input_batch', 'weights', 'biases', 'mask_batch'], 'W': ['hidden']},
-            operation_fn=_enqueue_forward,
-            params={}
+            access_map={
+                'input_batch': {AccessMode.SHARED_READ},
+                'weights': {AccessMode.SHARED_READ},
+                'biases': {AccessMode.SHARED_READ},
+                'mask_batch': {AccessMode.SHARED_READ},
+                'hidden': {AccessMode.EXCLUSIVE_WRITE_OVER}
+            },
+            operation_fn=self._enqueue_kernel,
+            params={'exec_req': req}
         )
 
     def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_buf, exit_weights_buf, exit_biases_buf, exit_probs_buf, losses_buf, targets_buf, exit_idx, actual_batch_size):
-        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
-            raise ValueError(f"Invalid global sizes: {global_sizes}")
-        def _enqueue_exit(queue, wait_for):
-            return self.program.compute_exit_probabilities(
-                queue, global_sizes, local_sizes, hidden_buf, exit_weights_buf, exit_biases_buf, exit_probs_buf,
-                losses_buf, targets_buf, np.int32(exit_idx), self.temperatures, np.int32(self.hidden_dim),
-                np.int32(self.output_classes), np.int32(self.padded_hidden_dim), np.int32(self.padded_output_classes),
-                np.int32(self.padded_batch_size), np.int32(actual_batch_size), wait_for=wait_for
-            )
+        req = KernelExecutionRequest(self.program, 'compute_exit_probabilities', global_sizes, local_sizes)
+        req.bind_argument(0, hidden_buf)
+        req.bind_argument(1, exit_weights_buf)
+        req.bind_argument(2, exit_biases_buf)
+        req.bind_argument(3, exit_probs_buf)
+        req.bind_argument(4, losses_buf)
+        req.bind_argument(5, targets_buf)
+        req.bind_argument(6, np.int32(exit_idx))
+        req.bind_argument(7, self.temperatures)
+        req.bind_argument(8, np.int32(self.hidden_dim))
+        req.bind_argument(9, np.int32(self.output_classes))
+        req.bind_argument(10, np.int32(self.padded_hidden_dim))
+        req.bind_argument(11, np.int32(self.padded_output_classes))
+        req.bind_argument(12, np.int32(self.padded_batch_size))
+        req.bind_argument(13, np.int32(actual_batch_size))
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
-            resource_access={'R': ['hidden', 'exit_weights', 'exit_biases', 'targets_batch', 'temps'], 'W': ['exit_probs', 'losses']},
-            operation_fn=_enqueue_exit,
-            params={}
+            access_map={
+                'hidden': {AccessMode.SHARED_READ},
+                'exit_weights': {AccessMode.SHARED_READ},
+                'exit_biases': {AccessMode.SHARED_READ},
+                'targets_batch': {AccessMode.SHARED_READ},
+                'temps': {AccessMode.SHARED_READ},
+                'exit_probs': {AccessMode.EXCLUSIVE_WRITE_OVER},
+                'losses': {AccessMode.EXCLUSIVE_WRITE_OVER}
+            },
+            operation_fn=self._enqueue_kernel,
+            params={'exec_req': req}
         )
 
     def compute_gradients(self, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf, grad_weights_buf, grad_biases_buf, grad_exit_weights_buf, grad_exit_biases_buf, targets_buf, actual_batch_size):
-        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
-            raise ValueError(f"Invalid global sizes: {global_sizes}")
-        def _enqueue_grad(queue, wait_for):
-            return self.program.compute_gradients(
-                queue, global_sizes, local_sizes, input_buf, hidden_buf, exit_probs_buf, exit_weights_buf,
-                grad_weights_buf, grad_biases_buf, grad_exit_weights_buf, grad_exit_biases_buf, targets_buf,
-                self.temperatures, np.int32(self.input_dim), np.int32(self.hidden_dim), np.int32(self.output_classes),
-                np.int32(self.padded_input_dim), np.int32(self.padded_hidden_dim), np.int32(self.padded_output_classes),
-                np.int32(self.padded_batch_size), np.int32(actual_batch_size), np.int32(self.num_exits), wait_for=wait_for
-            )
+        req = KernelExecutionRequest(self.program, 'compute_gradients', global_sizes, local_sizes)
+        req.bind_argument(0, input_buf)
+        req.bind_argument(1, hidden_buf)
+        req.bind_argument(2, exit_probs_buf)
+        req.bind_argument(3, exit_weights_buf)
+        req.bind_argument(4, grad_weights_buf)
+        req.bind_argument(5, grad_biases_buf)
+        req.bind_argument(6, grad_exit_weights_buf)
+        req.bind_argument(7, grad_exit_biases_buf)
+        req.bind_argument(8, targets_buf)
+        req.bind_argument(9, self.temperatures)
+        req.bind_argument(10, np.int32(self.input_dim))
+        req.bind_argument(11, np.int32(self.hidden_dim))
+        req.bind_argument(12, np.int32(self.output_classes))
+        req.bind_argument(13, np.int32(self.padded_input_dim))
+        req.bind_argument(14, np.int32(self.padded_hidden_dim))
+        req.bind_argument(15, np.int32(self.padded_output_classes))
+        req.bind_argument(16, np.int32(self.padded_batch_size))
+        req.bind_argument(17, np.int32(actual_batch_size))
+        req.bind_argument(18, np.int32(self.num_exits))
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
-            resource_access={'R': ['input_batch', 'hidden', 'exit_probs', 'exit_weights', 'targets_batch', 'temps'],
-                            'W': ['grad_weights', 'grad_biases', 'grad_exit_weights', 'grad_exit_biases']},
-            operation_fn=_enqueue_grad,
-            params={}
+            access_map={
+                'input_batch': {AccessMode.SHARED_READ},
+                'hidden': {AccessMode.SHARED_READ},
+                'exit_probs': {AccessMode.SHARED_READ},
+                'exit_weights': {AccessMode.SHARED_READ},
+                'targets_batch': {AccessMode.SHARED_READ},
+                'temps': {AccessMode.SHARED_READ},
+                'grad_weights': {AccessMode.EXCLUSIVE_WRITE_OVER},
+                'grad_biases': {AccessMode.EXCLUSIVE_WRITE_OVER},
+                'grad_exit_weights': {AccessMode.EXCLUSIVE_WRITE_OVER},
+                'grad_exit_biases': {AccessMode.EXCLUSIVE_WRITE_OVER}
+            },
+            operation_fn=self._enqueue_kernel,
+            params={'exec_req': req}
         )
 
     def compute_temp_gradients(self, global_sizes, local_sizes, exit_probs_buf, targets_buf, grad_temps_buf, actual_batch_size):
-        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
-            raise ValueError(f"Invalid global sizes: {global_sizes}")
-        def _enqueue_temp_grad(queue, wait_for):
-            return self.program.compute_temp_gradients(
-                queue, global_sizes, local_sizes, exit_probs_buf, targets_buf, grad_temps_buf, self.temperatures,
-                np.int32(self.output_classes), np.int32(self.padded_output_classes), np.int32(self.padded_batch_size),
-                np.int32(actual_batch_size), np.int32(self.num_exits), wait_for=wait_for
-            )
+        req = KernelExecutionRequest(self.program, 'compute_temp_gradients', global_sizes, local_sizes)
+        req.bind_argument(0, exit_probs_buf)
+        req.bind_argument(1, targets_buf)
+        req.bind_argument(2, grad_temps_buf)
+        req.bind_argument(3, self.temperatures)
+        req.bind_argument(4, np.int32(self.output_classes))
+        req.bind_argument(5, np.int32(self.padded_output_classes))
+        req.bind_argument(6, np.int32(self.padded_batch_size))
+        req.bind_argument(7, np.int32(actual_batch_size))
+        req.bind_argument(8, np.int32(self.num_exits))
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
-            resource_access={'R': ['exit_probs', 'targets_batch', 'temps'], 'W': ['grad_temps']},
-            operation_fn=_enqueue_temp_grad,
-            params={}
+            access_map={
+                'exit_probs': {AccessMode.SHARED_READ},
+                'targets_batch': {AccessMode.SHARED_READ},
+                'temps': {AccessMode.SHARED_READ},
+                'grad_temps': {AccessMode.EXCLUSIVE_WRITE_OVER}
+            },
+            operation_fn=self._enqueue_kernel,
+            params={'exec_req': req}
         )
 
     def adam_update(self, global_sizes, local_sizes, grad_buf, param_buf, m1_buf, m2_buf, grad_name, param_name, m1_name, m2_name, total_params):
-        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
-            raise ValueError(f"Invalid global sizes: {global_sizes}")
-        def _enqueue_adam(queue, wait_for):
-            return self.program.adam_update(
-                queue, global_sizes, local_sizes, grad_buf, param_buf, m1_buf, m2_buf, self.adam_beta1,
-                self.adam_beta2, self.beta1_t, self.beta2_t, self.learning_rate, self.epsilon, np.int32(total_params),
-                wait_for=wait_for
-            )
+        req = KernelExecutionRequest(self.program, 'adam_update', global_sizes, local_sizes)
+        req.bind_argument(0, grad_buf)
+        req.bind_argument(1, param_buf)
+        req.bind_argument(2, m1_buf)
+        req.bind_argument(3, m2_buf)
+        req.bind_argument(4, self.adam_beta1)
+        req.bind_argument(5, self.adam_beta2)
+        req.bind_argument(6, self.beta1_t)
+        req.bind_argument(7, self.beta2_t)
+        req.bind_argument(8, self.learning_rate)
+        req.bind_argument(9, self.epsilon)
+        req.bind_argument(10, np.int32(total_params))
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
-            resource_access={'R': [grad_name, param_name, m1_name, m2_name], 'W': [param_name, m1_name, m2_name]},
-            operation_fn=_enqueue_adam,
-            params={}
+            access_map={
+                grad_name: {AccessMode.SHARED_READ},
+                param_name: {AccessMode.EXCLUSIVE_UPDATE},
+                m1_name: {AccessMode.EXCLUSIVE_UPDATE},
+                m2_name: {AccessMode.EXCLUSIVE_UPDATE}
+            },
+            operation_fn=self._enqueue_kernel,
+            params={'exec_req': req}
         )
 
     def clamp_temperatures(self, global_sizes, local_sizes, temps_buf):
-        if min(global_sizes) < 1 or any(g > self.buffer_manager.device.max_work_item_sizes for g in global_sizes):
-            raise ValueError(f"Invalid global sizes: {global_sizes}")
-        def _enqueue_clamp(queue, wait_for):
-            return self.program.clamp_temperatures(
-                queue, global_sizes, local_sizes,
-                temps_buf, self.min_temp, self.max_temp,
-                np.int32(self.num_exits),
-                wait_for=wait_for
-            )
+        req = KernelExecutionRequest(self.program, 'clamp_temperatures', global_sizes, local_sizes)
+        req.bind_argument(0, temps_buf)
+        req.bind_argument(1, self.min_temp)
+        req.bind_argument(2, self.max_temp)
+        req.bind_argument(3, np.int32(self.num_exits))
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
-            resource_access={'R': ['temps'], 'W': ['temps']},
-            operation_fn=_enqueue_clamp,
-            params={}
+            access_map={'temps': {AccessMode.EXCLUSIVE_UPDATE}},
+            operation_fn=self._enqueue_kernel,
+            params={'exec_req': req}
         )
+
+    def _enqueue_kernel(self, queue, wait_for, node_params):
+        req = node_params['exec_req']
+        local_mem_args = {idx: cl.LocalMemory(size) for idx, (size, mode) in req.local_mem_reqs.items()}
+        args = []
+        for i in range(max(req.argument_bindings.keys() | local_mem_args.keys()) + 1):
+            args.append(local_mem_args.get(i, req.argument_bindings.get(i)))
+        return cl.enqueue_nd_range_kernel(queue, req.kernel, req.global_sizes, req.local_sizes, *args, wait_for=wait_for)
 
 # OpenCL Setup
 ctx = cl.create_some_context()
