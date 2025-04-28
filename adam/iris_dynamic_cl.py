@@ -7,7 +7,7 @@ from sklearn.preprocessing import StandardScaler
 import networkx as nx
 import re
 from collections import deque, defaultdict
-from enum import Enum
+from enum import Enum, auto
 from dataclasses import dataclass
 
 # Define data type sizes
@@ -164,21 +164,91 @@ class AccessMode(Enum):
 
 ACCESS_WRITE_MODES = {AccessMode.EXCLUSIVE_WRITE_OVER, AccessMode.EXCLUSIVE_ZERO, AccessMode.EXCLUSIVE_UPDATE}
 
-@dataclass
-class MaskedBuffer:
-    data: str
-    mask: str
-    real_shape: tuple
-    padded_shape: tuple
-    mask_real_shape: tuple
-    mask_padded_shape: tuple
-    dtype: np.dtype
-    const_mask: bool = False
+class BufferType(Enum):
+    DATA = auto()      # Buffers needing per-element masking (e.g., input, hidden, output)
+    PARAMETER = auto() # Buffers needing alignment padding only (e.g., weights, biases)
+    MASK = auto()      # Special case for mask buffers
 
-    def __post_init__(self):
-        if not self.const_mask:
-            if self.padded_shape[0] != self.mask_padded_shape[0]:
-                raise ValueError("Batch dimension mismatch between data and mask")
+@dataclass
+class BufferSpec:
+    name: str
+    real_shape: tuple
+    dtype: np.dtype
+    type: BufferType
+    padded_shape: tuple = None
+    simd_alignment: int = None
+
+class Buffer:
+    def __init__(self, spec: BufferSpec, cl_buffer: cl.Buffer):
+        self.spec = spec
+        self.cl_buffer = cl_buffer
+
+class DataBuffer(Buffer):
+    def __init__(self, spec: BufferSpec, cl_buffer: cl.Buffer, mask_buffer: cl.Buffer):
+        super().__init__(spec, cl_buffer)
+        self.mask_buffer = mask_buffer
+
+class ParameterBuffer(Buffer):
+    def __init__(self, spec: BufferSpec, cl_buffer: cl.Buffer):
+        super().__init__(spec, cl_buffer)
+
+class DataBufferManager:
+    def __init__(self, context, device, work_manager):
+        self.context = context
+        self.device = device
+        self.work_manager = work_manager
+        self.padding_ctx = PaddingContext.from_device(device)
+
+    def create_data_buffer(self, name, real_shape, dtype):
+        spec = BufferSpec(name, real_shape, dtype, BufferType.DATA)
+        padded_shape = self._pad_data_shape(real_shape)
+        spec.padded_shape = padded_shape
+        data_buffer = self._allocate_buffer(name, padded_shape, dtype)
+        
+        mask_name = f"mask_{name}"
+        mask_real_shape = (real_shape[0],)
+        mask_padded_shape = (padded_shape[0],)
+        mask_spec = BufferSpec(mask_name, mask_real_shape, np.float32, BufferType.MASK, mask_padded_shape)
+        mask_buffer = self._allocate_buffer(mask_name, mask_padded_shape, np.float32)
+        
+        return DataBuffer(spec, data_buffer, mask_buffer)
+
+    def _pad_data_shape(self, shape):
+        # Pad batch dimension to next power of 2
+        batch_size = shape[0]
+        padded_batch_size = next_pow2(batch_size)
+        return (padded_batch_size, *shape[1:])
+
+    def _allocate_buffer(self, name, shape, dtype):
+        size = np.prod(shape) * dtype().itemsize
+        buffer = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=size)
+        self.work_manager.logical_resources[name] = (buffer, 0)
+        return buffer
+
+class ParameterBufferManager:
+    def __init__(self, context, device, work_manager):
+        self.context = context
+        self.device = device
+        self.work_manager = work_manager
+        self.padding_ctx = PaddingContext.from_device(device)
+
+    def create_parameter(self, name, real_shape, dtype):
+        spec = BufferSpec(name, real_shape, dtype, BufferType.PARAMETER)
+        padded_shape = self._pad_parameter_shape(real_shape)
+        spec.padded_shape = padded_shape
+        param_buffer = self._allocate_buffer(name, padded_shape, dtype)
+        return ParameterBuffer(spec, param_buffer)
+
+    def _pad_parameter_shape(self, shape):
+        # Pad dimensions to SIMD width
+        simd_width = self.padding_ctx.simd_width
+        return tuple((dim + simd_width - 1) // simd_width * simd_width for dim in shape)
+
+    def _allocate_buffer(self, name, shape, dtype):
+        size = np.prod(shape) * dtype().itemsize
+        buffer = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=size)
+        self.work_manager.logical_resources[name] = (buffer, 0)
+        return buffer
 
 class WorkManager:
     def __init__(self, context):
@@ -356,153 +426,6 @@ class WorkManager:
         self.node_id_counter = 0
         self.user_events.clear()
 
-class BufferManager:
-    def __init__(self, context, device, work_manager):
-        self.ctx = context
-        self.device = device
-        self.work_manager = work_manager
-        self.padding_ctx = PaddingContext.from_device(device)
-        self.buffer_metadata = {}
-        self.staging_pool = deque(maxlen=8)
-        self.buffers = {}
-        self.masked_buffers = {}
-        self.work_manager.logical_resources.update(self.buffers)
-        self.staging_buffer_ownership = {}
-
-    def acquire_buffer(self, name, real_shape, dtype, pad_strategy=None, access_mode=AccessMode.EXCLUSIVE_WRITE_OVER):
-        strategy = pad_strategy or self.padding_ctx.padding_mode
-        padded_shape = PaddingStrategy.apply(self.padding_ctx, real_shape, dtype)
-        size = np.prod(padded_shape) * dtype().itemsize
-        metadata = {
-            'real_shape': real_shape,
-            'padded_shape': padded_shape,
-            'dtype': dtype,
-            'strategy': strategy
-        }
-        alloc_node = self.work_manager.create_mem_node(name, MemOpType.ALLOC, size=size, metadata=metadata)
-        self.buffer_metadata[name] = metadata
-
-        if access_mode == AccessMode.EXCLUSIVE_ZERO:
-            zero_node = self._enqueue_zero_init(name)
-            self.work_manager.execution_graph.add_edge(alloc_node, zero_node)
-
-        # Create mask buffer
-        if len(real_shape) > 0 and real_shape[0] == BATCH_SIZE:
-            mask_real_shape = (BATCH_SIZE,)
-            mask_padded_shape = (padded_shape[0],)
-            const_mask = False
-        else:
-            mask_real_shape = (1,)
-            mask_padded_shape = (1,)
-            const_mask = True
-
-        mask_name = f"mask_{name}"
-        mask_size = np.prod(mask_padded_shape) * np.float32().itemsize
-        mask_metadata = {'real_shape': mask_real_shape, 'padded_shape': mask_padded_shape, 'dtype': np.float32, 'strategy': 'none'}
-        mask_alloc_node = self.work_manager.create_mem_node(mask_name, MemOpType.ALLOC, size=mask_size, metadata=mask_metadata)
-        self.buffer_metadata[mask_name] = mask_metadata
-
-        if const_mask:
-            def init_mask_fn(queue, wait_for):
-                buffer = self.work_manager.logical_resources[mask_name][0]
-                return cl.enqueue_fill_buffer(queue, buffer, np.float32(1.0), 0, mask_size, wait_for=wait_for)
-            init_mask_node = self.work_manager.create_node(
-                NodeType.COMPUTE, 'compute',
-                {mask_name: {AccessMode.EXCLUSIVE_WRITE_OVER}},
-                init_mask_fn, {}
-            )
-            self.work_manager.execution_graph.add_edge(mask_alloc_node, init_mask_node)
-
-        mbuf = MaskedBuffer(
-            data=name,
-            mask=mask_name,
-            real_shape=real_shape,
-            padded_shape=padded_shape,
-            mask_real_shape=mask_real_shape,
-            mask_padded_shape=mask_padded_shape,
-            dtype=dtype,
-            const_mask=const_mask
-        )
-        self.masked_buffers[name] = mbuf
-        return mbuf
-
-    def _enqueue_zero_init(self, name):
-        def zero_op(queue, wait_for):
-            buffer = self.work_manager.logical_resources[name][0]
-            return cl.enqueue_fill_buffer(queue, buffer, np.float32(0), 0, buffer.size, wait_for=wait_for)
-        zero_node = self.work_manager.create_node(
-            NodeType.COMPUTE, 'compute',
-            {name: {AccessMode.EXCLUSIVE_WRITE_OVER}},
-            zero_op, {}
-        )
-        return zero_node
-
-    def release_buffer(self, name):
-        if name in self.masked_buffers:
-            mbuf = self.masked_buffers[name]
-            self.work_manager.create_mem_node(mbuf.data, MemOpType.FREE)
-            self.work_manager.create_mem_node(mbuf.mask, MemOpType.FREE)
-            del self.masked_buffers[name]
-            del self.buffer_metadata[mbuf.data]
-            del self.buffer_metadata[mbuf.mask]
-
-    def get_dimensions(self, name):
-        return (self.buffer_metadata[name]['real_shape'], self.buffer_metadata[name]['padded_shape'])
-
-    def staged_transfer(self, host_data, mbuf: MaskedBuffer, is_device_to_host=False):
-        if is_device_to_host:
-            data_host = np.empty(mbuf.padded_shape, dtype=mbuf.dtype)
-            mask_host = np.empty(mbuf.mask_padded_shape, dtype=np.float32)
-            def transfer_data_fn(queue, wait_for):
-                buffer = self.work_manager.logical_resources[mbuf.data][0]
-                return cl.enqueue_copy(queue, data_host, buffer, wait_for=wait_for)
-            def transfer_mask_fn(queue, wait_for):
-                buffer = self.work_manager.logical_resources[mbuf.mask][0]
-                return cl.enqueue_copy(queue, mask_host, buffer, wait_for=wait_for)
-            data_node = self.work_manager.create_node(
-                NodeType.TRANSFER, 'xfer',
-                {mbuf.data: {AccessMode.SHARED_READ}},
-                transfer_data_fn, {}
-            )
-            mask_node = self.work_manager.create_node(
-                NodeType.TRANSFER, 'xfer',
-                {mbuf.mask: {AccessMode.SHARED_READ}},
-                transfer_mask_fn, {}
-            )
-            return data_node, data_host, mask_node, mask_host
-        else:
-            def transfer_data_fn(queue, wait_for):
-                buffer = self.work_manager.logical_resources[mbuf.data][0]
-                return cl.enqueue_copy(queue, buffer, host_data['data'], wait_for=wait_for)
-            def transfer_mask_fn(queue, wait_for):
-                buffer = self.work_manager.logical_resources[mbuf.mask][0]
-                return cl.enqueue_copy(queue, buffer, host_data['mask'], wait_for=wait_for)
-            data_node = self.work_manager.create_node(
-                NodeType.TRANSFER, 'xfer',
-                {mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER}},
-                transfer_data_fn, {}
-            )
-            mask_node = self.work_manager.create_node(
-                NodeType.TRANSFER, 'xfer',
-                {mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER}},
-                transfer_mask_fn, {}
-            )
-            return data_node, mask_node
-
-    def validate_memory(self):
-        padded_sizes = [
-            np.prod(meta['padded_shape']) * np.dtype(meta['dtype']).itemsize
-            for meta in self.buffer_metadata.values()
-        ]
-        total_buffer_alloc = sum(padded_sizes)
-        staging_pool_alloc = sum(buf.size for buf in self.staging_pool)
-        total_alloc = total_buffer_alloc + staging_pool_alloc
-        device_max = self.device.global_mem_size
-        if total_alloc / device_max > 0.8:
-            raise MemoryError(
-                f"Used {total_alloc / 1024**2:.2f}MB of {device_max / 1024**2:.2f}MB device memory"
-            )
-
 class ParamManager:
     PARAM_TYPES = {
         'dense_weight': {
@@ -524,10 +447,9 @@ class ParamManager:
         }
     }
 
-    def __init__(self, context, buffer_manager):
-        self.ctx = context
-        self.buffer_manager = buffer_manager
-        self.padding_ctx = PaddingContext.from_device(buffer_manager.device)
+    def __init__(self, context, parameter_manager):
+        self.context = context
+        self.parameter_manager = parameter_manager
         self.params = {}
         self.buffers = {}
         self.grad_buffers = {}
@@ -550,30 +472,26 @@ class ParamManager:
             ptype = spec['ptype']
             handler = self.PARAM_TYPES[ptype]
             init_values = handler['init'](spec['shape'])
-            padded = pad_tensor(init_values, self.padding_ctx)
+            # Create parameter buffer with zero-copy initialization
+            param_buf = self.parameter_manager.create_parameter(name, spec['shape'], np.float32)
+            self.buffers[name] = param_buf.cl_buffer
+            # Zero-copy initialization
+            padded = pad_tensor(init_values, self.parameter_manager.padding_ctx)
             post_pad_fn = handler.get('post_pad_fn', lambda x, sw: x)
-            processed = post_pad_fn(padded, self.padding_ctx.simd_width)
-            mbuf = self.buffer_manager.acquire_buffer(name, spec['shape'], np.float32)
-            self.buffer_manager.staged_transfer({'data': processed, 'mask': np.ones((1,), dtype=np.float32)}, mbuf)
+            processed = post_pad_fn(padded, self.parameter_manager.padding_ctx.simd_width)
+            event = cl.enqueue_copy(self.context.queue, param_buf.cl_buffer, processed)
+            event.wait()  # Ensure initialization completes
             if spec['requires_grad']:
-                grad_mbuf = self.buffer_manager.acquire_buffer(f"grad_{name}", spec['shape'], np.float32, access_mode=AccessMode.EXCLUSIVE_ZERO)
-                m1_mbuf = self.buffer_manager.acquire_buffer(f"m1_{name}", spec['shape'], np.float32, access_mode=AccessMode.EXCLUSIVE_ZERO)
-                m2_mbuf = self.buffer_manager.acquire_buffer(f"m2_{name}", spec['shape'], np.float32, access_mode=AccessMode.EXCLUSIVE_ZERO)
-                self.params[name]['grad_mbuf'] = grad_mbuf
-                self.params[name]['m1_mbuf'] = m1_mbuf
-                self.params[name]['m2_mbuf'] = m2_mbuf
-
-    def set_buffers(self, logical_resources):
-        for name in self.params:
-            mbuf = self.buffer_manager.masked_buffers[name]
-            self.buffers[name] = logical_resources[mbuf.data][0]
-            if self.params[name]['requires_grad']:
-                grad_mbuf = self.params[name]['grad_mbuf']
-                m1_mbuf = self.params[name]['m1_mbuf']
-                m2_mbuf = self.params[name]['m2_mbuf']
-                self.grad_buffers[name] = logical_resources[grad_mbuf.data][0]
-                self.m1_buffers[name] = logical_resources[m1_mbuf.data][0]
-                self.m2_buffers[name] = logical_resources[m2_mbuf.data][0]
+                grad_buf = self.parameter_manager.create_parameter(f"grad_{name}", spec['shape'], np.float32)
+                m1_buf = self.parameter_manager.create_parameter(f"m1_{name}", spec['shape'], np.float32)
+                m2_buf = self.parameter_manager.create_parameter(f"m2_{name}", spec['shape'], np.float32)
+                self.grad_buffers[name] = grad_buf.cl_buffer
+                self.m1_buffers[name] = m1_buf.cl_buffer
+                self.m2_buffers[name] = m2_buf.cl_buffer
+                # Zero initialize grad, m1, m2
+                for buf in [grad_buf.cl_buffer, m1_buf.cl_buffer, m2_buf.cl_buffer]:
+                    event = cl.enqueue_fill_buffer(self.context.queue, buf, np.float32(0), 0, buf.size)
+                    event.wait()  # Ensure initialization completes
 
     def zero_gradients(self, work_manager):
         for name, spec in self.params.items():
@@ -605,17 +523,18 @@ class KernelExecutionRequest:
         self.argument_bindings[arg_index] = arg
 
 class KernelWrapper:
-    def __init__(self, program, manager, global_step, compute_queue, buffer_manager):
+    def __init__(self, program, manager, global_step, compute_queue, data_manager, parameter_manager):
         self.program = program
         self.manager = manager
         self.queue = compute_queue
-        self.buffer_manager = buffer_manager
+        self.data_manager = data_manager
+        self.parameter_manager = parameter_manager
         self.mask = None
         self.temperatures = None
-        self.padded_input_dim = self.buffer_manager.buffer_metadata['input_batch']['padded_shape'][1]
-        self.padded_hidden_dim = self.buffer_manager.buffer_metadata['hidden']['padded_shape'][0]
-        self.padded_output_classes = ((OUTPUT_CLASSES + self.buffer_manager.padding_ctx.simd_width - 1) // self.buffer_manager.padding_ctx.simd_width) * self.buffer_manager.padding_ctx.simd_width
-        self.padded_batch_size = self.buffer_manager.buffer_metadata['input_batch']['padded_shape'][0]
+        self.padded_input_dim = self.data_manager.create_data_buffer('input_batch', (BATCH_SIZE, INPUT_DIM), np.float32).spec.padded_shape[1]
+        self.padded_hidden_dim = self.data_manager.create_data_buffer('hidden', (BATCH_SIZE, HIDDEN_DIM), np.float32).spec.padded_shape[0]
+        self.padded_output_classes = ((OUTPUT_CLASSES + self.data_manager.padding_ctx.simd_width - 1) // self.data_manager.padding_ctx.simd_width) * self.data_manager.padding_ctx.simd_width
+        self.padded_batch_size = self.data_manager.create_data_buffer('input_batch', (BATCH_SIZE, INPUT_DIM), np.float32).spec.padded_shape[0]
         self.input_dim = INPUT_DIM
         self.hidden_dim = HIDDEN_DIM
         self.output_classes = OUTPUT_CLASSES
@@ -637,26 +556,22 @@ class KernelWrapper:
         self.temperatures = temps
         return self
 
-    def forward_pass(self, global_sizes, local_sizes, input_mbuf, weights_mbuf, biases_mbuf, hidden_mbuf):
+    def forward_pass(self, global_sizes, local_sizes, input_buf: DataBuffer, weights_buf: ParameterBuffer, biases_buf: ParameterBuffer, hidden_buf: DataBuffer):
         req = KernelExecutionRequest(self.program, 'forward_pass', global_sizes, local_sizes)
         req.set_local_mem_argument(0, local_sizes[0] * FLOAT_SIZE, AccessMode.LOCAL)
-        req.bind_argument(1, self.buffer_manager.buffers[input_mbuf.data])
-        req.bind_argument(2, self.buffer_manager.buffers[input_mbuf.mask])
-        req.bind_argument(3, self.buffer_manager.buffers[weights_mbuf.data])
-        req.bind_argument(4, self.buffer_manager.buffers[weights_mbuf.mask])
-        req.bind_argument(5, self.buffer_manager.buffers[biases_mbuf.data])
-        req.bind_argument(6, self.buffer_manager.buffers[biases_mbuf.mask])
-        req.bind_argument(7, self.buffer_manager.buffers[hidden_mbuf.data])
-        req.bind_argument(8, self.buffer_manager.buffers[hidden_mbuf.mask])
+        req.bind_argument(1, input_buf.cl_buffer)
+        req.bind_argument(2, input_buf.mask_buffer)
+        req.bind_argument(3, weights_buf.cl_buffer)
+        req.bind_argument(4, biases_buf.cl_buffer)
+        req.bind_argument(5, hidden_buf.cl_buffer)
+        req.bind_argument(6, hidden_buf.mask_buffer)
         access_map = {
-            input_mbuf.data: {AccessMode.SHARED_READ},
-            input_mbuf.mask: {AccessMode.SHARED_READ},
-            weights_mbuf.data: {AccessMode.SHARED_READ},
-            weights_mbuf.mask: {AccessMode.SHARED_READ},
-            biases_mbuf.data: {AccessMode.SHARED_READ},
-            biases_mbuf.mask: {AccessMode.SHARED_READ},
-            hidden_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
-            hidden_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            input_buf.spec.name: {AccessMode.SHARED_READ},
+            f"mask_{input_buf.spec.name}": {AccessMode.SHARED_READ},
+            weights_buf.spec.name: {AccessMode.SHARED_READ},
+            biases_buf.spec.name: {AccessMode.SHARED_READ},
+            hidden_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            f"mask_{hidden_buf.spec.name}": {AccessMode.EXCLUSIVE_WRITE_OVER},
         }
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
@@ -666,41 +581,37 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_mbuf, exit_weights_mbuf, exit_biases_mbuf, exit_probs_mbuf, losses_mbuf, targets_mbuf, exit_idx):
+    def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_buf: DataBuffer, exit_weights_buf: ParameterBuffer, exit_biases_buf: ParameterBuffer, exit_probs_buf: DataBuffer, losses_buf: DataBuffer, targets_buf: DataBuffer, exit_idx):
         req = KernelExecutionRequest(self.program, 'compute_exit_probabilities', global_sizes, local_sizes)
-        req.bind_argument(0, self.buffer_manager.buffers[hidden_mbuf.data])
-        req.bind_argument(1, self.buffer_manager.buffers[hidden_mbuf.mask])
-        req.bind_argument(2, self.buffer_manager.buffers[exit_weights_mbuf.data])
-        req.bind_argument(3, self.buffer_manager.buffers[exit_weights_mbuf.mask])
-        req.bind_argument(4, self.buffer_manager.buffers[exit_biases_mbuf.data])
-        req.bind_argument(5, self.buffer_manager.buffers[exit_biases_mbuf.mask])
-        req.bind_argument(6, self.buffer_manager.buffers[exit_probs_mbuf.data])
-        req.bind_argument(7, self.buffer_manager.buffers[exit_probs_mbuf.mask])
-        req.bind_argument(8, self.buffer_manager.buffers[losses_mbuf.data])
-        req.bind_argument(9, self.buffer_manager.buffers[losses_mbuf.mask])
-        req.bind_argument(10, self.buffer_manager.buffers[targets_mbuf.data])
-        req.bind_argument(11, self.buffer_manager.buffers[targets_mbuf.mask])
-        req.bind_argument(12, np.int32(exit_idx))
-        req.bind_argument(13, self.temperatures)
-        req.bind_argument(14, np.int32(self.hidden_dim))
-        req.bind_argument(15, np.int32(self.output_classes))
-        req.bind_argument(16, np.int32(self.padded_hidden_dim))
-        req.bind_argument(17, np.int32(self.padded_output_classes))
-        req.bind_argument(18, np.int32(self.padded_batch_size))
+        req.bind_argument(0, hidden_buf.cl_buffer)
+        req.bind_argument(1, hidden_buf.mask_buffer)
+        req.bind_argument(2, exit_weights_buf.cl_buffer)
+        req.bind_argument(3, exit_biases_buf.cl_buffer)
+        req.bind_argument(4, exit_probs_buf.cl_buffer)
+        req.bind_argument(5, exit_probs_buf.mask_buffer)
+        req.bind_argument(6, losses_buf.cl_buffer)
+        req.bind_argument(7, losses_buf.mask_buffer)
+        req.bind_argument(8, targets_buf.cl_buffer)
+        req.bind_argument(9, targets_buf.mask_buffer)
+        req.bind_argument(10, np.int32(exit_idx))
+        req.bind_argument(11, self.temperatures)
+        req.bind_argument(12, np.int32(self.hidden_dim))
+        req.bind_argument(13, np.int32(self.output_classes))
+        req.bind_argument(14, np.int32(self.padded_hidden_dim))
+        req.bind_argument(15, np.int32(self.padded_output_classes))
+        req.bind_argument(16, np.int32(self.padded_batch_size))
         access_map = {
-            hidden_mbuf.data: {AccessMode.SHARED_READ},
-            hidden_mbuf.mask: {AccessMode.SHARED_READ},
-            exit_weights_mbuf.data: {AccessMode.SHARED_READ},
-            exit_weights_mbuf.mask: {AccessMode.SHARED_READ},
-            exit_biases_mbuf.data: {AccessMode.SHARED_READ},
-            exit_biases_mbuf.mask: {AccessMode.SHARED_READ},
-            targets_mbuf.data: {AccessMode.SHARED_READ},
-            targets_mbuf.mask: {AccessMode.SHARED_READ},
+            hidden_buf.spec.name: {AccessMode.SHARED_READ},
+            f"mask_{hidden_buf.spec.name}": {AccessMode.SHARED_READ},
+            exit_weights_buf.spec.name: {AccessMode.SHARED_READ},
+            exit_biases_buf.spec.name: {AccessMode.SHARED_READ},
+            targets_buf.spec.name: {AccessMode.SHARED_READ},
+            f"mask_{targets_buf.spec.name}": {AccessMode.SHARED_READ},
             'temps': {AccessMode.SHARED_READ},
-            exit_probs_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
-            exit_probs_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER},
-            losses_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
-            losses_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER}
+            exit_probs_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            f"mask_{exit_probs_buf.spec.name}": {AccessMode.EXCLUSIVE_WRITE_OVER},
+            losses_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            f"mask_{losses_buf.spec.name}": {AccessMode.EXCLUSIVE_WRITE_OVER}
         }
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
@@ -710,55 +621,45 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def compute_gradients(self, global_sizes, local_sizes, input_mbuf, hidden_mbuf, exit_probs_mbuf, exit_weights_mbuf, grad_weights_mbuf, grad_biases_mbuf, grad_exit_weights_mbuf, grad_exit_biases_mbuf, targets_mbuf):
+    def compute_gradients(self, global_sizes, local_sizes, input_buf: DataBuffer, hidden_buf: DataBuffer, exit_probs_buf: DataBuffer, exit_weights_buf: ParameterBuffer, grad_weights_buf: ParameterBuffer, grad_biases_buf: ParameterBuffer, grad_exit_weights_buf: ParameterBuffer, grad_exit_biases_buf: ParameterBuffer, targets_buf: DataBuffer):
         req = KernelExecutionRequest(self.program, 'compute_gradients', global_sizes, local_sizes)
-        req.bind_argument(0, self.buffer_manager.buffers[input_mbuf.data])
-        req.bind_argument(1, self.buffer_manager.buffers[input_mbuf.mask])
-        req.bind_argument(2, self.buffer_manager.buffers[hidden_mbuf.data])
-        req.bind_argument(3, self.buffer_manager.buffers[hidden_mbuf.mask])
-        req.bind_argument(4, self.buffer_manager.buffers[exit_probs_mbuf.data])
-        req.bind_argument(5, self.buffer_manager.buffers[exit_probs_mbuf.mask])
-        req.bind_argument(6, self.buffer_manager.buffers[exit_weights_mbuf.data])
-        req.bind_argument(7, self.buffer_manager.buffers[exit_weights_mbuf.mask])
-        req.bind_argument(8, self.buffer_manager.buffers[grad_weights_mbuf.data])
-        req.bind_argument(9, self.buffer_manager.buffers[grad_weights_mbuf.mask])
-        req.bind_argument(10, self.buffer_manager.buffers[grad_biases_mbuf.data])
-        req.bind_argument(11, self.buffer_manager.buffers[grad_biases_mbuf.mask])
-        req.bind_argument(12, self.buffer_manager.buffers[grad_exit_weights_mbuf.data])
-        req.bind_argument(13, self.buffer_manager.buffers[grad_exit_weights_mbuf.mask])
-        req.bind_argument(14, self.buffer_manager.buffers[grad_exit_biases_mbuf.data])
-        req.bind_argument(15, self.buffer_manager.buffers[grad_exit_biases_mbuf.mask])
-        req.bind_argument(16, self.buffer_manager.buffers[targets_mbuf.data])
-        req.bind_argument(17, self.buffer_manager.buffers[targets_mbuf.mask])
-        req.bind_argument(18, self.temperatures)
-        req.bind_argument(19, np.int32(self.input_dim))
-        req.bind_argument(20, np.int32(self.hidden_dim))
-        req.bind_argument(21, np.int32(self.output_classes))
-        req.bind_argument(22, np.int32(self.padded_input_dim))
-        req.bind_argument(23, np.int32(self.padded_hidden_dim))
-        req.bind_argument(24, np.int32(self.padded_output_classes))
-        req.bind_argument(25, np.int32(self.padded_batch_size))
-        req.bind_argument(26, np.int32(self.num_exits))
+        req.bind_argument(0, input_buf.cl_buffer)
+        req.bind_argument(1, input_buf.mask_buffer)
+        req.bind_argument(2, hidden_buf.cl_buffer)
+        req.bind_argument(3, hidden_buf.mask_buffer)
+        req.bind_argument(4, exit_probs_buf.cl_buffer)
+        req.bind_argument(5, exit_probs_buf.mask_buffer)
+        req.bind_argument(6, exit_weights_buf.cl_buffer)
+        req.bind_argument(7, grad_weights_buf.cl_buffer)
+        req.bind_argument(8, grad_biases_buf.cl_buffer)
+        req.bind_argument(9, grad_exit_weights_buf.cl_buffer)
+        req.bind_argument(10, grad_exit_biases_buf.cl_buffer)
+        req.bind_argument(11, targets_buf.cl_buffer)
+        req.bind_argument(12, targets_buf.mask_buffer)
+        req.bind_argument(13, self.temperatures)
+        req.bind_argument(14, np.int32(self.input_dim))
+        req.bind_argument(15, np.int32(self.hidden_dim))
+        req.bind_argument(16, np.int32(self.output_classes))
+        req.bind_argument(17, np.int32(self.padded_input_dim))
+        req.bind_argument(18, np.int32(self.padded_hidden_dim))
+        req.bind_argument(19, np.int32(self.padded_output_classes))
+        req.bind_argument(20, np.int32(self.padded_batch_size))
+        req.bind_argument(21, np.int32(self.num_exits))
         access_map = {
-            input_mbuf.data: {AccessMode.SHARED_READ},
-            input_mbuf.mask: {AccessMode.SHARED_READ},
-            hidden_mbuf.data: {AccessMode.SHARED_READ},
-            hidden_mbuf.mask: {AccessMode.SHARED_READ},
-            exit_probs_mbuf.data: {AccessMode.SHARED_READ},
-            exit_probs_mbuf.mask: {AccessMode.SHARED_READ},
-            exit_weights_mbuf.data: {AccessMode.SHARED_READ},
-            exit_weights_mbuf.mask: {AccessMode.SHARED_READ},
-            targets_mbuf.data: {AccessMode.SHARED_READ},
-            targets_mbuf.mask: {AccessMode.SHARED_READ},
+            input_buf.spec.name: {AccessMode.SHARED_READ},
+            f"mask_{input_buf.spec.name}": {AccessMode.SHARED_READ},
+            hidden_buf.spec.name: {AccessMode.SHARED_READ},
+            f"mask_{hidden_buf.spec.name}": {AccessMode.SHARED_READ},
+            exit_probs_buf.spec.name: {AccessMode.SHARED_READ},
+            f"mask_{exit_probs_buf.spec.name}": {AccessMode.SHARED_READ},
+            exit_weights_buf.spec.name: {AccessMode.SHARED_READ},
+            targets_buf.spec.name: {AccessMode.SHARED_READ},
+            f"mask_{targets_buf.spec.name}": {AccessMode.SHARED_READ},
             'temps': {AccessMode.SHARED_READ},
-            grad_weights_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
-            grad_weights_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER},
-            grad_biases_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
-            grad_biases_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER},
-            grad_exit_weights_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
-            grad_exit_weights_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER},
-            grad_exit_biases_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
-            grad_exit_biases_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER}
+            grad_weights_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            grad_biases_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            grad_exit_weights_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER},
+            grad_exit_biases_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER}
         }
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
@@ -768,27 +669,25 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def compute_temp_gradients(self, global_sizes, local_sizes, exit_probs_mbuf, targets_mbuf, grad_temps_mbuf):
+    def compute_temp_gradients(self, global_sizes, local_sizes, exit_probs_buf: DataBuffer, targets_buf: DataBuffer, grad_temps_buf: ParameterBuffer):
         req = KernelExecutionRequest(self.program, 'compute_temp_gradients', global_sizes, local_sizes)
-        req.bind_argument(0, self.buffer_manager.buffers[exit_probs_mbuf.data])
-        req.bind_argument(1, self.buffer_manager.buffers[exit_probs_mbuf.mask])
-        req.bind_argument(2, self.buffer_manager.buffers[targets_mbuf.data])
-        req.bind_argument(3, self.buffer_manager.buffers[targets_mbuf.mask])
-        req.bind_argument(4, self.buffer_manager.buffers[grad_temps_mbuf.data])
-        req.bind_argument(5, self.buffer_manager.buffers[grad_temps_mbuf.mask])
-        req.bind_argument(6, self.temperatures)
-        req.bind_argument(7, np.int32(self.output_classes))
-        req.bind_argument(8, np.int32(self.padded_output_classes))
-        req.bind_argument(9, np.int32(self.padded_batch_size))
-        req.bind_argument(10, np.int32(self.num_exits))
+        req.bind_argument(0, exit_probs_buf.cl_buffer)
+        req.bind_argument(1, exit_probs_buf.mask_buffer)
+        req.bind_argument(2, targets_buf.cl_buffer)
+        req.bind_argument(3, targets_buf.mask_buffer)
+        req.bind_argument(4, grad_temps_buf.cl_buffer)
+        req.bind_argument(5, self.temperatures)
+        req.bind_argument(6, np.int32(self.output_classes))
+        req.bind_argument(7, np.int32(self.padded_output_classes))
+        req.bind_argument(8, np.int32(self.padded_batch_size))
+        req.bind_argument(9, np.int32(self.num_exits))
         access_map = {
-            exit_probs_mbuf.data: {AccessMode.SHARED_READ},
-            exit_probs_mbuf.mask: {AccessMode.SHARED_READ},
-            targets_mbuf.data: {AccessMode.SHARED_READ},
-            targets_mbuf.mask: {AccessMode.SHARED_READ},
+            exit_probs_buf.spec.name: {AccessMode.SHARED_READ},
+            f"mask_{exit_probs_buf.spec.name}": {AccessMode.SHARED_READ},
+            targets_buf.spec.name: {AccessMode.SHARED_READ},
+            f"mask_{targets_buf.spec.name}": {AccessMode.SHARED_READ},
             'temps': {AccessMode.SHARED_READ},
-            grad_temps_mbuf.data: {AccessMode.EXCLUSIVE_WRITE_OVER},
-            grad_temps_mbuf.mask: {AccessMode.EXCLUSIVE_WRITE_OVER}
+            grad_temps_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER}
         }
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
@@ -798,32 +697,24 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def adam_update(self, global_sizes, local_sizes, grad_mbuf, param_mbuf, m1_mbuf, m2_mbuf, grad_name, param_name, m1_name, m2_name, total_params):
+    def adam_update(self, global_sizes, local_sizes, grad_buf: ParameterBuffer, param_buf: ParameterBuffer, m1_buf: ParameterBuffer, m2_buf: ParameterBuffer, grad_name, param_name, m1_name, m2_name, total_params):
         req = KernelExecutionRequest(self.program, 'adam_update', global_sizes, local_sizes)
-        req.bind_argument(0, self.buffer_manager.buffers[grad_mbuf.data])
-        req.bind_argument(1, self.buffer_manager.buffers[grad_mbuf.mask])
-        req.bind_argument(2, self.buffer_manager.buffers[param_mbuf.data])
-        req.bind_argument(3, self.buffer_manager.buffers[param_mbuf.mask])
-        req.bind_argument(4, self.buffer_manager.buffers[m1_mbuf.data])
-        req.bind_argument(5, self.buffer_manager.buffers[m1_mbuf.mask])
-        req.bind_argument(6, self.buffer_manager.buffers[m2_mbuf.data])
-        req.bind_argument(7, self.buffer_manager.buffers[m2_mbuf.mask])
-        req.bind_argument(8, self.adam_beta1)
-        req.bind_argument(9, self.adam_beta2)
-        req.bind_argument(10, self.beta1_t)
-        req.bind_argument(11, self.beta2_t)
-        req.bind_argument(12, self.learning_rate)
-        req.bind_argument(13, self.epsilon)
-        req.bind_argument(14, np.int32(total_params))
+        req.bind_argument(0, grad_buf.cl_buffer)
+        req.bind_argument(1, param_buf.cl_buffer)
+        req.bind_argument(2, m1_buf.cl_buffer)
+        req.bind_argument(3, m2_buf.cl_buffer)
+        req.bind_argument(4, self.adam_beta1)
+        req.bind_argument(5, self.adam_beta2)
+        req.bind_argument(6, self.beta1_t)
+        req.bind_argument(7, self.beta2_t)
+        req.bind_argument(8, self.learning_rate)
+        req.bind_argument(9, self.epsilon)
+        req.bind_argument(10, np.int32(total_params))
         access_map = {
-            grad_mbuf.data: {AccessMode.SHARED_READ},
-            grad_mbuf.mask: {AccessMode.SHARED_READ},
-            param_mbuf.data: {AccessMode.EXCLUSIVE_UPDATE},
-            param_mbuf.mask: {AccessMode.EXCLUSIVE_UPDATE},
-            m1_mbuf.data: {AccessMode.EXCLUSIVE_UPDATE},
-            m1_mbuf.mask: {AccessMode.EXCLUSIVE_UPDATE},
-            m2_mbuf.data: {AccessMode.EXCLUSIVE_UPDATE},
-            m2_mbuf.mask: {AccessMode.EXCLUSIVE_UPDATE}
+            grad_buf.spec.name: {AccessMode.SHARED_READ},
+            param_buf.spec.name: {AccessMode.EXCLUSIVE_UPDATE},
+            m1_buf.spec.name: {AccessMode.EXCLUSIVE_UPDATE},
+            m2_buf.spec.name: {AccessMode.EXCLUSIVE_UPDATE}
         }
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
@@ -833,16 +724,14 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def clamp_temperatures(self, global_sizes, local_sizes, temps_mbuf):
+    def clamp_temperatures(self, global_sizes, local_sizes, temps_buf: ParameterBuffer):
         req = KernelExecutionRequest(self.program, 'clamp_temperatures', global_sizes, local_sizes)
-        req.bind_argument(0, self.buffer_manager.buffers[temps_mbuf.data])
-        req.bind_argument(1, self.buffer_manager.buffers[temps_mbuf.mask])
-        req.bind_argument(2, self.min_temp)
-        req.bind_argument(3, self.max_temp)
-        req.bind_argument(4, np.int32(self.num_exits))
+        req.bind_argument(0, temps_buf.cl_buffer)
+        req.bind_argument(1, self.min_temp)
+        req.bind_argument(2, self.max_temp)
+        req.bind_argument(3, np.int32(self.num_exits))
         access_map = {
-            temps_mbuf.data: {AccessMode.EXCLUSIVE_UPDATE},
-            temps_mbuf.mask: {AccessMode.EXCLUSIVE_UPDATE}
+            temps_buf.spec.name: {AccessMode.EXCLUSIVE_UPDATE}
         }
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
@@ -871,34 +760,31 @@ device_limits = device
 manager = WorkManager(ctx)
 manager.hardware_queues = {'xfer': transfer_queue, 'compute': compute_queue}
 
-# BufferManager Initialization
-buffer_mgr = BufferManager(ctx, device, manager)
+# Buffer Managers Initialization
+data_mgr = DataBufferManager(ctx, device, manager)
+param_mgr = ParameterBufferManager(ctx, device, manager)
 
 # ParamManager Initialization
-pm = ParamManager(ctx, buffer_mgr)
+pm = ParamManager(ctx, param_mgr)
 pm.register_parameter('weights', (INPUT_DIM, HIDDEN_DIM), 'dense_weight')
 pm.register_parameter('biases', (HIDDEN_DIM,), 'bias_vector')
 pm.register_parameter('exit_weights', (NUM_EXITS, HIDDEN_DIM, OUTPUT_CLASSES), 'exit_weight')
 pm.register_parameter('exit_biases', (NUM_EXITS, OUTPUT_CLASSES), 'bias_vector')
 pm.register_parameter('temps', (NUM_EXITS,), 'temperature', requires_grad=True)
 
-# Additional Buffers
-buffer_mgr.acquire_buffer('input_batch', (BATCH_SIZE, INPUT_DIM), np.float32)
-buffer_mgr.acquire_buffer('hidden', (BATCH_SIZE, HIDDEN_DIM), np.float32)
-buffer_mgr.acquire_buffer('exit_probs', (BATCH_SIZE, NUM_EXITS, OUTPUT_CLASSES), np.float32)
-buffer_mgr.acquire_buffer('losses', (NUM_EXITS * BATCH_SIZE,), np.float32)
-buffer_mgr.acquire_buffer('targets_batch', (BATCH_SIZE,), np.int32)
-buffer_mgr.acquire_buffer('mask_batch', (BATCH_SIZE,), np.float32)
-
+# Create parameter buffers
 pm._create_buffers()
+
+# Create data buffers
+input_buf = data_mgr.create_data_buffer('input_batch', (BATCH_SIZE, INPUT_DIM), np.float32)
+hidden_buf = data_mgr.create_data_buffer('hidden', (BATCH_SIZE, HIDDEN_DIM), np.float32)
+exit_probs_buf = data_mgr.create_data_buffer('exit_probs', (BATCH_SIZE, NUM_EXITS, OUTPUT_CLASSES), np.float32)
+losses_buf = data_mgr.create_data_buffer('losses', (NUM_EXITS * BATCH_SIZE,), np.float32)
+targets_buf = data_mgr.create_data_buffer('targets_batch', (BATCH_SIZE,), np.int32)
+mask_buf = data_mgr.create_data_buffer('mask_batch', (BATCH_SIZE,), np.float32)
 
 # Commit initialization workload
 manager.commit_workload()
-
-# Set buffer references
-pm.set_buffers(manager.logical_resources)
-for name in buffer_mgr.buffer_metadata:
-    buffer_mgr.buffers[name] = manager.logical_resources[name][0]
 
 # Data Preparation
 iris = load_iris()
@@ -916,18 +802,18 @@ for fname in CL_KERNEL_FILES:
     except FileNotFoundError:
         print(f"Warning: Kernel file {fname} not found. Please ensure all kernel files are present.")
         kernel_src.append("")
-simd_width = buffer_mgr.padding_ctx.simd_width
+simd_width = data_mgr.padding_ctx.simd_width
 build_opts = [
     f"-D VECTOR_TYPE={'float' + str(simd_width) if simd_width > 1 else 'float'}",
     f"-D SIMD_WIDTH={simd_width}",
-    f"-D LOSS_STRIDE={buffer_mgr.buffer_metadata['losses']['padded_shape'][0] // NUM_EXITS}",
+    f"-D LOSS_STRIDE={losses_buf.spec.padded_shape[0] // NUM_EXITS}",
     f"-D USE_FAST_MATH=1"
 ]
 program = cl.Program(ctx, "\n".join(kernel_src)).build(options=" ".join(build_opts))
 
 # Training Loop
 global_step = 1
-batch_padder = BatchPadder(buffer_mgr.padding_ctx)
+batch_padder = BatchPadder(data_mgr.padding_ctx)
 for epoch in range(EPOCHS):
     shuffled_indices = np.random.permutation(len(X))
     num_batches = (len(X) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -944,53 +830,71 @@ for epoch in range(EPOCHS):
         X_padded, y_padded, mask = batch_padder.pad_batch(X_batch, y_batch)
 
         # Transfer nodes for input data
-        input_mbuf = buffer_mgr.masked_buffers['input_batch']
-        targets_mbuf = buffer_mgr.masked_buffers['targets_batch']
-        mask_mbuf = buffer_mgr.masked_buffers['mask_batch']
-        input_transfer_data, input_transfer_mask = buffer_mgr.staged_transfer({'data': X_padded, 'mask': mask}, input_mbuf)
-        targets_transfer_data, targets_transfer_mask = buffer_mgr.staged_transfer({'data': y_padded, 'mask': mask}, targets_mbuf)
-        mask_transfer_data, mask_transfer_mask = buffer_mgr.staged_transfer({'data': mask, 'mask': np.ones_like(mask)}, mask_mbuf)
+        def transfer_input_data(queue, wait_for):
+            return cl.enqueue_copy(queue, input_buf.cl_buffer, X_padded, wait_for=wait_for)
+        def transfer_input_mask(queue, wait_for):
+            return cl.enqueue_copy(queue, input_buf.mask_buffer, mask, wait_for=wait_for)
+        def transfer_targets_data(queue, wait_for):
+            return cl.enqueue_copy(queue, targets_buf.cl_buffer, y_padded, wait_for=wait_for)
+        def transfer_targets_mask(queue, wait_for):
+            return cl.enqueue_copy(queue, targets_buf.mask_buffer, mask, wait_for=wait_for)
+        input_transfer_data = manager.create_node(
+            NodeType.TRANSFER, 'xfer',
+            {input_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER}},
+            transfer_input_data, {}
+        )
+        input_transfer_mask = manager.create_node(
+            NodeType.TRANSFER, 'xfer',
+            {f"mask_{input_buf.spec.name}": {AccessMode.EXCLUSIVE_WRITE_OVER}},
+            transfer_input_mask, {}
+        )
+        targets_transfer_data = manager.create_node(
+            NodeType.TRANSFER, 'xfer',
+            {targets_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER}},
+            transfer_targets_data, {}
+        )
+        targets_transfer_mask = manager.create_node(
+            NodeType.TRANSFER, 'xfer',
+            {f"mask_{targets_buf.spec.name}": {AccessMode.EXCLUSIVE_WRITE_OVER}},
+            transfer_targets_mask, {}
+        )
 
-        kernel_wrapper = KernelWrapper(program, manager, global_step, compute_queue, buffer_mgr)
-        kernel_wrapper.set_mask(buffer_mgr.buffers[mask_mbuf.data]).set_temps(buffer_mgr.buffers[buffer_mgr.masked_buffers['temps'].data])
+        kernel_wrapper = KernelWrapper(program, manager, global_step, compute_queue, data_mgr, param_mgr)
+        kernel_wrapper.set_mask(mask_buf.cl_buffer).set_temps(pm.buffers['temps'])
         pm.zero_gradients(manager)
 
-        # Forward pass node with dependencies
-        global_forward = (buffer_mgr.buffer_metadata['input_batch']['padded_shape'][0], HIDDEN_DIM)
+        # Forward pass
+        global_forward = (input_buf.spec.padded_shape[0], HIDDEN_DIM)
         local_forward = optimal_local_sizes(global_forward, device_limits)
         forward_node = kernel_wrapper.forward_pass(
             global_forward, local_forward,
-            input_mbuf, buffer_mgr.masked_buffers['weights'],
-            buffer_mgr.masked_buffers['biases'], buffer_mgr.masked_buffers['hidden']
+            input_buf, pm.buffers['weights'], pm.buffers['biases'], hidden_buf
         )
         manager.execution_graph.add_edge(input_transfer_data, forward_node)
         manager.execution_graph.add_edge(input_transfer_mask, forward_node)
-        manager.execution_graph.add_edge(mask_transfer_data, forward_node)
-        manager.execution_graph.add_edge(mask_transfer_mask, forward_node)
 
+        # Compute exit probabilities
         for exit_idx in range(NUM_EXITS):
-            global_exit = (buffer_mgr.buffer_metadata['input_batch']['padded_shape'][0],)
+            global_exit = (input_buf.spec.padded_shape[0],)
             local_exit = optimal_local_sizes(global_exit, device_limits)
             exit_node = kernel_wrapper.compute_exit_probabilities(
                 global_exit, local_exit,
-                buffer_mgr.masked_buffers['hidden'], buffer_mgr.masked_buffers['exit_weights'],
-                buffer_mgr.masked_buffers['exit_biases'], buffer_mgr.masked_buffers['exit_probs'],
-                buffer_mgr.masked_buffers['losses'], buffer_mgr.masked_buffers['targets_batch'],
-                exit_idx
+                hidden_buf, pm.buffers['exit_weights'], pm.buffers['exit_biases'],
+                exit_probs_buf, losses_buf, targets_buf, exit_idx
             )
             manager.execution_graph.add_edge(forward_node, exit_node)
             manager.execution_graph.add_edge(targets_transfer_data, exit_node)
             manager.execution_graph.add_edge(targets_transfer_mask, exit_node)
 
+        # Compute gradients
         global_grad = (INPUT_DIM, HIDDEN_DIM)
         local_grad = optimal_local_sizes(global_grad, device_limits)
         grad_node = kernel_wrapper.compute_gradients(
             global_grad, local_grad,
-            input_mbuf, buffer_mgr.masked_buffers['hidden'],
-            buffer_mgr.masked_buffers['exit_probs'], buffer_mgr.masked_buffers['exit_weights'],
-            buffer_mgr.masked_buffers['grad_weights'], buffer_mgr.masked_buffers['grad_biases'],
-            buffer_mgr.masked_buffers['grad_exit_weights'], buffer_mgr.masked_buffers['grad_exit_biases'],
-            targets_mbuf
+            input_buf, hidden_buf, exit_probs_buf, pm.buffers['exit_weights'],
+            pm.buffers['grad_weights'], pm.buffers['grad_biases'],
+            pm.buffers['grad_exit_weights'], pm.buffers['grad_exit_biases'],
+            targets_buf
         )
         manager.execution_graph.add_edge(input_transfer_data, grad_node)
         manager.execution_graph.add_edge(input_transfer_mask, grad_node)
@@ -998,58 +902,71 @@ for epoch in range(EPOCHS):
         manager.execution_graph.add_edge(targets_transfer_data, grad_node)
         manager.execution_graph.add_edge(targets_transfer_mask, grad_node)
 
+        # Compute temperature gradients
         global_temp_grad = (NUM_EXITS,)
         local_temp_grad = optimal_local_sizes(global_temp_grad, device_limits)
         temp_grad_node = kernel_wrapper.compute_temp_gradients(
             global_temp_grad, local_temp_grad,
-            buffer_mgr.masked_buffers['exit_probs'], targets_mbuf,
-            buffer_mgr.masked_buffers['grad_temps']
+            exit_probs_buf, targets_buf, pm.buffers['grad_temps']
         )
         manager.execution_graph.add_edge(targets_transfer_data, temp_grad_node)
         manager.execution_graph.add_edge(targets_transfer_mask, temp_grad_node)
 
+        # ADAM update
         for param in ['weights', 'biases', 'exit_weights', 'exit_biases', 'temps']:
             if param in pm.params and pm.params[param]['requires_grad']:
-                grad_mbuf = pm.params[param]['grad_mbuf']
-                param_mbuf = buffer_mgr.masked_buffers[param]
-                m1_mbuf = pm.params[param]['m1_mbuf']
-                m2_mbuf = pm.params[param]['m2_mbuf']
-                grad_name = f'grad_{param}'
-                param_name = param
-                m1_name = f'm1_{param}'
-                m2_name = f'm2_{param}'
-                total_params = int(np.prod(buffer_mgr.buffer_metadata[param]['padded_shape']))
+                grad_buf = pm.buffers[f'grad_{param}']
+                param_buf = pm.buffers[param]
+                m1_buf = pm.buffers[f'm1_{param}']
+                m2_buf = pm.buffers[f'm2_{param}']
+                total_params = int(np.prod(param_buf.spec.padded_shape))
                 global_adam = (total_params,)
                 local_adam = optimal_local_sizes(global_adam, device_limits)
                 adam_node = kernel_wrapper.adam_update(
                     global_adam, local_adam,
-                    grad_mbuf, param_mbuf, m1_mbuf, m2_mbuf,
-                    grad_name, param_name, m1_name, m2_name, total_params
+                    grad_buf, param_buf, m1_buf, m2_buf,
+                    f'grad_{param}', param, f'm1_{param}', f'm2_{param}', total_params
                 )
                 manager.execution_graph.add_edge(grad_node if param != 'temps' else temp_grad_node, adam_node)
                 if param == 'temps':
                     global_clamp = (NUM_EXITS,)
                     local_clamp = optimal_local_sizes(global_clamp, device_limits)
-                    clamp_node = kernel_wrapper.clamp_temperatures(global_clamp, local_clamp, param_mbuf)
+                    clamp_node = kernel_wrapper.clamp_temperatures(global_clamp, local_clamp, param_buf)
                     manager.execution_graph.add_edge(adam_node, clamp_node)
 
-        # Device-to-host transfers for results
-        losses_mbuf = buffer_mgr.masked_buffers['losses']
-        exit_probs_mbuf = buffer_mgr.masked_buffers['exit_probs']
-        temps_mbuf = buffer_mgr.masked_buffers['temps']
-        losses_transfer_data, losses_host, losses_transfer_mask, losses_mask_host = buffer_mgr.staged_transfer(None, losses_mbuf, is_device_to_host=True)
-        exit_probs_transfer_data, exit_probs_host, exit_probs_transfer_mask, exit_probs_mask_host = buffer_mgr.staged_transfer(None, exit_probs_mbuf, is_device_to_host=True)
-        temps_transfer_data, temps_host, temps_transfer_mask, temps_mask_host = buffer_mgr.staged_transfer(None, temps_mbuf, is_device_to_host=True)
+        # Device-to-host transfers
+        losses_host = np.empty(losses_buf.spec.padded_shape, dtype=np.float32)
+        exit_probs_host = np.empty(exit_probs_buf.spec.padded_shape, dtype=np.float32)
+        temps_host = np.empty(pm.buffers['temps'].spec.padded_shape, dtype=np.float32)
+        def transfer_losses(queue, wait_for):
+            return cl.enqueue_copy(queue, losses_host, losses_buf.cl_buffer, wait_for=wait_for)
+        def transfer_exit_probs(queue, wait_for):
+            return cl.enqueue_copy(queue, exit_probs_host, exit_probs_buf.cl_buffer, wait_for=wait_for)
+        def transfer_temps(queue, wait_for):
+            return cl.enqueue_copy(queue, temps_host, pm.buffers['temps'].cl_buffer, wait_for=wait_for)
+        losses_transfer = manager.create_node(
+            NodeType.TRANSFER, 'xfer',
+            {losses_buf.spec.name: {AccessMode.SHARED_READ}},
+            transfer_losses, {}
+        )
+        exit_probs_transfer = manager.create_node(
+            NodeType.TRANSFER, 'xfer',
+            {exit_probs_buf.spec.name: {AccessMode.SHARED_READ}},
+            transfer_exit_probs, {}
+        )
+        temps_transfer = manager.create_node(
+            NodeType.TRANSFER, 'xfer',
+            {'temps': {AccessMode.SHARED_READ}},
+            transfer_temps, {}
+        )
 
-        # Create SYNC node for HOST_SIGNAL
-        sync_uid = manager.create_sync_node(SyncType.HOST_SIGNAL, dependencies=[losses_transfer_data, exit_probs_transfer_data, temps_transfer_data])
+        # Sync node
+        sync_uid = manager.create_sync_node(SyncType.HOST_SIGNAL, dependencies=[losses_transfer, exit_probs_transfer, temps_transfer])
         manager.commit_workload()
-
-        # Wait for sync
         manager.wait_for_sync(sync_uid)
 
-        # Access results with masking
-        padded_batch_size = buffer_mgr.buffer_metadata['losses']['padded_shape'][0] // NUM_EXITS
+        # Process results
+        padded_batch_size = losses_buf.spec.padded_shape[0] // NUM_EXITS
         losses_reshaped = losses_host.reshape(NUM_EXITS, padded_batch_size)
         exit_losses = []
         for exit_idx in range(NUM_EXITS):
@@ -1062,7 +979,6 @@ for epoch in range(EPOCHS):
             else:
                 exit_losses.append(0.0)
         print(f"Batch {batch_idx}: Per-exit Losses: {exit_losses}")
-        buffer_mgr.validate_memory()
         valid_mask = mask > 0
         valid_probs = exit_probs_host[valid_mask, :, :OUTPUT_CLASSES]
         confidences = np.array([valid_probs[:, i, :].max(axis=1) ** (1 / (temps_host[i] + 1e-8)) for i in range(NUM_EXITS)])
@@ -1079,11 +995,6 @@ for epoch in range(EPOCHS):
     train_acc = correct_predictions / len(X)
     print(f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | Acc: {train_acc:.1%}")
     print(f"Temperatures: {temps_host}")
-
-# Cleanup
-for name in list(buffer_mgr.masked_buffers.keys()):
-    buffer_mgr.release_buffer(name)
-manager.commit_workload()
 
 if __name__ == "__main__":
     pass
