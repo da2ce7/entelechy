@@ -637,7 +637,7 @@ class KernelWrapper:
         self.temperatures = temps
         return self
 
-    def forward_pass(self, global_sizes, local_sizes, input_mbuf, weights_mbuf, biases_mbuf, hidden_mbuf, actual_batch_size):
+    def forward_pass(self, global_sizes, local_sizes, input_mbuf, weights_mbuf, biases_mbuf, hidden_mbuf):
         req = KernelExecutionRequest(self.program, 'forward_pass', global_sizes, local_sizes)
         req.set_local_mem_argument(0, local_sizes[0] * FLOAT_SIZE, AccessMode.LOCAL)
         req.bind_argument(1, self.buffer_manager.buffers[input_mbuf.data])
@@ -648,7 +648,6 @@ class KernelWrapper:
         req.bind_argument(6, self.buffer_manager.buffers[biases_mbuf.mask])
         req.bind_argument(7, self.buffer_manager.buffers[hidden_mbuf.data])
         req.bind_argument(8, self.buffer_manager.buffers[hidden_mbuf.mask])
-        req.bind_argument(9, np.int32(actual_batch_size))
         access_map = {
             input_mbuf.data: {AccessMode.SHARED_READ},
             input_mbuf.mask: {AccessMode.SHARED_READ},
@@ -667,7 +666,7 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_mbuf, exit_weights_mbuf, exit_biases_mbuf, exit_probs_mbuf, losses_mbuf, targets_mbuf, exit_idx, actual_batch_size):
+    def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_mbuf, exit_weights_mbuf, exit_biases_mbuf, exit_probs_mbuf, losses_mbuf, targets_mbuf, exit_idx):
         req = KernelExecutionRequest(self.program, 'compute_exit_probabilities', global_sizes, local_sizes)
         req.bind_argument(0, self.buffer_manager.buffers[hidden_mbuf.data])
         req.bind_argument(1, self.buffer_manager.buffers[hidden_mbuf.mask])
@@ -688,7 +687,6 @@ class KernelWrapper:
         req.bind_argument(16, np.int32(self.padded_hidden_dim))
         req.bind_argument(17, np.int32(self.padded_output_classes))
         req.bind_argument(18, np.int32(self.padded_batch_size))
-        req.bind_argument(19, np.int32(actual_batch_size))
         access_map = {
             hidden_mbuf.data: {AccessMode.SHARED_READ},
             hidden_mbuf.mask: {AccessMode.SHARED_READ},
@@ -712,7 +710,7 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def compute_gradients(self, global_sizes, local_sizes, input_mbuf, hidden_mbuf, exit_probs_mbuf, exit_weights_mbuf, grad_weights_mbuf, grad_biases_mbuf, grad_exit_weights_mbuf, grad_exit_biases_mbuf, targets_mbuf, actual_batch_size):
+    def compute_gradients(self, global_sizes, local_sizes, input_mbuf, hidden_mbuf, exit_probs_mbuf, exit_weights_mbuf, grad_weights_mbuf, grad_biases_mbuf, grad_exit_weights_mbuf, grad_exit_biases_mbuf, targets_mbuf):
         req = KernelExecutionRequest(self.program, 'compute_gradients', global_sizes, local_sizes)
         req.bind_argument(0, self.buffer_manager.buffers[input_mbuf.data])
         req.bind_argument(1, self.buffer_manager.buffers[input_mbuf.mask])
@@ -740,8 +738,7 @@ class KernelWrapper:
         req.bind_argument(23, np.int32(self.padded_hidden_dim))
         req.bind_argument(24, np.int32(self.padded_output_classes))
         req.bind_argument(25, np.int32(self.padded_batch_size))
-        req.bind_argument(26, np.int32(actual_batch_size))
-        req.bind_argument(27, np.int32(self.num_exits))
+        req.bind_argument(26, np.int32(self.num_exits))
         access_map = {
             input_mbuf.data: {AccessMode.SHARED_READ},
             input_mbuf.mask: {AccessMode.SHARED_READ},
@@ -771,7 +768,7 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def compute_temp_gradients(self, global_sizes, local_sizes, exit_probs_mbuf, targets_mbuf, grad_temps_mbuf, actual_batch_size):
+    def compute_temp_gradients(self, global_sizes, local_sizes, exit_probs_mbuf, targets_mbuf, grad_temps_mbuf):
         req = KernelExecutionRequest(self.program, 'compute_temp_gradients', global_sizes, local_sizes)
         req.bind_argument(0, self.buffer_manager.buffers[exit_probs_mbuf.data])
         req.bind_argument(1, self.buffer_manager.buffers[exit_probs_mbuf.mask])
@@ -783,8 +780,7 @@ class KernelWrapper:
         req.bind_argument(7, np.int32(self.output_classes))
         req.bind_argument(8, np.int32(self.padded_output_classes))
         req.bind_argument(9, np.int32(self.padded_batch_size))
-        req.bind_argument(10, np.int32(actual_batch_size))
-        req.bind_argument(11, np.int32(self.num_exits))
+        req.bind_argument(10, np.int32(self.num_exits))
         access_map = {
             exit_probs_mbuf.data: {AccessMode.SHARED_READ},
             exit_probs_mbuf.mask: {AccessMode.SHARED_READ},
@@ -965,7 +961,7 @@ for epoch in range(EPOCHS):
         forward_node = kernel_wrapper.forward_pass(
             global_forward, local_forward,
             input_mbuf, buffer_mgr.masked_buffers['weights'],
-            buffer_mgr.masked_buffers['biases'], buffer_mgr.masked_buffers['hidden'], actual_batch_size
+            buffer_mgr.masked_buffers['biases'], buffer_mgr.masked_buffers['hidden']
         )
         manager.execution_graph.add_edge(input_transfer_data, forward_node)
         manager.execution_graph.add_edge(input_transfer_mask, forward_node)
@@ -980,7 +976,7 @@ for epoch in range(EPOCHS):
                 buffer_mgr.masked_buffers['hidden'], buffer_mgr.masked_buffers['exit_weights'],
                 buffer_mgr.masked_buffers['exit_biases'], buffer_mgr.masked_buffers['exit_probs'],
                 buffer_mgr.masked_buffers['losses'], buffer_mgr.masked_buffers['targets_batch'],
-                exit_idx, actual_batch_size
+                exit_idx
             )
             manager.execution_graph.add_edge(forward_node, exit_node)
             manager.execution_graph.add_edge(targets_transfer_data, exit_node)
@@ -994,7 +990,7 @@ for epoch in range(EPOCHS):
             buffer_mgr.masked_buffers['exit_probs'], buffer_mgr.masked_buffers['exit_weights'],
             buffer_mgr.masked_buffers['grad_weights'], buffer_mgr.masked_buffers['grad_biases'],
             buffer_mgr.masked_buffers['grad_exit_weights'], buffer_mgr.masked_buffers['grad_exit_biases'],
-            targets_mbuf, actual_batch_size
+            targets_mbuf
         )
         manager.execution_graph.add_edge(input_transfer_data, grad_node)
         manager.execution_graph.add_edge(input_transfer_mask, grad_node)
@@ -1007,7 +1003,7 @@ for epoch in range(EPOCHS):
         temp_grad_node = kernel_wrapper.compute_temp_gradients(
             global_temp_grad, local_temp_grad,
             buffer_mgr.masked_buffers['exit_probs'], targets_mbuf,
-            buffer_mgr.masked_buffers['grad_temps'], actual_batch_size
+            buffer_mgr.masked_buffers['grad_temps']
         )
         manager.execution_graph.add_edge(targets_transfer_data, temp_grad_node)
         manager.execution_graph.add_edge(targets_transfer_mask, temp_grad_node)
@@ -1053,16 +1049,22 @@ for epoch in range(EPOCHS):
         manager.wait_for_sync(sync_uid)
 
         # Access results with masking
+        padded_batch_size = buffer_mgr.buffer_metadata['losses']['padded_shape'][0] // NUM_EXITS
+        losses_reshaped = losses_host.reshape(NUM_EXITS, padded_batch_size)
         exit_losses = []
         for exit_idx in range(NUM_EXITS):
-            start = exit_idx * (buffer_mgr.buffer_metadata['losses']['padded_shape'][0] // NUM_EXITS)
-            end = min(start + actual_batch_size, len(losses_host))
-            if end > start:
-                exit_loss = losses_host[start:end].mean()
+            masked_losses = losses_reshaped[exit_idx] * mask
+            total_loss = np.sum(masked_losses)
+            num_valid = np.sum(mask)
+            if num_valid > 0:
+                exit_loss = total_loss / num_valid
                 exit_losses.append(float(exit_loss))
+            else:
+                exit_losses.append(0.0)
         print(f"Batch {batch_idx}: Per-exit Losses: {exit_losses}")
         buffer_mgr.validate_memory()
-        valid_probs = exit_probs_host[:actual_batch_size].reshape(actual_batch_size, NUM_EXITS, OUTPUT_CLASSES)
+        valid_mask = mask > 0
+        valid_probs = exit_probs_host[valid_mask, :, :OUTPUT_CLASSES]
         confidences = np.array([valid_probs[:, i, :].max(axis=1) ** (1 / (temps_host[i] + 1e-8)) for i in range(NUM_EXITS)])
         weights = np.exp(confidences) / np.sum(np.exp(confidences), axis=0)
         ensemble_probs = np.einsum('ijk,j->ik', valid_probs, weights)
