@@ -9,48 +9,57 @@ import re
 from collections import deque, defaultdict
 from enum import Enum, auto
 from dataclasses import dataclass
+from typing import Tuple, List, Set, Dict, Callable, Optional, Union
 
 # Define data type sizes
-FLOAT_SIZE = np.float32().itemsize
-INT_SIZE = np.int32().itemsize
+FLOAT_SIZE: int = np.float32().itemsize
+INT_SIZE: int = np.int32().itemsize
 
 # Network Configuration
-INPUT_DIM = 4
-HIDDEN_DIM = 65
-OUTPUT_CLASSES = 3
-NUM_EXITS = 40
-EPOCHS = 100
-BATCH_SIZE = 130
-ADAM_BETA1 = 0.9
-ADAM_BETA2 = 0.999
-LEARNING_RATE = 0.001
-MIN_TEMP = 1.0e-3
-MAX_TEMP = 10.0
-EPSILON = 1.0e-8
+INPUT_DIM: int = 4
+HIDDEN_DIM: int = 65
+OUTPUT_CLASSES: int = 3
+NUM_EXITS: int = 40
+EPOCHS: int = 100
+BATCH_SIZE: int = 130
+ADAM_BETA1: float = 0.9
+ADAM_BETA2: float = 0.999
+LEARNING_RATE: float = 0.001
+MIN_TEMP: float = 1.0e-3
+MAX_TEMP: float = 10.0
+EPSILON: float = 1.0e-8
 
-# OpenCL kernel files (assumed to exist and updated to use masks)
-CL_KERNEL_FILES = [
-    'kernel_forward_pass.cl',
-    'kernel_backpropagation.cl',
-    'kernel_adam_update.cl',
-    'kernel_multi_exit.cl'
+# OpenCL kernel files (assumed to exist)
+CL_HEADER_FILES: List[str] = [
+    'kernels.cl.h',       # Common macros/defs
+    'math_utils.cl.h'     # Math functions
 ]
 
-def lcm(a, b):
+CL_KERNEL_FILES: List[str] = [
+    'network_operations.cl.c',    # Forward + exits
+    'autograd.cl.c',              # Gradients
+    'parameter_optim.cl.c'        # Adam + constraints
+]
+
+def lcm(a: int, b: int) -> int:
+    """Calculate the least common multiple of two integers."""
     return a * b // gcd(a, b)
 
-def next_pow2(n):
+def next_pow2(n: int) -> int:
+    """Find the next power of 2 greater than or equal to n."""
     return 1 if n == 0 else 1 << (n - 1).bit_length()
 
-def divisors(n):
-    divs = set()
+def divisors(n: int) -> List[int]:
+    """Return a sorted list of divisors of n in descending order."""
+    divs: Set[int] = set()
     for i in range(1, int(math.sqrt(n)) + 1):
         if n % i == 0:
             divs.add(i)
-            divs.add(n//i)
+            divs.add(n // i)
     return sorted(divs, reverse=True)
 
-def he_init(shape):
+def he_init(shape: Tuple[int, ...]) -> np.ndarray:
+    """Initialize weights using He initialization for neural networks."""
     if len(shape) == 2:
         fan_in = shape[0]
     elif len(shape) == 3:
@@ -60,7 +69,8 @@ def he_init(shape):
     scale = np.sqrt(2.0 / fan_in)
     return np.random.normal(0, scale, shape).astype(np.float32)
 
-def select_simd_width(device):
+def select_simd_width(device: cl.Device) -> int:
+    """Determine the SIMD width based on the device vendor and properties."""
     if 'Intel' in device.vendor and 'cl_intel_subgroups' in device.extensions:
         return 16
     elif 'AMD' in device.vendor:
@@ -72,7 +82,8 @@ def select_simd_width(device):
         return 4
     return 1
 
-def optimal_local_sizes(global_sizes, device):
+def optimal_local_sizes(global_sizes: Tuple[int, ...], device: cl.Device) -> Tuple[int, ...]:
+    """Calculate optimal local work group sizes for OpenCL kernels."""
     max_work_group_size = device.max_work_group_size
     max_work_item_sizes = device.max_work_item_sizes
     local_sizes = []
@@ -86,13 +97,15 @@ def optimal_local_sizes(global_sizes, device):
 
 @dataclass
 class PaddingContext:
+    """Context for padding tensors based on device properties."""
     simd_width: int
     min_alignment: int
     device: cl.Device
     padding_mode: str = 'simd_aware'
 
     @classmethod
-    def from_device(cls, device):
+    def from_device(cls, device: cl.Device) -> 'PaddingContext':
+        """Create a PaddingContext instance from a device."""
         return cls(
             simd_width=select_simd_width(device),
             min_alignment=max(device.min_data_type_align_size, 16),
@@ -100,26 +113,31 @@ class PaddingContext:
         )
 
 class PaddingStrategy:
-    _strategies = {}
+    """Manages different padding strategies for tensors."""
+    _strategies: Dict[str, Callable] = {}
 
     @classmethod
-    def register(cls, name):
-        def decorator(func):
+    def register(cls, name: str) -> Callable:
+        """Register a padding strategy function."""
+        def decorator(func: Callable) -> Callable:
             cls._strategies[name] = func
             return func
         return decorator
 
     @classmethod
-    def apply(cls, context, shape, dtype=np.float32):
+    def apply(cls, context: PaddingContext, shape: Tuple[int, ...], dtype: np.dtype = np.float32) -> Tuple[int, ...]:
+        """Apply the specified padding strategy."""
         return cls._strategies[context.padding_mode](context, shape, dtype)
 
 @PaddingStrategy.register('simd_aware')
-def _simd_strategy(ctx, shape, dtype):
+def _simd_strategy(ctx: PaddingContext, shape: Tuple[int, ...], dtype: np.dtype) -> Tuple[int, ...]:
+    """SIMD-aware padding strategy."""
     item_size = np.dtype(dtype).itemsize
     alignment = lcm(ctx.min_alignment, ctx.simd_width * item_size)
     return tuple((dim + alignment - 1) // alignment * alignment for dim in shape)
 
-def pad_tensor(data, context: PaddingContext, strategy='simd_aware'):
+def pad_tensor(data: np.ndarray, context: PaddingContext, strategy: str = 'simd_aware') -> np.ndarray:
+    """Pad a tensor according to the specified strategy."""
     orig_shape = data.shape
     padded_shape = PaddingStrategy.apply(context, orig_shape, data.dtype)
     padded = np.zeros(padded_shape, dtype=data.dtype)
@@ -128,13 +146,20 @@ def pad_tensor(data, context: PaddingContext, strategy='simd_aware'):
     return padded
 
 class BatchPadder:
-    def __init__(self, context):
-        self.ctx = context
+    """Handles padding for batches of data."""
+    def __init__(self, input_buffer_spec: 'BufferSpec', target_buffer_spec: 'BufferSpec'):
+        self.input_spec = input_buffer_spec
+        self.target_spec = target_buffer_spec
 
-    def pad_batch(self, X, y):
-        X_padded = pad_tensor(X, self.ctx)
-        y_padded = pad_tensor(y, self.ctx, strategy='simd_aware')
-        mask = pad_tensor(np.ones(len(X), dtype=np.float32), self.ctx)
+    def pad_batch(self, X: np.ndarray, y_true: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Pad input and target tensors to fixed buffer sizes."""
+        batch_size = X.shape[0]
+        X_padded = np.zeros(self.input_spec.padded_shape, dtype=np.float32)
+        X_padded[:batch_size] = X
+        y_padded = np.zeros(self.target_spec.padded_shape, dtype=np.int32)
+        y_padded[:batch_size] = y_true
+        mask = np.zeros(self.input_spec.padded_shape[0], dtype=np.float32)
+        mask[:batch_size] = 1.0
         return X_padded, y_padded, mask
 
 class TransferDirection(Enum):
@@ -162,44 +187,50 @@ class AccessMode(Enum):
     EXCLUSIVE_ZERO = 4
     EXCLUSIVE_UPDATE = 5
 
-ACCESS_WRITE_MODES = {AccessMode.EXCLUSIVE_WRITE_OVER, AccessMode.EXCLUSIVE_ZERO, AccessMode.EXCLUSIVE_UPDATE}
+ACCESS_WRITE_MODES: Set[AccessMode] = {AccessMode.EXCLUSIVE_WRITE_OVER, AccessMode.EXCLUSIVE_ZERO, AccessMode.EXCLUSIVE_UPDATE}
 
 class BufferType(Enum):
-    DATA = auto()      # Buffers needing per-element masking (e.g., input, hidden, output)
-    PARAMETER = auto() # Buffers needing alignment padding only (e.g., weights, biases)
-    MASK = auto()      # Special case for mask buffers
+    DATA = auto()
+    PARAMETER = auto()
+    MASK = auto()
 
 @dataclass
 class BufferSpec:
+    """Specification for an OpenCL buffer."""
     name: str
-    real_shape: tuple
+    real_shape: Tuple[int, ...]
     dtype: np.dtype
     type: BufferType
-    padded_shape: tuple = None
-    simd_alignment: int = None
+    padded_shape: Optional[Tuple[int, ...]] = None
+    simd_alignment: Optional[int] = None
 
 class Buffer:
+    """Base class for OpenCL buffers."""
     def __init__(self, spec: BufferSpec, cl_buffer: cl.Buffer):
         self.spec = spec
         self.cl_buffer = cl_buffer
 
 class DataBuffer(Buffer):
+    """Buffer for data with masking."""
     def __init__(self, spec: BufferSpec, cl_buffer: cl.Buffer, mask_buffer: cl.Buffer):
         super().__init__(spec, cl_buffer)
         self.mask_buffer = mask_buffer
 
 class ParameterBuffer(Buffer):
+    """Buffer for parameters."""
     def __init__(self, spec: BufferSpec, cl_buffer: cl.Buffer):
         super().__init__(spec, cl_buffer)
 
 class DataBufferManager:
-    def __init__(self, context, device, work_manager):
+    """Manages data buffers with masking."""
+    def __init__(self, context: cl.Context, device: cl.Device, work_manager: 'WorkManager'):
         self.context = context
         self.device = device
         self.work_manager = work_manager
         self.padding_ctx = PaddingContext.from_device(device)
 
-    def create_data_buffer(self, name, real_shape, dtype):
+    def create_data_buffer(self, name: str, real_shape: Tuple[int, ...], dtype: np.dtype) -> DataBuffer:
+        """Create a data buffer with associated mask buffer."""
         spec = BufferSpec(name, real_shape, dtype, BufferType.DATA)
         padded_shape = self._pad_data_shape(real_shape)
         spec.padded_shape = padded_shape
@@ -213,75 +244,83 @@ class DataBufferManager:
         
         return DataBuffer(spec, data_buffer, mask_buffer)
 
-    def _pad_data_shape(self, shape):
-        # Pad batch dimension to next power of 2
+    def _pad_data_shape(self, shape: Tuple[int, ...]) -> Tuple[int, ...]:
+        """Pad the batch dimension to the next power of 2."""
         batch_size = shape[0]
         padded_batch_size = next_pow2(batch_size)
         return (padded_batch_size, *shape[1:])
 
-    def _allocate_buffer(self, name, shape, dtype):
+    def _allocate_buffer(self, name: str, shape: Tuple[int, ...], dtype: np.dtype) -> cl.Buffer:
+        """Allocate an OpenCL buffer."""
         size = np.prod(shape) * dtype().itemsize
         buffer = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=size)
         self.work_manager.logical_resources[name] = (buffer, 0)
         return buffer
 
 class ParameterBufferManager:
-    def __init__(self, context, device, work_manager):
+    """Manages parameter buffers."""
+    def __init__(self, context: cl.Context, device: cl.Device, work_manager: 'WorkManager'):
         self.context = context
         self.device = device
         self.work_manager = work_manager
         self.padding_ctx = PaddingContext.from_device(device)
 
-    def create_parameter(self, name, real_shape, dtype):
+    def create_parameter(self, name: str, real_shape: Tuple[int, ...], dtype: np.dtype) -> ParameterBuffer:
+        """Create a parameter buffer."""
         spec = BufferSpec(name, real_shape, dtype, BufferType.PARAMETER)
         padded_shape = self._pad_parameter_shape(real_shape)
         spec.padded_shape = padded_shape
         param_buffer = self._allocate_buffer(name, padded_shape, dtype)
         return ParameterBuffer(spec, param_buffer)
 
-    def _pad_parameter_shape(self, shape):
-        # Pad dimensions to SIMD width
+    def _pad_parameter_shape(self, shape: Tuple[int, ...]) -> Tuple[int, ...]:
+        """Pad dimensions to SIMD width."""
         simd_width = self.padding_ctx.simd_width
         return tuple((dim + simd_width - 1) // simd_width * simd_width for dim in shape)
 
-    def _allocate_buffer(self, name, shape, dtype):
+    def _allocate_buffer(self, name: str, shape: Tuple[int, ...], dtype: np.dtype) -> cl.Buffer:
+        """Allocate an OpenCL buffer."""
         size = np.prod(shape) * dtype().itemsize
         buffer = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=size)
         self.work_manager.logical_resources[name] = (buffer, 0)
         return buffer
 
 class WorkManager:
-    def __init__(self, context):
+    """Manages the execution graph and OpenCL resources."""
+    def __init__(self, context: cl.Context):
         self.context = context
         self.execution_graph = nx.MultiDiGraph()
-        self.logical_resources = {}
-        self.hardware_queues = {}
-        self.node_id_counter = 0
+        self.logical_resources: Dict[str, Tuple[cl.Buffer, int]] = {}
+        self.hardware_queues: Dict[str, cl.CommandQueue] = {}
+        self.node_id_counter: int = 0
         self.buffer_tracker = defaultdict(lambda: {'version': 0, 'alloc_node': None, 'free_node': None, 'metadata': None})
-        self.user_events = {}
-        self.last_writer = {}
+        self.user_events: Dict[int, cl.UserEvent] = {}
+        self.last_writer: Dict[str, int] = {}
         self.pending_readers = defaultdict(set)
 
     @dataclass
     class ExecutionNode:
+        """Represents a node in the execution graph."""
         __slots__ = ['uid', 'node_type', 'queue_type', 'access_map', 'dependencies', 'expected_versions', 'params', 'event']
         uid: int
         node_type: NodeType
         queue_type: str
-        access_map: dict
-        dependencies: set
-        expected_versions: dict
-        params: dict
-        event: cl.Event = None
+        access_map: Dict[str, Set[AccessMode]]
+        dependencies: Set[int]
+        expected_versions: Dict[str, int]
+        params: Dict
+        event: Optional[cl.Event] = None
 
-    def validate_access_modes(self, modes):
+    def validate_access_modes(self, modes: Set[AccessMode]) -> None:
+        """Validate access modes for a resource."""
         write_count = sum(1 for m in modes if m in ACCESS_WRITE_MODES)
         if write_count > 1:
             raise ValueError(f"Conflicting write modes: {modes}")
         if AccessMode.SHARED_READ in modes and modes & ACCESS_WRITE_MODES:
             raise ValueError("Cannot combine SHARED_READ with write modes")
 
-    def create_node(self, node_type, queue_type, access_map, operation_fn, params):
+    def create_node(self, node_type: NodeType, queue_type: str, access_map: Dict[str, Set[AccessMode]], operation_fn: Callable, params: Dict) -> int:
+        """Create a new execution node."""
         node = self.ExecutionNode(self.node_id_counter, node_type, queue_type, access_map, set(), {}, params)
         node.execute = operation_fn
 
@@ -318,9 +357,10 @@ class WorkManager:
         self.node_id_counter += 1
         return node.uid
 
-    def create_mem_node(self, name, op_type, size=None, buffer=None, metadata=None):
+    def create_mem_node(self, name: str, op_type: MemOpType, size: Optional[int] = None, buffer: Optional[cl.Buffer] = None, metadata: Optional[Dict] = None) -> int:
+        """Create a memory operation node."""
         if op_type == MemOpType.ALLOC:
-            def _alloc_fn(queue, wait_for):
+            def _alloc_fn(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> None:
                 buffer = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=size)
                 self.logical_resources[name] = (buffer, 0)
                 self.buffer_tracker[name]['alloc_node'] = self.node_id_counter
@@ -329,7 +369,7 @@ class WorkManager:
             node = self.ExecutionNode(self.node_id_counter, NodeType.MEMORY, 'compute', {name: {AccessMode.EXCLUSIVE_WRITE_OVER}}, set(), {'op_type': op_type, 'size': size})
             node.execute = _alloc_fn
         elif op_type == MemOpType.FREE:
-            def _free_fn(queue, wait_for):
+            def _free_fn(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> None:
                 buffer = self.logical_resources[name][0]
                 buffer.release()
                 del self.logical_resources[name]
@@ -346,11 +386,10 @@ class WorkManager:
         self.node_id_counter += 1
         return node.uid
 
-    def create_sync_node(self, sync_type, dependencies=[]):
-        user_event = None
-        if sync_type == SyncType.HOST_SIGNAL:
-            user_event = cl.UserEvent(self.context)
-        elif sync_type == SyncType.DEVICE_WAIT:
+    def create_sync_node(self, sync_type: SyncType, dependencies: List[int] = []) -> int:
+        """Create a synchronization node."""
+        user_event = cl.UserEvent(self.context) if sync_type == SyncType.HOST_SIGNAL else None
+        if sync_type == SyncType.DEVICE_WAIT:
             raise ValueError("DEVICE_WAIT requires a user_event, which should be handled differently.")
         node = self.ExecutionNode(self.node_id_counter, NodeType.SYNC, 'compute', {}, set(dependencies), {'sync_type': sync_type, 'user_event': user_event})
         self.execution_graph.add_node(node.uid, node=node)
@@ -359,19 +398,22 @@ class WorkManager:
         self.node_id_counter += 1
         return node.uid
 
-    def get_sync_event(self, node_uid):
+    def get_sync_event(self, node_uid: int) -> Optional[cl.UserEvent]:
+        """Get the sync event for a node."""
         return self.user_events.get(node_uid, None)
 
-    def wait_for_sync(self, node_uid):
+    def wait_for_sync(self, node_uid: int) -> None:
+        """Wait for a synchronization event."""
         if node_uid in self.user_events:
             event = self.user_events.pop(node_uid)
             cl.wait_for_events([event])
         else:
             raise KeyError(f"No UserEvent found for node UID {node_uid}")
 
-    def commit_workload(self):
+    def commit_workload(self) -> None:
+        """Commit and execute the workload."""
         ordered_nodes = list(nx.topological_sort(self.execution_graph))
-        completion_events = {}
+        completion_events: Dict[int, cl.Event] = {}
         for uid in ordered_nodes:
             node = self.execution_graph.nodes[uid]['node']
             queue = self.hardware_queues[node.queue_type]
@@ -399,35 +441,41 @@ class WorkManager:
                     buffer, version = self.logical_resources[res]
                     self.logical_resources[res] = (buffer, version + 1)
 
-    def _dispatch_compute(self, node, wait_for):
+    def _dispatch_compute(self, node: 'WorkManager.ExecutionNode', wait_for: List[cl.Event]) -> None:
+        """Dispatch a compute node."""
         queue = self.hardware_queues[node.queue_type]
         node.event = node.execute(queue, wait_for=wait_for)
 
-    def _dispatch_memory(self, node, wait_for):
+    def _dispatch_memory(self, node: 'WorkManager.ExecutionNode', wait_for: List[cl.Event]) -> None:
+        """Dispatch a memory node."""
         node.execute(self.hardware_queues[node.queue_type], wait_for=wait_for)
 
-    def _dispatch_transfer(self, node, wait_for):
+    def _dispatch_transfer(self, node: 'WorkManager.ExecutionNode', wait_for: List[cl.Event]) -> None:
+        """Dispatch a transfer node."""
         node.event = node.execute(self.hardware_queues[node.queue_type], wait_for=wait_for, node_params=node.params)
 
-    def _dispatch_sync(self, node, wait_for):
+    def _dispatch_sync(self, node: 'WorkManager.ExecutionNode', wait_for: List[cl.Event]) -> None:
+        """Dispatch a sync node."""
         queue = self.hardware_queues[node.queue_type]
         if node.params['sync_type'] == SyncType.DEVICE_WAIT:
             all_wait_for = wait_for + [node.params['user_event']]
             node.event = cl.enqueue_marker(queue, wait_for=all_wait_for)
         elif node.params['sync_type'] == SyncType.HOST_SIGNAL:
             node.event = cl.enqueue_marker(queue, wait_for=wait_for)
-            def callback(event, status):
+            def callback(event: cl.Event, status: int) -> None:
                 if status == cl.command_execution_status.COMPLETE:
                     node.params['user_event'].set_status(cl.command_execution_status.COMPLETE)
             node.event.set_callback(cl.command_execution_status.COMPLETE, callback)
 
-    def reset_graph(self):
+    def reset_graph(self) -> None:
+        """Reset the execution graph."""
         self.execution_graph.clear()
         self.node_id_counter = 0
         self.user_events.clear()
 
 class ParamManager:
-    PARAM_TYPES = {
+    """Manages neural network parameters."""
+    PARAM_TYPES: Dict[str, Dict[str, Union[Callable, Tuple[float, float]]]] = {
         'dense_weight': {
             'init': he_init,
             'post_pad_fn': lambda padded, sw: padded.T.reshape(padded.shape[1] // sw, padded.shape[0], sw)
@@ -447,16 +495,17 @@ class ParamManager:
         }
     }
 
-    def __init__(self, context, parameter_manager):
+    def __init__(self, context: cl.Context, parameter_manager: ParameterBufferManager):
         self.context = context
         self.parameter_manager = parameter_manager
-        self.params = {}
-        self.buffers = {}
-        self.grad_buffers = {}
-        self.m1_buffers = {}
-        self.m2_buffers = {}
+        self.params: Dict[str, Dict] = {}
+        self.buffers: Dict[str, cl.Buffer] = {}
+        self.grad_buffers: Dict[str, cl.Buffer] = {}
+        self.m1_buffers: Dict[str, cl.Buffer] = {}
+        self.m2_buffers: Dict[str, cl.Buffer] = {}
 
-    def register_parameter(self, name, shape, ptype, requires_grad=True):
+    def register_parameter(self, name: str, shape: Tuple[int, ...], ptype: str, requires_grad: bool = True) -> None:
+        """Register a parameter with its properties."""
         if name in self.buffers:
             raise ValueError(f"Parameter {name} already registered")
         if ptype == 'temperature' and (shape[0] != NUM_EXITS):
@@ -467,20 +516,19 @@ class ParamManager:
             'requires_grad': requires_grad
         }
 
-    def _create_buffers(self):
+    def _create_buffers(self) -> None:
+        """Create buffers for all registered parameters."""
         for name, spec in self.params.items():
             ptype = spec['ptype']
             handler = self.PARAM_TYPES[ptype]
             init_values = handler['init'](spec['shape'])
-            # Create parameter buffer with zero-copy initialization
             param_buf = self.parameter_manager.create_parameter(name, spec['shape'], np.float32)
             self.buffers[name] = param_buf.cl_buffer
-            # Zero-copy initialization
             padded = pad_tensor(init_values, self.parameter_manager.padding_ctx)
             post_pad_fn = handler.get('post_pad_fn', lambda x, sw: x)
             processed = post_pad_fn(padded, self.parameter_manager.padding_ctx.simd_width)
             event = cl.enqueue_copy(self.context.queue, param_buf.cl_buffer, processed)
-            event.wait()  # Ensure initialization completes
+            event.wait()
             if spec['requires_grad']:
                 grad_buf = self.parameter_manager.create_parameter(f"grad_{name}", spec['shape'], np.float32)
                 m1_buf = self.parameter_manager.create_parameter(f"m1_{name}", spec['shape'], np.float32)
@@ -488,16 +536,16 @@ class ParamManager:
                 self.grad_buffers[name] = grad_buf.cl_buffer
                 self.m1_buffers[name] = m1_buf.cl_buffer
                 self.m2_buffers[name] = m2_buf.cl_buffer
-                # Zero initialize grad, m1, m2
                 for buf in [grad_buf.cl_buffer, m1_buf.cl_buffer, m2_buf.cl_buffer]:
                     event = cl.enqueue_fill_buffer(self.context.queue, buf, np.float32(0), 0, buf.size)
-                    event.wait()  # Ensure initialization completes
+                    event.wait()
 
-    def zero_gradients(self, work_manager):
+    def zero_gradients(self, work_manager: 'WorkManager') -> None:
+        """Zero out all gradient buffers."""
         for name, spec in self.params.items():
             if spec['requires_grad']:
                 grad_buffer = self.grad_buffers[name]
-                def _zero_fn(queue, wait_for):
+                def _zero_fn(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> cl.Event:
                     return cl.enqueue_fill_buffer(queue, grad_buffer, np.float32(0), 0, grad_buffer.size, wait_for=wait_for)
                 work_manager.create_node(
                     node_type=NodeType.COMPUTE,
@@ -508,29 +556,33 @@ class ParamManager:
                 )
 
 class KernelExecutionRequest:
-    def __init__(self, program, kernel_name, global_sizes, local_sizes):
+    """Represents a request to execute an OpenCL kernel."""
+    def __init__(self, program: cl.Program, kernel_name: str, global_sizes: Tuple[int, ...], local_sizes: Tuple[int, ...]):
         self.program = program
         self.kernel = getattr(program, kernel_name)
         self.global_sizes = global_sizes
         self.local_sizes = local_sizes
-        self.local_mem_reqs = {}
-        self.argument_bindings = {}
+        self.local_mem_reqs: Dict[int, Tuple[int, AccessMode]] = {}
+        self.argument_bindings: Dict[int, Union[cl.Buffer, np.ndarray, np.int32, np.float32]] = {}
 
-    def set_local_mem_argument(self, arg_index, size_bytes, access=AccessMode.LOCAL):
+    def set_local_mem_argument(self, arg_index: int, size_bytes: int, access: AccessMode = AccessMode.LOCAL) -> None:
+        """Set a local memory argument."""
         self.local_mem_reqs[arg_index] = (size_bytes, access)
 
-    def bind_argument(self, arg_index, arg):
+    def bind_argument(self, arg_index: int, arg: Union[cl.Buffer, np.ndarray, np.int32, np.float32]) -> None:
+        """Bind an argument to the kernel."""
         self.argument_bindings[arg_index] = arg
 
 class KernelWrapper:
-    def __init__(self, program, manager, global_step, compute_queue, data_manager, parameter_manager):
+    """High-level interface for kernel execution."""
+    def __init__(self, program: cl.Program, manager: WorkManager, global_step: int, compute_queue: cl.CommandQueue, data_manager: DataBufferManager, parameter_manager: ParameterBufferManager):
         self.program = program
         self.manager = manager
         self.queue = compute_queue
         self.data_manager = data_manager
         self.parameter_manager = parameter_manager
-        self.mask = None
-        self.temperatures = None
+        self.mask: Optional[cl.Buffer] = None
+        self.temperatures: Optional[cl.Buffer] = None
         self.padded_input_dim = self.data_manager.create_data_buffer('input_batch', (BATCH_SIZE, INPUT_DIM), np.float32).spec.padded_shape[1]
         self.padded_hidden_dim = self.data_manager.create_data_buffer('hidden', (BATCH_SIZE, HIDDEN_DIM), np.float32).spec.padded_shape[0]
         self.padded_output_classes = ((OUTPUT_CLASSES + self.data_manager.padding_ctx.simd_width - 1) // self.data_manager.padding_ctx.simd_width) * self.data_manager.padding_ctx.simd_width
@@ -538,7 +590,6 @@ class KernelWrapper:
         self.input_dim = INPUT_DIM
         self.hidden_dim = HIDDEN_DIM
         self.output_classes = OUTPUT_CLASSES
-        self.num_exits = NUM_EXITS
         self.adam_beta1 = np.float32(ADAM_BETA1)
         self.adam_beta2 = np.float32(ADAM_BETA2)
         self.learning_rate = np.float32(LEARNING_RATE)
@@ -548,15 +599,18 @@ class KernelWrapper:
         self.beta1_t = np.float32(ADAM_BETA1 ** global_step)
         self.beta2_t = np.float32(ADAM_BETA2 ** global_step)
 
-    def set_mask(self, mask):
+    def set_mask(self, mask: cl.Buffer) -> 'KernelWrapper':
+        """Set the mask buffer."""
         self.mask = mask
         return self
 
-    def set_temps(self, temps):
+    def set_temps(self, temps: cl.Buffer) -> 'KernelWrapper':
+        """Set the temperatures buffer."""
         self.temperatures = temps
         return self
 
-    def forward_pass(self, global_sizes, local_sizes, input_buf: DataBuffer, weights_buf: ParameterBuffer, biases_buf: ParameterBuffer, hidden_buf: DataBuffer):
+    def forward_pass(self, global_sizes: Tuple[int, ...], local_sizes: Tuple[int, ...], input_buf: DataBuffer, weights_buf: ParameterBuffer, biases_buf: ParameterBuffer, hidden_buf: DataBuffer) -> int:
+        """Enqueue the forward pass kernel."""
         req = KernelExecutionRequest(self.program, 'forward_pass', global_sizes, local_sizes)
         req.set_local_mem_argument(0, local_sizes[0] * FLOAT_SIZE, AccessMode.LOCAL)
         req.bind_argument(1, input_buf.cl_buffer)
@@ -581,7 +635,8 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def compute_exit_probabilities(self, global_sizes, local_sizes, hidden_buf: DataBuffer, exit_weights_buf: ParameterBuffer, exit_biases_buf: ParameterBuffer, exit_probs_buf: DataBuffer, losses_buf: DataBuffer, targets_buf: DataBuffer, exit_idx):
+    def compute_exit_probabilities(self, global_sizes: Tuple[int, ...], local_sizes: Tuple[int, ...], hidden_buf: DataBuffer, exit_weights_buf: ParameterBuffer, exit_biases_buf: ParameterBuffer, exit_probs_buf: DataBuffer, losses_buf: DataBuffer, targets_buf: DataBuffer, exit_idx: int) -> int:
+        """Enqueue the exit probabilities kernel."""
         req = KernelExecutionRequest(self.program, 'compute_exit_probabilities', global_sizes, local_sizes)
         req.bind_argument(0, hidden_buf.cl_buffer)
         req.bind_argument(1, hidden_buf.mask_buffer)
@@ -621,7 +676,8 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def compute_gradients(self, global_sizes, local_sizes, input_buf: DataBuffer, hidden_buf: DataBuffer, exit_probs_buf: DataBuffer, exit_weights_buf: ParameterBuffer, grad_weights_buf: ParameterBuffer, grad_biases_buf: ParameterBuffer, grad_exit_weights_buf: ParameterBuffer, grad_exit_biases_buf: ParameterBuffer, targets_buf: DataBuffer):
+    def compute_gradients(self, global_sizes: Tuple[int, ...], local_sizes: Tuple[int, ...], input_buf: DataBuffer, hidden_buf: DataBuffer, exit_probs_buf: DataBuffer, exit_weights_buf: ParameterBuffer, grad_weights_buf: ParameterBuffer, grad_biases_buf: ParameterBuffer, grad_exit_weights_buf: ParameterBuffer, grad_exit_biases_buf: ParameterBuffer, targets_buf: DataBuffer) -> int:
+        """Enqueue the gradients computation kernel."""
         req = KernelExecutionRequest(self.program, 'compute_gradients', global_sizes, local_sizes)
         req.bind_argument(0, input_buf.cl_buffer)
         req.bind_argument(1, input_buf.mask_buffer)
@@ -644,7 +700,6 @@ class KernelWrapper:
         req.bind_argument(18, np.int32(self.padded_hidden_dim))
         req.bind_argument(19, np.int32(self.padded_output_classes))
         req.bind_argument(20, np.int32(self.padded_batch_size))
-        req.bind_argument(21, np.int32(self.num_exits))
         access_map = {
             input_buf.spec.name: {AccessMode.SHARED_READ},
             f"mask_{input_buf.spec.name}": {AccessMode.SHARED_READ},
@@ -669,7 +724,8 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def compute_temp_gradients(self, global_sizes, local_sizes, exit_probs_buf: DataBuffer, targets_buf: DataBuffer, grad_temps_buf: ParameterBuffer):
+    def compute_temp_gradients(self, global_sizes: Tuple[int, ...], local_sizes: Tuple[int, ...], exit_probs_buf: DataBuffer, targets_buf: DataBuffer, grad_temps_buf: ParameterBuffer) -> int:
+        """Enqueue the temperature gradients computation kernel."""
         req = KernelExecutionRequest(self.program, 'compute_temp_gradients', global_sizes, local_sizes)
         req.bind_argument(0, exit_probs_buf.cl_buffer)
         req.bind_argument(1, exit_probs_buf.mask_buffer)
@@ -680,7 +736,6 @@ class KernelWrapper:
         req.bind_argument(6, np.int32(self.output_classes))
         req.bind_argument(7, np.int32(self.padded_output_classes))
         req.bind_argument(8, np.int32(self.padded_batch_size))
-        req.bind_argument(9, np.int32(self.num_exits))
         access_map = {
             exit_probs_buf.spec.name: {AccessMode.SHARED_READ},
             f"mask_{exit_probs_buf.spec.name}": {AccessMode.SHARED_READ},
@@ -697,7 +752,8 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def adam_update(self, global_sizes, local_sizes, grad_buf: ParameterBuffer, param_buf: ParameterBuffer, m1_buf: ParameterBuffer, m2_buf: ParameterBuffer, grad_name, param_name, m1_name, m2_name, total_params):
+    def adam_update(self, global_sizes: Tuple[int, ...], local_sizes: Tuple[int, ...], grad_buf: ParameterBuffer, param_buf: ParameterBuffer, m1_buf: ParameterBuffer, m2_buf: ParameterBuffer, grad_name: str, param_name: str, m1_name: str, m2_name: str, total_params: int) -> int:
+        """Enqueue the ADAM update kernel."""
         req = KernelExecutionRequest(self.program, 'adam_update', global_sizes, local_sizes)
         req.bind_argument(0, grad_buf.cl_buffer)
         req.bind_argument(1, param_buf.cl_buffer)
@@ -724,12 +780,12 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def clamp_temperatures(self, global_sizes, local_sizes, temps_buf: ParameterBuffer):
+    def clamp_temperatures(self, global_sizes: Tuple[int, ...], local_sizes: Tuple[int, ...], temps_buf: ParameterBuffer) -> int:
+        """Enqueue the temperature clamping kernel."""
         req = KernelExecutionRequest(self.program, 'clamp_temperatures', global_sizes, local_sizes)
         req.bind_argument(0, temps_buf.cl_buffer)
         req.bind_argument(1, self.min_temp)
         req.bind_argument(2, self.max_temp)
-        req.bind_argument(3, np.int32(self.num_exits))
         access_map = {
             temps_buf.spec.name: {AccessMode.EXCLUSIVE_UPDATE}
         }
@@ -741,7 +797,8 @@ class KernelWrapper:
             params={'exec_req': req}
         )
 
-    def _enqueue_kernel(self, queue, wait_for, node_params):
+    def _enqueue_kernel(self, queue: cl.CommandQueue, wait_for: List[cl.Event], node_params: Dict) -> cl.Event:
+        """Enqueue a kernel execution."""
         req = node_params['exec_req']
         local_mem_args = {idx: cl.LocalMemory(size) for idx, (size, mode) in req.local_mem_reqs.items()}
         args = []
@@ -750,11 +807,11 @@ class KernelWrapper:
         return cl.enqueue_nd_range_kernel(queue, req.kernel, req.global_sizes, req.local_sizes, *args, wait_for=wait_for)
 
 # OpenCL Setup
-ctx = cl.create_some_context()
-transfer_queue = cl.CommandQueue(ctx)
-compute_queue = cl.CommandQueue(ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
-device = ctx.devices[0]
-device_limits = device
+ctx: cl.Context = cl.create_some_context()
+transfer_queue: cl.CommandQueue = cl.CommandQueue(ctx)
+compute_queue: cl.CommandQueue = cl.CommandQueue(ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
+device: cl.Device = ctx.devices[0]
+device_limits: cl.Device = device
 
 # WorkManager Initialization
 manager = WorkManager(ctx)
@@ -788,37 +845,40 @@ manager.commit_workload()
 
 # Data Preparation
 iris = load_iris()
-X = iris.data.astype(np.float32)
-y_true = iris.target.astype(np.int32)
+X: np.ndarray = iris.data.astype(np.float32)
+y_true: np.ndarray = iris.target.astype(np.int32)
 scaler = StandardScaler()
-X_normalized = scaler.fit_transform(X)
+X_normalized: np.ndarray = scaler.fit_transform(X)
 
 # Compile Kernels
-kernel_src = []
-for fname in CL_KERNEL_FILES:
+kernel_src: List[str] = []
+for fname in CL_HEADER_FILES + CL_KERNEL_FILES:
     try:
         with open(fname, 'r') as f:
             kernel_src.append(f.read())
     except FileNotFoundError:
         print(f"Warning: Kernel file {fname} not found. Please ensure all kernel files are present.")
         kernel_src.append("")
-simd_width = data_mgr.padding_ctx.simd_width
-build_opts = [
+simd_width: int = data_mgr.padding_ctx.simd_width
+build_opts: List[str] = [
     f"-D VECTOR_TYPE={'float' + str(simd_width) if simd_width > 1 else 'float'}",
     f"-D SIMD_WIDTH={simd_width}",
+    f"-D NUM_EXITS={NUM_EXITS}",
     f"-D LOSS_STRIDE={losses_buf.spec.padded_shape[0] // NUM_EXITS}",
     f"-D USE_FAST_MATH=1"
 ]
-program = cl.Program(ctx, "\n".join(kernel_src)).build(options=" ".join(build_opts))
+program: cl.Program = cl.Program(ctx, "\n".join(kernel_src)).build(options=" ".join(build_opts))
+
+# Initialize BatchPadder with buffer specs
+batch_padder = BatchPadder(input_buf.spec, targets_buf.spec)
 
 # Training Loop
-global_step = 1
-batch_padder = BatchPadder(data_mgr.padding_ctx)
+global_step: int = 1
 for epoch in range(EPOCHS):
-    shuffled_indices = np.random.permutation(len(X))
-    num_batches = (len(X) + BATCH_SIZE - 1) // BATCH_SIZE
-    epoch_loss = 0.0
-    correct_predictions = 0
+    shuffled_indices: np.ndarray = np.random.permutation(len(X))
+    num_batches: int = (len(X) + BATCH_SIZE - 1) // BATCH_SIZE
+    epoch_loss: float = 0.0
+    correct_predictions: int = 0
     for batch_idx in range(num_batches):
         manager.reset_graph()
         batch_start = batch_idx * BATCH_SIZE
@@ -830,13 +890,13 @@ for epoch in range(EPOCHS):
         X_padded, y_padded, mask = batch_padder.pad_batch(X_batch, y_batch)
 
         # Transfer nodes for input data
-        def transfer_input_data(queue, wait_for):
+        def transfer_input_data(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> cl.Event:
             return cl.enqueue_copy(queue, input_buf.cl_buffer, X_padded, wait_for=wait_for)
-        def transfer_input_mask(queue, wait_for):
+        def transfer_input_mask(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> cl.Event:
             return cl.enqueue_copy(queue, input_buf.mask_buffer, mask, wait_for=wait_for)
-        def transfer_targets_data(queue, wait_for):
+        def transfer_targets_data(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> cl.Event:
             return cl.enqueue_copy(queue, targets_buf.cl_buffer, y_padded, wait_for=wait_for)
-        def transfer_targets_mask(queue, wait_for):
+        def transfer_targets_mask(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> cl.Event:
             return cl.enqueue_copy(queue, targets_buf.mask_buffer, mask, wait_for=wait_for)
         input_transfer_data = manager.create_node(
             NodeType.TRANSFER, 'xfer',
@@ -938,11 +998,11 @@ for epoch in range(EPOCHS):
         losses_host = np.empty(losses_buf.spec.padded_shape, dtype=np.float32)
         exit_probs_host = np.empty(exit_probs_buf.spec.padded_shape, dtype=np.float32)
         temps_host = np.empty(pm.buffers['temps'].spec.padded_shape, dtype=np.float32)
-        def transfer_losses(queue, wait_for):
+        def transfer_losses(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> cl.Event:
             return cl.enqueue_copy(queue, losses_host, losses_buf.cl_buffer, wait_for=wait_for)
-        def transfer_exit_probs(queue, wait_for):
+        def transfer_exit_probs(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> cl.Event:
             return cl.enqueue_copy(queue, exit_probs_host, exit_probs_buf.cl_buffer, wait_for=wait_for)
-        def transfer_temps(queue, wait_for):
+        def transfer_temps(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> cl.Event:
             return cl.enqueue_copy(queue, temps_host, pm.buffers['temps'].cl_buffer, wait_for=wait_for)
         losses_transfer = manager.create_node(
             NodeType.TRANSFER, 'xfer',
@@ -995,6 +1055,4 @@ for epoch in range(EPOCHS):
     train_acc = correct_predictions / len(X)
     print(f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | Acc: {train_acc:.1%}")
     print(f"Temperatures: {temps_host}")
-
-if __name__ == "__main__":
-    pass
+    
