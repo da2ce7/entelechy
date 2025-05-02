@@ -8,7 +8,7 @@ import networkx as nx
 import re
 from collections import deque, defaultdict
 from enum import Enum, auto
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Tuple, List, Set, Dict, Callable, Optional, Union
 
 # Define data type sizes
@@ -16,6 +16,7 @@ FLOAT_SIZE: int = np.float32().itemsize
 INT_SIZE: int = np.int32().itemsize
 
 # Network Configuration
+# Note: All Host Constant, and Kernel Runtime.
 INPUT_DIM: int = 4
 HIDDEN_DIM: int = 65
 OUTPUT_CLASSES: int = 3
@@ -145,49 +146,28 @@ def pad_tensor(data: np.ndarray, context: PaddingContext, strategy: str = 'simd_
     padded[slices] = data
     return padded
 
-class BatchPadder:
-    """Handles padding for batches of data."""
-    def __init__(self, input_buffer_spec: 'BufferSpec', target_buffer_spec: 'BufferSpec'):
-        self.input_spec = input_buffer_spec
-        self.target_spec = target_buffer_spec
+@dataclass(frozen=True)
+class LogicalShape:
+    """Describes the original data dimensions"""
+    batch: int
+    features: tuple  # Other dimensions
 
-    def pad_batch(self, X: np.ndarray, y_true: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Pad input and target tensors to fixed buffer sizes."""
-        batch_size = X.shape[0]
-        X_padded = np.zeros(self.input_spec.padded_shape, dtype=np.float32)
-        X_padded[:batch_size] = X
-        y_padded = np.zeros(self.target_spec.padded_shape, dtype=np.int32)
-        y_padded[:batch_size] = y_true
-        mask = np.zeros(self.input_spec.padded_shape[0], dtype=np.float32)
-        mask[:batch_size] = 1.0
-        return X_padded, y_padded, mask
+@dataclass(frozen=True)
+class PaddedShape:
+    """Describes actual memory layout after padding"""
+    values: tuple
 
-class TransferDirection(Enum):
-    H2D = 1
-    D2H = 2
+    @property
+    def batch_dim(self) -> int:
+        return self.values[0]
 
-class NodeType(Enum):
-    MEMORY = 1
-    COMPUTE = 2
-    TRANSFER = 3
-    SYNC = 4
-
-class MemOpType(Enum):
-    ALLOC = 1
-    FREE = 2
-
-class SyncType(Enum):
-    HOST_SIGNAL = 1
-    DEVICE_WAIT = 2
-
-class AccessMode(Enum):
-    LOCAL = 1
-    SHARED_READ = 2
-    EXCLUSIVE_WRITE_OVER = 3
-    EXCLUSIVE_ZERO = 4
-    EXCLUSIVE_UPDATE = 5
-
-ACCESS_WRITE_MODES: Set[AccessMode] = {AccessMode.EXCLUSIVE_WRITE_OVER, AccessMode.EXCLUSIVE_ZERO, AccessMode.EXCLUSIVE_UPDATE}
+class BufferPurpose(Enum):
+    LOSSES = auto()
+    INPUT_DATA = auto()
+    HIDDEN_ACT = auto()
+    TARGETS = auto()
+    MASK = auto()
+    EXIT_PROBS = auto()
 
 class BufferType(Enum):
     DATA = auto()
@@ -204,6 +184,89 @@ class BufferSpec:
     padded_shape: Optional[Tuple[int, ...]] = None
     simd_alignment: Optional[int] = None
 
+# Specialized BufferSpecs
+@dataclass
+class LossBufferSpec(BufferSpec):
+    purpose: BufferPurpose = BufferPurpose.LOSSES
+    logical: LogicalShape = field(init=False)
+    padded: PaddedShape = field(init=False)
+
+    def __post_init__(self):
+        if len(self.real_shape) != 2:
+            raise ValueError("Loss buffers must be 2D (batch, exits)")
+        self.logical = LogicalShape(
+               batch=self.real_shape[1],
+               features=(self.real_shape[0],)
+           )
+        self.padded = PaddedShape(self.padded_shape)
+
+@dataclass
+class InputBufferSpec(BufferSpec):
+    purpose: BufferPurpose = BufferPurpose.INPUT_DATA
+    logical: LogicalShape = field(init=False)
+    padded: PaddedShape = field(init=False)
+
+    def __post_init__(self):
+        self.logical = LogicalShape(
+            batch=self.real_shape[0],
+            features=self.real_shape[1:]
+        )
+        self.padded = PaddedShape(self.padded_shape)
+
+@dataclass
+class HiddenActBufferSpec(BufferSpec):
+    purpose: BufferPurpose = BufferPurpose.HIDDEN_ACT
+    logical: LogicalShape = field(init=False)
+    padded: PaddedShape = field(init=False)
+
+    def __post_init__(self):
+        self.logical = LogicalShape(
+            batch=self.real_shape[0],
+            features=self.real_shape[1:]
+        )
+        self.padded = PaddedShape(self.padded_shape)
+
+@dataclass
+class TargetsBufferSpec(BufferSpec):
+    purpose: BufferPurpose = BufferPurpose.TARGETS
+    logical: LogicalShape = field(init=False)
+    padded: PaddedShape = field(init=False)
+
+    def __post_init__(self):
+        self.logical = LogicalShape(
+            batch=self.real_shape[0],
+            features=()
+        )
+        self.padded = PaddedShape(self.padded_shape)
+
+@dataclass
+class MaskBufferSpec(BufferSpec):
+    purpose: BufferPurpose = BufferPurpose.MASK
+    logical: LogicalShape = field(init=False)
+    padded: PaddedShape = field(init=False)
+
+    def __post_init__(self):
+        self.logical = LogicalShape(
+            batch=self.real_shape[0],
+            features=()
+        )
+        self.padded = PaddedShape(self.padded_shape)
+
+@dataclass
+class ExitProbsBufferSpec(BufferSpec):
+    purpose: BufferPurpose = BufferPurpose.EXIT_PROBS
+    logical: LogicalShape = field(init=False)
+    padded: PaddedShape = field(init=False)
+
+    def __post_init__(self):
+        if len(self.real_shape) != 3:
+            raise ValueError("Exit probabilities buffers must be 3D (batch, exits, classes)")
+        self.logical = LogicalShape(
+            batch=self.real_shape[0],
+            features=(self.real_shape[1], self.real_shape[2])
+        )
+        self.padded = PaddedShape(self.padded_shape)
+
 class Buffer:
     """Base class for OpenCL buffers."""
     def __init__(self, spec: BufferSpec, cl_buffer: cl.Buffer):
@@ -212,7 +275,7 @@ class Buffer:
 
 class DataBuffer(Buffer):
     """Buffer for data with masking."""
-    def __init__(self, spec: BufferSpec, cl_buffer: cl.Buffer, mask_buffer: cl.Buffer):
+    def __init__(self, spec: BufferSpec, cl_buffer: cl.Buffer, mask_buffer: Optional[cl.Buffer]):
         super().__init__(spec, cl_buffer)
         self.mask_buffer = mask_buffer
 
@@ -222,33 +285,62 @@ class ParameterBuffer(Buffer):
         super().__init__(spec, cl_buffer)
 
 class DataBufferManager:
-    """Manages data buffers with masking."""
+    """Manages data buffers with masking and purpose-specific padding."""
     def __init__(self, context: cl.Context, device: cl.Device, work_manager: 'WorkManager'):
         self.context = context
         self.device = device
         self.work_manager = work_manager
         self.padding_ctx = PaddingContext.from_device(device)
 
-    def create_data_buffer(self, name: str, real_shape: Tuple[int, ...], dtype: np.dtype) -> DataBuffer:
-        """Create a data buffer with associated mask buffer."""
-        spec = BufferSpec(name, real_shape, dtype, BufferType.DATA)
-        padded_shape = self._pad_data_shape(real_shape)
+    def create_data_buffer(self, name: str, real_shape: Tuple[int, ...], dtype: np.dtype, purpose: BufferPurpose) -> DataBuffer:
+        """Create a data buffer with associated mask buffer based on purpose."""
+        if purpose == BufferPurpose.LOSSES:
+            spec = LossBufferSpec(name, real_shape, dtype, BufferType.DATA)
+        elif purpose == BufferPurpose.INPUT_DATA:
+            spec = InputBufferSpec(name, real_shape, dtype, BufferType.DATA)
+        elif purpose == BufferPurpose.HIDDEN_ACT:
+            spec = HiddenActBufferSpec(name, real_shape, dtype, BufferType.DATA)
+        elif purpose == BufferPurpose.TARGETS:
+            spec = TargetsBufferSpec(name, real_shape, dtype, BufferType.DATA)
+        elif purpose == BufferPurpose.MASK:
+            spec = MaskBufferSpec(name, real_shape, dtype, BufferType.MASK)
+        elif purpose == BufferPurpose.EXIT_PROBS:
+            spec = ExitProbsBufferSpec(name, real_shape, dtype, BufferType.DATA)
+        else:
+            raise ValueError(f"Unsupported buffer purpose: {purpose}")
+
+        padded_shape = self._pad_data_shape(real_shape, purpose)
         spec.padded_shape = padded_shape
         data_buffer = self._allocate_buffer(name, padded_shape, dtype)
-        
-        mask_name = f"mask_{name}"
-        mask_real_shape = (real_shape[0],)
-        mask_padded_shape = (padded_shape[0],)
-        mask_spec = BufferSpec(mask_name, mask_real_shape, np.float32, BufferType.MASK, mask_padded_shape)
-        mask_buffer = self._allocate_buffer(mask_name, mask_padded_shape, np.float32)
-        
+
+        if purpose != BufferPurpose.MASK:  # Masks don't need their own mask
+            mask_name = f"mask_{name}"
+            mask_real_shape = (real_shape[0],)
+            mask_padded_shape = (padded_shape[0],)
+            mask_spec = MaskBufferSpec(mask_name, mask_real_shape, np.float32, BufferType.MASK)
+            mask_spec.padded_shape = mask_padded_shape
+            mask_buffer = self._allocate_buffer(mask_name, mask_padded_shape, np.float32)
+        else:
+            mask_buffer = None
+
         return DataBuffer(spec, data_buffer, mask_buffer)
 
-    def _pad_data_shape(self, shape: Tuple[int, ...]) -> Tuple[int, ...]:
-        """Pad the batch dimension to the next power of 2."""
-        batch_size = shape[0]
-        padded_batch_size = next_pow2(batch_size)
-        return (padded_batch_size, *shape[1:])
+    def _pad_data_shape(self, shape: Tuple[int, ...], purpose: BufferPurpose) -> Tuple[int, ...]:
+        """Pad the shape based on the buffer purpose."""
+        if purpose in [BufferPurpose.TARGETS, BufferPurpose.MASK]:
+            # Only pad batch dimension
+            padded_batch = next_pow2(shape[0])
+            return (padded_batch,) + shape[1:]
+        elif purpose in [BufferPurpose.LOSSES]: 
+            padded_exits = next_pow2(shape[0])
+            padded_batch = next_pow2(shape[1])
+            return (padded_exits, padded_batch)
+        elif purpose in [BufferPurpose.INPUT_DATA, BufferPurpose.HIDDEN_ACT, BufferPurpose.EXIT_PROBS]:
+            # Pad batch and feature dimensions
+            padded_batch = next_pow2(shape[0])
+            padded_features = tuple(next_pow2(dim) for dim in shape[1:])
+            return (padded_batch,) + padded_features
+        raise ValueError(f"Unsupported buffer purpose for padding: {purpose}")
 
     def _allocate_buffer(self, name: str, shape: Tuple[int, ...], dtype: np.dtype) -> cl.Buffer:
         """Allocate an OpenCL buffer."""
@@ -256,6 +348,46 @@ class DataBufferManager:
         buffer = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=size)
         self.work_manager.logical_resources[name] = (buffer, 0)
         return buffer
+
+# Host-side data access helper
+class HostView:
+    def __init__(self, buffer: DataBuffer):
+        self.spec = buffer.spec
+        self.host_data = None
+
+    def update_from_device(self, queue: cl.CommandQueue, cl_buffer: cl.Buffer):
+        """Copy from device buffer to host, maintaining padding"""
+        self.host_data = np.empty(self.spec.padded.values, dtype=self.spec.dtype)
+        cl.enqueue_copy(queue, self.host_data, cl_buffer)
+
+    @property
+    def valid_slice(self):
+        """Returns a view into just the non-padded data"""
+        if isinstance(self.spec, LossBufferSpec):
+            return self.host_data[:self.spec.logical.features[0], :self.spec.logical.batch]
+        elif isinstance(self.spec, (InputBufferSpec, HiddenActBufferSpec, ExitProbsBufferSpec)):
+            slices = (slice(0, self.spec.logical.batch),) + tuple(slice(0, f) for f in self.spec.logical.features)
+            return self.host_data[slices]
+        elif isinstance(self.spec, (TargetsBufferSpec, MaskBufferSpec)):
+            return self.host_data[:self.spec.logical.batch]
+        raise ValueError(f"Unsupported buffer spec type: {type(self.spec)}")
+
+class BatchPadder:
+    """Handles padding for batches of data using buffer specs."""
+    def __init__(self, input_buffer_spec: InputBufferSpec, target_buffer_spec: TargetsBufferSpec):
+        self.input_spec = input_buffer_spec
+        self.target_spec = target_buffer_spec
+
+    def pad_batch(self, X: np.ndarray, y_true: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Pad input and target tensors to fixed buffer sizes."""
+        batch_size = X.shape[0]
+        X_padded = np.zeros(self.input_spec.padded.values, dtype=np.float32)
+        X_padded[:batch_size, :X.shape[1]] = X
+        y_padded = np.zeros(self.target_spec.padded.values, dtype=np.int32)
+        y_padded[:batch_size] = y_true
+        mask = np.zeros(self.input_spec.padded.values[0], dtype=np.float32)
+        mask[:batch_size] = 1.0
+        return X_padded, y_padded, mask
 
 class ParameterBufferManager:
     """Manages parameter buffers."""
@@ -284,6 +416,33 @@ class ParameterBufferManager:
         buffer = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=size)
         self.work_manager.logical_resources[name] = (buffer, 0)
         return buffer
+
+class TransferDirection(Enum):
+    H2D = 1
+    D2H = 2
+
+class NodeType(Enum):
+    MEMORY = 1
+    COMPUTE = 2
+    TRANSFER = 3
+    SYNC = 4
+
+class MemOpType(Enum):
+    ALLOC = 1
+    FREE = 2
+
+class SyncType(Enum):
+    HOST_SIGNAL = 1
+    DEVICE_WAIT = 2
+
+class AccessMode(Enum):
+    LOCAL = 1
+    SHARED_READ = 2
+    EXCLUSIVE_WRITE_OVER = 3
+    EXCLUSIVE_ZERO = 4
+    EXCLUSIVE_UPDATE = 5
+
+ACCESS_WRITE_MODES: Set[AccessMode] = {AccessMode.EXCLUSIVE_WRITE_OVER, AccessMode.EXCLUSIVE_ZERO, AccessMode.EXCLUSIVE_UPDATE}
 
 class WorkManager:
     """Manages the execution graph and OpenCL resources."""
@@ -481,8 +640,7 @@ class ParamManager:
             'post_pad_fn': lambda padded, sw: padded.T.reshape(padded.shape[1] // sw, padded.shape[0], sw)
         },
         'exit_weight': {
-            'init': he_init,
-            'post_pad_fn': lambda padded, sw: padded.transpose(0, 2, 1).reshape(padded.shape[0], padded.shape[2] // sw, padded.shape[1], sw)
+            'post_pad_fn': lambda padded, sw: padded.reshape(padded.shape[0], sw, padded.shape[1]//sw, padded.shape[2])
         },
         'temperature': {
             'init': lambda s: np.ones(s, dtype=np.float32) * (MAX_TEMP + MIN_TEMP) / 2,
@@ -499,10 +657,10 @@ class ParamManager:
         self.context = context
         self.parameter_manager = parameter_manager
         self.params: Dict[str, Dict] = {}
-        self.buffers: Dict[str, cl.Buffer] = {}
-        self.grad_buffers: Dict[str, cl.Buffer] = {}
-        self.m1_buffers: Dict[str, cl.Buffer] = {}
-        self.m2_buffers: Dict[str, cl.Buffer] = {}
+        self.buffers: Dict[str, ParameterBuffer] = {}
+        self.grad_buffers: Dict[str, ParameterBuffer] = {}
+        self.m1_buffers: Dict[str, ParameterBuffer] = {}
+        self.m2_buffers: Dict[str, ParameterBuffer] = {}
 
     def register_parameter(self, name: str, shape: Tuple[int, ...], ptype: str, requires_grad: bool = True) -> None:
         """Register a parameter with its properties."""
@@ -523,7 +681,7 @@ class ParamManager:
             handler = self.PARAM_TYPES[ptype]
             init_values = handler['init'](spec['shape'])
             param_buf = self.parameter_manager.create_parameter(name, spec['shape'], np.float32)
-            self.buffers[name] = param_buf.cl_buffer
+            self.buffers[name] = param_buf
             padded = pad_tensor(init_values, self.parameter_manager.padding_ctx)
             post_pad_fn = handler.get('post_pad_fn', lambda x, sw: x)
             processed = post_pad_fn(padded, self.parameter_manager.padding_ctx.simd_width)
@@ -533,9 +691,9 @@ class ParamManager:
                 grad_buf = self.parameter_manager.create_parameter(f"grad_{name}", spec['shape'], np.float32)
                 m1_buf = self.parameter_manager.create_parameter(f"m1_{name}", spec['shape'], np.float32)
                 m2_buf = self.parameter_manager.create_parameter(f"m2_{name}", spec['shape'], np.float32)
-                self.grad_buffers[name] = grad_buf.cl_buffer
-                self.m1_buffers[name] = m1_buf.cl_buffer
-                self.m2_buffers[name] = m2_buf.cl_buffer
+                self.grad_buffers[name] = grad_buf
+                self.m1_buffers[name] = m1_buf
+                self.m2_buffers[name] = m2_buf
                 for buf in [grad_buf.cl_buffer, m1_buf.cl_buffer, m2_buf.cl_buffer]:
                     event = cl.enqueue_fill_buffer(self.context.queue, buf, np.float32(0), 0, buf.size)
                     event.wait()
@@ -544,7 +702,7 @@ class ParamManager:
         """Zero out all gradient buffers."""
         for name, spec in self.params.items():
             if spec['requires_grad']:
-                grad_buffer = self.grad_buffers[name]
+                grad_buffer = self.grad_buffers[name].cl_buffer
                 def _zero_fn(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> cl.Event:
                     return cl.enqueue_fill_buffer(queue, grad_buffer, np.float32(0), 0, grad_buffer.size, wait_for=wait_for)
                 work_manager.create_node(
@@ -583,13 +741,14 @@ class KernelWrapper:
         self.parameter_manager = parameter_manager
         self.mask: Optional[cl.Buffer] = None
         self.temperatures: Optional[cl.Buffer] = None
-        self.padded_input_dim = self.data_manager.create_data_buffer('input_batch', (BATCH_SIZE, INPUT_DIM), np.float32).spec.padded_shape[1]
-        self.padded_hidden_dim = self.data_manager.create_data_buffer('hidden', (BATCH_SIZE, HIDDEN_DIM), np.float32).spec.padded_shape[0]
+        self.padded_input_dim = self.data_manager.create_data_buffer('input_batch', (BATCH_SIZE, INPUT_DIM), np.float32, BufferPurpose.INPUT_DATA).spec.padded.values[1]
+        self.padded_hidden_dim = self.data_manager.create_data_buffer('hidden', (BATCH_SIZE, HIDDEN_DIM), np.float32, BufferPurpose.HIDDEN_ACT).spec.padded.values[1]
         self.padded_output_classes = ((OUTPUT_CLASSES + self.data_manager.padding_ctx.simd_width - 1) // self.data_manager.padding_ctx.simd_width) * self.data_manager.padding_ctx.simd_width
-        self.padded_batch_size = self.data_manager.create_data_buffer('input_batch', (BATCH_SIZE, INPUT_DIM), np.float32).spec.padded_shape[0]
+        self.padded_batch_size = self.data_manager.create_data_buffer('input_batch', (BATCH_SIZE, INPUT_DIM), np.float32, BufferPurpose.INPUT_DATA).spec.padded.values[0]
         self.input_dim = INPUT_DIM
         self.hidden_dim = HIDDEN_DIM
         self.output_classes = OUTPUT_CLASSES
+        self.num_exits = NUM_EXITS
         self.adam_beta1 = np.float32(ADAM_BETA1)
         self.adam_beta2 = np.float32(ADAM_BETA2)
         self.learning_rate = np.float32(LEARNING_RATE)
@@ -619,6 +778,7 @@ class KernelWrapper:
         req.bind_argument(4, biases_buf.cl_buffer)
         req.bind_argument(5, hidden_buf.cl_buffer)
         req.bind_argument(6, hidden_buf.mask_buffer)
+
         access_map = {
             input_buf.spec.name: {AccessMode.SHARED_READ},
             f"mask_{input_buf.spec.name}": {AccessMode.SHARED_READ},
@@ -650,11 +810,13 @@ class KernelWrapper:
         req.bind_argument(9, targets_buf.mask_buffer)
         req.bind_argument(10, np.int32(exit_idx))
         req.bind_argument(11, self.temperatures)
-        req.bind_argument(12, np.int32(self.hidden_dim))
-        req.bind_argument(13, np.int32(self.output_classes))
-        req.bind_argument(14, np.int32(self.padded_hidden_dim))
-        req.bind_argument(15, np.int32(self.padded_output_classes))
-        req.bind_argument(16, np.int32(self.padded_batch_size))
+        req.bind_argument(12, np.int32(self.padded_batch_size))
+        req.bind_argument(13, np.int32(self.hidden_dim))
+        req.bind_argument(14, np.int32(self.output_classes))
+        req.bind_argument(15, np.int32(self.padded_hidden_dim))
+        req.bind_argument(16, np.int32(self.padded_output_classes))
+        req.bind_argument(17, np.int32(self.num_exits))
+
         access_map = {
             hidden_buf.spec.name: {AccessMode.SHARED_READ},
             f"mask_{hidden_buf.spec.name}": {AccessMode.SHARED_READ},
@@ -668,6 +830,7 @@ class KernelWrapper:
             losses_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER},
             f"mask_{losses_buf.spec.name}": {AccessMode.EXCLUSIVE_WRITE_OVER}
         }
+
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
@@ -700,6 +863,7 @@ class KernelWrapper:
         req.bind_argument(18, np.int32(self.padded_hidden_dim))
         req.bind_argument(19, np.int32(self.padded_output_classes))
         req.bind_argument(20, np.int32(self.padded_batch_size))
+
         access_map = {
             input_buf.spec.name: {AccessMode.SHARED_READ},
             f"mask_{input_buf.spec.name}": {AccessMode.SHARED_READ},
@@ -716,6 +880,7 @@ class KernelWrapper:
             grad_exit_weights_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER},
             grad_exit_biases_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER}
         }
+
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
@@ -736,6 +901,8 @@ class KernelWrapper:
         req.bind_argument(6, np.int32(self.output_classes))
         req.bind_argument(7, np.int32(self.padded_output_classes))
         req.bind_argument(8, np.int32(self.padded_batch_size))
+        req.bind_argument(9, np.int32(self.num_exits))
+
         access_map = {
             exit_probs_buf.spec.name: {AccessMode.SHARED_READ},
             f"mask_{exit_probs_buf.spec.name}": {AccessMode.SHARED_READ},
@@ -744,6 +911,7 @@ class KernelWrapper:
             'temps': {AccessMode.SHARED_READ},
             grad_temps_buf.spec.name: {AccessMode.EXCLUSIVE_WRITE_OVER}
         }
+
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
@@ -766,12 +934,14 @@ class KernelWrapper:
         req.bind_argument(8, self.learning_rate)
         req.bind_argument(9, self.epsilon)
         req.bind_argument(10, np.int32(total_params))
+
         access_map = {
             grad_buf.spec.name: {AccessMode.SHARED_READ},
             param_buf.spec.name: {AccessMode.EXCLUSIVE_UPDATE},
             m1_buf.spec.name: {AccessMode.EXCLUSIVE_UPDATE},
             m2_buf.spec.name: {AccessMode.EXCLUSIVE_UPDATE}
         }
+
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
@@ -786,9 +956,12 @@ class KernelWrapper:
         req.bind_argument(0, temps_buf.cl_buffer)
         req.bind_argument(1, self.min_temp)
         req.bind_argument(2, self.max_temp)
+        req.bind_argument(3, np.int32(self.num_exits))
+
         access_map = {
             temps_buf.spec.name: {AccessMode.EXCLUSIVE_UPDATE}
         }
+
         return self.manager.create_node(
             node_type=NodeType.COMPUTE,
             queue_type='compute',
@@ -832,13 +1005,13 @@ pm.register_parameter('temps', (NUM_EXITS,), 'temperature', requires_grad=True)
 # Create parameter buffers
 pm._create_buffers()
 
-# Create data buffers
-input_buf = data_mgr.create_data_buffer('input_batch', (BATCH_SIZE, INPUT_DIM), np.float32)
-hidden_buf = data_mgr.create_data_buffer('hidden', (BATCH_SIZE, HIDDEN_DIM), np.float32)
-exit_probs_buf = data_mgr.create_data_buffer('exit_probs', (BATCH_SIZE, NUM_EXITS, OUTPUT_CLASSES), np.float32)
-losses_buf = data_mgr.create_data_buffer('losses', (NUM_EXITS * BATCH_SIZE,), np.float32)
-targets_buf = data_mgr.create_data_buffer('targets_batch', (BATCH_SIZE,), np.int32)
-mask_buf = data_mgr.create_data_buffer('mask_batch', (BATCH_SIZE,), np.float32)
+# Create data buffers with specific purposes
+input_buf = data_mgr.create_data_buffer('input_batch', (BATCH_SIZE, INPUT_DIM), np.float32, BufferPurpose.INPUT_DATA)
+hidden_buf = data_mgr.create_data_buffer('hidden', (BATCH_SIZE, HIDDEN_DIM), np.float32, BufferPurpose.HIDDEN_ACT)
+exit_probs_buf = data_mgr.create_data_buffer('exit_probs', (NUM_EXITS, BATCH_SIZE, OUTPUT_CLASSES), np.float32, BufferPurpose.EXIT_PROBS)
+losses_buf = data_mgr.create_data_buffer('losses', (NUM_EXITS, BATCH_SIZE), np.float32, BufferPurpose.LOSSES)
+targets_buf = data_mgr.create_data_buffer('targets_batch', (BATCH_SIZE,), np.int32, BufferPurpose.TARGETS)
+mask_buf = data_mgr.create_data_buffer('mask_batch', (BATCH_SIZE,), np.float32, BufferPurpose.MASK)
 
 # Commit initialization workload
 manager.commit_workload()
@@ -863,14 +1036,17 @@ simd_width: int = data_mgr.padding_ctx.simd_width
 build_opts: List[str] = [
     f"-D VECTOR_TYPE={'float' + str(simd_width) if simd_width > 1 else 'float'}",
     f"-D SIMD_WIDTH={simd_width}",
-    f"-D NUM_EXITS={NUM_EXITS}",
-    f"-D LOSS_STRIDE={losses_buf.spec.padded_shape[0] // NUM_EXITS}",
     f"-D USE_FAST_MATH=1"
 ]
 program: cl.Program = cl.Program(ctx, "\n".join(kernel_src)).build(options=" ".join(build_opts))
 
-# Initialize BatchPadder with buffer specs
+# Initialize BatchPadder
 batch_padder = BatchPadder(input_buf.spec, targets_buf.spec)
+
+# HostViews for device-to-host transfers
+losses_view = HostView(losses_buf)
+exit_probs_view = HostView(exit_probs_buf)
+temps_view = HostView(pm.buffers['temps'])
 
 # Training Loop
 global_step: int = 1
@@ -920,11 +1096,11 @@ for epoch in range(EPOCHS):
         )
 
         kernel_wrapper = KernelWrapper(program, manager, global_step, compute_queue, data_mgr, param_mgr)
-        kernel_wrapper.set_mask(mask_buf.cl_buffer).set_temps(pm.buffers['temps'])
+        kernel_wrapper.set_mask(mask_buf.cl_buffer).set_temps(pm.buffers['temps'].cl_buffer)
         pm.zero_gradients(manager)
 
         # Forward pass
-        global_forward = (input_buf.spec.padded_shape[0], HIDDEN_DIM)
+        global_forward = (input_buf.spec.padded.values[0], HIDDEN_DIM)
         local_forward = optimal_local_sizes(global_forward, device_limits)
         forward_node = kernel_wrapper.forward_pass(
             global_forward, local_forward,
@@ -935,7 +1111,7 @@ for epoch in range(EPOCHS):
 
         # Compute exit probabilities
         for exit_idx in range(NUM_EXITS):
-            global_exit = (input_buf.spec.padded_shape[0],)
+            global_exit = (input_buf.spec.padded.values[0],)
             local_exit = optimal_local_sizes(global_exit, device_limits)
             exit_node = kernel_wrapper.compute_exit_probabilities(
                 global_exit, local_exit,
@@ -994,16 +1170,16 @@ for epoch in range(EPOCHS):
                     clamp_node = kernel_wrapper.clamp_temperatures(global_clamp, local_clamp, param_buf)
                     manager.execution_graph.add_edge(adam_node, clamp_node)
 
-        # Device-to-host transfers
-        losses_host = np.empty(losses_buf.spec.padded_shape, dtype=np.float32)
-        exit_probs_host = np.empty(exit_probs_buf.spec.padded_shape, dtype=np.float32)
-        temps_host = np.empty(pm.buffers['temps'].spec.padded_shape, dtype=np.float32)
+        # Device-to-host transfers using HostView
         def transfer_losses(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> cl.Event:
-            return cl.enqueue_copy(queue, losses_host, losses_buf.cl_buffer, wait_for=wait_for)
+            losses_view.update_from_device(queue, losses_buf.cl_buffer)
+            return cl.enqueue_marker(queue, wait_for=wait_for)
         def transfer_exit_probs(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> cl.Event:
-            return cl.enqueue_copy(queue, exit_probs_host, exit_probs_buf.cl_buffer, wait_for=wait_for)
+            exit_probs_view.update_from_device(queue, exit_probs_buf.cl_buffer)
+            return cl.enqueue_marker(queue, wait_for=wait_for)
         def transfer_temps(queue: cl.CommandQueue, wait_for: List[cl.Event]) -> cl.Event:
-            return cl.enqueue_copy(queue, temps_host, pm.buffers['temps'].cl_buffer, wait_for=wait_for)
+            temps_view.update_from_device(queue, pm.buffers['temps'].cl_buffer)
+            return cl.enqueue_marker(queue, wait_for=wait_for)
         losses_transfer = manager.create_node(
             NodeType.TRANSFER, 'xfer',
             {losses_buf.spec.name: {AccessMode.SHARED_READ}},
@@ -1025,25 +1201,26 @@ for epoch in range(EPOCHS):
         manager.commit_workload()
         manager.wait_for_sync(sync_uid)
 
-        # Process results
-        padded_batch_size = losses_buf.spec.padded_shape[0] // NUM_EXITS
-        losses_reshaped = losses_host.reshape(NUM_EXITS, padded_batch_size)
+        # Process results using HostView valid slices
+        valid_losses = losses_view.valid_slice.T  # Shape (actual_batch, NUM_EXITS)
         exit_losses = []
         for exit_idx in range(NUM_EXITS):
-            masked_losses = losses_reshaped[exit_idx] * mask
+            masked_losses = valid_losses[:, exit_idx] * mask[:actual_batch_size]
             total_loss = np.sum(masked_losses)
-            num_valid = np.sum(mask)
+            num_valid = np.sum(mask[:actual_batch_size])
             if num_valid > 0:
                 exit_loss = total_loss / num_valid
                 exit_losses.append(float(exit_loss))
             else:
                 exit_losses.append(0.0)
         print(f"Batch {batch_idx}: Per-exit Losses: {exit_losses}")
-        valid_mask = mask > 0
-        valid_probs = exit_probs_host[valid_mask, :, :OUTPUT_CLASSES]
-        confidences = np.array([valid_probs[:, i, :].max(axis=1) ** (1 / (temps_host[i] + 1e-8)) for i in range(NUM_EXITS)])
+
+        valid_exit_probs = exit_probs_view.valid_slice.transpose(1, 0, 2) # Shape (actual_batch, NUM_EXITS, OUTPUT_CLASSES)
+        valid_temps = temps_view.valid_slice  # Shape (NUM_EXITS,)
+
+        confidences = np.array([valid_exit_probs[:, i, :].max(axis=1) ** (1 / (valid_temps[i] + 1e-8)) for i in range(NUM_EXITS)])
         weights = np.exp(confidences) / np.sum(np.exp(confidences), axis=0)
-        ensemble_probs = np.einsum('ijk,j->ik', valid_probs, weights)
+        ensemble_probs = np.einsum('ijk,j->ik', valid_exit_probs, weights)
         ensemble_probs /= np.sum(ensemble_probs, axis=1, keepdims=True) + 1e-8
         log_probs = np.log(ensemble_probs + 1e-8)
         batch_loss = -np.mean(log_probs[np.arange(actual_batch_size), y_batch])
@@ -1054,5 +1231,4 @@ for epoch in range(EPOCHS):
     avg_loss = epoch_loss / len(X)
     train_acc = correct_predictions / len(X)
     print(f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | Acc: {train_acc:.1%}")
-    print(f"Temperatures: {temps_host}")
-    
+    print(f"Temperatures: {valid_temps}")
