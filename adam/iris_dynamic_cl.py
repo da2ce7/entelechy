@@ -195,9 +195,9 @@ class LossBufferSpec(BufferSpec):
         if len(self.real_shape) != 2:
             raise ValueError("Loss buffers must be 2D (batch, exits)")
         self.logical = LogicalShape(
-               batch=self.real_shape[1],
-               features=(self.real_shape[0],)
-           )
+            batch=self.real_shape[1],
+            features=(self.real_shape[0],)
+        )
         self.padded = PaddedShape(self.padded_shape)
 
 @dataclass
@@ -643,7 +643,7 @@ class ParamManager:
             'post_pad_fn': lambda padded, sw: padded.reshape(padded.shape[0], sw, padded.shape[1]//sw, padded.shape[2])
         },
         'temperature': {
-            'init': lambda s: np.ones(s, dtype=np.float32) * (MAX_TEMP + MIN_TEMP) / 2,
+            'init': lambda s: np.full(s, (MAX_TEMP + MIN_TEMP) / 2, np.float32),
             'constraint': (MIN_TEMP, MAX_TEMP),
             'post_pad_fn': lambda padded, sw: padded
         },
@@ -1034,7 +1034,6 @@ for fname in CL_HEADER_FILES + CL_KERNEL_FILES:
         kernel_src.append("")
 simd_width: int = data_mgr.padding_ctx.simd_width
 build_opts: List[str] = [
-    f"-D VECTOR_TYPE={'float' + str(simd_width) if simd_width > 1 else 'float'}",
     f"-D SIMD_WIDTH={simd_width}",
     f"-D USE_FAST_MATH=1"
 ]
