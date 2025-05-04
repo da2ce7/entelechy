@@ -79,6 +79,9 @@ __kernel void forward_pass(
     hidden[hidden_idx] = scalar_relu(accum);
 }
 
+#define SAFE_LOG_MIN (SCALAR_TYPE)(1.0e-7)
+#define EXIT_PROB_INDEX(exit, batch, class) ((exit) * padded_batch_size * padded_output_classes + (batch) * padded_output_classes + (class))
+
 __kernel void compute_exit_probabilities(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict hidden,
@@ -98,99 +101,171 @@ __kernel void compute_exit_probabilities(
     int padded_hidden_dim,
     int padded_output_classes,
     int num_exits) {
+    // Precompute common indices
     const uint exit_idx  = get_global_id(0);
     const uint batch_idx = get_global_id(1);
     const uint lid       = get_local_id(0);
     const uint lsize     = get_local_size(0);
 
-    const bool valid_sample    = (hidden_mask[batch_idx] > 0.5f) && (targets_mask[batch_idx] > 0.5f);
-    exit_probs_mask[batch_idx] = valid_sample ? (SCALAR_TYPE)1.0 : SCALAR_ZERO;
-    losses_mask[batch_idx]     = valid_sample ? (SCALAR_TYPE)1.0 : SCALAR_ZERO;
+    // Get true class early
+    const int  true_class  = targets[batch_idx];
+    const uint exit_offset = EXIT_PROB_INDEX(exit_idx, batch_idx, 0);
+    const uint weight_base = exit_idx * padded_hidden_dim * padded_output_classes;
 
-    if (!valid_sample || exit_idx >= num_exits) {
+    // Vectorization setup
+    const uint vec_size    = min((uint)4, (uint)(SIMD_WIDTH / 2));
+    const uint vec_classes = output_classes / vec_size;
+    const uint rem_classes = output_classes % vec_size;
+
+    // Mask handling
+    const SCALAR_TYPE mask_val = hidden_mask[batch_idx] * targets_mask[batch_idx];
+    exit_probs_mask[batch_idx] = (mask_val > 0.5f) ? (SCALAR_TYPE)1.0 : SCALAR_ZERO;
+    losses_mask[batch_idx]     = exit_probs_mask[batch_idx];
+
+    // Early exit for invalid work-items
+    if (mask_val <= 0.5f || exit_idx >= num_exits) {
+#pragma unroll 4
         for (uint c = lid; c < padded_output_classes; c += lsize) {
-            exit_probs[exit_idx * padded_batch_size * padded_output_classes + batch_idx * padded_output_classes + c] = SCALAR_ZERO;
+            exit_probs[exit_offset + c] = SCALAR_ZERO;
         }
         return;
     }
 
-    const int         true_class = targets[batch_idx];
-    const SCALAR_TYPE temp       = temperatures[exit_idx];
-    SCALAR_TYPE       max_logit  = -INFINITY;
-    SCALAR_TYPE       sum_exp    = SCALAR_ZERO;
-    SCALAR_TYPE       loss       = SCALAR_ZERO;
+    // Shared memory buffers
+    __local SCALAR_TYPE max_buffer[WG_SIZE];
+    __local SCALAR_TYPE sum_buffer[WG_SIZE];
+    SCALAR_TYPE         max_logit  = -INFINITY;
+    SCALAR_TYPE         sum_exp    = SCALAR_ZERO;
+    SCALAR_TYPE         final_loss = SCALAR_ZERO;
 
-    // Phase 1: Compute logits & find global max
-    for (uint c = lid; c < output_classes; c += lsize) {
-        SCALAR_TYPE logit = exit_biases[exit_idx * padded_output_classes + c];
+    // Phase 1: Vectorized logit computation
+    // Process vector chunks
+    const uint k_stride = padded_hidden_dim * SIMD_WIDTH;
 
-        const uint weight_block = exit_idx * padded_hidden_dim * padded_output_classes + (c / SIMD_WIDTH) * padded_hidden_dim * SIMD_WIDTH;
+#pragma unroll 2
+    for (uint vc = lid; vc < vec_classes; vc += lsize) {
+        const uint  c_base    = vc * vec_size;
+        SCALAR_TYPE logits[4] = {0};
 
+        const uint weight_base_part = weight_base + (c_base / SIMD_WIDTH) * k_stride;
+
+// Accumulate weights
+#pragma unroll 4
         for (uint k = 0; k < hidden_dim; k++) {
-            logit += hidden[batch_idx * padded_hidden_dim + k] * exit_weights[weight_block + k * SIMD_WIDTH + (batch_idx % SIMD_WIDTH)];
+            const uint weight_idx = weight_base_part + k * SIMD_WIDTH + (batch_idx % SIMD_WIDTH);
+
+// Load bias vector
+#if SIMD_WIDTH >= 4
+            const SCALAR_TYPE4 bias_vec = vload4(vc, exit_biases + exit_idx * padded_output_classes);
+            logits[0]                   = bias_vec.x;
+            logits[1]                   = bias_vec.y;
+            logits[2]                   = bias_vec.z;
+            logits[3]                   = bias_vec.w;
+#else
+#pragma unroll
+            for (uint i = 0; i < vec_size; i++)
+                logits[i] = exit_biases[exit_idx * padded_output_classes + c_base + i];
+#endif
+
+// Accumulate weights
+#pragma unroll 4
+            for (uint k = 0; k < hidden_dim; k++) {
+                const uint weight_idx = weight_base + (c_base / SIMD_WIDTH) * padded_hidden_dim * SIMD_WIDTH + k * SIMD_WIDTH + (batch_idx % SIMD_WIDTH);
+
+#if SIMD_WIDTH >= 4
+                const SCALAR_TYPE weight_vec[4] = {exit_weights[weight_idx], exit_weights[weight_idx + 1], exit_weights[weight_idx + 2], exit_weights[weight_idx + 3]};
+#else
+                const SCALAR_TYPE weight = exit_weights[weight_idx];
+#endif
+
+                const SCALAR_TYPE h = hidden[batch_idx * padded_hidden_dim + k];
+
+#pragma unroll
+                for (uint i = 0; i < vec_size; i++) {
+#if SIMD_WIDTH >= 4
+                    logits[i] += h * weight_vec[i];
+#else
+                    logits[i] += h * exit_weights[weight_idx + i];
+#endif
+                }
+            }
+
+// Store logits and track max
+#pragma unroll
+            for (uint i = 0; i < vec_size; i++) {
+                const uint        c         = c_base + i;
+                const SCALAR_TYPE logit     = logits[i] * native_recip(temperatures[exit_idx]);
+                exit_probs[exit_offset + c] = logit;
+                max_logit                   = fmax(max_logit, logit);
+            }
         }
 
-        logit *= native_recip(temp);
-        exit_probs[exit_idx * padded_batch_size * padded_output_classes + batch_idx * padded_output_classes + c] = logit;
+// Process remainder elements
+#pragma unroll 1
+        for (uint c = vec_classes * vec_size + lid; c < output_classes; c += lsize) {
+            SCALAR_TYPE logit = exit_biases[exit_idx * padded_output_classes + c];
 
-        max_logit = fmax(max_logit, logit);
-    }
+            for (uint k = 0; k < hidden_dim; k++) {
+                const uint weight_idx = weight_base + (c / SIMD_WIDTH) * padded_hidden_dim * SIMD_WIDTH + k * SIMD_WIDTH + (batch_idx % SIMD_WIDTH);
 
-    // Single barrier for max reduction
-    local_mem[lid] = max_logit;
-    barrier(CLK_LOCAL_MEM_FENCE);
+                logit += hidden[batch_idx * padded_hidden_dim + k] * exit_weights[weight_idx];
+            }
 
-    // Reduction for max (no tree)
-    for (uint s = lsize; s > 1; s = (s + 1) / 2) {
-        const uint half = s / 2;
-        if (lid < half && lid + half < s) {
-            local_mem[lid] = fmax(local_mem[lid], local_mem[lid + half]);
+            logit *= native_recip(temperatures[exit_idx]);
+            exit_probs[exit_offset + c] = logit;
+            max_logit                   = fmax(max_logit, logit);
         }
+
+        // Max reduction
+        max_buffer[lid] = max_logit;
         barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const SCALAR_TYPE global_max = local_mem[0];
-
-    // Phase 2: Compute exps and sum (on previous data)
-    for (uint c = lid; c < output_classes; c += lsize) {
-        SCALAR_TYPE val = exp(exit_probs[exit_idx * padded_batch_size * padded_output_classes + batch_idx * padded_output_classes + c] - global_max);
-        sum_exp += val;
-        exit_probs[exit_idx * padded_batch_size * padded_output_classes + batch_idx * padded_output_classes + c] = val;
-    }
-
-    // Single barrier for sum reduction
-    local_mem[lid] = sum_exp;
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    // Reduction for sum (horizontal collapse)
-    for (uint s = lsize; s > 1; s = (s + 1) / 2) {
-        const uint half = s / 2;
-        if (lid < half && lid + half < s) {
-            local_mem[lid] += local_mem[lid + half];
+        for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
+            if (lid < stride) {
+                max_buffer[lid] = fmax(max_buffer[lid], max_buffer[lid + stride]);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
         }
+        const SCALAR_TYPE global_max = max_buffer[0];
+
+// Phase 2: Exp and sum
+#pragma unroll 4
+        for (uint c = lid; c < output_classes; c += lsize) {
+            SCALAR_TYPE val             = exp(exit_probs[exit_offset + c] - global_max);
+            exit_probs[exit_offset + c] = val;
+            sum_exp += val;
+        }
+
+        // Sum reduction
+        sum_buffer[lid] = sum_exp;
         barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const SCALAR_TYPE total_sum = fmax(local_mem[0], SAFE_LOG_MIN);
-
-    // Phase 3: Final probabilities and loss
-    if (lid == 0) {
-        losses[exit_idx * padded_batch_size + batch_idx] = SCALAR_ZERO;
-    }
-
-    for (uint c = lid; c < output_classes; c += lsize) {
-        exit_probs[exit_idx * padded_batch_size * padded_output_classes + batch_idx * padded_output_classes + c] /= total_sum;
-
-        if ((int)c == true_class) {
-            loss = -native_log(fmax(exit_probs[exit_idx * padded_batch_size * padded_output_classes + batch_idx * padded_output_classes + c], SAFE_LOG_MIN));
+        for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
+            if (lid < stride) {
+                sum_buffer[lid] += sum_buffer[lid + stride];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
         }
-    }
+        const SCALAR_TYPE sum_total = fmax(sum_buffer[0], SAFE_LOG_MIN);
 
-    // Final loss accumulation (single write)
-    if (lid == 0 && output_classes > 0) {
-        losses[exit_idx * padded_batch_size + batch_idx] = loss;
-    }
+// Phase 3: Final probabilities and loss
+#pragma unroll 4
+        for (uint c = lid; c < output_classes; c += lsize) {
+            const SCALAR_TYPE prob      = exit_probs[exit_offset + c] / sum_total;
+            exit_probs[exit_offset + c] = prob;
 
-    // Handle padded classes
-    for (uint c = output_classes + lid; c < padded_output_classes; c += lsize) {
-        exit_probs[exit_idx * padded_batch_size * padded_output_classes + batch_idx * padded_output_classes + c] = SCALAR_ZERO;
+            if ((int)c == true_class) {
+                final_loss = -native_log(fmax(prob, SAFE_LOG_MIN));
+            }
+        }
+
+        // Unique loss write
+        if (lid == 0) {
+            losses[exit_idx * padded_batch_size + batch_idx] = final_loss;
+        }
+
+// Zero-pad remaining classes
+#pragma unroll 4
+        for (uint c = output_classes + lid; c < padded_output_classes; c += lsize) {
+            exit_probs[exit_offset + c] = SCALAR_ZERO;
+        }
     }
 }
