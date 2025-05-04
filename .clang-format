@@ -1,0 +1,38 @@
+# =====================================
+#  clang-format configuration (LLVM+)
+# =====================================
+
+### Basis & Meta Preferences ###
+BasedOnStyle: LLVM
+
+### Indentation Rules ###
+IndentWidth: 4
+UseTab: Never
+NamespaceIndentation: All
+
+# Controls offset of access modifiers (-2 = compact)
+AccessModifierOffset: -2
+
+### Line Handling ###
+ColumnLimit: 200
+
+# Parameter wrapping policies
+AllowAllParametersOfDeclarationOnNextLine: false
+BinPackParameters: false
+
+# Operator wrapping rules
+BreakBeforeBinaryOperators: All
+
+### Code Alignment ###
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+AlignAfterOpenBracket: AlwaysBreak
+
+### Pointer Style ###
+PointerAlignment: Right
+
+### Brace Handling ###
+BreakBeforeBraces: Attach  # K&R style brace attachment
+
+### Initializer Formatting ###
+ConstructorInitializerIndentWidth: 4
