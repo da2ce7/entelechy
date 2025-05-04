@@ -1026,13 +1026,14 @@ class KernelWrapper:
         exit_probs_buf: DataBuffer,
         losses_buf: DataBuffer,
         targets_buf: DataBuffer,
-        exit_idx: int,
     ) -> int:
-        """Enqueue the exit probabilities kernel."""
+        """Enqueue the exit probabilities kernel for all exits simultaneously."""
         req = KernelExecutionRequest(
             self.program, "compute_exit_probabilities", global_sizes, local_sizes
         )
-        req.set_local_mem_argument(0, local_size * SCALAR_SIZE)
+        # Set local memory for weights
+        weight_size = self.hidden_dim * self.output_classes * SCALAR_SIZE
+        req.set_local_mem_argument(0, weight_size)
         req.bind_argument(1, hidden_buf.cl_buffer)
         req.bind_argument(2, hidden_buf.mask_buffer)
         req.bind_argument(3, exit_weights_buf.cl_buffer)
@@ -1043,14 +1044,13 @@ class KernelWrapper:
         req.bind_argument(8, losses_buf.mask_buffer)
         req.bind_argument(9, targets_buf.cl_buffer)
         req.bind_argument(10, targets_buf.mask_buffer)
-        req.bind_argument(11, np.int32(exit_idx))
-        req.bind_argument(12, self.temperatures)
-        req.bind_argument(13, np.int32(self.padded_batch_size))
-        req.bind_argument(14, np.int32(self.hidden_dim))
-        req.bind_argument(15, np.int32(self.output_classes))
-        req.bind_argument(16, np.int32(self.padded_hidden_dim))
-        req.bind_argument(17, np.int32(self.padded_output_classes))
-        req.bind_argument(18, np.int32(self.num_exits))
+        req.bind_argument(11, self.temperatures)
+        req.bind_argument(12, np.int32(self.padded_batch_size))
+        req.bind_argument(13, np.int32(self.hidden_dim))
+        req.bind_argument(14, np.int32(self.output_classes))
+        req.bind_argument(15, np.int32(self.padded_hidden_dim))
+        req.bind_argument(16, np.int32(self.padded_output_classes))
+        req.bind_argument(17, np.int32(self.num_exits))
 
         access_map = {
             hidden_buf.spec.name: {AccessMode.SHARED_READ},
@@ -1440,23 +1440,21 @@ for epoch in range(EPOCHS):
         manager.execution_graph.add_edge(input_transfer_mask, forward_node)
 
         # Compute exit probabilities
-        for exit_idx in range(NUM_EXITS):
-            global_exit = (input_buf.spec.padded.values[0],)
-            local_exit = optimal_local_sizes(global_exit, device_limits)
-            exit_node = kernel_wrapper.compute_exit_probabilities(
-                global_exit,
-                local_exit,
-                hidden_buf,
-                pm.buffers["exit_weights"],
-                pm.buffers["exit_biases"],
-                exit_probs_buf,
-                losses_buf,
-                targets_buf,
-                exit_idx,
-            )
-            manager.execution_graph.add_edge(forward_node, exit_node)
-            manager.execution_graph.add_edge(targets_transfer_data, exit_node)
-            manager.execution_graph.add_edge(targets_transfer_mask, exit_node)
+        global_exit = (NUM_EXITS, padded_batch_size)
+        local_exit = optimal_local_sizes(global_exit, device_limits)
+        exit_node = kernel_wrapper.compute_exit_probabilities(
+            global_exit,
+            local_exit,
+            hidden_buf,
+            pm.buffers["exit_weights"],
+            pm.buffers["exit_biases"],
+            exit_probs_buf,
+            losses_buf,
+            targets_buf,
+        )
+        manager.execution_graph.add_edge(forward_node, exit_node)
+        manager.execution_graph.add_edge(targets_transfer_data, exit_node)
+        manager.execution_graph.add_edge(targets_transfer_mask, exit_node)
 
         # Compute gradients
         global_grad = (INPUT_DIM, HIDDEN_DIM)
@@ -1479,6 +1477,7 @@ for epoch in range(EPOCHS):
         manager.execution_graph.add_edge(forward_node, grad_node)
         manager.execution_graph.add_edge(targets_transfer_data, grad_node)
         manager.execution_graph.add_edge(targets_transfer_mask, grad_node)
+        manager.execution_graph.add_edge(exit_node, grad_node)
 
         # Compute temperature gradients
         global_temp_grad = (NUM_EXITS,)
@@ -1492,6 +1491,7 @@ for epoch in range(EPOCHS):
         )
         manager.execution_graph.add_edge(targets_transfer_data, temp_grad_node)
         manager.execution_graph.add_edge(targets_transfer_mask, temp_grad_node)
+        manager.execution_graph.add_edge(exit_node, temp_grad_node)
 
         # ADAM update
         for param in ["weights", "biases", "exit_weights", "exit_biases", "temps"]:
@@ -1561,6 +1561,9 @@ for epoch in range(EPOCHS):
             transfer_temps,
             {},
         )
+        manager.execution_graph.add_edge(exit_node, losses_transfer)
+        manager.execution_graph.add_edge(exit_node, exit_probs_transfer)
+        manager.execution_graph.add_edge(exit_node, temps_transfer)
 
         # Sync node
         sync_uid = manager.create_sync_node(

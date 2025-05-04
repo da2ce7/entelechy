@@ -98,7 +98,7 @@ Host Assumptions:
 - The kernel relies on masks (e.g., hidden_mask, targets_mask) to process only valid elements, making no assumptions about the padding strategy.
 - Local memory size is workgroup_x * sizeof(SCALAR_TYPE), where workgroup_x is the local work size in the x-dimension.
 - Workgroup dimensions are optimized by the host, typically multiples of SIMD_WIDTH.
-- The kernel processes each exit based on the provided exit_idx.
+- The kernel processes all exits in a single call, with each work item handling a unique (exit, batch) pair based on its global ID.
 - Buffer dimensions (e.g., padded_batch_size, padded_hidden_dim) are provided by the host, and masks are used to handle valid elements.
 */
 __kernel void compute_exit_probabilities(
@@ -113,7 +113,6 @@ __kernel void compute_exit_probabilities(
     __global SCALAR_TYPE *__restrict losses_mask,        // [shape: padded_batch_size]
     __global const int *__restrict targets,              // [shape: padded_batch_size]
     __global const SCALAR_TYPE *__restrict targets_mask, // [shape: padded_batch_size]
-    int exit_idx,                                        // Exit index between 0 and NUM_EXITS-1
     __global const SCALAR_TYPE *__restrict temperatures, // [shape: NUM_EXITS]
     int padded_batch_size,                               // Padded batch size provided by the host
     int hidden_dim,                                      // True HIDDEN_DIM
