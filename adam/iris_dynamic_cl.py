@@ -334,11 +334,16 @@ class DataBufferManager:
         if purpose in [BufferPurpose.TARGETS, BufferPurpose.MASK]:
             padded_batch = next_pow2(shape[0])
             return (padded_batch,) + shape[1:]
-        elif purpose in [BufferPurpose.LOSSES]: 
+        elif purpose in [BufferPurpose.LOSSES]:
             padded_exits = next_pow2(shape[0])
             padded_batch = next_pow2(shape[1])
             return (padded_exits, padded_batch)
-        elif purpose in [BufferPurpose.INPUT_DATA, BufferPurpose.HIDDEN_ACT, BufferPurpose.EXIT_PROBS]:
+        elif purpose in [BufferPurpose.HIDDEN_ACT]:
+            padded_batch = next_pow2(shape[0])
+            simd_width = self.padding_ctx.simd_width
+            hidden_blocks = (shape[1] + simd_width - 1) // simd_width
+            return (padded_batch, hidden_blocks, simd_width)
+        elif purpose in [BufferPurpose.INPUT_DATA, BufferPurpose.EXIT_PROBS]:
             padded_batch = next_pow2(shape[0])
             padded_features = tuple(next_pow2(dim) for dim in shape[1:])
             return (padded_batch,) + padded_features
@@ -367,7 +372,12 @@ class HostView:
         """Returns a view into just the non-padded data."""
         if isinstance(self.spec, LossBufferSpec):
             return self.host_data[:self.spec.logical.features[0], :self.spec.logical.batch]
-        elif isinstance(self.spec, (InputBufferSpec, HiddenActBufferSpec, ExitProbsBufferSpec)):
+        elif isinstance(self.spec, HiddenActBufferSpec):
+            batch = self.spec.logical.batch
+            simd_width = self.spec.simd_alignment or self.spec.padded.values[-1]
+            hidden_blocks = (self.spec.logical.features[0] + simd_width - 1) // simd_width
+            return self.host_data[:batch, :hidden_blocks, :simd_width]
+        elif isinstance(self.spec, (InputBufferSpec, ExitProbsBufferSpec)):
             slices = (slice(0, self.spec.logical.batch),) + tuple(slice(0, f) for f in self.spec.logical.features)
             return self.host_data[slices]
         elif isinstance(self.spec, (TargetsBufferSpec, MaskBufferSpec)):
@@ -773,13 +783,15 @@ class KernelWrapper:
     def forward_pass(self, global_sizes: Tuple[int, ...], local_sizes: Tuple[int, ...], input_buf: DataBuffer, weights_buf: ParameterBuffer, biases_buf: ParameterBuffer, hidden_buf: DataBuffer) -> int:
         """Enqueue the forward pass kernel."""
         req = KernelExecutionRequest(self.program, 'forward_pass', global_sizes, local_sizes)
-        req.set_local_mem_argument(0, local_sizes[0] * SCALAR_SIZE, AccessMode.LOCAL)
+        req.set_local_mem_argument(0, 2* local_sizes[0] * SCALAR_SIZE, AccessMode.LOCAL)
         req.bind_argument(1, input_buf.cl_buffer)
         req.bind_argument(2, input_buf.mask_buffer)
         req.bind_argument(3, weights_buf.cl_buffer)
         req.bind_argument(4, biases_buf.cl_buffer)
         req.bind_argument(5, hidden_buf.cl_buffer)
         req.bind_argument(6, hidden_buf.mask_buffer)
+        req.bind_argument(7, np.int32(self.padded_input_dim))
+        req.bind_argument(8, np.int32(self.padded_hidden_dim))
 
         access_map = {
             input_buf.spec.name: {AccessMode.SHARED_READ},
@@ -1042,6 +1054,7 @@ for fname in CL_HEADER_FILES + CL_KERNEL_FILES:
         kernel_src.append("")
 simd_width: int = data_mgr.padding_ctx.simd_width
 build_opts: List[str] = [
+    f"-cl-std=CL1.2",
     f"-D SCALAR_TYPE={CL_SCALAR_TYPE}",
     f"-D SIMD_WIDTH={simd_width}",
     f"-D USE_FAST_MATH=1"
@@ -1108,7 +1121,9 @@ for epoch in range(EPOCHS):
         pm.zero_gradients(manager)
 
         # Forward pass
-        global_forward = (input_buf.spec.padded.values[0], HIDDEN_DIM)
+        padded_batch_size = input_buf.spec.padded.values[0]
+        hidden_blocks = hidden_buf.spec.padded.values[1]  # ceil(HIDDEN_DIM/SIMD_WIDTH)
+        global_forward = (padded_batch_size, hidden_blocks)
         local_forward = optimal_local_sizes(global_forward, device_limits)
         forward_node = kernel_wrapper.forward_pass(
             global_forward, local_forward,

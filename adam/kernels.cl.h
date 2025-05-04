@@ -3,6 +3,25 @@
 
 // Check for OpenCL environment
 #ifdef __OPENCL_VERSION__
+// Require OpenCL 1.2 or later
+#if __OPENCL_VERSION__ < 120
+#error "OpenCL 1.2 or newer is required. Please use a compatible device/driver."
+#endif
+
+// Enable FP16 extension if using half precision
+#if SCALAR_TYPE == half
+#if !defined(cl_khr_fp16)
+#error "FP16 extension (cl_khr_fp16) required for half precision but not supported by device"
+#endif
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#define SCALAR_ZERO 0.0h
+#else
+#define SCALAR_ZERO 0.0f
+#endif
+
+// Define standard kernel attributes for OpenCL environment
+#define KERNEL_ATTR __attribute__((work_group_size_hint(SIMD_WIDTH, 1, 1)))
+
 // In OpenCL mode, require SCALAR_TYPE and SIMD_WIDTH to be defined
 #ifndef SCALAR_TYPE
 #error "SCALAR_TYPE must be defined in OpenCL mode"
@@ -10,8 +29,9 @@
 #ifndef SIMD_WIDTH
 #error "SIMD_WIDTH must be defined in OpenCL mode"
 #endif
+
 #else
-// Not in OpenCL mode, set default values
+// Host/C++ mode definitions
 #ifndef __kernel
 #define __kernel
 #endif
@@ -21,38 +41,56 @@
 #ifndef __global
 #define __global
 #endif
+#ifndef uint
+#define uint int
+#endif
+#define KERNEL_ATTR
+
+// Default to float types if not defined
 #ifndef SCALAR_TYPE
 #define SCALAR_TYPE float
+#define SCALAR_ZERO 0.0f
 #endif
+
+// Default SIMD width for host-side code analysis
 #ifndef SIMD_WIDTH
 #define SIMD_WIDTH 1
 #endif
-#endif
 
-// Set default for USE_FAST_MATH if not defined
+#endif // __OPENCL_VERSION__
+
 #ifndef USE_FAST_MATH
 #define USE_FAST_MATH 0
+#endif
+
+// Common math configuration
+#if USE_FAST_MATH
+#define MATH_FN native_
+#else
+#define MATH_FN
 #endif
 
 // Kernel function declarations for neural network operations
 
 /* ======== Feed Forward Pass ========
 Host Assumptions:
-- The kernel relies on the input_mask to process only valid elements, making no assumptions about the padding strategy.
-- Local memory size is workgroup_x * sizeof(SCALAR_TYPE), where workgroup_x is the local work size in the x-dimension.
-- Workgroup dimensions are optimized by the host, typically multiples of SIMD_WIDTH.
-- Input buffer dimensions are (padded_batch_size, padded_input_dim), with padded sizes provided by the host.
-- Weight matrix is reshaped for vectorized operations, but the kernel uses masks to handle valid elements.
-- Hidden buffer is allocated with padding, but the kernel uses hidden_mask to process only valid elements.
+- Uses 3D NDRange: (dim0: padded_batch_size, dim1: ceil(HIDDEN_DIM/SIMD_WIDTH), dim2: 1)
+- Local memory requirement: 2× workgroup_x * sizeof(SCALAR_TYPE)
+- Weights must be pre-transposed to "SIMD-major" layout:
+  (ceil(HIDDEN_DIM/SIMD_WIDTH), INPUT_DIM, SIMD_WIDTH) for full memory coalescing
+- Local memory split between tile_input[workgroup_x] and tile_weights[workgroup_x]
+- Hidden buffer layout expects SIMD_WIDTH groupings: hidden[batch_id][hidden_block][SIMD_lane]
 */
 __kernel void forward_pass(
-    __local SCALAR_TYPE *local_mem,                    // [req_size: local_sizes[0] * sizeof(SCALAR_TYPE)]
+    __local SCALAR_TYPE *local_mem,                    // [req_size: 2 * local_sizes[0] * sizeof(SCALAR_TYPE)]
     __global const SCALAR_TYPE *__restrict input,      // [shape: (padded_batch_size, padded_input_dim)]
     __global const SCALAR_TYPE *__restrict input_mask, // [shape: padded_batch_size]
     __global const SCALAR_TYPE *__restrict weights,    // [shape: (ceil(HIDDEN_DIM/SIMD_WIDTH), INPUT_DIM, SIMD_WIDTH)]
     __global const SCALAR_TYPE *__restrict biases,     // [shape: padded_hidden_dim]
-    __global SCALAR_TYPE *__restrict hidden,           // [shape: (padded_batch_size, padded_hidden_dim)]
-    __global SCALAR_TYPE *__restrict hidden_mask       // [shape: padded_batch_size]
+    __global SCALAR_TYPE *__restrict hidden,           // [shape: (padded_batch_size, ceil(HIDDEN_DIM/SIMD_WIDTH), SIMD_WIDTH)]
+    __global SCALAR_TYPE *__restrict hidden_mask,      // [shape: padded_batch_size]
+    int padded_input_dim,                              // Padded input dimension provided by the host
+    int padded_hidden_dim                              // Padded hidden dimension provided by the host
 );
 
 /* ======== Exit Probability Computation ========
