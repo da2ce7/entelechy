@@ -107,6 +107,13 @@ def optimal_local_sizes(global_sizes: Tuple[int, ...], device: cl.Device) -> Tup
     return tuple(local_sizes)
 
 
+def validate_targets(y: np.ndarray, num_classes: int):
+    if not np.all(np.logical_and(y >= 0, y < num_classes)):
+        raise ValueError(f"Target labels must be integers between 0 and {num_classes - 1}")
+    if not np.issubdtype(y.dtype, np.integer):
+        raise ValueError("Target labels must be integers")
+
+
 @dataclass
 class PaddingContext:
     """Context for padding tensors based on device properties."""
@@ -160,9 +167,7 @@ def _simd_strategy(ctx: PaddingContext, shape: Tuple[int, ...], dtype: np.dtype)
     return tuple((dim + alignment - 1) // alignment * alignment for dim in shape)
 
 
-def pad_tensor(
-    data: np.ndarray, context: PaddingContext, strategy: str = "simd_aware"
-) -> np.ndarray:
+def pad_tensor(data: np.ndarray, context: PaddingContext, strategy: str = "simd_aware") -> np.ndarray:
     """Pad a tensor according to the specified strategy."""
     orig_shape = data.shape
     padded_shape = PaddingStrategy.apply(context, orig_shape, data.dtype)
@@ -285,9 +290,7 @@ class ExitProbsBufferSpec(BufferSpec):
     def __post_init__(self):
         if len(self.real_shape) != 3:
             raise ValueError("Exit probabilities buffers must be 3D (batch, exits, classes)")
-        self.logical = LogicalShape(
-            batch=self.real_shape[0], features=(self.real_shape[1], self.real_shape[2])
-        )
+        self.logical = LogicalShape(batch=self.real_shape[0], features=(self.real_shape[1], self.real_shape[2]))
         self.padded = PaddedShape(self.padded_shape)
 
 
@@ -413,9 +416,7 @@ class HostView:
             hidden_blocks = (self.spec.logical.features[0] + simd_width - 1) // simd_width
             return self.host_data[:batch, :hidden_blocks, :simd_width]
         elif isinstance(self.spec, (InputBufferSpec, ExitProbsBufferSpec)):
-            slices = (slice(0, self.spec.logical.batch),) + tuple(
-                slice(0, f) for f in self.spec.logical.features
-            )
+            slices = (slice(0, self.spec.logical.batch),) + tuple(slice(0, f) for f in self.spec.logical.features)
             return self.host_data[slices]
         elif isinstance(self.spec, (TargetsBufferSpec, MaskBufferSpec)):
             return self.host_data[: self.spec.logical.batch]
@@ -429,9 +430,7 @@ class BatchPadder:
         self.input_spec = input_buffer_spec
         self.target_spec = target_buffer_spec
 
-    def pad_batch(
-        self, X: np.ndarray, y_true: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def pad_batch(self, X: np.ndarray, y_true: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Pad input and target tensors to fixed buffer sizes."""
         batch_size = X.shape[0]
         X_padded = np.zeros(self.input_spec.padded.values, dtype=SCALAR_NP_TYPE)
@@ -452,9 +451,7 @@ class ParameterBufferManager:
         self.work_manager = work_manager
         self.padding_ctx = PaddingContext.from_device(device)
 
-    def create_parameter(
-        self, name: str, real_shape: Tuple[int, ...], dtype: np.dtype
-    ) -> ParameterBuffer:
+    def create_parameter(self, name: str, real_shape: Tuple[int, ...], dtype: np.dtype) -> ParameterBuffer:
         """Create a parameter buffer."""
         spec = BufferSpec(name, real_shape, dtype, BufferType.PARAMETER)
         padded_shape = self._pad_parameter_shape(real_shape)
@@ -573,9 +570,7 @@ class WorkManager:
         params: Dict,
     ) -> int:
         """Create a new execution node."""
-        node = self.ExecutionNode(
-            self.node_id_counter, node_type, queue_type, access_map, set(), {}, params
-        )
+        node = self.ExecutionNode(self.node_id_counter, node_type, queue_type, access_map, set(), {}, params)
         node.execute = operation_fn
 
         for res, modes in access_map.items():
@@ -585,9 +580,7 @@ class WorkManager:
 
             if write_modes:
                 if res in self.last_writer:
-                    last_writer_modes = self.execution_graph.nodes[self.last_writer[res]][
-                        "node"
-                    ].access_map[res]
+                    last_writer_modes = self.execution_graph.nodes[self.last_writer[res]]["node"].access_map[res]
                     if not (
                         AccessMode.EXCLUSIVE_WRITE_OVER in write_modes
                         and AccessMode.EXCLUSIVE_WRITE_OVER in last_writer_modes
@@ -673,9 +666,7 @@ class WorkManager:
         """Create a synchronization node."""
         user_event = cl.UserEvent(self.context) if sync_type == SyncType.HOST_SIGNAL else None
         if sync_type == SyncType.DEVICE_WAIT:
-            raise ValueError(
-                "DEVICE_WAIT requires a user_event, which should be handled differently."
-            )
+            raise ValueError("DEVICE_WAIT requires a user_event, which should be handled differently.")
         node = self.ExecutionNode(
             self.node_id_counter,
             NodeType.SYNC,
@@ -735,9 +726,7 @@ class WorkManager:
                     buffer, version = self.logical_resources[res]
                     self.logical_resources[res] = (buffer, version + 1)
 
-    def _dispatch_compute(
-        self, node: "WorkManager.ExecutionNode", wait_for: List[cl.Event]
-    ) -> None:
+    def _dispatch_compute(self, node: "WorkManager.ExecutionNode", wait_for: List[cl.Event]) -> None:
         """Dispatch a compute node."""
         queue = self.hardware_queues[node.queue_type]
         node.event = node.execute(queue, wait_for=wait_for)
@@ -746,9 +735,7 @@ class WorkManager:
         """Dispatch a memory node."""
         node.execute(self.hardware_queues[node.queue_type], wait_for=wait_for)
 
-    def _dispatch_transfer(
-        self, node: "WorkManager.ExecutionNode", wait_for: List[cl.Event]
-    ) -> None:
+    def _dispatch_transfer(self, node: "WorkManager.ExecutionNode", wait_for: List[cl.Event]) -> None:
         """Dispatch a transfer node."""
         node.event = node.execute(
             self.hardware_queues[node.queue_type],
@@ -784,9 +771,7 @@ class ParamManager:
     PARAM_TYPES: Dict[str, Dict[str, Union[Callable, Tuple[float, float]]]] = {
         "dense_weight": {
             "init": he_init,
-            "post_pad_fn": lambda padded, sw: padded.T.reshape(
-                padded.shape[1] // sw, padded.shape[0], sw
-            ),
+            "post_pad_fn": lambda padded, sw: padded.T.reshape(padded.shape[1] // sw, padded.shape[0], sw),
         },
         "exit_weight": {
             "post_pad_fn": lambda padded, sw: padded.reshape(
@@ -813,9 +798,7 @@ class ParamManager:
         self.m1_buffers: Dict[str, ParameterBuffer] = {}
         self.m2_buffers: Dict[str, ParameterBuffer] = {}
 
-    def register_parameter(
-        self, name: str, shape: Tuple[int, ...], ptype: str, requires_grad: bool = True
-    ) -> None:
+    def register_parameter(self, name: str, shape: Tuple[int, ...], ptype: str, requires_grad: bool = True) -> None:
         """Register a parameter with its properties."""
         if name in self.buffers:
             raise ValueError(f"Parameter {name} already registered")
@@ -841,22 +824,14 @@ class ParamManager:
             event = cl.enqueue_copy(self.context.queue, param_buf.cl_buffer, processed)
             event.wait()
             if spec["requires_grad"]:
-                grad_buf = self.parameter_manager.create_parameter(
-                    f"grad_{name}", spec["shape"], SCALAR_NP_TYPE
-                )
-                m1_buf = self.parameter_manager.create_parameter(
-                    f"m1_{name}", spec["shape"], SCALAR_NP_TYPE
-                )
-                m2_buf = self.parameter_manager.create_parameter(
-                    f"m2_{name}", spec["shape"], SCALAR_NP_TYPE
-                )
+                grad_buf = self.parameter_manager.create_parameter(f"grad_{name}", spec["shape"], SCALAR_NP_TYPE)
+                m1_buf = self.parameter_manager.create_parameter(f"m1_{name}", spec["shape"], SCALAR_NP_TYPE)
+                m2_buf = self.parameter_manager.create_parameter(f"m2_{name}", spec["shape"], SCALAR_NP_TYPE)
                 self.grad_buffers[name] = grad_buf
                 self.m1_buffers[name] = m1_buf
                 self.m2_buffers[name] = m2_buf
                 for buf in [grad_buf.cl_buffer, m1_buf.cl_buffer, m2_buf.cl_buffer]:
-                    event = cl.enqueue_fill_buffer(
-                        self.context.queue, buf, SCALAR_NP_TYPE(0), 0, buf.size
-                    )
+                    event = cl.enqueue_fill_buffer(self.context.queue, buf, SCALAR_NP_TYPE(0), 0, buf.size)
                     event.wait()
 
     def zero_gradients(self, work_manager: "WorkManager") -> None:
@@ -899,13 +874,9 @@ class KernelExecutionRequest:
         self.global_sizes = global_sizes
         self.local_sizes = local_sizes
         self.local_mem_reqs: Dict[int, Tuple[int, AccessMode]] = {}
-        self.argument_bindings: Dict[
-            int, Union[cl.Buffer, np.ndarray, np.int32, SCALAR_NP_TYPE]
-        ] = {}
+        self.argument_bindings: Dict[int, Union[cl.Buffer, np.ndarray, np.int32, SCALAR_NP_TYPE]] = {}
 
-    def set_local_mem_argument(
-        self, arg_index: int, size_bytes: int, access: AccessMode = AccessMode.LOCAL
-    ) -> None:
+    def set_local_mem_argument(self, arg_index: int, size_bytes: int, access: AccessMode = AccessMode.LOCAL) -> None:
         """Set a local memory argument."""
         self.local_mem_reqs[arg_index] = (size_bytes, access)
 
@@ -947,8 +918,7 @@ class KernelWrapper:
             "hidden", (BATCH_SIZE, HIDDEN_DIM), SCALAR_NP_TYPE, BufferPurpose.HIDDEN_ACT
         ).spec.padded.values[1]
         self.padded_output_classes = (
-            (OUTPUT_CLASSES + self.data_manager.padding_ctx.simd_width - 1)
-            // self.data_manager.padding_ctx.simd_width
+            (OUTPUT_CLASSES + self.data_manager.padding_ctx.simd_width - 1) // self.data_manager.padding_ctx.simd_width
         ) * self.data_manager.padding_ctx.simd_width
         self.padded_batch_size = self.data_manager.create_data_buffer(
             "input_batch",
@@ -1028,12 +998,8 @@ class KernelWrapper:
         targets_buf: DataBuffer,
     ) -> int:
         """Enqueue the exit probabilities kernel for all exits simultaneously."""
-        req = KernelExecutionRequest(
-            self.program, "compute_exit_probabilities", global_sizes, local_sizes
-        )
-        # Set local memory for weights
-        weight_size = self.hidden_dim * self.output_classes * SCALAR_SIZE
-        req.set_local_mem_argument(0, weight_size)
+        req = KernelExecutionRequest(self.program, "compute_exit_probabilities", global_sizes, local_sizes)
+        # req.set_local_mem_argument(0, NONE)  # no local memory
         req.bind_argument(1, hidden_buf.cl_buffer)
         req.bind_argument(2, hidden_buf.mask_buffer)
         req.bind_argument(3, exit_weights_buf.cl_buffer)
@@ -1147,19 +1113,18 @@ class KernelWrapper:
         grad_temps_buf: ParameterBuffer,
     ) -> int:
         """Enqueue the temperature gradients computation kernel."""
-        req = KernelExecutionRequest(
-            self.program, "compute_temp_gradients", global_sizes, local_sizes
-        )
-        req.bind_argument(0, exit_probs_buf.cl_buffer)
-        req.bind_argument(1, exit_probs_buf.mask_buffer)
-        req.bind_argument(2, targets_buf.cl_buffer)
-        req.bind_argument(3, targets_buf.mask_buffer)
-        req.bind_argument(4, grad_temps_buf.cl_buffer)
-        req.bind_argument(5, self.temperatures)
-        req.bind_argument(6, np.int32(self.output_classes))
-        req.bind_argument(7, np.int32(self.padded_output_classes))
-        req.bind_argument(8, np.int32(self.padded_batch_size))
-        req.bind_argument(9, np.int32(self.num_exits))
+        req = KernelExecutionRequest(self.program, "compute_temp_gradients", global_sizes, local_sizes)
+        # req.set_local_mem_argument(0, NONE)  # no local memory
+        req.bind_argument(1, exit_probs_buf.cl_buffer)
+        req.bind_argument(2, exit_probs_buf.mask_buffer)
+        req.bind_argument(3, targets_buf.cl_buffer)
+        req.bind_argument(4, targets_buf.mask_buffer)
+        req.bind_argument(5, grad_temps_buf.cl_buffer)
+        req.bind_argument(6, self.temperatures)
+        req.bind_argument(7, np.int32(self.output_classes))
+        req.bind_argument(8, np.int32(self.padded_output_classes))
+        req.bind_argument(9, np.int32(self.padded_batch_size))
+        req.bind_argument(10, np.int32(self.num_exits))
 
         access_map = {
             exit_probs_buf.spec.name: {AccessMode.SHARED_READ},
@@ -1194,17 +1159,18 @@ class KernelWrapper:
     ) -> int:
         """Enqueue the ADAM update kernel."""
         req = KernelExecutionRequest(self.program, "adam_update", global_sizes, local_sizes)
-        req.bind_argument(0, grad_buf.cl_buffer)
-        req.bind_argument(1, param_buf.cl_buffer)
-        req.bind_argument(2, m1_buf.cl_buffer)
-        req.bind_argument(3, m2_buf.cl_buffer)
-        req.bind_argument(4, self.adam_beta1)
-        req.bind_argument(5, self.adam_beta2)
-        req.bind_argument(6, self.beta1_t)
-        req.bind_argument(7, self.beta2_t)
-        req.bind_argument(8, self.learning_rate)
-        req.bind_argument(9, self.epsilon)
-        req.bind_argument(10, np.int32(total_params))
+        # req.set_local_mem_argument(0, NONE)  # no local memory
+        req.bind_argument(1, grad_buf.cl_buffer)
+        req.bind_argument(2, param_buf.cl_buffer)
+        req.bind_argument(3, m1_buf.cl_buffer)
+        req.bind_argument(4, m2_buf.cl_buffer)
+        req.bind_argument(5, self.adam_beta1)
+        req.bind_argument(6, self.adam_beta2)
+        req.bind_argument(7, self.beta1_t)
+        req.bind_argument(8, self.beta2_t)
+        req.bind_argument(9, self.learning_rate)
+        req.bind_argument(10, self.epsilon)
+        req.bind_argument(11, np.int32(total_params))
 
         access_map = {
             grad_buf.spec.name: {AccessMode.SHARED_READ},
@@ -1229,10 +1195,11 @@ class KernelWrapper:
     ) -> int:
         """Enqueue the temperature clamping kernel."""
         req = KernelExecutionRequest(self.program, "clamp_temperatures", global_sizes, local_sizes)
-        req.bind_argument(0, temps_buf.cl_buffer)
-        req.bind_argument(1, self.min_temp)
-        req.bind_argument(2, self.max_temp)
-        req.bind_argument(3, np.int32(self.num_exits))
+        # req.set_local_mem_argument(0, NONE)  # no local memory
+        req.bind_argument(1, temps_buf.cl_buffer)
+        req.bind_argument(2, self.min_temp)
+        req.bind_argument(3, self.max_temp)
+        req.bind_argument(4, np.int32(self.num_exits))
 
         access_map = {temps_buf.spec.name: {AccessMode.EXCLUSIVE_UPDATE}}
 
@@ -1244,14 +1211,10 @@ class KernelWrapper:
             params={"exec_req": req},
         )
 
-    def _enqueue_kernel(
-        self, queue: cl.CommandQueue, wait_for: List[cl.Event], node_params: Dict
-    ) -> cl.Event:
+    def _enqueue_kernel(self, queue: cl.CommandQueue, wait_for: List[cl.Event], node_params: Dict) -> cl.Event:
         """Enqueue a kernel execution."""
         req = node_params["exec_req"]
-        local_mem_args = {
-            idx: cl.LocalMemory(size) for idx, (size, mode) in req.local_mem_reqs.items()
-        }
+        local_mem_args = {idx: cl.LocalMemory(size) for idx, (size, mode) in req.local_mem_reqs.items()}
         args = []
         for i in range(max(req.argument_bindings.keys() | local_mem_args.keys()) + 1):
             args.append(local_mem_args.get(i, req.argument_bindings.get(i)))
@@ -1268,9 +1231,7 @@ class KernelWrapper:
 # OpenCL Setup
 ctx: cl.Context = cl.create_some_context()
 transfer_queue: cl.CommandQueue = cl.CommandQueue(ctx)
-compute_queue: cl.CommandQueue = cl.CommandQueue(
-    ctx, properties=cl.command_queue_properties.PROFILING_ENABLE
-)
+compute_queue: cl.CommandQueue = cl.CommandQueue(ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
 device: cl.Device = ctx.devices[0]
 device_limits: cl.Device = device
 
@@ -1301,24 +1262,16 @@ pm._create_buffers()
 input_buf = data_mgr.create_data_buffer(
     "input_batch", (BATCH_SIZE, INPUT_DIM), SCALAR_NP_TYPE, BufferPurpose.INPUT_DATA
 )
-hidden_buf = data_mgr.create_data_buffer(
-    "hidden", (BATCH_SIZE, HIDDEN_DIM), SCALAR_NP_TYPE, BufferPurpose.HIDDEN_ACT
-)
+hidden_buf = data_mgr.create_data_buffer("hidden", (BATCH_SIZE, HIDDEN_DIM), SCALAR_NP_TYPE, BufferPurpose.HIDDEN_ACT)
 exit_probs_buf = data_mgr.create_data_buffer(
     "exit_probs",
     (NUM_EXITS, BATCH_SIZE, OUTPUT_CLASSES),
     SCALAR_NP_TYPE,
     BufferPurpose.EXIT_PROBS,
 )
-losses_buf = data_mgr.create_data_buffer(
-    "losses", (NUM_EXITS, BATCH_SIZE), SCALAR_NP_TYPE, BufferPurpose.LOSSES
-)
-targets_buf = data_mgr.create_data_buffer(
-    "targets_batch", (BATCH_SIZE,), np.int32, BufferPurpose.TARGETS
-)
-mask_buf = data_mgr.create_data_buffer(
-    "mask_batch", (BATCH_SIZE,), SCALAR_NP_TYPE, BufferPurpose.MASK
-)
+losses_buf = data_mgr.create_data_buffer("losses", (NUM_EXITS, BATCH_SIZE), SCALAR_NP_TYPE, BufferPurpose.LOSSES)
+targets_buf = data_mgr.create_data_buffer("targets_batch", (BATCH_SIZE,), np.int32, BufferPurpose.TARGETS)
+mask_buf = data_mgr.create_data_buffer("mask_batch", (BATCH_SIZE,), SCALAR_NP_TYPE, BufferPurpose.MASK)
 
 # Commit initialization workload
 manager.commit_workload()
@@ -1327,6 +1280,7 @@ manager.commit_workload()
 iris = load_iris()
 X: np.ndarray = iris.data.astype(SCALAR_NP_TYPE)
 y_true: np.ndarray = iris.target.astype(np.int32)
+validate_targets(y_true, OUTPUT_CLASSES)
 scaler = StandardScaler()
 X_normalized: np.ndarray = scaler.fit_transform(X).astype(SCALAR_NP_TYPE)
 
@@ -1337,9 +1291,7 @@ for fname in CL_HEADER_FILES + CL_KERNEL_FILES:
         with open(fname, "r") as f:
             kernel_src.append(f.read())
     except FileNotFoundError:
-        print(
-            f"Warning: Kernel file {fname} not found. Please ensure all kernel files are present."
-        )
+        print(f"Warning: Kernel file {fname} not found. Please ensure all kernel files are present.")
         kernel_src.append("")
 simd_width: int = data_mgr.padding_ctx.simd_width
 build_opts: List[str] = [
@@ -1417,9 +1369,7 @@ for epoch in range(EPOCHS):
             {},
         )
 
-        kernel_wrapper = KernelWrapper(
-            program, manager, global_step, compute_queue, data_mgr, param_mgr
-        )
+        kernel_wrapper = KernelWrapper(program, manager, global_step, compute_queue, data_mgr, param_mgr)
         kernel_wrapper.set_mask(mask_buf.cl_buffer).set_temps(pm.buffers["temps"].cl_buffer)
         pm.zero_gradients(manager)
 
@@ -1516,15 +1466,11 @@ for epoch in range(EPOCHS):
                     f"m2_{param}",
                     total_params,
                 )
-                manager.execution_graph.add_edge(
-                    grad_node if param != "temps" else temp_grad_node, adam_node
-                )
+                manager.execution_graph.add_edge(grad_node if param != "temps" else temp_grad_node, adam_node)
                 if param == "temps":
                     global_clamp = (NUM_EXITS,)
                     local_clamp = optimal_local_sizes(global_clamp, device_limits)
-                    clamp_node = kernel_wrapper.clamp_temperatures(
-                        global_clamp, local_clamp, param_buf
-                    )
+                    clamp_node = kernel_wrapper.clamp_temperatures(global_clamp, local_clamp, param_buf)
                     manager.execution_graph.add_edge(adam_node, clamp_node)
 
         # Device-to-host transfers using HostView
@@ -1574,9 +1520,7 @@ for epoch in range(EPOCHS):
         manager.wait_for_sync(sync_uid)
 
         # Process results using HostView valid slices with casting to float32
-        valid_losses = losses_view.valid_slice.T.astype(
-            np.float32
-        )  # Shape (actual_batch, NUM_EXITS)
+        valid_losses = losses_view.valid_slice.T.astype(np.float32)  # Shape (actual_batch, NUM_EXITS)
         exit_losses = []
         for exit_idx in range(NUM_EXITS):
             masked_losses = valid_losses[:, exit_idx] * mask[:actual_batch_size].astype(np.float32)
@@ -1595,10 +1539,7 @@ for epoch in range(EPOCHS):
         valid_temps = temps_view.valid_slice.astype(np.float32)  # Shape (NUM_EXITS,)
 
         confidences = np.array(
-            [
-                valid_exit_probs[:, i, :].max(axis=1) ** (1 / (valid_temps[i] + 1e-8))
-                for i in range(NUM_EXITS)
-            ]
+            [valid_exit_probs[:, i, :].max(axis=1) ** (1 / (valid_temps[i] + 1e-8)) for i in range(NUM_EXITS)]
         )
         weights = np.exp(confidences) / np.sum(np.exp(confidences), axis=0)
         ensemble_probs = np.einsum("ijk,j->ik", valid_exit_probs, weights)
