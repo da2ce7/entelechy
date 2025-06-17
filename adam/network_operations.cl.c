@@ -83,7 +83,6 @@ __kernel void forward_pass(
 #define EXIT_PROB_INDEX(exit, batch, class) ((exit) * padded_batch_size * padded_output_classes + (batch) * padded_output_classes + (class))
 
 __kernel void compute_exit_probabilities(
-    __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict hidden,
     __global const SCALAR_TYPE *__restrict hidden_mask,
     __global const SCALAR_TYPE *__restrict exit_weights,
@@ -100,35 +99,38 @@ __kernel void compute_exit_probabilities(
     int output_classes,
     int padded_hidden_dim,
     int padded_output_classes,
-    int num_exits)
-{
-    // Precompute common indices
-    const uint exit_idx = get_global_id(0);
+    int num_exits) {
+    const uint exit_idx  = get_global_id(0);
     const uint batch_idx = get_global_id(1);
-    const uint lid = get_local_id(0);
-    const uint lsize = get_local_size(0);
+    const uint lid       = get_local_id(0);
+    const uint lsize     = get_local_size(0);
 
-    // Early exit checks and initializations
+    // Mask handling
     const SCALAR_TYPE mask_val = hidden_mask[batch_idx] * targets_mask[batch_idx];
     exit_probs_mask[batch_idx] = (mask_val > 0.5f) ? (SCALAR_TYPE)1.0 : SCALAR_ZERO;
-    losses_mask[batch_idx] = exit_probs_mask[batch_idx];
+    losses_mask[batch_idx]     = exit_probs_mask[batch_idx];
 
-    if(mask_val <= 0.5f || exit_idx >= num_exits) {
-        for(uint c = lid; c < padded_output_classes; c += lsize) {
+    if (mask_val <= 0.5f || exit_idx >= num_exits) {
+#pragma unroll 4
+        for (uint c = lid; c < padded_output_classes; c += lsize) {
             exit_probs[EXIT_PROB_INDEX(exit_idx, batch_idx, c)] = SCALAR_ZERO;
         }
         return;
     }
 
-    const int true_class = targets[batch_idx];
+    const int  true_class  = targets[batch_idx];
     const uint exit_offset = EXIT_PROB_INDEX(exit_idx, batch_idx, 0);
     const uint weight_base = exit_idx * padded_hidden_dim * padded_output_classes;
+    const uint vec_size    = min((uint)4, (uint)(SIMD_WIDTH / 2));
+    const uint vec_classes = output_classes / vec_size;
 
     // Shared memory buffers
     __local SCALAR_TYPE max_buffer[WG_SIZE];
     __local SCALAR_TYPE sum_buffer[WG_SIZE];
-    __local SCALAR_TYPE loss_buffer[WG_SIZE];
-    __local int wg_found;
+    __local SCALAR_TYPE loss_reduce[WG_SIZE];
+
+    SCALAR_TYPE max_logit = -INFINITY;
+    SCALAR_TYPE sum_exp   = SCALAR_ZERO;
 
     // Phase 1: Vectorized logit computation
     const uint k_stride = padded_hidden_dim * SIMD_WIDTH;
@@ -232,47 +234,35 @@ __kernel void compute_exit_probabilities(
     }
     const SCALAR_TYPE sum_total = fmax(sum_buffer[0], SAFE_LOG_MIN);
 
-    // Phase 3: Final probabilities and loss
-  // Initialize tracking
-  if(lid == 0) wg_found = 0;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  SCALAR_TYPE final_loss = SCALAR_ZERO;
+    // Phase 3: Final probabilities and loss calculation
+    __local int class_loc;
 
-  // Process classes in chunks aligned with WG size
-  for(uint c_base = 0; c_base < output_classes; c_base += lsize) {
-      const uint c = c_base + lid;
+    // 1. Single-pass parallel search
+    SCALAR_TYPE private_loss = 0;
+    for (uint c = lid; c < output_classes; c += lsize) {
+        const SCALAR_TYPE prob      = exit_probs[exit_offset + c] / sum_total;
+        exit_probs[exit_offset + c] = prob;
 
-      // Exit early if class processed
-      if(c >= output_classes || wg_found > 0) break;
+        if ((int)c == true_class) {
+            private_loss = -native_log(fmax(prob, SAFE_LOG_MIN));
+            class_loc    = lid; // Track location
+        }
+    }
 
-      // Compute probability (mandatory)
-      const SCALAR_TYPE prob = exit_probs[exit_offset + c] / sum_total;
-      exit_probs[exit_offset + c] = prob;
+    // 2. Loss gathering with broadcast
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == class_loc) {
+        loss_reduce[0] = private_loss;
+    }
 
-      // Early exit: first thread to find target claims it
-      if(c == (uint)true_class) {
-          final_loss = -native_log(fmax(prob, SAFE_LOG_MIN));
-          wg_found = 1; // Signal found using local mem
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0) {
+        losses[exit_idx * padded_batch_size + batch_idx] = loss_reduce[0];
+    }
 
-          // Broadcast final loss to buffer
-          loss_buffer[lid] = final_loss;
-      }
-  }
-
-  // Fast reduction if target found
-  barrier(CLK_LOCAL_MEM_FENCE);
-  if(wg_found) {
-      for(uint stride = lsize/2; stride > 0; stride >>= 1) {
-          if(lid < stride) loss_buffer[lid] += loss_buffer[lid + stride];
-          barrier(CLK_LOCAL_MEM_FENCE);
-      }
-      if(lid == 0) losses[EXIT_PROB_INDEX(exit_idx, batch_idx, 0)] = loss_buffer[0];
-  } else if(lid == 0) {
-      losses[EXIT_PROB_INDEX(exit_idx, batch_idx, 0)] = SCALAR_ZERO;
-  }
-
-  // Zero-pad remaining classes
-  for(uint c = output_classes + lid; c < padded_output_classes; c += lsize) {
-      exit_probs[EXIT_PROB_INDEX(exit_idx, batch_idx, c)] = SCALAR_ZERO;
-  }
+// Zero-pad remaining classes
+#pragma unroll 4
+    for (uint c = output_classes + lid; c < padded_output_classes; c += lsize) {
+        exit_probs[EXIT_PROB_INDEX(exit_idx, batch_idx, c)] = SCALAR_ZERO;
+    }
 }
