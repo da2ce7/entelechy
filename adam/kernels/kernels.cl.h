@@ -124,313 +124,259 @@ inline SCALAR_TYPE select(SCALAR_TYPE a, SCALAR_TYPE b, int c) { return (c) ? b 
 /**
  * @brief (Node 4) Performs the feed-forward pass for the neural network's shared layer.
  *
- * This kernel computes the hidden layer activations using the input data, weights, and biases.
- * It uses a 3D NDRange for parallelization across the batch and hidden dimensions.
- *
  * Host Assumptions:
- * - The NDRange is set with global sizes (padded_batch_size, ceil(HIDDEN_DIM / SIMD_WIDTH), 1).
- * - Weights are pre-transposed to a "SIMD-major" layout for efficient memory access.
+ * - This kernel requires weights in a special, pre-transposed "SIMD-major" layout for performance.
  */
 __kernel void forward_pass(
-    __local SCALAR_TYPE *local_mem,                     // [size: 2 * local_size[0] * sizeof(SCALAR_TYPE)] Local memory for tiling input and weights.
-    __global const SCALAR_TYPE *__restrict input_buf,   // [shape: (padded_batch_size, padded_input_dim)] Input data buffer.
-    __global const SCALAR_TYPE *__restrict input_mask,  // [shape: (padded_batch_size)] Mask for input data, indicates valid samples.
-    __global const SCALAR_TYPE *__restrict weights_buf, // [shape: (ceil(HIDDEN_DIM / SIMD_WIDTH), INPUT_DIM, SIMD_WIDTH)] Pre-transposed weights buffer.
-    __global const SCALAR_TYPE *__restrict biases_buf,  // [shape: (padded_hidden_dim)] Biases buffer.
-    __global SCALAR_TYPE *__restrict hidden_buf,        // [shape: (padded_batch_size, ceil(HIDDEN_DIM / SIMD_WIDTH), SIMD_WIDTH)] Hidden layer output buffer.
-    __global SCALAR_TYPE *__restrict hidden_mask,       // [shape: (padded_batch_size)] Mask for hidden layer, to be computed.
-    int padded_input_dim,                               // Padded input dimension.
-    int padded_hidden_dim                               // Padded hidden dimension.
+    __local SCALAR_TYPE *local_mem,                                // [MEMORY size: 2 * local_size[0] * sizeof(SCALAR_TYPE)] Local memory for tiling.
+    __global const SCALAR_TYPE *__restrict input_buf,              // [INPUT shape: (padded_batch_size, padded_input_dim)] The batch's input feature data.
+    __global const SCALAR_TYPE *__restrict input_mask,             // [INPUT shape: (padded_batch_size)] Mask for valid samples in the input.
+    __global const SCALAR_TYPE *__restrict weights_simd_major_buf, // [INPUT physical_shape: (ceil(HIDDEN_DIM/SIMD_WIDTH), IN_DIM, SIMD_WIDTH)] SIMD-major weights.
+    __global const SCALAR_TYPE *__restrict biases_buf,             // [INPUT shape: (padded_hidden_dim)] Biases for the hidden layer.
+    __global SCALAR_TYPE *__restrict hidden_buf,                   // [OUTPUT physical_shape: (padded_batch_size, hidden_dim/SIMD_WIDTH, SIMD_WIDTH)] Resulting hidden layer activations.
+    __global SCALAR_TYPE *__restrict hidden_mask,                  // [OUTPUT shape: (padded_batch_size)] Calculated mask for valid hidden activations.
+    int padded_input_dim,                                          // [INPUT scalar: (assumes padded value >= INPUT_DIM)] The padded dimension of the input layer.
+    int padded_hidden_dim                                          // [INPUT scalar: (assumes padded value >= HIDDEN_DIM)] The padded dimension of the hidden layer.
 );
 
 /**
  * @brief (Node 5) Computes outputs for each network exit from the shared hidden layer.
  *
- * This kernel calculates the logits, probabilities, and per-exit losses for each exit using the hidden layer activations.
- * It uses a 2D NDRange for parallelization across exits and batch samples.
- *
  * Host Assumptions:
- * - The NDRange is set with global sizes (NUM_EXITS, PADDED_BATCH_SIZE).
- * - Local work size should be optimized by the host (1D or 2D).
+ * - `hidden_buf` has a physical layout of (batch, hidden_dim/SIMD_WIDTH, SIMD_WIDTH) and must be read accordingly.
  */
 __kernel void compute_all_exits(
-    __global const SCALAR_TYPE *__restrict hidden_buf,       // [shape: (padded_batch_size, hidden_dim)] Hidden layer output.
-    __global const SCALAR_TYPE *__restrict hidden_mask,      // [shape: (padded_batch_size)] Mask for hidden layer.
-    __global const SCALAR_TYPE *__restrict exit_weights_buf, // [shape: (NUM_EXITS, hidden_dim, output_classes)] Weights for exits.
-    __global const SCALAR_TYPE *__restrict exit_biases_buf,  // [shape: (NUM_EXITS, output_classes)] Biases for exits.
-    __global const SCALAR_TYPE *__restrict temps_buf,        // [shape: (NUM_EXITS)] Temperature values for each exit.
-    __global const int *__restrict targets_buf,              // [shape: (padded_batch_size)] Target labels.
-    __global const SCALAR_TYPE *__restrict targets_mask,     // [shape: (padded_batch_size)] Mask for targets.
-    __global SCALAR_TYPE *__restrict unscaled_logits_buf,    // [shape: (NUM_EXITS, padded_batch_size, output_classes)] Buffer for raw logits.
-    __global SCALAR_TYPE *__restrict exit_probs_buf,         // [shape: (NUM_EXITS, padded_batch_size, output_classes)] Buffer for probabilities after softmax.
-    __global SCALAR_TYPE *__restrict per_exit_losses_buf,    // [shape: (NUM_EXITS, padded_batch_size)] Buffer for per-exit losses.
-    int padded_batch_size,                                   // Padded batch size.
-    int hidden_dim,                                          // Hidden dimension.
-    int output_classes,                                      // Number of output classes.
-    int num_exits                                            // Number of exits.
+    __global const SCALAR_TYPE *__restrict hidden_buf,       // [INPUT physical_shape: (padded_batch_size, hidden_dim/SIMD_WIDTH, SIMD_WIDTH)] Activations from the shared layer.
+    __global const SCALAR_TYPE *__restrict hidden_mask,      // [INPUT shape: (padded_batch_size)] Mask for valid hidden activations.
+    __global const SCALAR_TYPE *__restrict exit_weights_buf, // [INPUT shape: (NUM_EXITS, hidden_dim, output_classes)] Weights for all exits.
+    __global const SCALAR_TYPE *__restrict exit_biases_buf,  // [INPUT shape: (NUM_EXITS, output_classes)] Biases for all exits.
+    __global const SCALAR_TYPE *__restrict temps_buf,        // [INPUT shape: (NUM_EXITS)] Temperature values for each exit.
+    __global const int *__restrict targets_buf,              // [INPUT shape: (padded_batch_size)] Ground truth labels.
+    __global const SCALAR_TYPE *__restrict targets_mask,     // [INPUT shape: (padded_batch_size)] Mask for valid labels.
+    __global SCALAR_TYPE *__restrict unscaled_logits_buf,    // [OUTPUT shape: (NUM_EXITS, padded_batch_size, output_classes)] Raw logits before temperature scaling.
+    __global SCALAR_TYPE *__restrict exit_probs_buf,         // [OUTPUT shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities after softmax and temp scaling.
+    __global SCALAR_TYPE *__restrict per_exit_losses_buf,    // [OUTPUT shape: (NUM_EXITS, padded_batch_size)] Per-sample, per-exit cross-entropy loss.
+    int padded_batch_size,                                   // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int hidden_dim,                                          // [INPUT scalar: (assumes padded value >= HIDDEN_DIM)] The padded dimension of the hidden layer.
+    int output_classes,                                      // [INPUT scalar: (assumes padded value >= OUTPUT_CLASSES)] The padded dimension of the output classes.
+    int num_exits                                            // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
 );
 
 /**
  * @brief (Node 6, Tier 1) Computes ensemble weights via a fast, in-register serial reduction.
- *
- * This kernel is optimized for small numbers of exits (N <= 64) and performs the entire calculation
- * serially in private registers for each sample, with no synchronization overhead.
- *
- * Host Assumptions:
- * - Launched with a 1D NDRange where global_size = padded_batch_size.
- * - The number of exits (num_exits) must be <= MAX_EXITS_ENSEMBLE.
  */
 __kernel void ensemble_weights_reg_reduce(
-    __global const SCALAR_TYPE *__restrict exit_probs,   // [shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from exits.
-    __global const SCALAR_TYPE *__restrict targets_mask, // [shape: (padded_batch_size)] Mask for targets.
-    __global SCALAR_TYPE *__restrict ensemble_weights,   // [shape: (padded_batch_size, num_exits)] Output ensemble weights.
-    int padded_batch_size,                               // Padded batch size.
-    int output_classes,                                  // Number of output classes.
-    int num_exits                                        // Number of exits.
+    __global const SCALAR_TYPE *__restrict exit_probs,   // [INPUT shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from all exits.
+    __global const SCALAR_TYPE *__restrict targets_mask, // [INPUT shape: (padded_batch_size)] Mask for valid samples.
+    __global SCALAR_TYPE *__restrict ensemble_weights,   // [OUTPUT shape: (padded_batch_size, num_exits)] Calculated ensemble weights.
+    int padded_batch_size,                               // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int output_classes,                                  // [INPUT scalar: (assumes padded value >= OUTPUT_CLASSES)] The padded dimension of the output classes.
+    int num_exits                                        // [INPUT scalar: (assumes value <= MAX_EXITS_ENSEMBLE)] The total number of network exits.
 );
 
 /**
- * @brief (Node 6, Tier 2 - CORRECTED) Computes ensemble weights for one sample using a single work-group.
- *
- * This kernel handles medium numbers of exits (64 < N <= 512) by assigning one full work-group to each sample.
- * It performs a parallel reduction within local memory to calculate the denominator before computing the weights.
- *
- * Host Assumptions:
- * - Launched such that each work-group handles one sample.
- * - Global size = (padded_batch_size * local_size), with local_size optimized by the host (e.g., 256).
+ * @brief (Node 6, Tier 2) Computes ensemble weights for one sample using a single work-group.
  */
 __kernel void ensemble_weights_local_reduce(
-    __local SCALAR_TYPE *l_reduction_mem,              // [size: local_size[0] * sizeof(SCALAR_TYPE)] Local memory for reduction.
-    __global const SCALAR_TYPE *__restrict exit_probs, // [shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from exits.
-    __global SCALAR_TYPE *__restrict ensemble_weights, // [shape: (padded_batch_size, num_exits)] Output ensemble weights.
-    int num_exits,                                     // Number of exits.
-    int output_classes,                                // Number of output classes.
-    int padded_batch_size                              // The padded size of the batch dimension for correct indexing.
+    __local SCALAR_TYPE *l_reduction_mem,              // [MEMORY size: local_size[0] * sizeof(SCALAR_TYPE)] Local memory for reduction.
+    __global const SCALAR_TYPE *__restrict exit_probs, // [INPUT shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from all exits.
+    __global SCALAR_TYPE *__restrict ensemble_weights, // [OUTPUT shape: (padded_batch_size, num_exits)] Calculated ensemble weights.
+    int num_exits,                                     // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
+    int output_classes,                                // [INPUT scalar: (assumes padded value >= OUTPUT_CLASSES)] The padded dimension of the output classes.
+    int padded_batch_size                              // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
 );
 
 /**
  * @brief (Node 6, Tier 3, Map Stage) Calculates exp(confidence) for every exit.
- *
- * This kernel is part of the scalable map-reduce chain for large numbers of exits (N > 512).
- * Each work-item computes exp(confidence) for a single exit and sample.
- *
- * Host Assumptions:
- * - Launched with a 2D NDRange where global_size = (padded_batch_size, num_exits).
  */
 __kernel void ensemble_weights_map_exp_conf(
-    __global const SCALAR_TYPE *__restrict exit_probs,   // [shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from exits.
-    __global const SCALAR_TYPE *__restrict targets_mask, // [shape: (padded_batch_size)] Mask for targets.
-    __global SCALAR_TYPE *__restrict temp_exp_conf_buf,  // [shape: (padded_batch_size, num_exits)] Temporary buffer for exp(confidence) values.
-    int padded_batch_size,                               // Padded batch size.
-    int num_exits,                                       // Number of exits.
-    int output_classes                                   // Number of output classes.
+    __global const SCALAR_TYPE *__restrict exit_probs,   // [INPUT shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from all exits.
+    __global const SCALAR_TYPE *__restrict targets_mask, // [INPUT shape: (padded_batch_size)] Mask for valid samples.
+    __global SCALAR_TYPE *__restrict temp_exp_conf_buf,  // [OUTPUT shape: (padded_batch_size, num_exits)] Intermediate exp(confidence) values.
+    int padded_batch_size,                               // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int num_exits,                                       // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
+    int output_classes                                   // [INPUT scalar: (assumes padded value >= OUTPUT_CLASSES)] The padded dimension of the output classes.
 );
 
 /**
  * @brief (Node 6, Tier 3, Reduce Stage) Reduces partial exponentiated confidence values.
- *
- * This kernel reduces the large temporary buffer of exp(confidence) values into a smaller buffer of partial sums.
- * Each work-group handles one chunk of the reduction for a sample.
- *
- * Host Assumptions:
- * - Launched with a 2D grid, e.g., global_size = (padded_batch_size, num_chunks * workgroup_size), local_size = (1, workgroup_size).
  */
 __kernel void reduce_partial_sums(
-    __local SCALAR_TYPE *l_reduction_mem,                     // [size: local_size[1] * sizeof(SCALAR_TYPE)] Local memory for reduction.
-    __global const SCALAR_TYPE *__restrict temp_exp_conf_buf, // [shape: (padded_batch_size, num_exits)] Input exp(confidence) values.
-    __global SCALAR_TYPE *__restrict temp_partial_sums_buf,   // [shape: (padded_batch_size, num_chunks)] Output partial sums.
-    int num_exits                                             // Number of exits.
+    __local SCALAR_TYPE *l_reduction_mem,                     // [MEMORY size: local_size[1] * sizeof(SCALAR_TYPE)] Local memory for reduction.
+    __global const SCALAR_TYPE *__restrict temp_exp_conf_buf, // [INPUT shape: (padded_batch_size, num_exits)] Intermediate exp(confidence) values.
+    __global SCALAR_TYPE *__restrict temp_partial_sums_buf,   // [OUTPUT shape: (padded_batch_size, num_chunks)] Partial sums for each sample.
+    int num_exits                                             // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
 );
 
 /**
  * @brief (Node 6, Tier 3, Finalize Stage) Aggregates partial sums and computes final weights.
- *
- * This kernel performs a small, serial reduction on the partial sums to calculate the final denominator,
- * then computes and writes the final ensemble weights for each sample.
- *
- * Host Assumptions:
- * - Launched with a 1D NDRange where global_size = padded_batch_size.
  */
 __kernel void ensemble_weights_finalize(
-    __global const SCALAR_TYPE *__restrict temp_exp_conf_buf,     // [shape: (padded_batch_size, num_exits)] Input exp(confidence) values.
-    __global const SCALAR_TYPE *__restrict temp_partial_sums_buf, // [shape: (padded_batch_size, num_chunks)] Input partial sums.
-    __global const SCALAR_TYPE *__restrict targets_mask,          // [shape: (padded_batch_size)] Mask for targets.
-    __global SCALAR_TYPE *__restrict ensemble_weights,            // [shape: (padded_batch_size, num_exits)] Final output ensemble weights.
-    int padded_batch_size,                                        // Padded batch size.
-    int num_exits,                                                // Number of exits.
-    int num_chunks                                                // Number of chunks from the reduce stage.
+    __global const SCALAR_TYPE *__restrict temp_exp_conf_buf,     // [INPUT shape: (padded_batch_size, num_exits)] Intermediate exp(confidence) values.
+    __global const SCALAR_TYPE *__restrict temp_partial_sums_buf, // [INPUT shape: (padded_batch_size, num_chunks)] Partial sums for each sample.
+    __global const SCALAR_TYPE *__restrict targets_mask,          // [INPUT shape: (padded_batch_size)] Mask for valid samples.
+    __global SCALAR_TYPE *__restrict ensemble_weights,            // [OUTPUT shape: (padded_batch_size, num_exits)] Final calculated ensemble weights.
+    int padded_batch_size,                                        // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int num_exits,                                                // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
+    int num_chunks                                                // [INPUT scalar: (assumes value > 0)] The number of partial sums to aggregate per sample.
 );
 
 /**
  * @brief (Node 7) Blends exit probabilities using pre-calculated weights to get the final distribution.
- *
- * This kernel computes the weighted average of all exit probabilities for each sample to produce the final blended probability distribution.
- *
- * Host Assumptions:
- * - Launched with a 1D NDRange where global_size = padded_batch_size.
  */
 __kernel void blend_ensemble_probabilities(
-    __global const SCALAR_TYPE *__restrict exit_probs,       // [shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from all exits.
-    __global const SCALAR_TYPE *__restrict ensemble_weights, // [shape: (padded_batch_size, num_exits)] Pre-calculated ensemble weights.
-    __global const SCALAR_TYPE *__restrict targets_mask,     // [shape: (padded_batch_size)] Mask for targets.
-    __global SCALAR_TYPE *__restrict ensemble_probs,         // [shape: (padded_batch_size, output_classes)] Final blended probabilities.
-    int padded_batch_size,                                   // Padded batch size.
-    int output_classes,                                      // Number of output classes.
-    int num_exits                                            // Number of exits.
+    __global const SCALAR_TYPE *__restrict exit_probs,       // [INPUT shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from all exits.
+    __global const SCALAR_TYPE *__restrict ensemble_weights, // [INPUT shape: (padded_batch_size, num_exits)] Calculated ensemble weights.
+    __global const SCALAR_TYPE *__restrict targets_mask,     // [INPUT shape: (padded_batch_size)] Mask for valid samples.
+    __global SCALAR_TYPE *__restrict ensemble_probs,         // [OUTPUT shape: (padded_batch_size, output_classes)] Final blended probabilities.
+    int padded_batch_size,                                   // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int output_classes,                                      // [INPUT scalar: (assumes padded value >= OUTPUT_CLASSES)] The padded dimension of the output classes.
+    int num_exits                                            // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
 );
 
 /**
  * @brief (Node 8) Computes partial cross-entropy losses for the batch.
- *
- * This kernel calculates partial sums of the cross-entropy loss for subsets of the batch.
- * It is the first stage in a two-stage reduction pattern for calculating the total batch loss.
- *
- * Host Assumptions:
- * - Launched with a 1D NDRange covering the batch, typically with a work-group size of 256.
- * - Host MUST provide a __local memory buffer for the reduction, sized to the work-group.
  */
 __kernel void calculate_partial_losses(
-    __local float *l_loss_sums,                                // [size: local_size[0] * sizeof(float)] Local memory for reduction.
-    __global const SCALAR_TYPE *__restrict ensemble_probs_buf, // [shape: (padded_batch_size, output_classes)] Ensemble probabilities.
-    __global const SCALAR_TYPE *__restrict targets_mask,       // [shape: (padded_batch_size)] Mask for targets.
-    __global const int *__restrict targets_buf,                // [shape: (padded_batch_size)] Target labels.
-    __global float *__restrict partial_loss_buf,               // [shape: (num_work_groups)] Partial loss sums per work-group.
-    int padded_batch_size,                                     // Padded batch size.
-    int output_classes                                         // Number of output classes.
+    __local float *l_loss_sums,                                // [MEMORY size: local_size[0] * sizeof(float)] Local memory for reduction.
+    __global const SCALAR_TYPE *__restrict ensemble_probs_buf, // [INPUT shape: (padded_batch_size, output_classes)] Final blended probabilities.
+    __global const SCALAR_TYPE *__restrict targets_mask,       // [INPUT shape: (padded_batch_size)] Mask for valid samples.
+    __global const int *__restrict targets_buf,                // [INPUT shape: (padded_batch_size)] Ground truth labels.
+    __global float *__restrict partial_loss_buf,               // [OUTPUT shape: (num_work_groups)] Partial loss sums per work-group.
+    int padded_batch_size,                                     // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int output_classes                                         // [INPUT scalar: (assumes padded value >= OUTPUT_CLASSES)] The padded dimension of the output classes.
 );
 
 /**
  * @brief (Node 9) Aggregates partial loss sums into a final total loss.
- *
- * This kernel sums up the partial loss values computed by `calculate_partial_losses` to obtain the
- * final, single floating-point value for the total batch loss.
- *
- * Host Assumptions:
- * - Launched with a single work-group (global_size == local_size).
- * - Host MUST provide a __local memory buffer for the reduction, sized to the work-group.
  */
 __kernel void aggregate_partial_losses(
-    __local float *l_reduction_mem,                    // [size: local_size[0] * sizeof(float)] Local memory for reduction.
-    __global const float *__restrict partial_loss_buf, // [shape: (num_partial_sums)] Partial loss sums.
-    __global float *__restrict final_loss_buf,         // [shape: (1)] Final total loss.
-    int num_partial_sums                               // Number of partial sums.
+    __local float *l_reduction_mem,                    // [MEMORY size: local_size[0] * sizeof(float)] Local memory for reduction.
+    __global const float *__restrict partial_loss_buf, // [INPUT shape: (num_partial_sums)] Partial loss sums from previous kernel.
+    __global float *__restrict final_loss_buf,         // [OUTPUT shape: (1)] Final total batch loss.
+    int num_partial_sums                               // [INPUT scalar: (assumes value > 0)] The number of partial sums to aggregate.
 );
 
 /**
  * @brief (Node 10) Computes gradients for exit-specific parameters and contributions to hidden layer gradients.
  *
- * This kernel calculates gradients for the exit weights and biases, as well as the contributions to the hidden layer gradients.
- *
  * Host Assumptions:
- * - Launched with a 2D NDRange where global sizes = (NUM_EXITS, HIDDEN_DIM).
- * - grad_exit_weights and grad_exit_biases must be zeroed before calling.
+ * - `grad_exit_weights` and `grad_exit_biases` must be zeroed before calling.
+ * - `hidden_buf` has a physical layout of (batch, hidden_dim/SIMD_WIDTH, SIMD_WIDTH) and must be read accordingly.
  */
 __kernel void calculate_exit_gradients(
-    __local SCALAR_TYPE *local_grad_w,                              // [size: local_size[0] * sizeof(SCALAR_TYPE)] Local memory for weight gradients.
-    __local SCALAR_TYPE *local_grad_b,                              // [size: local_size[0] * sizeof(SCALAR_TYPE)] Local memory for bias gradients.
-    __global const SCALAR_TYPE *__restrict hidden_buf,              // [shape: (padded_batch_size, hidden_dim)] Hidden layer output.
-    __global const SCALAR_TYPE *__restrict exit_probs_buf,          // [shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from exits.
-    __global const SCALAR_TYPE *__restrict ensemble_weights_buf,    // [shape: (padded_batch_size, num_exits)] Ensemble weights.
-    __global const int *__restrict targets_buf,                     // [shape: (padded_batch_size)] Target labels.
-    __global const SCALAR_TYPE *__restrict targets_mask,            // [shape: (padded_batch_size)] Mask for targets.
-    __global const SCALAR_TYPE *__restrict exit_weights_buf,        // [shape: (NUM_EXITS, hidden_dim, output_classes)] Weights for exits.
-    __global SCALAR_TYPE *__restrict grad_exit_weights,             // [shape: (NUM_EXITS, hidden_dim, output_classes)] Gradients for exit weights.
-    __global SCALAR_TYPE *__restrict grad_exit_biases,              // [shape: (NUM_EXITS, output_classes)] Gradients for exit biases.
-    __global SCALAR_TYPE *__restrict grad_hidden_contributions_buf, // [shape: (NUM_EXITS, padded_batch_size, hidden_dim)] Contributions to hidden gradients.
-    int padded_batch_size,                                          // Padded batch size.
-    int hidden_dim,                                                 // Hidden dimension.
-    int output_classes,                                             // Number of output classes.
-    int num_exits                                                   // Number of exits.
+    __local SCALAR_TYPE *local_grad_w,                              // [MEMORY size: local_size[0] * sizeof(SCALAR_TYPE)] Local memory for weight gradient reduction.
+    __local SCALAR_TYPE *local_grad_b,                              // [MEMORY size: local_size[0] * sizeof(SCALAR_TYPE)] Local memory for bias gradient reduction.
+    __global const SCALAR_TYPE *__restrict hidden_buf,              // [INPUT physical_shape: (padded_batch_size, hidden_dim/SIMD_WIDTH, SIMD_WIDTH)] Activations from the shared layer.
+    __global const SCALAR_TYPE *__restrict exit_probs_buf,          // [INPUT shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from all exits.
+    __global const SCALAR_TYPE *__restrict ensemble_weights_buf,    // [INPUT shape: (padded_batch_size, num_exits)] Calculated ensemble weights.
+    __global const int *__restrict targets_buf,                     // [INPUT shape: (padded_batch_size)] Ground truth labels.
+    __global const SCALAR_TYPE *__restrict targets_mask,            // [INPUT shape: (padded_batch_size)] Mask for valid samples.
+    __global const SCALAR_TYPE *__restrict exit_weights_buf,        // [INPUT shape: (NUM_EXITS, hidden_dim, output_classes)] Original weights for all exits.
+    __global SCALAR_TYPE *__restrict grad_exit_weights,             // [OUTPUT shape: (NUM_EXITS, hidden_dim, output_classes)] Gradients for exit weights.
+    __global SCALAR_TYPE *__restrict grad_exit_biases,              // [OUTPUT shape: (NUM_EXITS, output_classes)] Gradients for exit biases.
+    __global SCALAR_TYPE *__restrict grad_hidden_contributions_buf, // [OUTPUT shape: (NUM_EXITS, padded_batch_size, hidden_dim)] Upstream gradient signals for the shared layer.
+    int padded_batch_size,                                          // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int hidden_dim,                                                 // [INPUT scalar: (assumes padded value >= HIDDEN_DIM)] The padded dimension of the hidden layer.
+    int output_classes,                                             // [INPUT scalar: (assumes padded value >= OUTPUT_CLASSES)] The padded dimension of the output classes.
+    int num_exits                                                   // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
 );
 
 /**
- * @brief (Node 11) Computes gradients for shared weights and biases using aggregated hidden contributions.
- *
- * This kernel calculates gradients for the shared weights and biases of the neural network.
+ * @brief (Node 11) Aggregates upstream gradients and backpropagates through the activation function.
  *
  * Host Assumptions:
- * - Launched with a 2D NDRange where global sizes = (INPUT_DIM, HIDDEN_DIM).
- * - Must run after `calculate_exit_gradients`.
- * - grad_weights and grad_biases must be zeroed before calling.
+ * - `hidden_buf` has a physical layout of (batch, hidden_dim/SIMD_WIDTH, SIMD_WIDTH) and must be read accordingly.
  */
-__kernel void calculate_shared_gradients(
-    __local SCALAR_TYPE *local_grad_w,                                    // [size: local_size[0] * sizeof(SCALAR_TYPE)] Local memory for weight gradients.
-    __local SCALAR_TYPE *local_grad_b,                                    // [size: local_size[0] * sizeof(SCALAR_TYPE)] Local memory for bias gradients.
-    __global const SCALAR_TYPE *__restrict input_buf,                     // [shape: (padded_batch_size, input_dim)] Input data buffer.
-    __global const SCALAR_TYPE *__restrict input_mask,                    // [shape: (padded_batch_size)] Mask for input data.
-    __global const SCALAR_TYPE *__restrict hidden_buf,                    // [shape: (padded_batch_size, hidden_dim)] Hidden layer output.
-    __global const SCALAR_TYPE *__restrict grad_hidden_contributions_buf, // [shape: (NUM_EXITS, padded_batch_size, hidden_dim)] Contributions from exits.
-    __global SCALAR_TYPE *__restrict grad_weights,                        // [shape: (input_dim, hidden_dim)] Gradients for shared weights.
-    __global SCALAR_TYPE *__restrict grad_biases,                         // [shape: (hidden_dim)] Gradients for shared biases.
-    int padded_batch_size,                                                // Padded batch size.
-    int input_dim,                                                        // Input dimension.
-    int hidden_dim,                                                       // Hidden dimension.
-    int num_exits                                                         // Number of exits.
+__kernel void aggregate_and_backprop_activation(
+    __global const SCALAR_TYPE *__restrict hidden_buf,                    // [INPUT physical_shape: (padded_batch_size, hidden_dim/SIMD_WIDTH, SIMD_WIDTH)] Layer activations, for ReLU derivative.
+    __global const SCALAR_TYPE *__restrict hidden_mask,                   // [INPUT shape: (padded_batch_size)] Mask for valid samples.
+    __global const SCALAR_TYPE *__restrict grad_hidden_contributions_buf, // [INPUT shape: (NUM_EXITS, padded_batch_size, hidden_dim)] Upstream gradient signals from all exits.
+    __global SCALAR_TYPE *__restrict grad_pre_activation_buf,             // [OUTPUT shape: (padded_batch_size, hidden_dim)] Gradient signal before the activation function.
+    int padded_batch_size,                                                // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int hidden_dim,                                                       // [INPUT scalar: (assumes padded value >= HIDDEN_DIM)] The padded dimension of the hidden layer.
+    int num_exits                                                         // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
 );
 
 /**
- * @brief (Node 12) Computes gradients for temperature parameters.
- *
- * This kernel calculates the gradients for the temperature parameters used in the exits.
+ * @brief (Node 12) Calculates gradients for a dense layer's parameters (weights and biases).
  *
  * Host Assumptions:
- * - Launched with a 1D NDRange where global_size = NUM_EXITS.
- * - Requires `unscaled_logits_buf` from `compute_all_exits`.
- * - grad_temps must be zeroed before calling.
+ * - `grad_weights` and `grad_biases` must be zeroed before calling.
+ */
+__kernel void calculate_dense_layer_gradients(
+    __local SCALAR_TYPE *local_grad_w,                              // [MEMORY size: local_size[0] * sizeof(SCALAR_TYPE)] Local memory for weight gradient reduction.
+    __local SCALAR_TYPE *local_grad_b,                              // [MEMORY size: local_size[0] * sizeof(SCALAR_TYPE)] Local memory for bias gradient reduction.
+    __global const SCALAR_TYPE *__restrict input_buf,               // [INPUT shape: (padded_batch_size, input_dim)] The original input to the layer.
+    __global const SCALAR_TYPE *__restrict input_mask,              // [INPUT shape: (padded_batch_size)] Mask for valid samples.
+    __global const SCALAR_TYPE *__restrict grad_pre_activation_buf, // [INPUT shape: (padded_batch_size, hidden_dim)] Gradient signal from Node 11.
+    __global SCALAR_TYPE *__restrict grad_weights,                  // [OUTPUT shape: (input_dim, hidden_dim)] Final gradient for the weight matrix.
+    __global SCALAR_TYPE *__restrict grad_biases,                   // [OUTPUT shape: (hidden_dim)] Final gradient for the bias vector.
+    int padded_batch_size,                                          // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int input_dim,                                                  // [INPUT scalar: (assumes padded value >= INPUT_DIM)] The padded dimension of the layer's input.
+    int hidden_dim                                                  // [INPUT scalar: (assumes padded value >= HIDDEN_DIM)] The padded dimension of the layer's output.
+);
+
+/**
+ * @brief (Node 13) Propagates the gradient back to the input of a layer (W.T * grad).
+ *
+ * Host Assumptions:
+ * - This kernel requires weights in a standard row-major layout for efficient matrix multiplication.
+ */
+__kernel void backprop_input_gradient(
+    __global const SCALAR_TYPE *__restrict grad_pre_activation_buf, // [INPUT shape: (padded_batch_size, hidden_dim)] Upstream gradient from Node 11.
+    __global const SCALAR_TYPE *__restrict weights_standard_buf,    // [INPUT shape: (input_dim, hidden_dim)] Original layer weights in standard layout.
+    __global SCALAR_TYPE *__restrict grad_input_buf,                // [OUTPUT shape: (padded_batch_size, input_dim)] Downstream gradient for the previous layer.
+    int padded_batch_size,                                          // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int input_dim,                                                  // [INPUT scalar: (assumes padded value >= INPUT_DIM)] The padded dimension of the layer's input.
+    int hidden_dim                                                  // [INPUT scalar: (assumes padded value >= HIDDEN_DIM)] The padded dimension of the layer's output.
+);
+
+/**
+ * @brief (Node 14) Computes gradients for temperature parameters.
+ *
+ * Host Assumptions:
+ * - `grad_temps` must be zeroed before calling.
  */
 __kernel void calculate_temp_gradients(
-    __local SCALAR_TYPE *local_grad_sum,                         // [size: local_size[0] * sizeof(SCALAR_TYPE)] Local memory for gradient summation.
-    __global const SCALAR_TYPE *__restrict unscaled_logits_buf,  // [shape: (NUM_EXITS, padded_batch_size, output_classes)] Raw logits from exits.
-    __global const SCALAR_TYPE *__restrict exit_probs_buf,       // [shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from exits.
-    __global const SCALAR_TYPE *__restrict ensemble_weights_buf, // [shape: (padded_batch_size, num_exits)] Ensemble weights.
-    __global const SCALAR_TYPE *__restrict temps_buf,            // [shape: (NUM_EXITS)] Temperature values.
-    __global const int *__restrict targets_buf,                  // [shape: (padded_batch_size)] Target labels.
-    __global const SCALAR_TYPE *__restrict targets_mask,         // [shape: (padded_batch_size)] Mask for targets.
-    __global SCALAR_TYPE *__restrict grad_temps,                 // [shape: (NUM_EXITS)] Gradients for temperatures.
-    int padded_batch_size,                                       // Padded batch size.
-    int output_classes,                                          // Number of output classes.
-    int num_exits                                                // Number of exits.
+    __local SCALAR_TYPE *local_grad_sum,                         // [MEMORY size: local_size[0] * sizeof(SCALAR_TYPE)] Local memory for gradient summation.
+    __global const SCALAR_TYPE *__restrict unscaled_logits_buf,  // [INPUT shape: (NUM_EXITS, padded_batch_size, output_classes)] Raw logits from exits.
+    __global const SCALAR_TYPE *__restrict exit_probs_buf,       // [INPUT shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from exits.
+    __global const SCALAR_TYPE *__restrict ensemble_weights_buf, // [INPUT shape: (padded_batch_size, num_exits)] Ensemble weights.
+    __global const SCALAR_TYPE *__restrict temps_buf,            // [INPUT shape: (NUM_EXITS)] Current temperature values.
+    __global const int *__restrict targets_buf,                  // [INPUT shape: (padded_batch_size)] Ground truth labels.
+    __global const SCALAR_TYPE *__restrict targets_mask,         // [INPUT shape: (padded_batch_size)] Mask for valid samples.
+    __global SCALAR_TYPE *__restrict grad_temps,                 // [OUTPUT shape: (NUM_EXITS)] Final gradient for temperatures.
+    int padded_batch_size,                                       // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int output_classes,                                          // [INPUT scalar: (assumes padded value >= OUTPUT_CLASSES)] The padded dimension of the output classes.
+    int num_exits                                                // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
 );
 
 /**
- * @brief Performs Adam optimizer update for a parameter buffer.
- *
- * This kernel applies the Adam optimization algorithm to update the parameters based on the computed gradients.
- * It is used in the parameter update phase for shared weights, exit parameters, and temperatures.
- *
- * Host Assumptions:
- * - Launched with a 1D NDRange where global_size = total_params.
- * - Must run after gradient computation.
- * - Host provides Adam hyperparameters and pre-calculated bias corrections.
+ * @brief (Node 15) Performs Adam optimizer update for a parameter buffer.
  */
 __kernel void adam_update(
-    __global const SCALAR_TYPE *__restrict grad, // [shape: (total_params)] Gradient buffer.
-    SCALAR_TYPE beta1,                           // Adam hyperparameter beta1.
-    SCALAR_TYPE beta2,                           // Adam hyperparameter beta2.
-    SCALAR_TYPE beta1_t,                         // Time-adjusted beta1 (beta1^t).
-    SCALAR_TYPE beta2_t,                         // Time-adjusted beta2 (beta2^t).
-    SCALAR_TYPE learning_rate,                   // Global learning rate.
-    SCALAR_TYPE epsilon,                         // Adam epsilon for numerical stability.
-    __global SCALAR_TYPE *__restrict param,      // [shape: (total_params)] Parameter buffer, updated in-place.
-    __global SCALAR_TYPE *__restrict m1,         // [shape: (total_params)] First moment vector, updated in-place.
-    __global SCALAR_TYPE *__restrict m2,         // [shape: (total_params)] Second moment vector, updated in-place.
-    int total_params                             // Total number of elements.
+    __global const SCALAR_TYPE *__restrict grad, // [INPUT shape: (total_params)] Gradient for the parameters.
+    SCALAR_TYPE beta1,                           // [INPUT scalar: (assumes 0 < value < 1)] Adam hyperparameter beta1.
+    SCALAR_TYPE beta2,                           // [INPUT scalar: (assumes 0 < value < 1)] Adam hyperparameter beta2.
+    SCALAR_TYPE beta1_t,                         // [INPUT scalar: (assumes 0 < value < 1)] Time-adjusted beta1 (beta1^t).
+    SCALAR_TYPE beta2_t,                         // [INPUT scalar: (assumes 0 < value < 1)] Time-adjusted beta2 (beta2^t).
+    SCALAR_TYPE learning_rate,                   // [INPUT scalar: (assumes value > 0)] Global learning rate.
+    SCALAR_TYPE epsilon,                         // [INPUT scalar: (assumes value > 0)] Adam epsilon for numerical stability.
+    __global SCALAR_TYPE *__restrict param,      // [IN/OUT shape: (total_params)] Parameters to be updated.
+    __global SCALAR_TYPE *__restrict m1,         // [IN/OUT shape: (total_params)] First moment vector (momentum).
+    __global SCALAR_TYPE *__restrict m2,         // [IN/OUT shape: (total_params)] Second moment vector (RMSprop).
+    int total_params                             // [INPUT scalar: (assumes value > 0)] Total number of elements in the buffers.
 );
 
 /**
- * @brief (Node 14) Clamps temperature values within a specified range.
- *
- * This kernel ensures that the temperature parameters stay within the defined minimum and maximum values.
- *
- * Host Assumptions:
- * - Launched with a 1D NDRange where global_size = NUM_EXITS.
- * - Assumes NUM_EXITS <= device's maximum work group size.
+ * @brief (Node 16) Clamps temperature values within a specified range.
  */
 __kernel void clamp_temperatures(
-    __global SCALAR_TYPE *__restrict temps_buf, // [shape: (NUM_EXITS)] Temperature buffer, updated in-place.
-    SCALAR_TYPE min_temp,                       // Minimum temperature value.
-    SCALAR_TYPE max_temp,                       // Maximum temperature value.
-    int         num_exits                       // Number of exits.
+    __global SCALAR_TYPE *__restrict temps_buf, // [IN/OUT shape: (NUM_EXITS)] Temperature values to be clamped.
+    SCALAR_TYPE min_temp,                       // [INPUT scalar: (assumes value > 0)] Minimum allowed temperature value.
+    SCALAR_TYPE max_temp,                       // [INPUT scalar: (assumes value > min_temp)] Maximum allowed temperature value.
+    int         num_exits                       // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
 );
 
 #endif // KERNELS_CL_H
