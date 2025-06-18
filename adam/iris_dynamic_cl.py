@@ -583,9 +583,12 @@ class KernelWrapper:
     def forward_pass(self) -> int:
         simd_width = self.b.padding_ctx.simd_width
 
-        # This kernel now has a STRICT requirement for its local work size.
+        # This kernel has a STRICT requirement for its local work size.
+        # Do not change this.
+        required_local_size = (simd_width,)
+
         g = (self.padded_batch_size, self.padded_hidden_dim // simd_width)
-        l = (simd_width,)  # MUST be this local size
+        l = required_local_size
 
         # The local memory size must match the tiling strategy in the kernel.
         # TILE_SIZE is set to simd_width in the kernel.
@@ -778,17 +781,22 @@ class KernelWrapper:
         return self._create_kernel_node("blend_ensemble_probabilities", g, l, access, *args)
 
     def calculate_losses(self) -> int:
-        g = (self.padded_batch_size,)
-        l = (min(256, g[0] if g[0] > 0 else 1),)
-        num_groups = math.ceil(g[0] / l[0]) if l[0] > 0 else 0
+        g1 = (self.padded_batch_size,)
+        # Ensure local size is a power of 2 for optimal reduction, and not zero
+        l1 = (min(256, next_pow2(g1[0] // 2) if g1[0] > 1 else 1),)
+        num_groups = math.ceil(g1[0] / l1[0]) if l1[0] > 0 else 0
         self.b.create_buffer("partial_loss_buf", BufferRole.PARTIAL_LOSS_REDUCTION, (num_groups,), np.float32)
 
+        # --- Stage 1: Partial Reduction ---
+        # Create the local memory argument for the first kernel
+        local_mem1 = cl.LocalMemory(l1[0] * np.dtype(np.float32).itemsize)
         access1 = {
             "ensemble_probs_buf": AccessMode.SHARED_READ,
             "targets_buf": AccessMode.SHARED_READ,
             "partial_loss_buf": AccessMode.EXCLUSIVE_WRITE,
         }
         args1 = (
+            local_mem1,  # <-- Pass local memory
             self.b.get("ensemble_probs_buf").cl_buffer,
             self.b.get("targets_buf").mask_buffer,
             self.b.get("targets_buf").cl_buffer,
@@ -796,11 +804,20 @@ class KernelWrapper:
             np.int32(self.padded_batch_size),
             np.int32(self.padded_output_classes),
         )
-        partial_node = self._create_kernel_node("calculate_partial_losses", g, l, access1, *args1)
+        partial_node = self._create_kernel_node("calculate_partial_losses", g1, l1, access1, *args1)
 
-        g2, l2 = (min(256, num_groups) if num_groups > 0 else 1,), (min(256, num_groups) if num_groups > 0 else 1,)
+        # --- Stage 2: Final Reduction ---
+        # This kernel runs with a single work-group
+        l2_val = min(256, next_pow2(num_groups // 2) if num_groups > 1 else 1)
+        g2, l2 = (l2_val,), (l2_val,)
+        local_mem2 = cl.LocalMemory(l2[0] * np.dtype(np.float32).itemsize)  # <-- Create local memory
         access2 = {"partial_loss_buf": AccessMode.SHARED_READ, "final_loss_buf": AccessMode.EXCLUSIVE_WRITE}
-        args2 = (self.b.get("partial_loss_buf").cl_buffer, self.b.get("final_loss_buf").cl_buffer, np.int32(num_groups))
+        args2 = (
+            local_mem2,  # <-- Pass local memory
+            self.b.get("partial_loss_buf").cl_buffer,
+            self.b.get("final_loss_buf").cl_buffer,
+            np.int32(num_groups),
+        )
 
         final_node = self._create_kernel_node("aggregate_partial_losses", g2, l2, access2, *args2)
         self.m.graph.add_edge(partial_node, final_node)
@@ -1088,7 +1105,6 @@ for epoch in range(EPOCHS):
         k.forward_pass()
         k.compute_all_exits()
 
-        # HOST CHOICE for Node 6 (Ensemble Weights)
         TIER2_MAX_EXITS = 512
         if NUM_EXITS <= MAX_EXITS_ENSEMBLE:
             k.ensemble_weights_tier1_reg_reduce()
@@ -1098,32 +1114,31 @@ for epoch in range(EPOCHS):
             k.ensemble_weights_tier3_map_reduce()
 
         k.blend_ensemble_probabilities()
-        final_loss_node = k.calculate_losses()
+        k.calculate_losses()
 
         k.calculate_exit_gradients()
         k.calculate_shared_gradients()
         k.calculate_temp_gradients()
 
-        adam_nodes, clamp_node = [], None
         for param in params:
             update_node = k.adam_update(param)
-            adam_nodes.append(update_node)
             if param.name == "temps":
                 clamp_node = k.clamp_temperatures()
                 manager.graph.add_edge(update_node, clamp_node)
 
+        # --- Create the specific D2H transfer nodes we need to wait for ---
         def d2h_op(view, buffer_name):
             buf = buffer_mgr.get(buffer_name).cl_buffer
             return lambda q, wf: view.update_from_device(q, buf, wait_for=wf)
 
-        loss_d2h = manager.create_node(
+        loss_d2h_node_uid = manager.create_node(
             "d2h_loss",
             NodeType.TRANSFER,
             "transfer",
             {"final_loss_buf": AccessMode.SHARED_READ},
             d2h_op(loss_view, "final_loss_buf"),
         )
-        probs_d2h = manager.create_node(
+        probs_d2h_node_uid = manager.create_node(
             "d2h_probs",
             NodeType.TRANSFER,
             "transfer",
@@ -1131,14 +1146,19 @@ for epoch in range(EPOCHS):
             d2h_op(probs_view, "ensemble_probs_buf"),
         )
 
-        all_leaves = [node for node, out_degree in manager.graph.out_degree() if out_degree == 0]
-        sync_node = manager.create_sync_node("final_sync", all_leaves)
+        # We explicitly list the handles (UIDs) of the two essential D2H transfer nodes.
+        sync_dependencies = [loss_d2h_node_uid, probs_d2h_node_uid]
+        sync_node = manager.create_sync_node("final_sync", sync_dependencies)
 
         manager.commit()
         manager.wait_for_sync(sync_node)
 
-        batch_loss = loss_view.valid_slice[0]
-        epoch_loss += batch_loss * actual_batch_size
+        total_batch_loss = loss_view.valid_slice[0]
+
+        # Normalize the loss by the number of real samples in the batch
+        batch_loss = total_batch_loss / actual_batch_size if actual_batch_size > 0 else 0.0
+        epoch_loss += total_batch_loss  # Add the un-normalized total loss to the epoch total
+
         valid_probs = probs_view.valid_slice[:actual_batch_size]
         predicted_classes = np.argmax(valid_probs, axis=1)
         correct_predictions += np.sum(predicted_classes == y_batch)

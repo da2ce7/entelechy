@@ -312,3 +312,142 @@ __kernel void calculate_temp_gradients(
         grad_temps[e_idx] = local_grad_sum[0];
     }
 }
+
+/**
+ * @brief (Node 8 - Stage 1) Calculates partial cross-entropy losses for the batch.
+ *
+ * This is the first stage of a two-stage parallel reduction for the total batch loss. Each
+ * work-group is responsible for a subset of the samples in the batch. It computes the
+ * cross-entropy loss for each of its assigned samples and then performs an efficient
+ * reduction within its own __local memory to produce a single "partial loss" sum.
+ *
+ * This partial sum is then written to a temporary global buffer, which will be consumed
+ * by the `aggregate_partial_losses` kernel in the next stage.
+ *
+ * Host Assumptions:
+ * - Launched with a 1D NDRange over the batch dimension, e.g., global_size=(padded_batch_size,).
+ * - Host must provide a __local memory buffer of size: local_size[0] * sizeof(float).
+ */
+__kernel void calculate_partial_losses(
+    // Local memory, dynamically allocated by the host
+    __local float *l_loss_sums,
+
+    // Inputs
+    __global const SCALAR_TYPE *__restrict ensemble_probs_buf,
+    __global const SCALAR_TYPE *__restrict targets_mask,
+    __global const int *__restrict targets_buf,
+
+    // Output
+    __global float *__restrict partial_loss_buf, // Buffer for one float per work-group
+
+    // Dimensions
+    int padded_batch_size,
+    int output_classes) {
+
+    // --- Get IDs and Sizes ---
+    const uint gid      = get_global_id(0);
+    const uint lid      = get_local_id(0);
+    const uint lsize    = get_local_size(0);
+    const uint group_id = get_group_id(0);
+    const uint gsize    = get_global_size(0);
+
+    // --- Phase 1: Private Accumulation ---
+    // Each thread calculates a sum of losses for its assigned samples.
+    // This sum is stored in a fast private register.
+    float p_loss_sum = 0.0f;
+
+    // This loop structure ensures that all samples are covered, even if the number of
+    // work-items (gsize) is smaller than the number of samples (padded_batch_size).
+    for (uint b = gid; b < padded_batch_size; b += gsize) {
+        // Skip any samples that are part of the padding mask
+        if (targets_mask[b] < (SCALAR_TYPE)0.5f) {
+            continue;
+        }
+
+        // Get the ground-truth label for this sample
+        const int true_class = targets_buf[b];
+
+        // Find the probability assigned to the true class by the ensemble
+        const uint  prob_idx = b * output_classes + true_class;
+        SCALAR_TYPE prob     = ensemble_probs_buf[prob_idx];
+
+        // Calculate cross-entropy loss for this single sample.
+        // Use fmax to prevent log(0) which would result in -inf.
+        p_loss_sum += -log(fmax((float)prob, 1e-7f));
+    }
+
+    // --- Phase 2: Parallel Reduction in Local Memory ---
+    // Each thread places its privately computed sum into the shared local "workbench".
+    l_loss_sums[lid] = p_loss_sum;
+
+    // Synchronize to ensure all private sums are written to local memory before reduction begins.
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Perform the reduction in-place. Each step halves the number of active threads.
+    for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            l_loss_sums[lid] += l_loss_sums[lid + stride];
+        }
+        // A barrier is essential here to prevent race conditions between reduction levels.
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // --- Phase 3: Final Write ---
+    // Only the first thread in each work-group (the "leader") writes the final,
+    // reduced partial sum to global memory.
+    if (lid == 0) {
+        partial_loss_buf[group_id] = l_loss_sums[0];
+    }
+}
+
+/**
+ * @brief (Node 9 - Stage 2) Aggregates partial loss sums into a final total loss.
+ *
+ * This is the second and final stage of the loss reduction. This kernel is launched with
+ * a single work-group to sum the small number of partial results from the previous stage.
+ * It uses the same efficient parallel reduction pattern to produce the single, final
+ * floating-point value representing the total loss for the batch.
+ *
+ * Host Assumptions:
+ * - Launched with a single work-group, where global_size == local_size.
+ * - Host must provide a __local memory buffer of size: local_size[0] * sizeof(float).
+ */
+__kernel void aggregate_partial_losses(
+    // Local memory, dynamically allocated by the host
+    __local float *l_reduction_mem,
+
+    // Inputs
+    __global const float *__restrict partial_loss_buf,
+    // Output
+    __global float *__restrict final_loss_buf,
+    // Dimensions
+    int num_partial_sums) {
+
+    // --- Get IDs ---
+    const uint lid   = get_local_id(0);
+    const uint lsize = get_local_size(0);
+
+    // --- Phase 1: Private Accumulation ---
+    // Each thread in the work-group sums up a portion of the partial_loss_buf.
+    float p_sum = 0.0f;
+    for (int i = lid; i < num_partial_sums; i += lsize) {
+        p_sum += partial_loss_buf[i];
+    }
+
+    // --- Phase 2: Parallel Reduction in Local Memory ---
+    l_reduction_mem[lid] = p_sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            l_reduction_mem[lid] += l_reduction_mem[lid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // --- Phase 3: Final Write ---
+    // The leader of this single work-group writes the grand total to the final output buffer.
+    if (lid == 0) {
+        final_loss_buf[0] = l_reduction_mem[0];
+    }
+}

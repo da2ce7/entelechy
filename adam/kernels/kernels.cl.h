@@ -89,6 +89,7 @@ inline int  get_global_id(int dim) { return 0; }
 inline int  get_local_id(int dim) { return 0; }
 inline int  get_group_id(int dim) { return 0; }
 inline int  get_local_size(int dim) { return 1; }
+inline int  get_global_size(int dim) { return 1; }
 inline int  get_num_groups(int dim) { return 1; }
 inline void barrier(int flags) { (void)flags; /* no-op */ }
 
@@ -281,12 +282,15 @@ __kernel void blend_ensemble_probabilities(
 /**
  * @brief (Node 8) Computes partial cross-entropy losses for the batch.
  *
- * This kernel calculates partial sums of the cross-entropy loss for subsets of the batch, to be aggregated later.
+ * This kernel calculates partial sums of the cross-entropy loss for subsets of the batch.
+ * It is the first stage in a two-stage reduction pattern for calculating the total batch loss.
  *
  * Host Assumptions:
- * - Launched with a 1D NDRange covering the batch, with local size <= 256.
+ * - Launched with a 1D NDRange covering the batch, typically with a work-group size of 256.
+ * - Host MUST provide a __local memory buffer for the reduction, sized to the work-group.
  */
 __kernel void calculate_partial_losses(
+    __local float *l_loss_sums,                                // [size: local_size[0] * sizeof(float)] Local memory for reduction.
     __global const SCALAR_TYPE *__restrict ensemble_probs_buf, // [shape: (padded_batch_size, output_classes)] Ensemble probabilities.
     __global const SCALAR_TYPE *__restrict targets_mask,       // [shape: (padded_batch_size)] Mask for targets.
     __global const int *__restrict targets_buf,                // [shape: (padded_batch_size)] Target labels.
@@ -298,12 +302,15 @@ __kernel void calculate_partial_losses(
 /**
  * @brief (Node 9) Aggregates partial loss sums into a final total loss.
  *
- * This kernel sums up the partial loss values computed by `calculate_partial_losses` to obtain the total loss.
+ * This kernel sums up the partial loss values computed by `calculate_partial_losses` to obtain the
+ * final, single floating-point value for the total batch loss.
  *
  * Host Assumptions:
- * - Launched with a single work-group.
+ * - Launched with a single work-group (global_size == local_size).
+ * - Host MUST provide a __local memory buffer for the reduction, sized to the work-group.
  */
 __kernel void aggregate_partial_losses(
+    __local float *l_reduction_mem,                    // [size: local_size[0] * sizeof(float)] Local memory for reduction.
     __global const float *__restrict partial_loss_buf, // [shape: (num_partial_sums)] Partial loss sums.
     __global float *__restrict final_loss_buf,         // [shape: (1)] Final total loss.
     int num_partial_sums                               // Number of partial sums.
