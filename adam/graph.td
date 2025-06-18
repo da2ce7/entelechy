@@ -15,7 +15,7 @@ graph TD
         N3[3. Zero Gradients]:::data
     end
 
-    %% === Phase 2 & 3: Forward Pass, with N6 implementation details expanded ===
+    %% === Phase 2 & 3: Forward Pass and Parallel Backward Pass ===
     subgraph "Phase 2 & 3: Forward Pass and Parallel Backward Pass"
 
         %% Forward Pass up to the choice
@@ -104,8 +104,12 @@ graph TD
         N18[18. Host Synchronization Point]:::sync
         Host[Host CPU Waits]:::root
 
-        N9 --> N17
-        N7 --> N17
+        %% The Host layer requires specific data for monitoring and diagnostics.
+        N9 --> N17   %% Total Loss
+        N7 --> N17   %% Final Probabilities (for accuracy)
+        N13 --> N17  %% Input Gradient (for diagnostics)
+
+        %% The Host must wait for all parameter updates AND data transfers to complete.
         N15a & N15b & N16 --> N18
         N17 --> N18
         N18 --> Host

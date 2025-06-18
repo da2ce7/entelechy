@@ -154,9 +154,8 @@ __kernel void calculate_exit_gradients(
             const uint        padded_hidden_dim_blocks = hidden_dim / SIMD_WIDTH;
             const uint        physical_hidden_idx      = b * padded_hidden_dim_blocks * SIMD_WIDTH + h_block * SIMD_WIDTH + h_lane;
             const SCALAR_TYPE h_val                    = hidden_buf[physical_hidden_idx];
-
-            const SCALAR_TYPE weight_be  = ensemble_weights_buf[b * num_exits + e_idx];
-            const int         true_class = targets_buf[b];
+            const SCALAR_TYPE weight_be                = ensemble_weights_buf[b * num_exits + e_idx];
+            const int         true_class               = targets_buf[b];
 
 #pragma unroll
             for (int c_local = 0; c_local < C_TILE_SIZE; ++c_local) {
@@ -383,6 +382,7 @@ __kernel void calculate_temp_gradients(
         const int         true_class        = targets_buf[b];
         const SCALAR_TYPE weight_be         = ensemble_weights_buf[b * num_exits + e_idx];
         SCALAR_TYPE       grad_contribution = SCALAR_ZERO;
+
         for (int c = 0; c < output_classes; ++c) {
             SCALAR_TYPE is_target      = select(SCALAR_ZERO, (SCALAR_TYPE)1.0f, c == true_class);
             SCALAR_TYPE prob           = exit_probs_buf[e_idx * padded_batch_size * output_classes + b * output_classes + c];
