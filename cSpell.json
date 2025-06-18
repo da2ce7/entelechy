@@ -1,0 +1,17 @@
+{
+    "words": [
+        "CDNA",
+        "itemsize",
+        "keepdims",
+        "ndarray",
+        "padder",
+        "probs",
+        "pyopencl",
+        "RDNA",
+        "reqs",
+        "xfer"
+    ],
+    "enableFiletypes": [
+        "shellscript"
+    ]
+}
