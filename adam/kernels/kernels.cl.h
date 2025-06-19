@@ -41,6 +41,7 @@
 #else
 #include <math.h>  // For fmax, sqrt, etc.
 #include <stdio.h> // For printf in debug stubs
+#include <float.h> // For FLT_MAX
 
 // Host/C++ mode definitions
 #ifndef __kernel
@@ -185,40 +186,45 @@ __kernel void ensemble_weights_local_reduce(
     int output_classes,                                // [INPUT scalar: (assumes padded value >= OUTPUT_CLASSES)] The padded dimension of the output classes.
     int padded_batch_size                              // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
 );
-
 /**
- * @brief (Node 6, Tier 3, Map Stage) Calculates exp(confidence) for every exit.
+ * @brief (Node 6, Hierarchical Tier, Stage 1) Processes chunks of exits to find the max logit and a stable sum-of-exponentials.
  */
-__kernel void ensemble_weights_map_exp_conf(
-    __global const SCALAR_TYPE *__restrict exit_probs,   // [INPUT shape: (NUM_EXITS, padded_batch_size, output_classes)] Probabilities from all exits.
-    __global const SCALAR_TYPE *__restrict targets_mask, // [INPUT shape: (padded_batch_size)] Mask for valid samples.
-    __global SCALAR_TYPE *__restrict temp_exp_conf_buf,  // [OUTPUT shape: (padded_batch_size, num_exits)] Intermediate exp(confidence) values.
-    int padded_batch_size,                               // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
-    int num_exits,                                       // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
-    int output_classes                                   // [INPUT scalar: (assumes padded value >= OUTPUT_CLASSES)] The padded dimension of the output classes.
+__kernel void compute_exit_chunk(
+    __global const SCALAR_TYPE *__restrict unscaled_logits, // [INPUT shape: (NUM_EXITS, padded_batch_size, output_classes)] Raw logits from all exits.
+    __global SCALAR_TYPE *__restrict chunk_max_out,         // [OUTPUT shape: (num_chunks, padded_batch_size)] Per-chunk maximum logit value.
+    __global SCALAR_TYPE *__restrict chunk_sum_out,         // [OUTPUT shape: (num_chunks, padded_batch_size)] Per-chunk sum of exponentials relative to its max.
+    int chunk_id,                                           // [INPUT scalar: (assumes value >= 0)] The ID of the chunk to process.
+    int chunk_size,                                         // [INPUT scalar: (assumes value > 0)] The number of exits per chunk.
+    int total_exits,                                        // [INPUT scalar: (assumes value == NUM_EXITS)] Total number of network exits.
+    int padded_batch_size,                                  // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int output_classes                                      // [INPUT scalar: (assumes padded value >= OUTPUT_CLASSES)] The padded dimension of the output classes.
 );
 
 /**
- * @brief (Node 6, Tier 3, Reduce Stage) Reduces partial exponentiated confidence values.
+ * @brief (Node 6, Hierarchical Tier, Stage 2) Reduces a group of intermediate chunk results into a single result.
  */
-__kernel void reduce_partial_sums(
-    __local SCALAR_TYPE *l_reduction_mem,                     // [MEMORY size: local_size[1] * sizeof(SCALAR_TYPE)] Local memory for reduction.
-    __global const SCALAR_TYPE *__restrict temp_exp_conf_buf, // [INPUT shape: (padded_batch_size, num_exits)] Intermediate exp(confidence) values.
-    __global SCALAR_TYPE *__restrict temp_partial_sums_buf,   // [OUTPUT shape: (padded_batch_size, num_chunks)] Partial sums for each sample.
-    int num_exits                                             // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
+__kernel void reduce_chunk_pair(
+    __global const SCALAR_TYPE *__restrict input_max, // [INPUT shape: (num_input_chunks, padded_batch_size)] Max values from the previous reduction level.
+    __global const SCALAR_TYPE *__restrict input_sum, // [INPUT shape: (num_input_chunks, padded_batch_size)] Sum values from the previous reduction level.
+    __global SCALAR_TYPE *__restrict output_max,      // [OUTPUT shape: (num_output_chunks, padded_batch_size)] Destination for the new reduced max values.
+    __global SCALAR_TYPE *__restrict output_sum,      // [OUTPUT shape: (num_output_chunks, padded_batch_size)] Destination for the new reduced sum values.
+    int start_chunk_idx,                              // [INPUT scalar: (assumes value >= 0)] The starting index in the input buffers for this reduction group.
+    int num_chunks_to_reduce,                         // [INPUT scalar: (assumes value > 0)] The number of input chunks to combine (the reduction factor).
+    int total_input_chunks,                           // [INPUT scalar: (assumes value > 0)] The total number of chunks at this input level.
+    int padded_batch_size                             // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
 );
 
 /**
- * @brief (Node 6, Tier 3, Finalize Stage) Aggregates partial sums and computes final weights.
+ * @brief (Node 6, Hierarchical Tier, Stage 3) Computes the final normalized ensemble weights.
  */
-__kernel void ensemble_weights_finalize(
-    __global const SCALAR_TYPE *__restrict temp_exp_conf_buf,     // [INPUT shape: (padded_batch_size, num_exits)] Intermediate exp(confidence) values.
-    __global const SCALAR_TYPE *__restrict temp_partial_sums_buf, // [INPUT shape: (padded_batch_size, num_chunks)] Partial sums for each sample.
-    __global const SCALAR_TYPE *__restrict targets_mask,          // [INPUT shape: (padded_batch_size)] Mask for valid samples.
-    __global SCALAR_TYPE *__restrict ensemble_weights,            // [OUTPUT shape: (padded_batch_size, num_exits)] Final calculated ensemble weights.
-    int padded_batch_size,                                        // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
-    int num_exits,                                                // [INPUT scalar: (assumes value == NUM_EXITS)] The total number of network exits.
-    int num_chunks                                                // [INPUT scalar: (assumes value > 0)] The number of partial sums to aggregate per sample.
+__kernel void normalize_weights(
+    __global const SCALAR_TYPE *__restrict unscaled_logits, // [INPUT shape: (NUM_EXITS, padded_batch_size, output_classes)] Raw logits from all exits.
+    __global const SCALAR_TYPE *__restrict global_max,      // [INPUT shape: (padded_batch_size)] Final maximum logit value across all exits.
+    __global const SCALAR_TYPE *__restrict global_sum,      // [INPUT shape: (padded_batch_size)] Final sum-of-exponentials relative to the global max.
+    __global SCALAR_TYPE *__restrict ensemble_weights,      // [OUTPUT shape: (padded_batch_size, num_exits)] The final calculated ensemble weights.
+    int total_exits,                                        // [INPUT scalar: (assumes value == NUM_EXITS)] Total number of network exits.
+    int padded_batch_size,                                  // [INPUT scalar: (assumes padded value >= BATCH_SIZE)] The padded size of the batch dimension.
+    int output_classes                                      // [INPUT scalar: (assumes padded value >= OUTPUT_CLASSES)] The padded dimension of the output classes.
 );
 
 /**

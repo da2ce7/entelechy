@@ -243,111 +243,316 @@ __kernel void ensemble_weights_local_reduce(
         ensemble_weights[b_idx * num_exits + e] = exp(max_prob) / denominator;
     }
 }
-
 /**
- * @brief (Node 6, Tier 3, Map Stage) The "Cargo Ship" (Part 1): Implements the 'map' stage of the scalable pattern.
+ * @brief (Node 6, Hierarchical Tier, Stage 1) Processes chunks of exits to find the max logit and a stable sum-of-exponentials.
  *
- * This is an embarrassingly parallel kernel where each work-item independently computes a single
- * exponentiated confidence score for one (sample, exit) pair and writes it to a large intermediate buffer.
+ * The massively parallel 'map' stage of the reduction. It initiates the distributed log-sum-exp
+ * trick for numerical stability. The two-pass approach first finds a chunk's true `max`,
+ * then calculates a sum of exponentials relative to it. Re-computing the per-exit max in
+ * the second pass is an intentional design choice, trading cheaper arithmetic operations
+ * for reduced memory traffic—a common and effective GPU optimization.
  */
-__kernel void ensemble_weights_map_exp_conf(
-    __global const SCALAR_TYPE *__restrict exit_probs,
-    __global const SCALAR_TYPE *__restrict targets_mask,
-    __global SCALAR_TYPE *__restrict temp_exp_conf_buf,
+__kernel void compute_exit_chunk(
+    __global const SCALAR_TYPE *__restrict unscaled_logits,
+    __global SCALAR_TYPE *__restrict chunk_max_out,
+    __global SCALAR_TYPE *__restrict chunk_sum_out,
+    int chunk_id,
+    int chunk_size,
+    int total_exits,
     int padded_batch_size,
-    int num_exits,
     int output_classes) {
     const uint b_idx = get_global_id(0);
-    const uint e_idx = get_global_id(1);
-
-    if (b_idx >= padded_batch_size || e_idx >= num_exits)
-        return;
-
-    if (targets_mask[b_idx] < 0.5f) {
-        temp_exp_conf_buf[b_idx * num_exits + e_idx] = SCALAR_ZERO;
+    if (b_idx >= padded_batch_size) {
         return;
     }
 
-    SCALAR_TYPE max_prob      = SCALAR_ZERO;
-    const uint  prob_base_idx = e_idx * padded_batch_size * output_classes + b_idx * output_classes;
-    for (int c = 0; c < output_classes; c++) {
-        max_prob = fmax(max_prob, exit_probs[prob_base_idx + c]);
+    const uint start_exit = chunk_id * chunk_size;
+    const uint end_exit   = min((uint)(start_exit + chunk_size), (uint)total_exits);
+
+    SCALAR_TYPE local_max_logit = -FLT_MAX;
+    for (uint e_idx = start_exit; e_idx < end_exit; e_idx++) {
+        SCALAR_TYPE current_exit_max_logit = -FLT_MAX;
+        const uint  logit_base_idx         = e_idx * padded_batch_size * output_classes + b_idx * output_classes;
+        for (int c = 0; c < output_classes; c++) {
+            current_exit_max_logit = fmax(current_exit_max_logit, unscaled_logits[logit_base_idx + c]);
+        }
+        local_max_logit = fmax(local_max_logit, current_exit_max_logit);
     }
-    temp_exp_conf_buf[b_idx * num_exits + e_idx] = exp(max_prob);
+
+    SCALAR_TYPE sum_of_exps = 0.0f;
+    for (uint e_idx = start_exit; e_idx < end_exit; e_idx++) {
+        SCALAR_TYPE current_exit_max_logit = -FLT_MAX;
+        const uint  logit_base_idx         = e_idx * padded_batch_size * output_classes + b_idx * output_classes;
+        for (int c = 0; c < output_classes; c++) {
+            current_exit_max_logit = fmax(current_exit_max_logit, unscaled_logits[logit_base_idx + c]);
+        }
+        sum_of_exps += exp(current_exit_max_logit - local_max_logit);
+    }
+
+    const uint out_idx     = chunk_id * padded_batch_size + b_idx;
+    chunk_max_out[out_idx] = local_max_logit;
+    chunk_sum_out[out_idx] = sum_of_exps;
 }
 
 /**
- * @brief (Node 6, Tier 3, Reduce Stage) The "Cargo Ship" (Part 2): Reduces a large buffer into partial sums.
+ * @brief (Node 6, Hierarchical Tier, Stage 2) Reduces a group of intermediate chunk results into a single, stable result.
  *
- * Each work-group is assigned a large chunk of the intermediate buffer from the 'map' stage
- * and performs a parallel reduction in `__local` memory to produce a single partial sum.
+ * The recursive 'reduce' workhorse of the reduction tree. It stably merges (`max`, `sum`)
+ * pairs from a previous level by first finding a new `max_of_maxes` and then re-basing
+ * each input sum relative to it before accumulation. This preserves numerical precision
+ * across the entire tree. This kernel is intentionally unaware of the full tree structure;
+ * the host orchestrates its execution in a chained sequence to form the complete reduction DAG.
  */
-__kernel void
-reduce_partial_sums(__local SCALAR_TYPE *l_reduction_mem, __global const SCALAR_TYPE *__restrict temp_exp_conf_buf, __global SCALAR_TYPE *__restrict temp_partial_sums_buf, int num_exits) {
-    const uint b_idx      = get_group_id(0);
-    const uint chunk_idx  = get_group_id(1);
-    const uint num_chunks = get_num_groups(1);
-    const uint tid        = get_local_id(1);
-    const uint lsize      = get_local_size(1);
-
-    const uint items_per_group = (num_exits + num_chunks - 1) / num_chunks;
-    const uint chunk_start_idx = chunk_idx * items_per_group;
-    const uint chunk_end_idx   = min(chunk_start_idx + items_per_group, (uint)num_exits);
-
-    SCALAR_TYPE p_sum = SCALAR_ZERO;
-    for (int e = chunk_start_idx + tid; e < chunk_end_idx; e += lsize) {
-        p_sum += temp_exp_conf_buf[b_idx * num_exits + e];
-    }
-    l_reduction_mem[tid] = p_sum;
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
-        if (tid < stride)
-            l_reduction_mem[tid] += l_reduction_mem[tid + stride];
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-
-    if (tid == 0) {
-        temp_partial_sums_buf[b_idx * num_chunks + chunk_idx] = l_reduction_mem[0];
-    }
-}
-
-/**
- * @brief (Node 6, Tier 3, Finalize Stage) The "Cargo Ship" (Part 3): Aggregates partial sums and computes final weights.
- *
- * Each thread handles one sample, performs a fast serial reduction of the few partial sums
- * to get the final denominator, and then scatters the final calculated weights back to global memory.
- */
-__kernel void ensemble_weights_finalize(
-    __global const SCALAR_TYPE *__restrict temp_exp_conf_buf,
-    __global const SCALAR_TYPE *__restrict temp_partial_sums_buf,
-    __global const SCALAR_TYPE *__restrict targets_mask,
-    __global SCALAR_TYPE *__restrict ensemble_weights,
-    int padded_batch_size,
-    int num_exits,
-    int num_chunks) {
+__kernel void reduce_chunk_pair(
+    __global const SCALAR_TYPE *__restrict input_max,
+    __global const SCALAR_TYPE *__restrict input_sum,
+    __global SCALAR_TYPE *__restrict output_max,
+    __global SCALAR_TYPE *__restrict output_sum,
+    int start_chunk_idx,
+    int num_chunks_to_reduce,
+    int total_input_chunks,
+    int padded_batch_size) {
     const uint b_idx = get_global_id(0);
-
-    if (b_idx >= padded_batch_size)
-        return;
-
-    if (targets_mask[b_idx] < 0.5f) {
-        for (int e = 0; e < num_exits; e++)
-            ensemble_weights[b_idx * num_exits + e] = SCALAR_ZERO;
+    if (b_idx >= padded_batch_size) {
         return;
     }
 
-    SCALAR_TYPE total_denominator = SCALAR_ZERO;
-    const uint  partials_base_idx = b_idx * num_chunks;
-    for (int i = 0; i < num_chunks; ++i) {
-        total_denominator += temp_partial_sums_buf[partials_base_idx + i];
-    }
-    total_denominator = fmax(total_denominator, (SCALAR_TYPE)1e-7f);
+    const uint end_chunk = min((uint)(start_chunk_idx + num_chunks_to_reduce), (uint)total_input_chunks);
 
-    const uint numerators_base_idx = b_idx * num_exits;
-    for (int e = 0; e < num_exits; ++e) {
-        ensemble_weights[numerators_base_idx + e] = temp_exp_conf_buf[numerators_base_idx + e] / total_denominator;
+    SCALAR_TYPE max_of_maxes = -FLT_MAX;
+    for (uint c_idx = start_chunk_idx; c_idx < end_chunk; c_idx++) {
+        max_of_maxes = fmax(max_of_maxes, input_max[c_idx * padded_batch_size + b_idx]);
     }
+
+    SCALAR_TYPE combined_sum = 0.0f;
+    for (uint c_idx = start_chunk_idx; c_idx < end_chunk; c_idx++) {
+        SCALAR_TYPE chunk_max = input_max[c_idx * padded_batch_size + b_idx];
+        SCALAR_TYPE chunk_sum = input_sum[c_idx * padded_batch_size + b_idx];
+        combined_sum += chunk_sum * exp(chunk_max - max_of_maxes);
+    }
+
+    const uint out_group_idx = start_chunk_idx / num_chunks_to_reduce;
+    const uint out_idx       = out_group_idx * padded_batch_size + b_idx;
+    output_max[out_idx]      = max_of_maxes;
+    output_sum[out_idx]      = combined_sum;
+}
+
+/**
+ * @brief (Node 6, Hierarchical Tier, Stage 3) Computes the final normalized ensemble weights using globally reduced values.
+
+ *
+ * The embarrassingly parallel 'finalize' stage, consuming the single root (`global_max`,
+ * `global_sum`) of the reduction tree. To conserve memory bandwidth throughout the preceding
+ * reduction stages, this kernel re-computes each exit's max logit. This recompute-vs-store
+ * strategy is a conscious design choice, leveraging the fact that arithmetic on modern GPUs
+ * is significantly cheaper than additional global memory access.
+ */
+__kernel void normalize_weights(
+    __global const SCALAR_TYPE *__restrict unscaled_logits,
+    __global const SCALAR_TYPE *__restrict global_max,
+    __global const SCALAR_TYPE *__restrict global_sum,
+    __global SCALAR_TYPE *__restrict ensemble_weights,
+    int total_exits,
+    int padded_batch_size,
+    int output_classes) {
+    const uint e_idx = get_global_id(0);
+    const uint b_idx = get_global_id(1);
+
+    if (e_idx >= total_exits || b_idx >= padded_batch_size) {
+        return;
+    }
+
+    SCALAR_TYPE exit_max_logit = -FLT_MAX;
+    const uint  logit_base_idx = e_idx * padded_batch_size * output_classes + b_idx * output_classes;
+    for (int c = 0; c < output_classes; c++) {
+        exit_max_logit = fmax(exit_max_logit, unscaled_logits[logit_base_idx + c]);
+    }
+
+    const SCALAR_TYPE g_max = global_max[b_idx];
+    const SCALAR_TYPE g_sum = global_sum[b_idx];
+
+    const SCALAR_TYPE numerator   = exp(exit_max_logit - g_max);
+    const SCALAR_TYPE denominator = g_sum;
+
+    const uint out_idx        = b_idx * total_exits + e_idx;
+    ensemble_weights[out_idx] = (denominator > 1e-9f) ? (numerator / denominator) : 0.0f;
+}
+
+/**
+ * @brief (Node 6, Hierarchical Tier, Stage 1) Processes chunks of exits to find the max logit and a stable sum-of-exponentials.
+ *
+ * This kernel is the first, massively parallel stage of the hierarchical reduction tree. It replaces the old, simpler 'map'
+ * stage. Each work-item is responsible for processing a single chunk of exits for a single batch item.
+ *
+ * To ensure numerical stability (implementing the log-sum-exp trick in a distributed manner), it uses a two-pass approach:
+ * 1.  **Pass 1:** It iterates through its assigned exits to find the true maximum logit value for that chunk.
+ * 2.  **Pass 2:** It re-iterates, calculating sum(exp(exit_max - chunk_max)) for all exits in its chunk.
+ *
+ * The resulting (max, sum) pair is written out, ready to be consumed by the `reduce_chunk_pair` kernel in the next level of the tree.
+ */
+__kernel void compute_exit_chunk(
+    __global const SCALAR_TYPE *__restrict unscaled_logits,
+    __global SCALAR_TYPE *__restrict chunk_max_out,
+    __global SCALAR_TYPE *__restrict chunk_sum_out,
+    int chunk_id,
+    int chunk_size,
+    int total_exits,
+    int padded_batch_size,
+    int output_classes) {
+    const uint b_idx = get_global_id(0);
+    if (b_idx >= padded_batch_size) {
+        return;
+    }
+
+    const uint start_exit = chunk_id * chunk_size;
+    const uint end_exit   = min((uint)(start_exit + chunk_size), (uint)total_exits);
+
+    // --- Pass 1: Find the true maximum logit value within this batch item's chunk ---
+    // This is the core of the log-sum-exp trick for numerical stability.
+    SCALAR_TYPE local_max_logit = -FLT_MAX;
+    for (uint e_idx = start_exit; e_idx < end_exit; e_idx++) {
+        SCALAR_TYPE current_exit_max_logit = -FLT_MAX;
+        const uint  logit_base_idx         = e_idx * padded_batch_size * output_classes + b_idx * output_classes;
+
+        for (int c = 0; c < output_classes; c++) {
+            current_exit_max_logit = fmax(current_exit_max_logit, unscaled_logits[logit_base_idx + c]);
+        }
+        local_max_logit = fmax(local_max_logit, current_exit_max_logit);
+    }
+
+    // --- Pass 2: Calculate sum of exponentials relative to the true local max ---
+    SCALAR_TYPE sum_of_exps = 0.0f;
+    for (uint e_idx = start_exit; e_idx < end_exit; e_idx++) {
+        SCALAR_TYPE current_exit_max_logit = -FLT_MAX;
+        const uint  logit_base_idx         = e_idx * padded_batch_size * output_classes + b_idx * output_classes;
+
+        // Note: This re-calculation can be optimized by using local memory to store
+        // the max logit for each exit from Pass 1 if chunk_size is small and fits.
+        // For a generic, robust implementation, re-calculating is safe and correct.
+        for (int c = 0; c < output_classes; c++) {
+            current_exit_max_logit = fmax(current_exit_max_logit, unscaled_logits[logit_base_idx + c]);
+        }
+
+        sum_of_exps += exp(current_exit_max_logit - local_max_logit);
+    }
+
+    // Write the stable, intermediate results for the next reduction stage.
+    const uint out_idx     = chunk_id * padded_batch_size + b_idx;
+    chunk_max_out[out_idx] = local_max_logit;
+    chunk_sum_out[out_idx] = sum_of_exps;
+}
+
+/**
+ * @brief (Node 6, Hierarchical Tier, Stage 2) Reduces a group of intermediate chunk results into a single, stable result.
+ *
+ * This kernel is the recursive workhorse of the reduction tree. It replaces the simple local-memory reduction of the old system.
+ * Instead of just summing values, this kernel intelligently merges a group of (max, sum) pairs from a previous level into a new,
+ * combined (max, sum) pair for the next level. This process is orchestrated by the host, which calls this kernel
+ * repeatedly in a loop, creating a chain of dependencies that form the Merkle-style reduction tree.
+ *
+ * The key operation is a numerically stable merge:
+ * 1.  It finds the absolute maximum (`max_of_maxes`) from all incoming chunk `max` values.
+ * 2.  It then scales each incoming `sum` relative to this new `max_of_maxes` before accumulating them.
+ *     (i.e., `combined_sum += chunk_sum * exp(chunk_max - max_of_maxes)`)
+ *
+ * This preserves numerical precision across the entire reduction tree, preventing intermediate values from becoming INF or zero.
+ */
+__kernel void reduce_chunk_pair(
+    __global const SCALAR_TYPE *__restrict input_max,
+    __global const SCALAR_TYPE *__restrict input_sum,
+    __global SCALAR_TYPE *__restrict output_max,
+    __global SCALAR_TYPE *__restrict output_sum,
+    int start_chunk_idx,
+    int num_chunks_to_reduce,
+    int total_input_chunks,
+    int padded_batch_size) {
+    // Each work-item is responsible for one batch item (e.g., one sample in the batch).
+    const uint b_idx = get_global_id(0);
+    if (b_idx >= padded_batch_size) {
+        return;
+    }
+
+    // Determine the range of input chunks this work-item needs to read and reduce.
+    const uint end_chunk = min((uint)(start_chunk_idx + num_chunks_to_reduce), (uint)total_input_chunks);
+
+    // --- Pass 1: Find the maximum of all incoming maxes for this reduction group ---
+    // This will become the new reference point for the combined sum, ensuring stability.
+    SCALAR_TYPE max_of_maxes = -FLT_MAX;
+    for (uint c_idx = start_chunk_idx; c_idx < end_chunk; c_idx++) {
+        max_of_maxes = fmax(max_of_maxes, input_max[c_idx * padded_batch_size + b_idx]);
+    }
+
+    // --- Pass 2: Combine the sums relative to the new `max_of_maxes` ---
+    // This is the core of the distributed log-sum-exp trick. Each chunk's sum, which was
+    // relative to its own local max, is now adjusted to be relative to the group's max.
+    SCALAR_TYPE combined_sum = 0.0f;
+    for (uint c_idx = start_chunk_idx; c_idx < end_chunk; c_idx++) {
+        SCALAR_TYPE chunk_max = input_max[c_idx * padded_batch_size + b_idx];
+        SCALAR_TYPE chunk_sum = input_sum[c_idx * padded_batch_size + b_idx];
+        combined_sum += chunk_sum * exp(chunk_max - max_of_maxes);
+    }
+
+    // Write the newly reduced (max, sum) pair to the correct location in the output buffers
+    // for the next level of the reduction tree.
+    const uint out_group_idx = start_chunk_idx / num_chunks_to_reduce;
+    const uint out_idx       = out_group_idx * padded_batch_size + b_idx;
+    output_max[out_idx]      = max_of_maxes;
+    output_sum[out_idx]      = combined_sum;
+}
+
+/**
+ * @brief (Node 6, Hierarchical Tier, Stage 3) Computes the final normalized ensemble weights using globally reduced values.
+ *
+ * This kernel is the final stage of the hierarchical reduction pipeline, replacing the old `finalize` kernel.
+ * Its purpose is to perform the last, correctly-scaled normalization step for every exit.
+ *
+ * Unlike the old kernel, which had to perform a final serial reduction over partial sums, this kernel benefits
+ * from the globally consistent `global_max` and `global_sum` values produced by the reduction tree.
+ *
+ * For each (exit, batch_item) pair, it:
+ * 1.  Re-computes the maximum logit for that single exit.
+ * 2.  Uses the pre-computed global values to perform the final, numerically stable division:
+ *     `weight = exp(exit_max - global_max) / global_sum`.
+ *
+ * This design is highly parallel and avoids the numerical precision issues of the previous approach.
+ */
+__kernel void normalize_weights(
+    __global const SCALAR_TYPE *__restrict unscaled_logits,
+    __global const SCALAR_TYPE *__restrict global_max,
+    __global const SCALAR_TYPE *__restrict global_sum,
+    __global SCALAR_TYPE *__restrict ensemble_weights,
+    int total_exits,
+    int padded_batch_size,
+    int output_classes) {
+    // This kernel uses a 2D grid where each work-item handles one exit for one batch item.
+    const uint e_idx = get_global_id(0); // Exit index
+    const uint b_idx = get_global_id(1); // Batch index
+
+    if (e_idx >= total_exits || b_idx >= padded_batch_size) {
+        return;
+    }
+
+    // --- Step 1: Find the max logit for this specific exit ---
+    // This value needs to be re-calculated as it was not stored during the reduction to save memory.
+    SCALAR_TYPE exit_max_logit = -FLT_MAX;
+    const uint  logit_base_idx = e_idx * padded_batch_size * output_classes + b_idx * output_classes;
+    for (int c = 0; c < output_classes; c++) {
+        exit_max_logit = fmax(exit_max_logit, unscaled_logits[logit_base_idx + c]);
+    }
+
+    // --- Step 2: Perform the final, numerically stable normalization ---
+    const SCALAR_TYPE g_max = global_max[b_idx];
+    const SCALAR_TYPE g_sum = global_sum[b_idx];
+
+    // This is the final, stable calculation. The numerator is scaled relative to the global max,
+    // and the denominator (g_sum) is already correctly scaled from the reduction tree.
+    const SCALAR_TYPE numerator   = exp(exit_max_logit - g_max);
+    const SCALAR_TYPE denominator = g_sum;
+
+    // Guard against division by zero. This can happen if all logits for a sample were -INF,
+    // resulting in a global_sum of 0. In this case, the weights should be zero.
+    const uint out_idx        = b_idx * total_exits + e_idx;
+    ensemble_weights[out_idx] = (denominator > 1e-9f) ? (numerator / denominator) : 0.0f;
 }
 
 /**

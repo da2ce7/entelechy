@@ -9,6 +9,7 @@ graph TD
     classDef path_a fill:#e2f0d9,stroke:#70ad47,stroke-dasharray: 5 5
     classDef path_b fill:#ddebf7,stroke:#5b9bd5,stroke-dasharray: 5 5
     classDef note fill:#fefefe,stroke:#ccc,stroke-width:1px,stroke-dasharray:2 2
+    classDef hierarchical_tier fill:#e6e6fa,stroke:#9370db,stroke-width:2px
 
     %% === Phase 1: Setup & Pre-computation ===
     subgraph Phase 1: Setup and Data Upload
@@ -24,17 +25,32 @@ graph TD
         subgraph "6. Calculate Ensemble Recipe [HOST CHOICE]"
             style "6. Calculate Ensemble Recipe [HOST CHOICE]" choice_box
             direction TB
-            N6_S[ensemble_weights_reg_reduce]:::choice_kernel
-            N6_M[ensemble_weights_local_reduce]:::choice_kernel
-            N6_L[ensemble_weights_... (Tier 3)]:::choice_kernel
+
+            N6_S["<b>Tier 1: Register Reduce</b><br/><i>(≤ 64 exits)</i>"]:::choice_kernel
+            N6_M["<b>Tier 2: Local Memory Reduce</b><br/><i>(65 to 100K exits)</i>"]:::choice_kernel
+
+            subgraph "Tier 3: Hierarchical DAG Reduction (> 100K exits)"
+                direction TB
+                style "Tier 3: Hierarchical DAG Reduction (> 100K exits)" fill:#f5f0ff, stroke:#9370db, stroke-width:1px
+                N6_H1["6c.1 Process Chunks<br/><i>(Kernel Dispatched in Parallel)</i>"]:::hierarchical_tier
+                N6_H2["6c.2 Reduce Chunk Pairs<br/><i>(Looped Kernel Chain)</i>"]:::hierarchical_tier
+                N6_H3["6c.3 Final Normalization<br/><i>(Single Kernel)</i>"]:::hierarchical_tier
+                N6_H1 --> N6_H2 --> N6_H3
+            end
         end
-        N5 --> N6_S & N6_M & N6_L
+
+        %% Input to the ensemble calculation
+        N5 --> N6_S & N6_M & N6_H1
         N2 --> N5
     end
 
     %% === FORK POINT ===
     N7["7. Blend Ensemble Probabilities"]:::kernel
-    N6_S & N6_M & N6_L --> N7
+
+    %% Outputs from all possible tiers feed into the Blend kernel
+    N6_S --> N7
+    N6_M --> N7
+    N6_H3 --> N7
 
     %% === Phase 3 & 4: Parallel Execution Paths ===
     subgraph "Phase 3 & 4: Parallel Execution Paths"
@@ -52,6 +68,7 @@ graph TD
             end
 
             subgraph "Gradient Calculation"
+                N6_S & N6_M & N6_H3 & N4 & N5 --> N10_B
                 N10_B[10b. Compute Exit Gradients]:::kernel --> N11_B["11b. Aggregate & Backprop"]:::kernel
                 N11_B --> N12_B["12b. Layer Gradients"]:::kernel & N13_B["13b. Input Gradient"]:::kernel
                 N14_B[14b. Temperature Gradients]:::kernel
@@ -70,12 +87,17 @@ graph TD
         %% Dependencies connecting the common trunk to the parallel paths
         N7 --> N7_D2H
         N7 & N2 --> N8_B
-        N6_S & N6_M & N6_L & N4 --> N10_B
-        N6_S & N6_M & N6_L & N5 --> N14_B
+
+        %% Ensemble results from ALL possible tiers are required for backprop
+        N6_S & N6_M & N6_H3 & N4 --> N10_B
+        N6_S & N6_M & N6_H3 & N5 --> N14_B
         N3 --> N10_B & N12_B & N13_B & N14_B
     end
 
-    %% === Phase 5: Asynchronous Synchronization & Host Interaction (CHANGED) ===
+    note_hierarchical["**Dynamic DAG Construction:**<br/>For Tier 3, the host dynamically builds a<br/>Merkle-style reduction tree of kernels.<br/>The 'Reduce Chunk Pairs' step is a chain of kernels<br/>looped until a single result remains."]:::note
+    N6_H2 --. note_hierarchical
+
+    %% === Phase 5: Asynchronous Synchronization & Host Interaction ===
     subgraph "Phase 5: Asynchronous Synchronization & Host Interaction"
         direction TB
 
@@ -86,27 +108,19 @@ graph TD
            Host_Action1 --> Host_Action2
         end
 
-        %% Defines the two distinct notification points the host waits on
         Sync_A["8c. Inference Stream Sync"]:::sync
         Sync_B["18. Final Batch Sync"]:::sync
 
-        %% Host Action 1 depends on the Inference Sync
         Sync_A --> Host_Action1
-
-        %% Host Action 2 depends on the Final Batch Sync
         Sync_B --> Host_Action2
 
-        %% Define what triggers each synchronization event
         N7_D2H --> Sync_A
 
-        %% The Final Sync waits for the training pipeline and late data transfers to complete
-        N16_B --> Sync_B         %% Last kernel in training op chain
+        N16_B --> Sync_B
         subgraph "17b. D2H Late Diagnostics"
             N17_Diag[ ]:::data
         end
-        N9_B --> N17_Diag        %% Total Loss
-        N13_B --> N17_Diag       %% Input Gradient
+        N9_B --> N17_Diag
+        N13_B --> N17_Diag
         N17_Diag --> Sync_B
-
-        note_sync["**Staggered Wait Explained:**<br/>The host code creates two notification events.<br/>It first waits *only* for the `Inference Stream Sync` to get the results.<br/>After processing them, it waits for the `Final Batch Sync`<br/>to ensure the model is fully updated before the next batch starts."]:::note
     end

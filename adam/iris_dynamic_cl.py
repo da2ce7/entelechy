@@ -287,6 +287,61 @@ class PadSelectedDimsStrategy(PaddingStrategy):
         return tuple(padded_list)
 
 
+@dataclass
+class ReductionTree:
+    """
+    Manages ephemeral buffers and parameters for a hierarchical reduction operation.
+    This class pre-calculates the required number of reduction stages and allocates
+    the necessary intermediate OpenCL buffers, abstracting away the resource management
+    for this complex, multi-kernel process.
+    """
+
+    context: cl.Context
+    padded_batch_size: int
+    num_exits: int
+    chunk_size: int
+    reduction_factor: int
+
+    # --- Buffers and parameters calculated on initialization ---
+    # A list of tuples: (max_buffer, sum_buffer, num_input_chunks_for_this_level)
+    levels: List[Tuple[cl.Buffer, cl.Buffer, int]] = field(default_factory=list, init=False)
+    # The final, single-element buffers for the whole tree
+    global_max: cl.Buffer = field(init=False)
+    global_sum: cl.Buffer = field(init=False)
+    # The number of chunks at the very first level (output of compute_exit_chunk)
+    num_chunks_level0: int = field(init=False)
+
+    def __post_init__(self):
+        """Calculates the necessary reduction levels and allocates all intermediate buffers."""
+        self.num_chunks_level0 = (self.num_exits + self.chunk_size - 1) // self.chunk_size
+        buffer_size = lambda num_items: num_items * self.padded_batch_size * SCALAR_SIZE
+
+        current_chunks = self.num_chunks_level0
+        # Create buffer levels for the reduction tree. This loop builds the tree
+        # from the bottom up (from the widest level of chunks towards the single root).
+        while current_chunks > 1:
+            # The number of chunks coming *into* this level of reduction
+            input_chunks_for_this_level = current_chunks
+            # The number of chunks *produced* by this level of reduction
+            output_chunks = (current_chunks + self.reduction_factor - 1) // self.reduction_factor
+
+            max_buf = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, buffer_size(output_chunks))
+            sum_buf = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, buffer_size(output_chunks))
+
+            # Each level stores its *output* buffers and the number of *input* chunks it will process.
+            self.levels.append((max_buf, sum_buf, input_chunks_for_this_level))
+            current_chunks = output_chunks
+
+        # The final global buffers are the output of the last reduction level.
+        # If the tree had levels, these buffers already exist. If not (i.e., all exits fit in one chunk), create them now.
+        if not self.levels:
+            self.global_max = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, buffer_size(1))
+            self.global_sum = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, buffer_size(1))
+        else:
+            # The global result is simply the output of the final reduction stage
+            self.global_max, self.global_sum, _ = self.levels[-1]
+
+
 # A declarative registry mapping (Role, Rank) to a specific padding strategy.
 # `None` as a rank key acts as a fallback for any dimensionality.
 PADDING_RULE_REGISTRY: Dict[BufferRole, Dict[Optional[int], PaddingStrategy]] = {
@@ -403,17 +458,32 @@ class BufferManager:
 
 
 class BatchPadder:
-    """Handles padding of input X and targets y for a batch."""
+    """
+    Handles padding of input data (X) and target labels (y) for a given batch.
+    """
 
     def __init__(self, input_spec: BufferSpec, target_spec: BufferSpec):
         self.input_spec, self.target_spec = input_spec, target_spec
 
     def pad_batch(self, X: np.ndarray, y_true: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Takes a batch of real data and pads it to the target dimensions.
+
+        Returns:
+            A tuple containing (X_padded, y_padded, mask_padded).
+        """
         batch_size = X.shape[0]
+
+        # Use the pre-calculated padded shapes from the buffer specs to pad the arrays.
         X_padded = pad_tensor(X, self.input_spec.padded_shape)
         y_padded = pad_tensor(y_true, self.target_spec.padded_shape)
-        mask_data = np.ones(batch_size, dtype=SCALAR_NP_TYPE)  # 1s for valid samples
+
+        # Create a mask of 1s for valid samples and 0s for padding. This is vital
+        # for kernels to ignore the padded entries during calculations like loss and gradients.
+        mask_data = np.ones(batch_size, dtype=SCALAR_NP_TYPE)
+        # The mask itself must also be padded to the padded batch dimension.
         mask_padded = pad_tensor(mask_data, (self.input_spec.padded_shape[0],))
+
         return X_padded, y_padded, mask_padded
 
 
@@ -523,6 +593,94 @@ class WorkManager:
             self.graph.add_edge(dep_uid, uid)
         return user_event
 
+    def build_reduction_tree(self, k: "KernelWrapper", queue_name: str) -> int:
+        """Dynamically constructs the hierarchical reduction DAG and returns the final node's UID."""
+        tree = k.reduction_tree
+        unscaled_logits_buf = k.b.get("unscaled_logits_buf").cl_buffer
+
+        # --- Stage 1: Parallel Chunk Processing (Map) ---
+        # These nodes process the raw unscaled_logits in parallel. Each kernel instance
+        # is responsible for a single chunk of exits over the entire batch.
+        level0_nodes = []
+
+        # The output buffers for level 0 are the first level's output, or the global buffers if there's only one chunk.
+        out_max_l0 = tree.levels[0][0] if tree.levels else tree.global_max
+        out_sum_l0 = tree.levels[0][1] if tree.levels else tree.global_sum
+
+        for i in range(tree.num_chunks_level0):
+            op_fn = k._dispatch_compute_exit_chunk(
+                unscaled_logits_buf, out_max_l0, out_sum_l0, i, tree.chunk_size, NUM_EXITS
+            )
+            # Note: A generic access map key is used. All chunk ops can write to the same buffer
+            # because they write to non-overlapping regions (indexed by chunk_id).
+            # The `last_writer` mechanism correctly serializes any *subsequent* kernel that reads the whole buffer.
+            access_map = {"unscaled_logits_buf": AccessMode.SHARED_READ, f"level0_out": AccessMode.EXCLUSIVE_WRITE}
+            node_uid = self.create_node(f"chunk_{i}", NodeType.COMPUTE, queue_name, access_map, op_fn)
+            level0_nodes.append(node_uid)
+
+        # If all exits fit into a single chunk, no reduction is needed. The `compute_exit_chunk`
+        # kernel wrote directly to the global buffers. `level0_nodes` contains the single node.
+        if not tree.levels:
+            final_node_before_norm = level0_nodes[0]
+        else:
+            # --- Stage 2: Looped Reduction Levels ---
+            # The output nodes of the previous level become the input nodes for the next.
+            previous_level_nodes = level0_nodes
+
+            for level_idx in range(len(tree.levels)):
+                in_max, in_sum, num_in_chunks = tree.levels[level_idx]
+
+                # Determine the output buffers for the current reduction level
+                is_last_reduction_level = level_idx == len(tree.levels) - 1
+                if is_last_reduction_level:
+                    out_max, out_sum = tree.global_max, tree.global_sum
+                else:
+                    out_max, out_sum, _ = tree.levels[level_idx + 1]
+
+                current_level_nodes = []
+                num_groups = (num_in_chunks + tree.reduction_factor - 1) // tree.reduction_factor
+
+                for group_idx in range(num_groups):
+                    start_chunk_idx = group_idx * tree.reduction_factor
+                    op_fn = k._dispatch_reduce_chunk_pair(
+                        in_max, in_sum, out_max, out_sum, start_chunk_idx, tree.reduction_factor, num_in_chunks
+                    )
+                    access_map = {
+                        f"level{level_idx}_in": AccessMode.SHARED_READ,
+                        f"level{level_idx+1}_out": AccessMode.EXCLUSIVE_WRITE,
+                    }
+                    # This reduction node depends on all nodes from the previous level that produced its inputs.
+                    # This creates the many-to-one dependency structure of the tree.
+                    dep_nodes_start = start_chunk_idx
+                    dep_nodes_end = min(start_chunk_idx + tree.reduction_factor, len(previous_level_nodes))
+
+                    # Create the node first, then add edges from its specific dependencies
+                    node_uid = self.create_node(
+                        f"reduce_L{level_idx}_G{group_idx}", NodeType.COMPUTE, queue_name, access_map, op_fn
+                    )
+                    for dep_node_uid in previous_level_nodes[dep_nodes_start:dep_nodes_end]:
+                        self.graph.add_edge(dep_node_uid, node_uid)
+
+                    current_level_nodes.append(node_uid)
+
+                previous_level_nodes = current_level_nodes
+
+            final_node_before_norm = previous_level_nodes[0]
+
+        # --- Stage 3: Final Normalization ---
+        # This kernel uses the final globally-reduced max/sum values to normalize all exit confidences.
+        op_fn_norm = k._dispatch_normalize_weights(
+            unscaled_logits_buf, tree.global_max, tree.global_sum, k.b.get("ensemble_weights_buf").cl_buffer, NUM_EXITS
+        )
+        access_map_norm = {
+            "unscaled_logits_buf": AccessMode.SHARED_READ,
+            "global_results": AccessMode.SHARED_READ,  # Represents reading from global_max/sum
+            "ensemble_weights_buf": AccessMode.EXCLUSIVE_WRITE,
+        }
+        norm_node_uid = self.create_node("normalize_weights", NodeType.COMPUTE, queue_name, access_map_norm, op_fn_norm)
+        self.graph.add_edge(final_node_before_norm, norm_node_uid)
+        return norm_node_uid
+
     def commit(self):
         """Enqueues all operations in topological order, respecting dependencies."""
         ordered_nodes = list(nx.topological_sort(self.graph))
@@ -558,10 +716,64 @@ class KernelWrapper:
         # Adam bias correction terms (1 - beta^t)
         self.beta1_t = SCALAR_NP_TYPE(1.0 - (ADAM_BETA1**global_step))
         self.beta2_t = SCALAR_NP_TYPE(1.0 - (ADAM_BETA2**global_step))
+        self.reduction_tree: Optional[ReductionTree] = None
 
     def _create_kernel_node(self, name, global_size, local_size, queue_name, access_map, *args):
         op_fn = lambda q, wf: getattr(self.p, name)(q, global_size, local_size, *args, wait_for=wf)
         return self.m.create_node(name, NodeType.COMPUTE, queue_name, access_map, op_fn)
+
+    def _dispatch_compute_exit_chunk(
+        self, unscaled_logits_buf, out_max_buf, out_sum_buf, chunk_id, chunk_size, total_exits
+    ):
+        """Returns a lambda to enqueue the compute_exit_chunk kernel."""
+        g, l = (self.padded_batch_size,), None
+        args = (
+            unscaled_logits_buf,
+            out_max_buf,
+            out_sum_buf,
+            np.int32(chunk_id),
+            np.int32(chunk_size),
+            np.int32(total_exits),
+            np.int32(self.padded_batch_size),
+            np.int32(self.padded_output_classes),
+        )
+        op_fn = lambda q, wf: self.p.compute_exit_chunk(q, g, l, *args, wait_for=wf)
+        return op_fn
+
+    def _dispatch_reduce_chunk_pair(
+        self, in_max_buf, in_sum_buf, out_max_buf, out_sum_buf, start_idx, num_to_reduce, total_in_chunks
+    ):
+        """Returns a lambda to enqueue the reduce_chunk_pair kernel."""
+        g, l = (self.padded_batch_size,), None
+        args = (
+            in_max_buf,
+            in_sum_buf,
+            out_max_buf,
+            out_sum_buf,
+            np.int32(start_idx),
+            np.int32(num_to_reduce),
+            np.int32(total_in_chunks),
+            np.int32(self.padded_batch_size),
+        )
+        op_fn = lambda q, wf: self.p.reduce_chunk_pair(q, g, l, *args, wait_for=wf)
+        return op_fn
+
+    def _dispatch_normalize_weights(
+        self, unscaled_logits_buf, global_max_buf, global_sum_buf, ensemble_weights_buf, total_exits
+    ):
+        """Returns a lambda to enqueue the normalize_weights kernel."""
+        g, l = (total_exits, self.padded_batch_size), None
+        args = (
+            unscaled_logits_buf,
+            global_max_buf,
+            global_sum_buf,
+            ensemble_weights_buf,
+            np.int32(total_exits),
+            np.int32(self.padded_batch_size),
+            np.int32(self.padded_output_classes),
+        )
+        op_fn = lambda q, wf: self.p.normalize_weights(q, g, l, *args, wait_for=wf)
+        return op_fn
 
     def zero_gradients(self, grad_buffer_name: str, queue_name: str) -> int:
         """Fills a gradient buffer with zeros."""
@@ -632,6 +844,37 @@ class KernelWrapper:
         )
         return self._create_kernel_node("compute_all_exits", g, l, queue_name, acc, *args)
 
+    def ensemble_weights(self, queue_name: str) -> int:
+        """
+        Selects and builds the appropriate ensemble weight calculation graph based on NUM_EXITS.
+        Returns the UID of the final node in the sub-graph. This method acts as a strategy
+        pattern implementation, dispatching to the optimal kernel set at runtime.
+        """
+        # Threshold between Tier 2 (local memory) and Tier 3 (hierarchical).
+        # This should be tuned based on device local memory size and architecture.
+        # e.g., 100k exits * 4 bytes/exit = 400KB, often too large for __local memory.
+        TIER2_MAX_EXITS = 100000
+
+        if NUM_EXITS <= MAX_EXITS_ENSEMBLE:
+            print("Using Ensemble Tier 1: Register Reduction")
+            return self.ensemble_weights_tier1_reg_reduce(queue_name)
+        elif NUM_EXITS <= TIER2_MAX_EXITS:
+            print("Using Ensemble Tier 2: Local Memory Reduction")
+            return self.ensemble_weights_tier2_local_reduce(queue_name)
+        else:
+            print("Using Ensemble Tier 3: Hierarchical Reduction")
+            # If the tree object for this batch doesn't exist, create it.
+            if not self.reduction_tree:
+                self.reduction_tree = ReductionTree(
+                    context=self.b.context,
+                    padded_batch_size=self.padded_batch_size,
+                    num_exits=NUM_EXITS,
+                    chunk_size=1024,  # Tunable: items processed by an initial compute_exit_chunk kernel
+                    reduction_factor=8,  # Tunable: items combined by one reduce_chunk_pair kernel
+                )
+            # Delegate DAG construction to the WorkManager
+            return self.m.build_reduction_tree(self, queue_name)
+
     def ensemble_weights_tier1_reg_reduce(self, queue_name: str) -> int:
         """(Tier 1) Ensemble weights via register reduction (for NUM_EXITS <= MAX_EXITS_ENSEMBLE)."""
         g, l = (self.padded_batch_size,), None
@@ -664,66 +907,6 @@ class KernelWrapper:
             np.int32(self.padded_batch_size),
         )
         return self._create_kernel_node("ensemble_weights_local_reduce", g, l, queue_name, acc, *args)
-
-    def ensemble_weights_tier3_map_reduce(self, queue_name: str) -> int:
-        """(Tier 3) Ensemble weights: Map (exp_conf) -> Reduce (partial_sums) -> Finalize (normalize)."""
-        num_chunks = (NUM_EXITS + TIER3_REDUCE_ITEMS_PER_GROUP - 1) // TIER3_REDUCE_ITEMS_PER_GROUP
-        self.b.create_buffer("temp_exp_conf_buf", BufferRole.INTERMEDIATE, (BATCH_SIZE, NUM_EXITS), SCALAR_NP_TYPE)
-        self.b.create_buffer("temp_partial_sums_buf", BufferRole.INTERMEDIATE, (BATCH_SIZE, num_chunks), SCALAR_NP_TYPE)
-        # Map stage
-        g_map, l_map = (self.padded_batch_size, NUM_EXITS), None
-        acc_map = {
-            "exit_probs_buf": AccessMode.SHARED_READ,
-            "targets_buf": AccessMode.SHARED_READ,
-            "temp_exp_conf_buf": AccessMode.EXCLUSIVE_WRITE,
-        }
-        args_map = (
-            self.b.get("exit_probs_buf").cl_buffer,
-            self.b.get("targets_buf").mask_buffer,
-            self.b.get("temp_exp_conf_buf").cl_buffer,
-            np.int32(self.padded_batch_size),
-            np.int32(NUM_EXITS),
-            np.int32(self.padded_output_classes),
-        )
-        map_node = self._create_kernel_node(
-            "ensemble_weights_map_exp_conf", g_map, l_map, queue_name, acc_map, *args_map
-        )
-        # Reduce stage
-        rls = 256
-        g_reduce, l_reduce = (self.padded_batch_size * rls, num_chunks), (rls, 1)
-        acc_reduce = {"temp_exp_conf_buf": AccessMode.SHARED_READ, "temp_partial_sums_buf": AccessMode.EXCLUSIVE_WRITE}
-        args_reduce = (
-            cl.LocalMemory(rls * SCALAR_SIZE),
-            self.b.get("temp_exp_conf_buf").cl_buffer,
-            self.b.get("temp_partial_sums_buf").cl_buffer,
-            np.int32(NUM_EXITS),
-        )
-        reduce_node = self._create_kernel_node(
-            "reduce_partial_sums", g_reduce, l_reduce, queue_name, acc_reduce, *args_reduce
-        )
-        # Finalize stage
-        g_fin, l_fin = (self.padded_batch_size,), None
-        acc_fin = {
-            "temp_exp_conf_buf": AccessMode.SHARED_READ,
-            "temp_partial_sums_buf": AccessMode.SHARED_READ,
-            "targets_buf": AccessMode.SHARED_READ,
-            "ensemble_weights_buf": AccessMode.EXCLUSIVE_WRITE,
-        }
-        args_fin = (
-            self.b.get("temp_exp_conf_buf").cl_buffer,
-            self.b.get("temp_partial_sums_buf").cl_buffer,
-            self.b.get("targets_buf").mask_buffer,
-            self.b.get("ensemble_weights_buf").cl_buffer,
-            np.int32(self.padded_batch_size),
-            np.int32(NUM_EXITS),
-            np.int32(num_chunks),
-        )
-        finalize_node = self._create_kernel_node(
-            "ensemble_weights_finalize", g_fin, l_fin, queue_name, acc_fin, *args_fin
-        )
-        self.m.graph.add_edge(map_node, reduce_node)
-        self.m.graph.add_edge(reduce_node, finalize_node)
-        return finalize_node
 
     def blend_ensemble_probabilities(self, queue_name: str) -> int:
         """Blends exit probabilities using calculated ensemble_weights."""
@@ -1071,17 +1254,14 @@ for epoch in range(EPOCHS):
             k.zero_gradients(param.grad, queue_name="Q_TRAINING")  # Zero gradients
         k.forward_pass(queue_name="Q_TRAINING")
         k.compute_all_exits(queue_name="Q_TRAINING")
-        # Tiered strategy for ensemble weight calculation
-        TIER2_MAX_EXITS = 512
-        if NUM_EXITS <= MAX_EXITS_ENSEMBLE:
-            k.ensemble_weights_tier1_reg_reduce(queue_name="Q_TRAINING")
-        elif NUM_EXITS <= TIER2_MAX_EXITS:
-            k.ensemble_weights_tier2_local_reduce(queue_name="Q_TRAINING")
-        else:
-            k.ensemble_weights_tier3_map_reduce(queue_name="Q_TRAINING")
+
+        # Tiered strategy for ensemble weight calculation is now encapsulated
+        ensemble_node_uid = k.ensemble_weights(queue_name="Q_TRAINING")
 
         # --- FORK POINT: `blend_ensemble_probabilities` is the last shared step before inference/training path split ---
         blend_node_uid = k.blend_ensemble_probabilities(queue_name="Q_TRAINING")
+        # CRITICAL: add dependency from whatever tier was chosen to the blending kernel
+        manager.graph.add_edge(ensemble_node_uid, blend_node_uid)
 
         # --- Path A: High-priority INFERENCE path (Q_INFERENCE) ---
         # Quickly gets blended probabilities for immediate processing.
