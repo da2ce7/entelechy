@@ -10,6 +10,7 @@ from collections import deque, defaultdict
 from enum import Enum, auto
 from dataclasses import dataclass, field
 from typing import Tuple, List, Set, Dict, Callable, Optional, Union
+from abc import ABC, abstractmethod
 from sklearn.datasets import load_iris
 from sklearn.preprocessing import StandardScaler
 
@@ -182,6 +183,143 @@ class PaddingContext:
         return cls(simd_width=select_simd_width(device))
 
 
+# --- Padding Strategy Definitions ---
+class PaddingStrategy(ABC):
+    """Abstract base class for all padding strategies."""
+
+    @abstractmethod
+    def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
+        pass
+
+
+@dataclass
+class NoPaddingStrategy(PaddingStrategy):
+    """Strategy for buffers that require no padding."""
+
+    def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
+        return real_shape
+
+
+@dataclass
+class PadLastDimStrategy(PaddingStrategy):
+    """Pads only the last dimension of the tensor to a multiple of SIMD width."""
+
+    def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
+        if not real_shape:
+            return ()
+        padded_last_dim = pad_to_multiple(real_shape[-1], ctx.simd_width)
+        return (*real_shape[:-1], padded_last_dim)
+
+
+@dataclass
+class PadBatchAndLastDimStrategy(PaddingStrategy):
+    """Pads the first (batch) dimension and the last feature dimension."""
+
+    def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
+        if len(real_shape) < 2:
+            return (pad_to_multiple(batch_size, ctx.simd_width),)
+
+        padded_batch = pad_to_multiple(batch_size, ctx.simd_width)
+        padded_last_dim = pad_to_multiple(real_shape[-1], ctx.simd_width)
+        return (padded_batch, *real_shape[1:-1], padded_last_dim)
+
+
+@dataclass
+class PadBatchDimOnlyStrategy(PaddingStrategy):
+    """Pads only the first (batch) dimension."""
+
+    def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
+        if not real_shape:
+            return ()
+        padded_batch = pad_to_multiple(batch_size, ctx.simd_width)
+        return (padded_batch, *real_shape[1:])
+
+
+@dataclass
+class SimdMajorWeightPadding(PaddingStrategy):
+    """Handles the special case for `forward_pass` weights: (I, H) -> (H_blocks, I, SW)."""
+
+    def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
+        if len(real_shape) != 2:
+            raise ValueError(f"SimdMajorWeightPadding only supports 2D shapes, got {len(real_shape)}D.")
+        input_dim, hidden_dim = real_shape
+        padded_hidden_dim = pad_to_multiple(hidden_dim, ctx.simd_width)
+        return (padded_hidden_dim // ctx.simd_width, input_dim, ctx.simd_width)
+
+
+@dataclass
+class StandardMatrixPadding(PaddingStrategy):
+    """Pads both dimensions of a 2D matrix (e.g., for standard gradients)."""
+
+    def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
+        if len(real_shape) != 2:
+            raise ValueError(f"StandardMatrixPadding only supports 2D shapes, got {len(real_shape)}D.")
+        return (pad_to_multiple(real_shape[0], ctx.simd_width), pad_to_multiple(real_shape[1], ctx.simd_width))
+
+
+@dataclass
+class PadLastTwoDimsStrategy(PaddingStrategy):
+    """For 3D+ tensors, pads the last two dimensions (e.g., exit weights)."""
+
+    def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
+        if len(real_shape) < 2:
+            raise ValueError(f"PadLastTwoDimsStrategy requires at least 2D shape, got {len(real_shape)}D.")
+        return (
+            *real_shape[:-2],
+            pad_to_multiple(real_shape[-2], ctx.simd_width),
+            pad_to_multiple(real_shape[-1], ctx.simd_width),
+        )
+
+
+@dataclass
+class PadSelectedDimsStrategy(PaddingStrategy):
+    """Pads dimensions specified by index. `batch_size` from manager is used for batch dimension."""
+
+    batch_dim_idx: Optional[int]
+    feature_dim_indices: List[int]
+
+    def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
+        padded_list = list(real_shape)
+        if self.batch_dim_idx is not None:
+            padded_list[self.batch_dim_idx] = pad_to_multiple(batch_size, ctx.simd_width)
+        for idx in self.feature_dim_indices:
+            padded_list[idx] = pad_to_multiple(real_shape[idx], ctx.simd_width)
+        return tuple(padded_list)
+
+
+# A declarative registry mapping (Role, Rank) to a specific padding strategy.
+# `None` as a rank key acts as a fallback for any dimensionality.
+PADDING_RULE_REGISTRY: Dict[BufferRole, Dict[Optional[int], PaddingStrategy]] = {
+    # Parameters & Optimizer states
+    BufferRole.WEIGHTS: {2: SimdMajorWeightPadding()},
+    BufferRole.GRADIENT: {1: PadLastDimStrategy(), 2: StandardMatrixPadding(), 3: PadLastTwoDimsStrategy()},
+    BufferRole.ADAM_M1: {1: PadLastDimStrategy(), 2: StandardMatrixPadding(), 3: PadLastTwoDimsStrategy()},
+    BufferRole.ADAM_M2: {1: PadLastDimStrategy(), 2: StandardMatrixPadding(), 3: PadLastTwoDimsStrategy()},
+    BufferRole.BIAS: {None: PadLastDimStrategy()},
+    BufferRole.EXIT_WEIGHTS: {None: PadLastTwoDimsStrategy()},
+    BufferRole.EXIT_BIAS: {None: PadLastTwoDimsStrategy()},
+    BufferRole.TEMPERATURES: {None: PadLastDimStrategy()},
+    # Data & Activations
+    BufferRole.INPUT_DATA: {None: PadBatchDimOnlyStrategy()},
+    BufferRole.TARGETS: {None: PadBatchDimOnlyStrategy()},
+    BufferRole.HIDDEN_ACTIVATION: {None: PadBatchAndLastDimStrategy()},
+    BufferRole.ENSEMBLE_PROBABILITIES: {None: PadBatchAndLastDimStrategy()},
+    # Intermediate / Scratch buffers
+    BufferRole.UNSCALED_LOGITS: {3: PadSelectedDimsStrategy(batch_dim_idx=1, feature_dim_indices=[2])},
+    BufferRole.EXIT_PROBABILITIES: {3: PadSelectedDimsStrategy(batch_dim_idx=1, feature_dim_indices=[2])},
+    BufferRole.ENSEMBLE_WEIGHTS: {2: PadBatchDimOnlyStrategy()},
+    BufferRole.GRAD_CONTRIBUTIONS: {3: PadSelectedDimsStrategy(batch_dim_idx=1, feature_dim_indices=[2])},
+    BufferRole.INTERMEDIATE: {
+        1: NoPaddingStrategy(),
+        2: PadBatchDimOnlyStrategy(),
+        3: PadSelectedDimsStrategy(batch_dim_idx=1, feature_dim_indices=[2]),
+    },
+    # Buffers with no padding
+    BufferRole.PARTIAL_LOSS_REDUCTION: {None: NoPaddingStrategy()},
+    BufferRole.FINAL_LOSS: {None: NoPaddingStrategy()},
+}
+
+
 @dataclass(frozen=True)
 class BufferSpec:
     name: str
@@ -199,69 +337,34 @@ class Buffer:
 
 
 class BufferManager:
-    def __init__(self, context: cl.Context, device: cl.Device):
+    def __init__(self, context: cl.Context, device: cl.Device, batch_size: int):
         self.context = context
         self.padding_ctx = PaddingContext.from_device(device)
         self.buffers: Dict[str, Buffer] = {}
+        self.batch_size = batch_size
+        self.padding_registry = PADDING_RULE_REGISTRY
 
     def _get_padded_shape(self, role: BufferRole, real_shape: Tuple[int, ...]) -> Tuple[int, ...]:
-        """Determines padded shape based on buffer role and device SIMD width."""
-        sw = self.padding_ctx.simd_width
-        padded_batch = pad_to_multiple(BATCH_SIZE, sw)
+        """
+        Determines padded shape by looking up the buffer's role and rank in the central registry
+        and delegating to the appropriate padding strategy.
+        """
+        rank = len(real_shape)
 
-        # `weights` for forward_pass: SIMD-major (hidden_blocks, input_dim, simd_width)
-        if role == BufferRole.WEIGHTS and len(real_shape) == 2:
-            return (pad_to_multiple(real_shape[1], sw) // sw, real_shape[0], sw)
-        # Standard 2D matrices (e.g.,`weights_standard`, gradients): pad both dims to SIMD multiple.
-        if (
-            role in [BufferRole.WEIGHTS, BufferRole.GRADIENT, BufferRole.ADAM_M1, BufferRole.ADAM_M2]
-            and len(real_shape) == 2
-        ):
-            return (pad_to_multiple(real_shape[0], sw), pad_to_multiple(real_shape[1], sw))
-        # 3D matrices (e.g., exit weights/grads): pad last two dims.
-        if (
-            role in [BufferRole.EXIT_WEIGHTS, BufferRole.GRADIENT, BufferRole.ADAM_M1, BufferRole.ADAM_M2]
-            and len(real_shape) == 3
-        ):
-            return (real_shape[0], pad_to_multiple(real_shape[1], sw), pad_to_multiple(real_shape[2], sw))
-        # 1D/2D vectors (biases, temps): pad feature dimension.
-        if role in [
-            BufferRole.BIAS,
-            BufferRole.EXIT_BIAS,
-            BufferRole.TEMPERATURES,
-            BufferRole.GRADIENT,
-            BufferRole.ADAM_M1,
-            BufferRole.ADAM_M2,
-        ]:
-            return (
-                (pad_to_multiple(real_shape[0], sw),)
-                if len(real_shape) == 1
-                else (real_shape[0], pad_to_multiple(real_shape[1], sw))
+        if role not in self.padding_registry:
+            raise KeyError(f"No padding rule defined for BufferRole: {role.name}")
+
+        role_rules = self.padding_registry[role]
+        # Find the specific rule for this rank, or fall back to the general rule (rank=None)
+        strategy = role_rules.get(rank, role_rules.get(None))
+
+        if not strategy:
+            raise ValueError(
+                f"No padding strategy for {role.name} with shape {real_shape} "
+                f"(rank={len(real_shape)}). Registered strategies for this role: {list(role_rules.keys())}"
             )
-        # Activations: pad batch and feature dim.
-        if role == BufferRole.HIDDEN_ACTIVATION:
-            return (padded_batch, pad_to_multiple(real_shape[1], sw))
-        # Multi-dimensional intermediate/output tensors: pad batch and last feature dim.
-        if (
-            role
-            in [
-                BufferRole.UNSCALED_LOGITS,
-                BufferRole.EXIT_PROBABILITIES,
-                BufferRole.GRAD_CONTRIBUTIONS,
-                BufferRole.INTERMEDIATE,
-            ]
-            and len(real_shape) > 1
-        ):
-            last_dim_padded = pad_to_multiple(real_shape[-1], sw) if len(real_shape) > 2 else real_shape[-1]
-            return (real_shape[0], padded_batch, last_dim_padded)
-        # Input/target/ensemble type buffers: pad batch dim.
-        if role in [BufferRole.INPUT_DATA, BufferRole.TARGETS, BufferRole.ENSEMBLE_WEIGHTS] or (
-            role == BufferRole.INTERMEDIATE and len(real_shape) == 2
-        ):
-            return (padded_batch, *real_shape[1:])
-        if role in [BufferRole.ENSEMBLE_PROBABILITIES]:
-            return (padded_batch, pad_to_multiple(real_shape[1], sw))
-        return real_shape  # Default: no special padding.
+
+        return strategy.get_padded_shape(real_shape, self.padding_ctx, self.batch_size)
 
     def create_buffer(
         self,
@@ -281,7 +384,9 @@ class BufferManager:
         mask_buf = None
 
         if role in [BufferRole.INPUT_DATA, BufferRole.TARGETS, BufferRole.HIDDEN_ACTIVATION]:
-            mask_padded_shape = (padded_shape[0],)
+            # The mask buffer is always 1D and padded to the batch size
+            padded_batch_size = pad_to_multiple(self.batch_size, self.padding_ctx.simd_width)
+            mask_padded_shape = (padded_batch_size,)
             mask_size = int(mask_padded_shape[0] * SCALAR_SIZE)
             mask_buf = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=max(mask_size, 4))
 
@@ -358,11 +463,12 @@ class WorkManager:
 
     def __init__(self, context: cl.Context):
         self.context = context
+        # Enable out-of-order execution to allow the driver to schedule independent kernels concurrently.
         self.properties = cl.command_queue_properties.OUT_OF_ORDER_EXEC_MODE_ENABLE
         self.graph = nx.DiGraph()
-        self.queues: Dict[str, cl.CommandQueue] = {  # Potentially for higher priority/concurrent tasks
-            "Q_TRAINING": cl.CommandQueue(context, self.properties),
-            "Q_INFERENCE": cl.CommandQueue(context, self.properties),
+        self.queues: Dict[str, cl.CommandQueue] = {
+            "Q_TRAINING": cl.CommandQueue(context, properties=self.properties),
+            "Q_INFERENCE": cl.CommandQueue(context, properties=self.properties),
         }
         self.node_id_counter: int = 0
         self.last_writer: Dict[str, int] = {}  # Tracks last node UID writing to a buffer for dependency building
@@ -449,9 +555,9 @@ class KernelWrapper:
         _hp = self.b.get("hidden_buf").spec.padded_shape
         self.padded_hidden_dim, self.padded_batch_size = _hp[1], _hp[0]
         self.padded_output_classes = self.b.get("exit_weights").spec.padded_shape[2]
-        self.beta1_t, self.beta2_t = SCALAR_NP_TYPE(ADAM_BETA1**global_step), SCALAR_NP_TYPE(
-            ADAM_BETA2**global_step
-        )  # For Adam bias correction
+        # Adam bias correction terms (1 - beta^t)
+        self.beta1_t = SCALAR_NP_TYPE(1.0 - (ADAM_BETA1**global_step))
+        self.beta2_t = SCALAR_NP_TYPE(1.0 - (ADAM_BETA2**global_step))
 
     def _create_kernel_node(self, name, global_size, local_size, queue_name, access_map, *args):
         op_fn = lambda q, wf: getattr(self.p, name)(q, global_size, local_size, *args, wait_for=wf)
@@ -841,7 +947,7 @@ ctx = cl.create_some_context(interactive=False)
 device = ctx.devices[0]
 print(f"Using device: {device.name} from vendor: {device.vendor}")
 manager = WorkManager(ctx)
-buffer_mgr = BufferManager(ctx, device)
+buffer_mgr = BufferManager(ctx, device, BATCH_SIZE)
 if SCALAR_TYPE == "half" and "cl_khr_fp16" not in device.extensions:
     raise RuntimeError("Device does not support FP16 (cl_khr_fp16 extension not found)")
 
@@ -866,7 +972,9 @@ for p in params:
     if p.name == "weights":  # Special handling for main 'weights'
         # `weights_standard`: standard layout (I,H) for some gradient calculations.
         init_data_std = init_fn(shape)
-        buffer_mgr.create_buffer("weights_standard", role, shape, SCALAR_NP_TYPE, init_data=init_data_std)
+        buffer_mgr.create_buffer(
+            "weights_standard", BufferRole.GRADIENT, shape, SCALAR_NP_TYPE, init_data=init_data_std
+        )
         # `weights` (p.value): SIMD-major layout for optimized forward_pass.
         sw = buffer_mgr.padding_ctx.simd_width
         ps_simd = buffer_mgr._get_padded_shape(role, shape)
