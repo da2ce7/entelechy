@@ -6,8 +6,11 @@ graph TD
     classDef root fill:#F2F2F2,stroke:#808080,stroke-width:2px
     classDef choice_box fill:#fafad2,stroke:#b8860b,stroke-width:1.5px,stroke-dasharray: 5 5
     classDef choice_kernel fill:#fff2cc,stroke:#d6b656,stroke-width:2px
+    classDef path_a fill:#e2f0d9,stroke:#70ad47,stroke-dasharray: 5 5
+    classDef path_b fill:#ddebf7,stroke:#5b9bd5,stroke-dasharray: 5 5
+    classDef note fill:#fefefe,stroke:#ccc,stroke-width:1px,stroke-dasharray:2 2
 
-    %% === Phase 1: Setup ===
+    %% === Phase 1: Setup & Pre-computation ===
     subgraph Phase 1: Setup and Data Upload
         direction LR
         N1[1. Input H2D]:::data
@@ -15,102 +18,95 @@ graph TD
         N3[3. Zero Gradients]:::data
     end
 
-    %% === Phase 2 & 3: Forward Pass and Parallel Backward Pass ===
-    subgraph "Phase 2 & 3: Forward Pass and Parallel Backward Pass"
-
-        %% Forward Pass up to the choice
+    %% === Phase 2: Common Forward Pass Trunk ===
+    subgraph "Phase 2: Common Forward Pass Trunk"
         N4[4. Shared Layer Forward Pass]:::kernel --> N5[5. Exits Forward Pass]:::kernel
-
-        %% The HOST CHOICE super-node for N6
-        subgraph "6. Calculate Ensemble Recipe (Weights) [HOST CHOICE]"
-            style "6. Calculate Ensemble Recipe (Weights) [HOST CHOICE]" choice_box
+        subgraph "6. Calculate Ensemble Recipe [HOST CHOICE]"
+            style "6. Calculate Ensemble Recipe [HOST CHOICE]" choice_box
             direction TB
-            subgraph "Tier 1: Small Exits (N <= 64)"
-                N6_S[ensemble_weights_reg_reduce]:::choice_kernel
-            end
-            subgraph "Tier 2: Medium Exits (64 < N <= 512)"
-                N6_M[ensemble_weights_local_reduce]:::choice_kernel
-            end
-            subgraph "Tier 3: Large Exits (N > 512)"
-                N6_L1[ensemble_weights_map_exp_conf]:::choice_kernel --> N6_L2[reduce_partial_sums]:::choice_kernel --> N6_L3[ensemble_weights_finalize]:::choice_kernel
-            end
+            N6_S[ensemble_weights_reg_reduce]:::choice_kernel
+            N6_M[ensemble_weights_local_reduce]:::choice_kernel
+            N6_L[ensemble_weights_... (Tier 3)]:::choice_kernel
         end
-
-        %% Dependencies entering the choice block
-        N5 --> N6_S
-        N5 --> N6_M
-        N5 --> N6_L1
-
-        subgraph "A: The Loss Calculation Path"
-            direction TB
-            N7["7. Blend Ensemble Probabilities"]:::kernel
-            N8[8. Calculate Partial Loss]:::kernel
-            N9[9. Aggregate Total Loss]:::kernel
-
-            N7 --> N8 --> N9
-            N2 --> N8
-        end
-
-        %% Dependencies exiting the choice block and forking
-        N6_S --> N7
-        N6_M --> N7
-        N6_L3 --> N7
-
-        subgraph "B: The Gradient Calculation Path"
-            direction TB
-            N10[10. Compute Exit Gradients]:::kernel
-            N11["11. Aggregate & <br/> Backprop Activation"]:::kernel
-            N12["12. Compute Layer Gradients <br/> (for W & b)"]:::kernel
-            N13["13. Backpropagate Input Gradient <br/> (for previous layer)"]:::kernel
-            N14[14. Compute Temperature Gradients]:::kernel
-
-            N10 --> N11
-            N11 --> N12
-            N11 --> N13
-
-        end
-
-        %% Dependencies from choice block to gradients
-        N6_S & N4 --> N10
-        N6_M & N4 --> N10
-        N6_L3 & N4 --> N10
-
-        %% Dependencies for the temperature gradient path
-        N6_S & N5 --> N14
-        N6_M & N5 --> N14
-        N6_L3 & N5 --> N14
+        N5 --> N6_S & N6_M & N6_L
+        N2 --> N5
     end
 
-    %% Other dependencies
-    N3 --> N10 & N12 & N13 & N14
-    N2 --> N5
+    %% === FORK POINT ===
+    N7["7. Blend Ensemble Probabilities"]:::kernel
+    N6_S & N6_M & N6_L --> N7
 
-    %% === Phase 4: Parameter Update ===
-    subgraph Phase 4: Apply Optimizer
-        N15a["15. Adam Update (Shared)"]:::kernel
-        N15b["15. Adam Update (Exits)"]:::kernel
-        N15c["15. Adam Update (Temps)"]:::kernel
-        N16[16. Clamp Temperatures]:::kernel
+    %% === Phase 3 & 4: Parallel Execution Paths ===
+    subgraph "Phase 3 & 4: Parallel Execution Paths"
+        direction TB
 
-        N12 --> N15a
-        N10 --> N15b
-        N14 --> N15c
-        N15c --> N16
+        subgraph "Path A: High-Priority Inference Stream"
+            style "Path A: High-Priority Inference Stream" path_a
+            N7_D2H["8a. D2H Early Results <br/>(Final Probabilities)"]:::data
+        end
+
+        subgraph "Path B: Lower-Priority Training Pipeline"
+            style "Path B: Lower-Priority Training Pipeline" path_b
+            subgraph "Loss Calculation"
+                N8_B[8b. Calculate Partial Loss]:::kernel --> N9_B[9b. Aggregate Total Loss]:::kernel
+            end
+
+            subgraph "Gradient Calculation"
+                N10_B[10b. Compute Exit Gradients]:::kernel --> N11_B["11b. Aggregate & Backprop"]:::kernel
+                N11_B --> N12_B["12b. Layer Gradients"]:::kernel & N13_B["13b. Input Gradient"]:::kernel
+                N14_B[14b. Temperature Gradients]:::kernel
+            end
+
+            subgraph "Parameter Update"
+                N15a_B["15b. Adam Update (Shared)"]:::kernel
+                N15b_B["15b. Adam Update (Exits)"]:::kernel
+                N15c_B["15b. Adam Update (Temps)"]:::kernel
+                N14_B --> N15c_B --> N16_B[16b. Clamp Temperatures]:::kernel
+                N12_B --> N15a_B
+                N10_B --> N15b_B
+            end
+        end
+
+        %% Dependencies connecting the common trunk to the parallel paths
+        N7 --> N7_D2H
+        N7 & N2 --> N8_B
+        N6_S & N6_M & N6_L & N4 --> N10_B
+        N6_S & N6_M & N6_L & N5 --> N14_B
+        N3 --> N10_B & N12_B & N13_B & N14_B
     end
 
-    %% === Phase 5: Synchronization ===
-    subgraph Phase 5: Finalization and Monitoring
-        N17[17. Copy Results to Host]:::data
-        N18[18. Host Synchronization Point]:::sync
-        Host[Host CPU Waits]:::root
+    %% === Phase 5: Asynchronous Synchronization & Host Interaction (CHANGED) ===
+    subgraph "Phase 5: Asynchronous Synchronization & Host Interaction"
+        direction TB
 
-        %% The Host layer requires specific data for monitoring and diagnostics.
-        N9 --> N17   %% Total Loss
-        N7 --> N17   %% Final Probabilities (for accuracy)
-        N13 --> N17  %% Input Gradient (for diagnostics)
+        subgraph "Host Interaction Sequence"
+           style "Host Interaction Sequence" fill:#f2f2f2, stroke-width:0px
+           Host_Action1["Host Processes Early Result<br/>(non-blocking)"]:::root
+           Host_Action2["Host Waits for Full Batch Completion<br/>(blocking before next iteration)"]:::root
+           Host_Action1 --> Host_Action2
+        end
 
-        %% The Host must wait for all parameter updates AND data transfers to complete.
-        N15a & N15b & N16 --> N18
-        N17 --> N18
-        N18 --> Host
+        %% Defines the two distinct notification points the host waits on
+        Sync_A["8c. Inference Stream Sync"]:::sync
+        Sync_B["18. Final Batch Sync"]:::sync
+
+        %% Host Action 1 depends on the Inference Sync
+        Sync_A --> Host_Action1
+
+        %% Host Action 2 depends on the Final Batch Sync
+        Sync_B --> Host_Action2
+
+        %% Define what triggers each synchronization event
+        N7_D2H --> Sync_A
+
+        %% The Final Sync waits for the training pipeline and late data transfers to complete
+        N16_B --> Sync_B         %% Last kernel in training op chain
+        subgraph "17b. D2H Late Diagnostics"
+            N17_Diag[ ]:::data
+        end
+        N9_B --> N17_Diag        %% Total Loss
+        N13_B --> N17_Diag       %% Input Gradient
+        N17_Diag --> Sync_B
+
+        note_sync["**Staggered Wait Explained:**<br/>The host code creates two notification events.<br/>It first waits *only* for the `Inference Stream Sync` to get the results.<br/>After processing them, it waits for the `Final Batch Sync`<br/>to ensure the model is fully updated before the next batch starts."]:::note
     end
