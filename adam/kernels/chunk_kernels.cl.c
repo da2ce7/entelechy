@@ -205,112 +205,99 @@ __kernel void compute_chunk_outputs(
     partial_loss_out[(chunk_id * chunk_size + exit_local_idx) * batch_size + batch_idx] = total_loss;
 }
 
-// In chunk_kernels.cl.c
-
 /**
- * @brief (Node 6) Calculates gradients for a single chunk of exits' parameters and hidden layer contributions.
+ * @brief (Node 6) Calculates PARTIAL gradients for a chunk of exits' parameters and hidden layer contributions.
  *
  * Architectural Insight:
- * - This is a hybrid "map-and-reduce" kernel that executes the core backpropagation logic for one chunk.
- * - WORK DISPATCH: Uses a "work-group per gradient" strategy. The work-group at (group_id.x, group_id.y)
- *   is responsible for exit `group_id.x` in the chunk and hidden unit `group_id.y`.
- * - REDUCE (grad_exit_*): Threads within the work-group parallelize the summation over the batch dimension.
- *   They use private register accumulators and a final, fast reduction in __local memory to compute the
- *   final gradients for this chunk's weights and biases. These are ready for an immediate/streaming Adam update.
- * - MAP (partial_grad_h): In the same pass over the batch, each thread also calculates the partial `dL/dH`
- *   contribution for its assigned (batch, hidden_unit) pair. This is a direct "map" operation where the result
- *   is written to a temporary buffer, destined to be summed by the aggregation engine (Node 8).
- * - TILING: The loop over `output_classes` is tiled to improve instruction-level parallelism and memory access patterns.
+ * - This kernel performs the core backpropagation logic for ONE chunk of exits.
+ * - Its contract is to produce THREE distinct PARTIAL results destined for the aggregation engine:
+ *   1. PARTIAL grad_H: The contribution of this exit chunk to the upstream gradient for the hidden layer.
+ *   2. PARTIAL grad_exit_w: The gradient for the weights of this exit chunk.
+ *   3. PARTIAL grad_exit_b: The gradient for the biases of this exit chunk.
+ * - This design ensures that all exit gradients are calculated based on the same `hidden_buf` state,
+ *   upholding the principles of standard mini-batch gradient descent.
+ *
+ * WORK DISPATCH: A "work-group per gradient" strategy. The work-group at (group_id.x, group_id.y)
+ * is responsible for exit `group_id.x` in the chunk and hidden unit `group_id.y`.
  */
 __kernel void calculate_chunk_gradients(
-    __local SCALAR_TYPE *local_mem,                          // [MEMORY] Local memory for reduction, size = lsize.
-    __global const SCALAR_TYPE *__restrict hidden_buf,       // [INPUT] Hidden activations for the current batch slice.
-    __global const SCALAR_TYPE *__restrict probs_buf,        // [INPUT] Probabilities for this chunk (from Node 5).
-    __global const void *__restrict targets_buf,             // [INPUT] Ground truth labels.
-    __global const SCALAR_TYPE *__restrict exit_weights_buf, // [INPUT] Exit weights for this chunk.
-    __global SCALAR_TYPE *__restrict partial_grad_h_out,     // [OUTPUT] Slice for this chunk's partial grad_H.
-    __global SCALAR_TYPE *__restrict grad_exit_w_out,        // [OUTPUT] Final weight gradients for this chunk.
-    __global SCALAR_TYPE *__restrict grad_exit_b_out,        // [OUTPUT] Final bias gradients for this chunk.
-    int problem_type_flag,                                   // [PARAM] PROBLEM_TYPE_CCE or PROBLEM_TYPE_BCE.
+    __local SCALAR_TYPE *local_mem,
+    __global const SCALAR_TYPE *__restrict hidden_buf,
+    __global const SCALAR_TYPE *__restrict partial_probs_buf, // FIX: Renamed from probs_buf for clarity
+    __global const void *__restrict targets_buf,
+    __global const SCALAR_TYPE *__restrict exit_weights_buf,
+    // --- FIX: Output names and logic corrected to align with PARTIAL data contract ---
+    __global SCALAR_TYPE *__restrict partial_grad_h_out,
+    __global SCALAR_TYPE *__restrict partial_grad_exit_w_out,
+    __global SCALAR_TYPE *__restrict partial_grad_exit_b_out,
+    // ---
+    int problem_type_flag,
     int chunk_id,
     int param_offset,
     int batch_size,
     int hidden_dim,
     int output_classes,
     int chunk_size) {
-    // Work-group per-gradient strategy:
-    // Work-group (x,y) computes gradient for exit_x and hidden_unit_y.
-    const uint exit_local_idx = get_group_id(0); // Corresponds to an exit in this chunk
-    const uint h_idx          = get_group_id(1); // Corresponds to a hidden unit
+    const uint exit_local_idx = get_group_id(0);
+    const uint h_idx          = get_group_id(1);
     const uint lid            = get_local_id(0);
     const uint lsize          = get_local_size(0);
 
-    // Bounds check for the entire work-group
     if (exit_local_idx >= chunk_size || h_idx >= hidden_dim) {
         return;
     }
 
-    // Map local exit index to the global index for accessing its parameters/weights
     const uint exit_global_idx = param_offset + exit_local_idx;
+    // The physical index into the large partial buffers, which includes the chunk_id offset.
+    const uint chunk_relative_exit_idx = chunk_id * chunk_size + exit_local_idx;
 
-    // --- Tiled pass over output classes (major performance improvement) ---
+    // Tiled pass over output classes
     for (int c_base = 0; c_base < output_classes; c_base += C_TILE_SIZE) {
-        // Private accumulators for weight/bias gradients for this tile
         SCALAR_TYPE p_grad_w[C_TILE_SIZE] = {SCALAR_ZERO};
         SCALAR_TYPE p_grad_b[C_TILE_SIZE] = {SCALAR_ZERO};
 
-        // --- Parallel loop over the batch (Reduction part 1: local accumulation) ---
-        // Each thread processes a slice of the batch.
+        // Parallel loop over the batch
         for (int b = lid; b < batch_size; b += lsize) {
-            // Get hidden value once per batch item, decoding physical layout
             const uint        h_block                  = h_idx / SIMD_WIDTH;
             const uint        h_lane                   = h_idx % SIMD_WIDTH;
             const uint        padded_hidden_dim_blocks = (hidden_dim + SIMD_WIDTH - 1) / SIMD_WIDTH;
             const uint        physical_hidden_idx      = b * padded_hidden_dim_blocks * SIMD_WIDTH + h_block * SIMD_WIDTH + h_lane;
             const SCALAR_TYPE h_val                    = hidden_buf[physical_hidden_idx];
 
-            // For this sample `b`, calculate its total contribution to grad_H for this exit.
-            // This is the "map" part of the kernel.
             SCALAR_TYPE grad_h_contribution_for_b = SCALAR_ZERO;
 
-            // Process a tile of output classes for this batch item
             for (int c_local = 0; c_local < C_TILE_SIZE; ++c_local) {
                 const int c_global = c_base + c_local;
                 if (c_global >= output_classes)
                     continue;
 
-                // Calculate gradient signal (dL/d_logit) ONCE
-                const uint  prob_idx = (chunk_id * chunk_size + exit_local_idx) * batch_size * output_classes + b * output_classes + c_global;
-                SCALAR_TYPE prob     = probs_buf[prob_idx];
+                const uint  prob_idx = chunk_relative_exit_idx * batch_size * output_classes + b * output_classes + c_global;
+                SCALAR_TYPE prob     = partial_probs_buf[prob_idx];
                 SCALAR_TYPE d_loss_d_logit;
 
                 if (problem_type_flag == PROBLEM_TYPE_CCE) {
                     const __global int *targets_cce = (__global int *)targets_buf;
                     d_loss_d_logit                  = select(prob, prob - 1.0f, c_global == targets_cce[b]);
-                } else { // PROBLEM_TYPE_BCE
+                } else {
                     const __global SCALAR_TYPE *targets_bce = (__global SCALAR_TYPE *)targets_buf;
                     d_loss_d_logit                          = prob - targets_bce[b * output_classes + c_global];
                 }
 
-                // 1. Accumulate for the weight/bias gradient reduction
                 p_grad_w[c_local] += d_loss_d_logit * h_val;
-                if (h_idx == 0) { // Bias gradient only computed by first row of WGs
+                if (h_idx == 0) {
                     p_grad_b[c_local] += d_loss_d_logit;
                 }
 
-                // 2. Accumulate for the grad_H "map" output
                 const uint weight_idx = exit_global_idx * hidden_dim * output_classes + h_idx * output_classes + c_global;
                 grad_h_contribution_for_b += d_loss_d_logit * exit_weights_buf[weight_idx];
             }
 
-            // Write the PARTIAL grad_H result for this specific exit's contribution.
-            // This is done inside the batch loop because it's a map (b, h_idx) -> value
-            const uint grad_h_out_idx          = (chunk_id * chunk_size + exit_local_idx) * batch_size * hidden_dim + b * hidden_dim + h_idx;
+            const uint grad_h_out_idx          = chunk_relative_exit_idx * batch_size * hidden_dim + b * hidden_dim + h_idx;
             partial_grad_h_out[grad_h_out_idx] = grad_h_contribution_for_b;
         }
 
-        // --- Intra-workgroup reduction for FINAL parameter gradients (grad_W, grad_B) ---
-        barrier(CLK_LOCAL_MEM_FENCE); // Ensure all threads finished their batch slice
+        // Intra-workgroup reduction for PARTIAL parameter gradients
+        barrier(CLK_LOCAL_MEM_FENCE);
 
         for (int c_local = 0; c_local < C_TILE_SIZE; ++c_local) {
             const int c_global = c_base + c_local;
@@ -326,10 +313,12 @@ __kernel void calculate_chunk_gradients(
                 barrier(CLK_LOCAL_MEM_FENCE);
             }
             if (lid == 0) {
-                grad_exit_w_out[exit_local_idx * hidden_dim * output_classes + h_idx * output_classes + c_global] = local_mem[0];
+                // FIX: Write to the correct slice of the large partial gradient buffer.
+                const uint out_idx               = chunk_relative_exit_idx * hidden_dim * output_classes + h_idx * output_classes + c_global;
+                partial_grad_exit_w_out[out_idx] = local_mem[0];
             }
 
-            // Reduce Bias Gradients (only if h_idx==0)
+            // Reduce Bias Gradients
             if (h_idx == 0) {
                 local_mem[lid] = p_grad_b[c_local];
                 barrier(CLK_LOCAL_MEM_FENCE);
@@ -339,14 +328,14 @@ __kernel void calculate_chunk_gradients(
                     barrier(CLK_LOCAL_MEM_FENCE);
                 }
                 if (lid == 0) {
-                    grad_exit_b_out[exit_local_idx * output_classes + c_global] = local_mem[0];
+                    // FIX: Write to the correct slice of the large partial gradient buffer.
+                    const uint out_idx               = chunk_relative_exit_idx * output_classes + c_global;
+                    partial_grad_exit_b_out[out_idx] = local_mem[0];
                 }
             }
         }
     }
 }
-
-// in chunk_kernels.cl.c
 
 /**
  * @brief (Node 7) Computes temperature gradients for a single chunk of exits using a parallel reduction.

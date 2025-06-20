@@ -11,9 +11,9 @@
  * This kernel is generic and can be applied to any flattened parameter buffer. Each work-item is
  * assigned to a single parameter and is completely independent.
  *
- * It supports sliced updates via `param_offset` and `num_params_to_update`, making it suitable for
- * both streaming updates (e.g., exit parameters inside the chunk loop) and global updates
- * (e.g., shared parameters after aggregation).
+ * It supports sliced updates via `param_offset` and `num_params_to_update`. This is used in the
+ * final phase of training to dispatch separate update calls for the different parameter groups
+ * (e.g., Shared Layer, Exit Layers, Temperatures), each with their own Adam state buffers.
  */
 __kernel void adam_update(
     // Inputs (Read-Only)
