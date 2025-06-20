@@ -3,6 +3,7 @@
 #ifdef __OPENCL_VERSION__
 #else
 #include "kernels.cl.h"
+#include "templates.cl.h"
 #endif
 
 /**
@@ -99,129 +100,6 @@ __kernel void aggregate_partial_losses(
 
     if (lid == 0) {
         final_loss_buf[0] = l_reduction_mem[0];
-    }
-}
-
-/**
- * @brief (Node 10) Calculates gradients for all exit-specific parameters.
- *
- * This implementation is memory-efficient, tiling the calculation over the `output_classes` dimension.
- * For each tile, gradients are first accumulated over the batch into private registers. Then, a fast
- * parallel reduction is performed in local memory for each class within the tile. The `grad_hidden_contributions`
- * are calculated separately in a second, untiled pass.
- */
-__kernel void calculate_exit_gradients(
-    // Local Memory
-    __local SCALAR_TYPE *local_grad_w,
-    __local SCALAR_TYPE *local_grad_b,
-
-    // Inputs
-    __global const SCALAR_TYPE *__restrict hidden_buf,
-    __global const SCALAR_TYPE *__restrict exit_probs_buf,
-    __global const SCALAR_TYPE *__restrict ensemble_weights_buf,
-    __global const int *__restrict targets_buf,
-    __global const SCALAR_TYPE *__restrict targets_mask,
-    __global const SCALAR_TYPE *__restrict exit_weights_buf,
-
-    // Outputs
-    __global SCALAR_TYPE *__restrict grad_exit_weights,
-    __global SCALAR_TYPE *__restrict grad_exit_biases,
-    __global SCALAR_TYPE *__restrict grad_hidden_contributions_buf,
-
-    // Dims
-    int padded_batch_size,
-    int hidden_dim,
-    int output_classes,
-    int num_exits) {
-
-    const uint e_idx = get_group_id(0);
-    const uint h_idx = get_group_id(1);
-    const uint lid   = get_local_id(0);
-    const uint lsize = get_local_size(0);
-
-    // Tiled pass for parameter gradients
-    for (int c_base = 0; c_base < output_classes; c_base += C_TILE_SIZE) {
-        SCALAR_TYPE p_grad_w[C_TILE_SIZE] = {SCALAR_ZERO};
-        SCALAR_TYPE p_grad_b[C_TILE_SIZE] = {SCALAR_ZERO};
-
-        for (int b = lid; b < padded_batch_size; b += lsize) {
-            if (targets_mask[b] < (SCALAR_TYPE)0.5f) {
-                continue;
-            }
-
-            const uint        h_block                  = h_idx / SIMD_WIDTH;
-            const uint        h_lane                   = h_idx % SIMD_WIDTH;
-            const uint        padded_hidden_dim_blocks = hidden_dim / SIMD_WIDTH;
-            const uint        physical_hidden_idx      = b * padded_hidden_dim_blocks * SIMD_WIDTH + h_block * SIMD_WIDTH + h_lane;
-            const SCALAR_TYPE h_val                    = hidden_buf[physical_hidden_idx];
-            const SCALAR_TYPE weight_be                = ensemble_weights_buf[b * num_exits + e_idx];
-            const int         true_class               = targets_buf[b];
-
-#pragma unroll
-            for (int c_local = 0; c_local < C_TILE_SIZE; ++c_local) {
-                const int c_global = c_base + c_local;
-                if (c_global >= output_classes) {
-                    continue;
-                }
-                SCALAR_TYPE is_target      = select(SCALAR_ZERO, (SCALAR_TYPE)1.0f, c_global == true_class);
-                SCALAR_TYPE prob           = exit_probs_buf[e_idx * padded_batch_size * output_classes + b * output_classes + c_global];
-                SCALAR_TYPE d_loss_d_logit = weight_be * (prob - is_target);
-
-                p_grad_w[c_local] += d_loss_d_logit * h_val;
-                if (h_idx == 0) {
-                    p_grad_b[c_local] += d_loss_d_logit;
-                }
-            }
-        }
-
-        for (int c_local = 0; c_local < C_TILE_SIZE; ++c_local) {
-            const int c_global = c_base + c_local;
-            if (c_global >= output_classes) {
-                continue;
-            }
-            local_grad_w[lid] = p_grad_w[c_local];
-            if (h_idx == 0) {
-                local_grad_b[lid] = p_grad_b[c_local];
-            }
-            barrier(CLK_LOCAL_MEM_FENCE);
-
-            for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
-                if (lid < stride) {
-                    local_grad_w[lid] += local_grad_w[lid + stride];
-                    if (h_idx == 0) {
-                        local_grad_b[lid] += local_grad_b[lid + stride];
-                    }
-                }
-                barrier(CLK_LOCAL_MEM_FENCE);
-            }
-
-            if (lid == 0) {
-                grad_exit_weights[e_idx * hidden_dim * output_classes + h_idx * output_classes + c_global] = local_grad_w[0];
-                if (h_idx == 0) {
-                    grad_exit_biases[e_idx * output_classes + c_global] = local_grad_b[0];
-                }
-            }
-        }
-    }
-
-    // Separate pass for hidden layer contributions
-    for (int b = lid; b < padded_batch_size; b += lsize) {
-        if (targets_mask[b] < (SCALAR_TYPE)0.5f) {
-            grad_hidden_contributions_buf[e_idx * padded_batch_size * hidden_dim + b * hidden_dim + h_idx] = SCALAR_ZERO;
-            continue;
-        }
-
-        SCALAR_TYPE       grad_h_contribution = SCALAR_ZERO;
-        const SCALAR_TYPE weight_be           = ensemble_weights_buf[b * num_exits + e_idx];
-        const int         true_class          = targets_buf[b];
-
-        for (int c = 0; c < output_classes; ++c) {
-            SCALAR_TYPE is_target      = select(SCALAR_ZERO, (SCALAR_TYPE)1.0f, c == true_class);
-            SCALAR_TYPE prob           = exit_probs_buf[e_idx * padded_batch_size * output_classes + b * output_classes + c];
-            SCALAR_TYPE d_loss_d_logit = weight_be * (prob - is_target);
-            grad_h_contribution += d_loss_d_logit * exit_weights_buf[e_idx * hidden_dim * output_classes + h_idx * output_classes + c];
-        }
-        grad_hidden_contributions_buf[e_idx * padded_batch_size * hidden_dim + b * hidden_dim + h_idx] = grad_h_contribution;
     }
 }
 
@@ -349,61 +227,28 @@ __kernel void backprop_input_gradient(
     grad_input_buf[b_idx * input_dim + i_idx] = sum;
 }
 
-/**
- * @brief (Node 14) Calculates gradients for the temperature parameters.
- *
- * This implementation uses the "work-group per temperature" strategy. Each work-group is
- * responsible for a single temperature's gradient. The threads within the group parallelize
- * the summation over the batch dimension, using a fast local memory reduction to produce the final sum.
- */
-__kernel void calculate_temp_gradients(
-    __local SCALAR_TYPE *local_grad_sum,
-    __global const SCALAR_TYPE *__restrict unscaled_logits_buf,
-    __global const SCALAR_TYPE *__restrict exit_probs_buf,
-    __global const SCALAR_TYPE *__restrict ensemble_weights_buf,
-    __global const SCALAR_TYPE *__restrict temps_buf,
-    __global const int *__restrict targets_buf,
-    __global const SCALAR_TYPE *__restrict targets_mask,
-    __global SCALAR_TYPE *__restrict grad_temps,
-    int padded_batch_size,
-    int output_classes,
-    int num_exits) {
-    const uint e_idx = get_group_id(0);
-    const uint lid   = get_local_id(0);
-    const uint lsize = get_local_size(0);
+// ========================================================================
+// ==  TEMPLATE INSTANTIATIONS (for calculate_exit_gradients) (Node 10)  ==
+// ========================================================================
+// The C preprocessor expands these macros into the full CCE and BCE kernels.
 
-    SCALAR_TYPE       p_grad_sum  = SCALAR_ZERO;
-    const SCALAR_TYPE temp        = temps_buf[e_idx];
-    const SCALAR_TYPE temp_sq_inv = -1.0f / (temp * temp);
+// --- Instantiate the CCE (Categorical Cross-Entropy) version ---
+// This version uses the derivative of softmax loss w.r.t logits.
+CALCULATE_EXIT_GRADIENTS_TEMPLATE(calculate_exit_gradients_cce, TargetPtrCCE, TargetTypeCCE, 1)
 
-    for (int b = lid; b < padded_batch_size; b += lsize) {
-        if (targets_mask[b] < 0.5f)
-            continue;
-        const int         true_class        = targets_buf[b];
-        const SCALAR_TYPE weight_be         = ensemble_weights_buf[b * num_exits + e_idx];
-        SCALAR_TYPE       grad_contribution = SCALAR_ZERO;
+// --- Instantiate the BCE (Binary Cross-Entropy) version ---
+// This version uses the derivative of sigmoid loss w.r.t logits.
+CALCULATE_EXIT_GRADIENTS_TEMPLATE(calculate_exit_gradients_bce, TargetPtrBCE, TargetTypeBCE, 0)
 
-        for (int c = 0; c < output_classes; ++c) {
-            SCALAR_TYPE is_target      = select(SCALAR_ZERO, (SCALAR_TYPE)1.0f, c == true_class);
-            SCALAR_TYPE prob           = exit_probs_buf[e_idx * padded_batch_size * output_classes + b * output_classes + c];
-            SCALAR_TYPE d_loss_d_logit = weight_be * (prob - is_target);
-            SCALAR_TYPE unscaled_logit = unscaled_logits_buf[e_idx * padded_batch_size * output_classes + b * output_classes + c];
-            grad_contribution += d_loss_d_logit * (unscaled_logit * temp_sq_inv);
-        }
-        p_grad_sum += grad_contribution;
-    }
+// ========================================================================
+// ==   TEMPLATE INSTANTIATIONS (for calculate_temp_gradients) (Node 14) ==
+// ========================================================================
+// The C preprocessor expands these macros into the full CCE and BCE kernels.
 
-    local_grad_sum[lid] = p_grad_sum;
-    barrier(CLK_LOCAL_MEM_FENCE);
+// --- Instantiate the CCE (Categorical Cross-Entropy) version ---
+// This version uses the CCE-derived gradient signal for temperature params.
+CALCULATE_TEMP_GRADIENTS_TEMPLATE(calculate_temp_gradients_cce, TargetPtrCCE, TargetTypeCCE, 1)
 
-    for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            local_grad_sum[lid] += local_grad_sum[lid + stride];
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-
-    if (lid == 0) {
-        grad_temps[e_idx] = local_grad_sum[0];
-    }
-}
+// --- Instantiate the BCE (Binary Cross-Entropy) version ---
+// This version uses the BCE-derived gradient signal for temperature params.
+CALCULATE_TEMP_GRADIENTS_TEMPLATE(calculate_temp_gradients_bce, TargetPtrBCE, TargetTypeBCE, 0)

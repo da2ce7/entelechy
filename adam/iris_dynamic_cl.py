@@ -30,6 +30,7 @@ BATCH_SIZE: int = 130
 EPOCHS: int = 100
 
 # --- Hyperparameters & Runtime Tuning Constants ---
+PROBLEM_TYPE = "CCE"  # Loss function type: "CCE" (Categorical Cross-Entropy) or "BCE" (Binary Cross-Entropy)
 LEARNING_RATE: float = 0.001
 ADAM_BETA1: float = 0.9
 ADAM_BETA2: float = 0.999
@@ -45,7 +46,7 @@ C_TILE_SIZE: int = 32  # Tile size used in some compute kernels.
 
 # --- File Configuration ---
 KERNEL_DIR: str = "kernels"
-CL_HEADERS: List[str] = ["kernels.cl.h"]
+CL_HEADERS: List[str] = ["kernels.cl.h", "templates.cl.h"]
 CL_SOURCES: List[str] = [
     "network_operations.cl.c",
     "autograd.cl.c",
@@ -54,6 +55,18 @@ CL_SOURCES: List[str] = [
 
 
 ### UTILITY FUNCTIONS
+def validate_problem_config():
+    """Validates the consistency of the problem type and output dimensions."""
+    if PROBLEM_TYPE == "BCE":
+        if OUTPUT_CLASSES < 1:
+            raise ValueError(f"BCE requires at least one output node, but OUTPUT_CLASSES is {OUTPUT_CLASSES}")
+    elif PROBLEM_TYPE == "CCE":
+        if OUTPUT_CLASSES <= 1:
+            raise ValueError(f"CCE requires at least two output classes, but OUTPUT_CLASSES is {OUTPUT_CLASSES}")
+    else:
+        raise ValueError(f"Invalid PROBLEM_TYPE: '{PROBLEM_TYPE}'. Must be 'CCE' or 'BCE'.")
+
+
 def load_and_concatenate_kernels(kernel_dir: str, headers: List[str], sources: List[str]) -> str:
     """
     Loads and concatenates OpenCL kernel source files in order.
@@ -119,11 +132,20 @@ def select_simd_width(device: cl.Device) -> int:
     return 8
 
 
-def validate_targets(y: np.ndarray, num_classes: int):
-    if not np.all(np.logical_and(y >= 0, y < num_classes)):
-        raise ValueError(f"Target labels must be integers between 0 and {num_classes - 1}")
-    if not np.issubdtype(y.dtype, np.integer):
-        raise ValueError("Target labels must be integers")
+def validate_targets(y: np.ndarray):
+    """Validates the format of target labels based on the configured PROBLEM_TYPE."""
+    if PROBLEM_TYPE == "CCE":
+        if not np.all(np.logical_and(y >= 0, y < OUTPUT_CLASSES)):
+            raise ValueError(f"For CCE, target labels must be integers between 0 and {OUTPUT_CLASSES - 1}")
+        if not np.issubdtype(y.dtype, np.integer):
+            raise ValueError("For CCE, target labels must be integers.")
+    else:  # BCE
+        if y.ndim != 2 or y.shape[1] != OUTPUT_CLASSES:
+            raise ValueError(f"For BCE, targets must be a 2D array with shape (batch_size, {OUTPUT_CLASSES}).")
+        if not np.all(np.isin(y, [0.0, 1.0])):
+            raise ValueError("For BCE, target values must be either 0.0 or 1.0.")
+        if not np.issubdtype(y.dtype, np.floating):
+            raise ValueError(f"For BCE, target dtype must be a float type, but got {y.dtype}.")
 
 
 def pad_tensor(data: np.ndarray, padded_shape: Tuple[int, ...]) -> np.ndarray:
@@ -356,7 +378,10 @@ PADDING_RULE_REGISTRY: Dict[BufferRole, Dict[Optional[int], PaddingStrategy]] = 
     BufferRole.TEMPERATURES: {None: PadLastDimStrategy()},
     # Data & Activations
     BufferRole.INPUT_DATA: {None: PadBatchDimOnlyStrategy()},
-    BufferRole.TARGETS: {None: PadBatchDimOnlyStrategy()},
+    BufferRole.TARGETS: {
+        1: PadBatchDimOnlyStrategy(),  # For CCE (int indices)
+        2: PadBatchAndLastDimStrategy(),  # For BCE (one-hot floats)
+    },
     BufferRole.HIDDEN_ACTIVATION: {None: PadBatchAndLastDimStrategy()},
     BufferRole.ENSEMBLE_PROBABILITIES: {None: PadBatchAndLastDimStrategy()},
     # Intermediate / Scratch buffers
@@ -460,6 +485,8 @@ class BufferManager:
 class BatchPadder:
     """
     Handles padding of input data (X) and target labels (y) for a given batch.
+    This class assumes the `y_true` passed in is already in the correct format
+    (i.e., integer indices for CCE, one-hot floats for BCE).
     """
 
     def __init__(self, input_spec: BufferSpec, target_spec: BufferSpec):
@@ -615,7 +642,7 @@ class WorkManager:
             # because they write to non-overlapping regions (indexed by chunk_id).
             # The `last_writer` mechanism correctly serializes any *subsequent* kernel that reads the whole buffer.
             access_map = {"unscaled_logits_buf": AccessMode.SHARED_READ, f"level0_out": AccessMode.EXCLUSIVE_WRITE}
-            node_uid = self.create_node(f"chunk_{i}", NodeType.COMPUTE, queue_name, access_map, op_fn)
+            node_uid = self.m.create_node(f"chunk_{i}", NodeType.COMPUTE, queue_name, access_map, op_fn)
             level0_nodes.append(node_uid)
 
         # If all exits fit into a single chunk, no reduction is needed. The `compute_exit_chunk`
@@ -655,7 +682,7 @@ class WorkManager:
                     dep_nodes_end = min(start_chunk_idx + tree.reduction_factor, len(previous_level_nodes))
 
                     # Create the node first, then add edges from its specific dependencies
-                    node_uid = self.create_node(
+                    node_uid = self.m.create_node(
                         f"reduce_L{level_idx}_G{group_idx}", NodeType.COMPUTE, queue_name, access_map, op_fn
                     )
                     for dep_node_uid in previous_level_nodes[dep_nodes_start:dep_nodes_end]:
@@ -677,7 +704,9 @@ class WorkManager:
             "global_results": AccessMode.SHARED_READ,  # Represents reading from global_max/sum
             "ensemble_weights_buf": AccessMode.EXCLUSIVE_WRITE,
         }
-        norm_node_uid = self.create_node("normalize_weights", NodeType.COMPUTE, queue_name, access_map_norm, op_fn_norm)
+        norm_node_uid = self.m.create_node(
+            "normalize_weights", NodeType.COMPUTE, queue_name, access_map_norm, op_fn_norm
+        )
         self.graph.add_edge(final_node_before_norm, norm_node_uid)
         return norm_node_uid
 
@@ -814,7 +843,8 @@ class KernelWrapper:
         return self._create_kernel_node("forward_pass", g, l, queue_name, acc, *args)
 
     def compute_all_exits(self, queue_name: str) -> int:
-        """Computes logits, probabilities, and per-exit XE losses for all early exits."""
+        """Computes logits, probabilities, and per-exit losses for all early exits using the configured loss function."""
+        kernel_name = f"compute_all_exits_{PROBLEM_TYPE.lower()}"
         g, l = (NUM_EXITS, self.padded_batch_size), None
         acc = {
             "hidden_buf": AccessMode.SHARED_READ,
@@ -842,7 +872,7 @@ class KernelWrapper:
             np.int32(self.padded_output_classes),
             np.int32(NUM_EXITS),
         )
-        return self._create_kernel_node("compute_all_exits", g, l, queue_name, acc, *args)
+        return self._create_kernel_node(kernel_name, g, l, queue_name, acc, *args)
 
     def ensemble_weights(self, queue_name: str) -> int:
         """
@@ -972,6 +1002,7 @@ class KernelWrapper:
 
     def calculate_exit_gradients(self, queue_name: str) -> int:
         """Exit gradients: dL/dW_exit, dL/dB_exit, and accumulates dL/dH_contributions from each exit."""
+        kernel_name = f"calculate_exit_gradients_{PROBLEM_TYPE.lower()}"
         ls = 256
         g, l = (NUM_EXITS * ls, self.padded_hidden_dim), (ls, 1)  # Reduction over batch dim (ls)
         acc = {
@@ -1001,7 +1032,7 @@ class KernelWrapper:
             np.int32(self.padded_output_classes),
             np.int32(NUM_EXITS),
         )
-        return self._create_kernel_node("calculate_exit_gradients", g, l, queue_name, acc, *args)
+        return self._create_kernel_node(kernel_name, g, l, queue_name, acc, *args)
 
     def aggregate_and_backprop_activation(self, queue_name: str) -> int:
         """Aggregates dL/dH_contributions from all exits and backprops through hidden layer's ReLU activation."""
@@ -1066,6 +1097,7 @@ class KernelWrapper:
 
     def calculate_temp_gradients(self, queue_name: str) -> int:
         """Calculates dL/dT for temperature parameters."""
+        kernel_name = f"calculate_temp_gradients_{PROBLEM_TYPE.lower()}"
         ls = 256
         g, l = (NUM_EXITS * ls,), (ls,)  # Reduction over batch dim (ls)
         acc = {
@@ -1089,7 +1121,7 @@ class KernelWrapper:
             np.int32(self.padded_output_classes),
             np.int32(NUM_EXITS),
         )
-        return self._create_kernel_node("calculate_temp_gradients", g, l, queue_name, acc, *args)
+        return self._create_kernel_node(kernel_name, g, l, queue_name, acc, *args)
 
     def adam_update(self, param: Parameter, queue_name: str) -> int:
         """Adam optimizer update for a given parameter (element-wise)."""
@@ -1126,6 +1158,7 @@ class KernelWrapper:
 
 ### MAIN EXECUTION ###
 # 1. Setup
+validate_problem_config()
 ctx = cl.create_some_context(interactive=False)
 device = ctx.devices[0]
 print(f"Using device: {device.name} from vendor: {device.vendor}")
@@ -1178,7 +1211,11 @@ for p in params:
 
 data_buffer_specs = {
     "input_buf": (BufferRole.INPUT_DATA, (BATCH_SIZE, INPUT_DIM), SCALAR_NP_TYPE),
-    "targets_buf": (BufferRole.TARGETS, (BATCH_SIZE,), np.int32),
+    "targets_buf": (
+        BufferRole.TARGETS,
+        (BATCH_SIZE, OUTPUT_CLASSES) if PROBLEM_TYPE == "BCE" else (BATCH_SIZE,),
+        SCALAR_NP_TYPE if PROBLEM_TYPE == "BCE" else np.int32,
+    ),
     "hidden_buf": (BufferRole.HIDDEN_ACTIVATION, (BATCH_SIZE, HIDDEN_DIM), SCALAR_NP_TYPE),
     "unscaled_logits_buf": (BufferRole.UNSCALED_LOGITS, (NUM_EXITS, BATCH_SIZE, OUTPUT_CLASSES), SCALAR_NP_TYPE),
     "exit_probs_buf": (BufferRole.EXIT_PROBABILITIES, (NUM_EXITS, BATCH_SIZE, OUTPUT_CLASSES), SCALAR_NP_TYPE),
@@ -1198,12 +1235,21 @@ for name, (role, shape, dtype) in data_buffer_specs.items():
     buffer_mgr.create_buffer(name, role, shape, dtype)
 
 # 3. Data & Kernel Prep
-X, y = load_iris(return_X_y=True)
+X, y_int = load_iris(return_X_y=True)
 X_normalized = StandardScaler().fit_transform(X).astype(SCALAR_NP_TYPE)
-y_true = y.astype(np.int32)
-validate_targets(y_true, OUTPUT_CLASSES)
+
+# Prepare target labels based on the problem type
+if PROBLEM_TYPE == "BCE":
+    # Convert integer labels to one-hot encoded float arrays for BCE
+    y_true = np.zeros((len(y_int), OUTPUT_CLASSES), dtype=SCALAR_NP_TYPE)
+    y_true[np.arange(len(y_int)), y_int] = 1.0
+else:  # CCE
+    y_true = y_int.astype(np.int32)
+
+validate_targets(y_true)  # Validate the final, correctly formatted targets
 batch_padder = BatchPadder(buffer_mgr.get("input_buf").spec, buffer_mgr.get("targets_buf").spec)
 kernel_src = load_and_concatenate_kernels(KERNEL_DIR, CL_HEADERS, CL_SOURCES)
+
 # Define compile-time macros for kernels
 build_opts = [
     f"-cl-std=CL1.2",
@@ -1211,8 +1257,10 @@ build_opts = [
     f"-D SIMD_WIDTH={buffer_mgr.padding_ctx.simd_width}",
     f"-D C_TILE_SIZE={C_TILE_SIZE}",
     f"-D MAX_EXITS_ENSEMBLE={MAX_EXITS_ENSEMBLE}",
+    f"-D PROBLEM_TYPE_{PROBLEM_TYPE}",  # Pass problem type as a macro, e.g., -D PROBLEM_TYPE_CCE
 ] + (["-cl-khr-fp16"] if SCALAR_TYPE == "half" else [])
 program = cl.Program(ctx, kernel_src).build(options=build_opts)
+
 loss_view, probs_view, grad_input_view = (
     HostView(buffer_mgr.get("final_loss_buf")),
     HostView(buffer_mgr.get("ensemble_probs_buf")),
@@ -1224,7 +1272,7 @@ print(f"Starting training for {EPOCHS} epochs...")
 global_step = 1  # For Adam optimizer bias correction
 for epoch in range(EPOCHS):
     shuffled_indices = np.random.permutation(len(X))
-    epoch_loss, correct_predictions = 0.0, 0
+    epoch_loss, correct_predictions, total_samples = 0.0, 0, 0
     for i in range(0, len(X), BATCH_SIZE):
         manager.reset()  # Clear graph for the new batch/iteration
         batch_indices = shuffled_indices[i : i + BATCH_SIZE]
@@ -1333,19 +1381,23 @@ for epoch in range(EPOCHS):
         inference_complete_event.wait()  # Wait for inference path (quick)
 
         # Process immediate inference result
-        valid_probs = probs_view.valid_slice[:actual_batch_size]  # Use actual_batch_size here
+        valid_probs = probs_view.valid_slice[:actual_batch_size]
         predicted_classes = np.argmax(valid_probs, axis=1)
-        correct_predictions += np.sum(predicted_classes == y_batch)
+
+        # For accuracy calculation, we need the original integer labels
+        y_batch_int_labels = y_int[batch_indices]
+        correct_predictions += np.sum(predicted_classes == y_batch_int_labels)
+        total_samples += actual_batch_size
 
         training_complete_event.wait()  # Sync with background training path before next iteration
 
         # Process late diagnostic results
         total_batch_loss = loss_view.valid_slice[0]
-        epoch_loss += total_batch_loss
+        epoch_loss += total_batch_loss * actual_batch_size
         global_step += 1  # For Adam's beta decay
 
-    avg_epoch_loss = epoch_loss / len(X)
-    train_acc = correct_predictions / len(X)
+    avg_epoch_loss = epoch_loss / total_samples
+    train_acc = correct_predictions / total_samples
     print(f"Epoch {epoch+1:3d}/{EPOCHS} | Loss: {avg_epoch_loss:.4f} | Accuracy: {train_acc:.2%}")
 
 print("\nTraining finished.")
