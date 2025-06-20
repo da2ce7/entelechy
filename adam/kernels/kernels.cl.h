@@ -3,7 +3,7 @@
 #ifndef KERNELS_CL_H
 #define KERNELS_CL_H
 
-// Check for OpenCL environment
+// Check for OpenCL environment (target: OpenCL 1.2 without atomics)
 #ifdef __OPENCL_VERSION__
 // Require OpenCL 1.2 or later
 #if __OPENCL_VERSION__ < 120
