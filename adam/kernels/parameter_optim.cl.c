@@ -6,11 +6,14 @@
 #endif
 
 /**
- * @brief (Node 15) Implements the Adam optimization step as an embarrassingly parallel map kernel.
+ * @brief (Node 12) Implements the Adam optimization step as an embarrassingly parallel map kernel.
  *
  * This kernel is generic and can be applied to any flattened parameter buffer. Each work-item is
- * assigned to a single parameter and is completely independent. It loads the parameter, its gradient,
- * and its momentum vectors; performs the standard Adam update equations; and writes the new values back.
+ * assigned to a single parameter and is completely independent.
+ *
+ * It supports sliced updates via `param_offset` and `num_params_to_update`, making it suitable for
+ * both streaming updates (e.g., exit parameters inside the chunk loop) and global updates
+ * (e.g., shared parameters after aggregation).
  */
 __kernel void adam_update(
     // Inputs (Read-Only)
@@ -28,17 +31,24 @@ __kernel void adam_update(
     __global SCALAR_TYPE *__restrict m2,
 
     // Dimensions
-    int total_params) {
+    int param_offset,
+    int num_params_to_update) {
 
-    const int idx = get_global_id(0);
+    // `local_idx` is the index within the *current slice* of work (0 to num_params_to_update-1).
+    const int local_idx = get_global_id(0);
 
-    if (idx >= total_params) {
+    // Bounds check for the current dispatch.
+    if (local_idx >= num_params_to_update) {
         return;
     }
 
-    const SCALAR_TYPE g      = grad[idx];
-    const SCALAR_TYPE m_prev = m1[idx];
-    const SCALAR_TYPE v_prev = m2[idx];
+    // `global_idx` is the absolute index into the full parameter buffers, calculated using the offset.
+    // This is the key change that enables sliced updates for the streaming architecture.
+    const int global_idx = param_offset + local_idx;
+
+    const SCALAR_TYPE g      = grad[global_idx];
+    const SCALAR_TYPE m_prev = m1[global_idx];
+    const SCALAR_TYPE v_prev = m2[global_idx];
 
     // Update biased first moment estimate
     const SCALAR_TYPE m_new = beta1 * m_prev + (1.0f - beta1) * g;
@@ -54,19 +64,19 @@ __kernel void adam_update(
 
     // Update the parameter
     const SCALAR_TYPE param_update = learning_rate * m_hat / (sqrt(v_hat) + epsilon);
-    param[idx] -= param_update;
+    param[global_idx] -= param_update;
 
     // Store the updated momentum values
-    m1[idx] = m_new;
-    m2[idx] = v_new;
+    m1[global_idx] = m_new;
+    m2[global_idx] = v_new;
 }
 
 /**
- * @brief (Node 16) Implements an element-wise clamp operation for the temperature parameters.
+ * @brief (Node 13) Implements an element-wise clamp operation for the temperature parameters.
  *
  * This is a simple, embarrassingly parallel kernel where each work-item is assigned to a single
  * temperature value. It reads the value, clamps it to the specified min/max range using the
- * built-in `clamp()` function, and writes the result back.
+ * built-in `clamp()` function, and writes the result back. This is the final operation in the training step.
  */
 __kernel void clamp_temperatures(
     // Inputs/Outputs

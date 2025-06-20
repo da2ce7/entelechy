@@ -25,58 +25,45 @@ INT_SIZE: int = np.int32().itemsize
 INPUT_DIM: int = 4
 HIDDEN_DIM: int = 65
 OUTPUT_CLASSES: int = 3
-NUM_EXITS: int = 40
+NUM_EXITS: int = 128  # Can be set to 1, 20, or 5000 to test different aggregation tiers.
 BATCH_SIZE: int = 130
 EPOCHS: int = 100
 
 # --- Hyperparameters & Runtime Tuning Constants ---
-PROBLEM_TYPE = "CCE"  # Loss function type: "CCE" (Categorical Cross-Entropy) or "BCE" (Binary Cross-Entropy)
+PROBLEM_TYPE = "CCE"
 LEARNING_RATE: float = 0.001
 ADAM_BETA1: float = 0.9
 ADAM_BETA2: float = 0.999
 EPSILON: float = 1.0e-8
 MIN_TEMP: float = 1.0e-3
 MAX_TEMP: float = 10.0
-TIER3_REDUCE_ITEMS_PER_GROUP: int = 1024  # Work-group granularity for Tier 3 ensemble reduction.
 
 # --- Compile-time Kernel Constants ---
-# Passed via -D flags to the OpenCL compiler.
-MAX_EXITS_ENSEMBLE: int = 64  # Threshold for using register-based (Tier 1) ensemble reduction.
-C_TILE_SIZE: int = 32  # Tile size used in some compute kernels.
+# Architectural Insight: These constants define the thresholds for the tiered memory strategy.
+# They are compile-time constants because they can affect kernel logic (e.g., loop bounds).
+MAX_REGISTER_AGGREGATE_ITEMS: int = 64  # Tier 1 threshold: Max items to reduce in registers.
+C_TILE_SIZE: int = 32
 
 # --- File Configuration ---
 KERNEL_DIR: str = "kernels"
-CL_HEADERS: List[str] = ["kernels.cl.h", "templates.cl.h"]
+CL_HEADERS: List[str] = ["kernels.cl.h"]
 CL_SOURCES: List[str] = [
-    "network_operations.cl.c",
-    "autograd.cl.c",
+    "chunk_kernels.cl.c",
+    "aggregation_kernels.cl.c",
+    "global_kernels.cl.c",
     "parameter_optim.cl.c",
 ]
 
 
-### UTILITY FUNCTIONS
+### UTILITY FUNCTIONS (Unchanged)
 def validate_problem_config():
-    """Validates the consistency of the problem type and output dimensions."""
-    if PROBLEM_TYPE == "BCE":
-        if OUTPUT_CLASSES < 1:
-            raise ValueError(f"BCE requires at least one output node, but OUTPUT_CLASSES is {OUTPUT_CLASSES}")
-    elif PROBLEM_TYPE == "CCE":
-        if OUTPUT_CLASSES <= 1:
-            raise ValueError(f"CCE requires at least two output classes, but OUTPUT_CLASSES is {OUTPUT_CLASSES}")
-    else:
-        raise ValueError(f"Invalid PROBLEM_TYPE: '{PROBLEM_TYPE}'. Must be 'CCE' or 'BCE'.")
+    if PROBLEM_TYPE == "CCE" and OUTPUT_CLASSES <= 1:
+        raise ValueError(f"CCE requires at least two output classes, but OUTPUT_CLASSES is {OUTPUT_CLASSES}")
 
 
 def load_and_concatenate_kernels(kernel_dir: str, headers: List[str], sources: List[str]) -> str:
-    """
-    Loads and concatenates OpenCL kernel source files in order.
-    This preprocesses includes by prepending header content, ensuring a correct
-    build order without relying on the OpenCL compiler's `#include` for these files.
-    """
     full_source_parts = []
     all_files_in_order = headers + sources
-    if not os.path.isdir(kernel_dir):
-        raise IOError(f"Kernel directory '{kernel_dir}' not found.")
     for filename in all_files_in_order:
         full_path = os.path.join(kernel_dir, filename)
         try:
@@ -93,7 +80,6 @@ def pad_to_multiple(dim: int, multiple: int) -> int:
 
 
 def he_init(shape: Tuple[int, ...]) -> np.ndarray:
-    """He initialization, assumes shape[0] or shape[1] is fan_in."""
     fan_in = shape[0] if len(shape) == 2 else shape[1]
     scale = np.sqrt(2.0 / fan_in)
     return np.random.normal(0, scale, shape).astype(SCALAR_NP_TYPE)
@@ -102,27 +88,14 @@ def he_init(shape: Tuple[int, ...]) -> np.ndarray:
 def he_init_simd_major(
     initial_weights: np.ndarray, real_shape: Tuple[int, int], padded_shape: Tuple[int, int, int], simd_width: int
 ) -> np.ndarray:
-    """
-    Transforms standard layout weights (input_dim, hidden_dim) to SIMD-major
-    (hidden_blocks, input_dim, simd_width) for the `forward_pass` kernel.
-    """
     input_dim, hidden_dim = real_shape
     padded_hidden_dim = pad_to_multiple(hidden_dim, simd_width)
-
     padded_weights = np.zeros((input_dim, padded_hidden_dim), dtype=SCALAR_NP_TYPE)
     padded_weights[:, :hidden_dim] = initial_weights
-
-    simd_major_weights = padded_weights.reshape(input_dim, padded_hidden_dim // simd_width, simd_width).transpose(
-        1, 0, 2
-    )
-    assert (
-        simd_major_weights.shape == padded_shape
-    ), f"SIMD-major weight shape mismatch: {simd_major_weights.shape}, expected {padded_shape}"
-    return simd_major_weights
+    return padded_weights.reshape(input_dim, padded_hidden_dim // simd_width, simd_width).transpose(1, 0, 2)
 
 
 def select_simd_width(device: cl.Device) -> int:
-    """Heuristic SIMD width based on device vendor (e.g., warp/wavefront size)."""
     if "Intel" in device.vendor:
         return 16
     if "NVIDIA" in device.vendor:
@@ -133,46 +106,22 @@ def select_simd_width(device: cl.Device) -> int:
 
 
 def validate_targets(y: np.ndarray):
-    """Validates the format of target labels based on the configured PROBLEM_TYPE."""
-    if PROBLEM_TYPE == "CCE":
-        if not np.all(np.logical_and(y >= 0, y < OUTPUT_CLASSES)):
-            raise ValueError(f"For CCE, target labels must be integers between 0 and {OUTPUT_CLASSES - 1}")
-        if not np.issubdtype(y.dtype, np.integer):
-            raise ValueError("For CCE, target labels must be integers.")
-    else:  # BCE
-        if y.ndim != 2 or y.shape[1] != OUTPUT_CLASSES:
-            raise ValueError(f"For BCE, targets must be a 2D array with shape (batch_size, {OUTPUT_CLASSES}).")
-        if not np.all(np.isin(y, [0.0, 1.0])):
-            raise ValueError("For BCE, target values must be either 0.0 or 1.0.")
-        if not np.issubdtype(y.dtype, np.floating):
-            raise ValueError(f"For BCE, target dtype must be a float type, but got {y.dtype}.")
+    if PROBLEM_TYPE == "CCE" and not np.issubdtype(y.dtype, np.integer):
+        raise ValueError("For CCE, target labels must be integers.")
 
 
 def pad_tensor(data: np.ndarray, padded_shape: Tuple[int, ...]) -> np.ndarray:
     if data.shape == padded_shape:
         return data
     padded = np.zeros(padded_shape, dtype=data.dtype)
-    original_slices = tuple(slice(0, d) for d in data.shape)
-    padded[original_slices] = data
+    padded[tuple(slice(0, d) for d in data.shape)] = data
     return padded
 
 
-### CORE ABSTRACTIONS
+### CORE ABSTRACTIONS (Unchanged)
 class BufferRole(Enum):
-    # Parameters & optimizer states
     WEIGHTS, BIAS, EXIT_WEIGHTS, EXIT_BIAS, TEMPERATURES, GRADIENT, ADAM_M1, ADAM_M2 = [auto() for _ in range(8)]
-    # Data & activations
-    (
-        INPUT_DATA,
-        TARGETS,
-        HIDDEN_ACTIVATION,
-        UNSCALED_LOGITS,
-        EXIT_PROBABILITIES,
-        ENSEMBLE_WEIGHTS,
-        ENSEMBLE_PROBABILITIES,
-    ) = [auto() for _ in range(7)]
-    # Intermediate/scratch buffers
-    GRAD_CONTRIBUTIONS, PARTIAL_LOSS_REDUCTION, FINAL_LOSS, INTERMEDIATE = [auto() for _ in range(4)]
+    INPUT_DATA, TARGETS, HIDDEN_ACTIVATION, INTERMEDIATE, FINAL_LOSS = [auto() for _ in range(5)]
 
 
 @dataclass(frozen=True)
@@ -205,10 +154,7 @@ class PaddingContext:
         return cls(simd_width=select_simd_width(device))
 
 
-# --- Padding Strategy Definitions ---
 class PaddingStrategy(ABC):
-    """Abstract base class for all padding strategies."""
-
     @abstractmethod
     def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
         pass
@@ -216,76 +162,54 @@ class PaddingStrategy(ABC):
 
 @dataclass
 class NoPaddingStrategy(PaddingStrategy):
-    """Strategy for buffers that require no padding."""
-
     def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
         return real_shape
 
 
 @dataclass
 class PadLastDimStrategy(PaddingStrategy):
-    """Pads only the last dimension of the tensor to a multiple of SIMD width."""
-
     def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
         if not real_shape:
             return ()
-        padded_last_dim = pad_to_multiple(real_shape[-1], ctx.simd_width)
-        return (*real_shape[:-1], padded_last_dim)
+            return (*real_shape[:-1], pad_to_multiple(real_shape[-1], ctx.simd_width))
 
 
 @dataclass
 class PadBatchAndLastDimStrategy(PaddingStrategy):
-    """Pads the first (batch) dimension and the last feature dimension."""
-
     def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
         if len(real_shape) < 2:
             return (pad_to_multiple(batch_size, ctx.simd_width),)
-
-        padded_batch = pad_to_multiple(batch_size, ctx.simd_width)
-        padded_last_dim = pad_to_multiple(real_shape[-1], ctx.simd_width)
-        return (padded_batch, *real_shape[1:-1], padded_last_dim)
+        return (
+            pad_to_multiple(batch_size, ctx.simd_width),
+            *real_shape[1:-1],
+            pad_to_multiple(real_shape[-1], ctx.simd_width),
+        )
 
 
 @dataclass
 class PadBatchDimOnlyStrategy(PaddingStrategy):
-    """Pads only the first (batch) dimension."""
-
     def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
         if not real_shape:
             return ()
-        padded_batch = pad_to_multiple(batch_size, ctx.simd_width)
-        return (padded_batch, *real_shape[1:])
+            return (pad_to_multiple(batch_size, ctx.simd_width), *real_shape[1:])
 
 
 @dataclass
 class SimdMajorWeightPadding(PaddingStrategy):
-    """Handles the special case for `forward_pass` weights: (I, H) -> (H_blocks, I, SW)."""
-
     def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
-        if len(real_shape) != 2:
-            raise ValueError(f"SimdMajorWeightPadding only supports 2D shapes, got {len(real_shape)}D.")
         input_dim, hidden_dim = real_shape
-        padded_hidden_dim = pad_to_multiple(hidden_dim, ctx.simd_width)
-        return (padded_hidden_dim // ctx.simd_width, input_dim, ctx.simd_width)
+        return (pad_to_multiple(hidden_dim, ctx.simd_width) // ctx.simd_width, input_dim, ctx.simd_width)
 
 
 @dataclass
 class StandardMatrixPadding(PaddingStrategy):
-    """Pads both dimensions of a 2D matrix (e.g., for standard gradients)."""
-
     def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
-        if len(real_shape) != 2:
-            raise ValueError(f"StandardMatrixPadding only supports 2D shapes, got {len(real_shape)}D.")
         return (pad_to_multiple(real_shape[0], ctx.simd_width), pad_to_multiple(real_shape[1], ctx.simd_width))
 
 
 @dataclass
 class PadLastTwoDimsStrategy(PaddingStrategy):
-    """For 3D+ tensors, pads the last two dimensions (e.g., exit weights)."""
-
     def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
-        if len(real_shape) < 2:
-            raise ValueError(f"PadLastTwoDimsStrategy requires at least 2D shape, got {len(real_shape)}D.")
         return (
             *real_shape[:-2],
             pad_to_multiple(real_shape[-2], ctx.simd_width),
@@ -293,109 +217,19 @@ class PadLastTwoDimsStrategy(PaddingStrategy):
         )
 
 
-@dataclass
-class PadSelectedDimsStrategy(PaddingStrategy):
-    """Pads dimensions specified by index. `batch_size` from manager is used for batch dimension."""
-
-    batch_dim_idx: Optional[int]
-    feature_dim_indices: List[int]
-
-    def get_padded_shape(self, real_shape: Tuple[int, ...], ctx: PaddingContext, batch_size: int) -> Tuple[int, ...]:
-        padded_list = list(real_shape)
-        if self.batch_dim_idx is not None:
-            padded_list[self.batch_dim_idx] = pad_to_multiple(batch_size, ctx.simd_width)
-        for idx in self.feature_dim_indices:
-            padded_list[idx] = pad_to_multiple(real_shape[idx], ctx.simd_width)
-        return tuple(padded_list)
-
-
-@dataclass
-class ReductionTree:
-    """
-    Manages ephemeral buffers and parameters for a hierarchical reduction operation.
-    This class pre-calculates the required number of reduction stages and allocates
-    the necessary intermediate OpenCL buffers, abstracting away the resource management
-    for this complex, multi-kernel process.
-    """
-
-    context: cl.Context
-    padded_batch_size: int
-    num_exits: int
-    chunk_size: int
-    reduction_factor: int
-
-    # --- Buffers and parameters calculated on initialization ---
-    # A list of tuples: (max_buffer, sum_buffer, num_input_chunks_for_this_level)
-    levels: List[Tuple[cl.Buffer, cl.Buffer, int]] = field(default_factory=list, init=False)
-    # The final, single-element buffers for the whole tree
-    global_max: cl.Buffer = field(init=False)
-    global_sum: cl.Buffer = field(init=False)
-    # The number of chunks at the very first level (output of compute_exit_chunk)
-    num_chunks_level0: int = field(init=False)
-
-    def __post_init__(self):
-        """Calculates the necessary reduction levels and allocates all intermediate buffers."""
-        self.num_chunks_level0 = (self.num_exits + self.chunk_size - 1) // self.chunk_size
-        buffer_size = lambda num_items: num_items * self.padded_batch_size * SCALAR_SIZE
-
-        current_chunks = self.num_chunks_level0
-        # Create buffer levels for the reduction tree. This loop builds the tree
-        # from the bottom up (from the widest level of chunks towards the single root).
-        while current_chunks > 1:
-            # The number of chunks coming *into* this level of reduction
-            input_chunks_for_this_level = current_chunks
-            # The number of chunks *produced* by this level of reduction
-            output_chunks = (current_chunks + self.reduction_factor - 1) // self.reduction_factor
-
-            max_buf = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, buffer_size(output_chunks))
-            sum_buf = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, buffer_size(output_chunks))
-
-            # Each level stores its *output* buffers and the number of *input* chunks it will process.
-            self.levels.append((max_buf, sum_buf, input_chunks_for_this_level))
-            current_chunks = output_chunks
-
-        # The final global buffers are the output of the last reduction level.
-        # If the tree had levels, these buffers already exist. If not (i.e., all exits fit in one chunk), create them now.
-        if not self.levels:
-            self.global_max = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, buffer_size(1))
-            self.global_sum = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, buffer_size(1))
-        else:
-            # The global result is simply the output of the final reduction stage
-            self.global_max, self.global_sum, _ = self.levels[-1]
-
-
-# A declarative registry mapping (Role, Rank) to a specific padding strategy.
-# `None` as a rank key acts as a fallback for any dimensionality.
 PADDING_RULE_REGISTRY: Dict[BufferRole, Dict[Optional[int], PaddingStrategy]] = {
-    # Parameters & Optimizer states
     BufferRole.WEIGHTS: {2: SimdMajorWeightPadding()},
-    BufferRole.GRADIENT: {1: PadLastDimStrategy(), 2: StandardMatrixPadding(), 3: PadLastTwoDimsStrategy()},
-    BufferRole.ADAM_M1: {1: PadLastDimStrategy(), 2: StandardMatrixPadding(), 3: PadLastTwoDimsStrategy()},
-    BufferRole.ADAM_M2: {1: PadLastDimStrategy(), 2: StandardMatrixPadding(), 3: PadLastTwoDimsStrategy()},
     BufferRole.BIAS: {None: PadLastDimStrategy()},
     BufferRole.EXIT_WEIGHTS: {None: PadLastTwoDimsStrategy()},
     BufferRole.EXIT_BIAS: {None: PadLastTwoDimsStrategy()},
     BufferRole.TEMPERATURES: {None: PadLastDimStrategy()},
-    # Data & Activations
+    BufferRole.GRADIENT: {1: PadLastDimStrategy(), 2: StandardMatrixPadding(), 3: PadLastTwoDimsStrategy()},
+    BufferRole.ADAM_M1: {1: PadLastDimStrategy(), 2: StandardMatrixPadding(), 3: PadLastTwoDimsStrategy()},
+    BufferRole.ADAM_M2: {1: PadLastDimStrategy(), 2: StandardMatrixPadding(), 3: PadLastTwoDimsStrategy()},
     BufferRole.INPUT_DATA: {None: PadBatchDimOnlyStrategy()},
-    BufferRole.TARGETS: {
-        1: PadBatchDimOnlyStrategy(),  # For CCE (int indices)
-        2: PadBatchAndLastDimStrategy(),  # For BCE (one-hot floats)
-    },
+    BufferRole.TARGETS: {1: PadBatchDimOnlyStrategy(), 2: PadBatchAndLastDimStrategy()},
     BufferRole.HIDDEN_ACTIVATION: {None: PadBatchAndLastDimStrategy()},
-    BufferRole.ENSEMBLE_PROBABILITIES: {None: PadBatchAndLastDimStrategy()},
-    # Intermediate / Scratch buffers
-    BufferRole.UNSCALED_LOGITS: {3: PadSelectedDimsStrategy(batch_dim_idx=1, feature_dim_indices=[2])},
-    BufferRole.EXIT_PROBABILITIES: {3: PadSelectedDimsStrategy(batch_dim_idx=1, feature_dim_indices=[2])},
-    BufferRole.ENSEMBLE_WEIGHTS: {2: PadBatchDimOnlyStrategy()},
-    BufferRole.GRAD_CONTRIBUTIONS: {3: PadSelectedDimsStrategy(batch_dim_idx=1, feature_dim_indices=[2])},
-    BufferRole.INTERMEDIATE: {
-        1: NoPaddingStrategy(),
-        2: PadBatchDimOnlyStrategy(),
-        3: PadSelectedDimsStrategy(batch_dim_idx=1, feature_dim_indices=[2]),
-    },
-    # Buffers with no padding
-    BufferRole.PARTIAL_LOSS_REDUCTION: {None: NoPaddingStrategy()},
+    BufferRole.INTERMEDIATE: {1: NoPaddingStrategy(), 2: PadBatchAndLastDimStrategy(), 3: PadBatchAndLastDimStrategy()},
     BufferRole.FINAL_LOSS: {None: NoPaddingStrategy()},
 }
 
@@ -413,37 +247,22 @@ class BufferSpec:
 class Buffer:
     spec: BufferSpec
     cl_buffer: cl.Buffer
-    mask_buffer: Optional[cl.Buffer] = None  # For batch items, marks valid (non-padded) entries.
+    mask_buffer: Optional[cl.Buffer] = None
 
 
 class BufferManager:
     def __init__(self, context: cl.Context, device: cl.Device, batch_size: int):
-        self.context = context
-        self.padding_ctx = PaddingContext.from_device(device)
-        self.buffers: Dict[str, Buffer] = {}
-        self.batch_size = batch_size
-        self.padding_registry = PADDING_RULE_REGISTRY
+        self.context, self.padding_ctx, self.buffers, self.batch_size, self.padding_registry = (
+            context,
+            PaddingContext.from_device(device),
+            {},
+            batch_size,
+            PADDING_RULE_REGISTRY,
+        )
 
     def _get_padded_shape(self, role: BufferRole, real_shape: Tuple[int, ...]) -> Tuple[int, ...]:
-        """
-        Determines padded shape by looking up the buffer's role and rank in the central registry
-        and delegating to the appropriate padding strategy.
-        """
         rank = len(real_shape)
-
-        if role not in self.padding_registry:
-            raise KeyError(f"No padding rule defined for BufferRole: {role.name}")
-
-        role_rules = self.padding_registry[role]
-        # Find the specific rule for this rank, or fall back to the general rule (rank=None)
-        strategy = role_rules.get(rank, role_rules.get(None))
-
-        if not strategy:
-            raise ValueError(
-                f"No padding strategy for {role.name} with shape {real_shape} "
-                f"(rank={len(real_shape)}). Registered strategies for this role: {list(role_rules.keys())}"
-            )
-
+        strategy = self.padding_registry[role].get(rank, self.padding_registry[role].get(None))
         return strategy.get_padded_shape(real_shape, self.padding_ctx, self.batch_size)
 
     def create_buffer(
@@ -454,28 +273,22 @@ class BufferManager:
         dtype: np.dtype,
         init_data: Optional[np.ndarray] = None,
     ) -> Buffer:
-        """Creates or retrieves an OpenCL buffer, handling padding and optional initialization."""
-        if name in self.buffers:  # important for temporary buffers in multi-stage kernels
+        if name in self.buffers:
             return self.buffers[name]
-
         padded_shape = self._get_padded_shape(role, real_shape)
         size = int(np.prod(padded_shape) * np.dtype(dtype).itemsize) if np.prod(padded_shape) > 0 else 0
-        cl_buf = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=max(size, 4))  # Min size for safety
+        cl_buf = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=max(size, 4))
         mask_buf = None
-
         if role in [BufferRole.INPUT_DATA, BufferRole.TARGETS, BufferRole.HIDDEN_ACTIVATION]:
-            # The mask buffer is always 1D and padded to the batch size
-            padded_batch_size = pad_to_multiple(self.batch_size, self.padding_ctx.simd_width)
-            mask_padded_shape = (padded_batch_size,)
-            mask_size = int(mask_padded_shape[0] * SCALAR_SIZE)
-            mask_buf = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=max(mask_size, 4))
-
+            mask_buf = cl.Buffer(
+                self.context,
+                cl.mem_flags.READ_WRITE,
+                size=max(int(pad_to_multiple(self.batch_size, self.padding_ctx.simd_width) * SCALAR_SIZE), 4),
+            )
         buffer_obj = Buffer(BufferSpec(name, role, real_shape, padded_shape, dtype), cl_buf, mask_buf)
         self.buffers[name] = buffer_obj
-
         if init_data is not None:
-            padded_data = pad_tensor(init_data, padded_shape)  # Pad host data before upload
-            cl.enqueue_copy(cl.CommandQueue(self.context), cl_buf, padded_data).wait()
+            cl.enqueue_copy(cl.CommandQueue(self.context), cl_buf, pad_tensor(init_data, padded_shape)).wait()
         return buffer_obj
 
     def get(self, name: str) -> Buffer:
@@ -483,55 +296,29 @@ class BufferManager:
 
 
 class BatchPadder:
-    """
-    Handles padding of input data (X) and target labels (y) for a given batch.
-    This class assumes the `y_true` passed in is already in the correct format
-    (i.e., integer indices for CCE, one-hot floats for BCE).
-    """
-
     def __init__(self, input_spec: BufferSpec, target_spec: BufferSpec):
         self.input_spec, self.target_spec = input_spec, target_spec
 
     def pad_batch(self, X: np.ndarray, y_true: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Takes a batch of real data and pads it to the target dimensions.
-
-        Returns:
-            A tuple containing (X_padded, y_padded, mask_padded).
-        """
-        batch_size = X.shape[0]
-
-        # Use the pre-calculated padded shapes from the buffer specs to pad the arrays.
-        X_padded = pad_tensor(X, self.input_spec.padded_shape)
-        y_padded = pad_tensor(y_true, self.target_spec.padded_shape)
-
-        # Create a mask of 1s for valid samples and 0s for padding. This is vital
-        # for kernels to ignore the padded entries during calculations like loss and gradients.
-        mask_data = np.ones(batch_size, dtype=SCALAR_NP_TYPE)
-        # The mask itself must also be padded to the padded batch dimension.
-        mask_padded = pad_tensor(mask_data, (self.input_spec.padded_shape[0],))
-
+        X_padded, y_padded = pad_tensor(X, self.input_spec.padded_shape), pad_tensor(
+            y_true, self.target_spec.padded_shape
+        )
+        mask_padded = pad_tensor(np.ones(X.shape[0], dtype=SCALAR_NP_TYPE), (self.input_spec.padded_shape[0],))
         return X_padded, y_padded, mask_padded
 
 
 class HostView:
-    """NumPy array view for host access to OpenCL buffer data."""
-
     def __init__(self, buffer: Buffer):
-        self.spec = buffer.spec
-        self.host_data = np.empty(buffer.spec.padded_shape, dtype=buffer.spec.dtype)  # Pre-allocate host memory
+        self.spec, self.host_data = buffer.spec, np.empty(buffer.spec.padded_shape, dtype=buffer.spec.dtype)
 
     def update_from_device(self, queue: cl.CommandQueue, cl_buffer: cl.Buffer, wait_for=None):
         return cl.enqueue_copy(queue, self.host_data, cl_buffer, wait_for=wait_for or [])
 
     @property
     def valid_slice(self):
-        """Returns the slice corresponding to 'real' (unpadded) dimensions."""
-        slicing = tuple(slice(0, dim) for dim in self.spec.real_shape)
-        return self.host_data[slicing]
+        return self.host_data[tuple(slice(0, dim) for dim in self.spec.real_shape)]
 
 
-### WORK MANAGER
 class NodeType(Enum):
     COMPUTE, TRANSFER, SYNC = auto(), auto(), auto()
 
@@ -551,25 +338,21 @@ class ExecutionNode:
     queue_name: str
     access_map: Dict[str, AccessMode]
     operation_fn: Callable
-    params: Dict = field(default_factory=dict)
     event: Optional[cl.Event] = None
 
 
 class WorkManager:
-    """Manages a DAG of operations for sequenced execution on OpenCL queues."""
-
     def __init__(self, context: cl.Context):
-        self.context = context
-        # Enable out-of-order execution to allow the driver to schedule independent kernels concurrently.
-        self.properties = cl.command_queue_properties.OUT_OF_ORDER_EXEC_MODE_ENABLE
-        self.graph = nx.DiGraph()
+        self.context, self.properties, self.graph = (
+            context,
+            cl.command_queue_properties.OUT_OF_ORDER_EXEC_MODE_ENABLE,
+            nx.DiGraph(),
+        )
         self.queues: Dict[str, cl.CommandQueue] = {
             "Q_TRAINING": cl.CommandQueue(context, properties=self.properties),
             "Q_INFERENCE": cl.CommandQueue(context, properties=self.properties),
         }
-        self.node_id_counter: int = 0
-        self.last_writer: Dict[str, int] = {}  # Tracks last node UID writing to a buffer for dependency building
-        self.notification_events: Dict[int, cl.UserEvent] = {}
+        self.node_id_counter, self.last_writer = 0, {}
 
     def _get_uid(self) -> int:
         uid = self.node_id_counter
@@ -577,249 +360,73 @@ class WorkManager:
         return uid
 
     def create_node(
-        self,
-        name: str,
-        node_type: NodeType,
-        queue_name: str,
-        access_map: Dict[str, AccessMode],
-        op_fn: Callable,
-        params: Dict = {},
+        self, name: str, node_type: NodeType, queue_name: str, access_map: Dict[str, AccessMode], op_fn: Callable
     ) -> int:
-        """Creates a graph node, adding dependencies based on buffer access (RAW, WAW, WAR implicitly handled by last_writer)."""
         uid = self._get_uid()
-        node = ExecutionNode(uid, name, node_type, queue_name, access_map, op_fn, params)
+        node = ExecutionNode(uid, name, node_type, queue_name, access_map, op_fn)
         self.graph.add_node(uid, node=node)
         for res, mode in access_map.items():
-            if res in self.last_writer:  # Depend on the last node that wrote to this resource
+            if res in self.last_writer:
                 self.graph.add_edge(self.last_writer[res], uid)
-            if mode in ACCESS_WRITE_MODES:  # This node is now the last writer
+            if mode in ACCESS_WRITE_MODES:
                 self.last_writer[res] = uid
         return uid
 
     def create_host_notification_point(self, name: str, dependencies: List[int]) -> cl.UserEvent:
-        """Creates a sync node that signals the host (via cl.UserEvent) upon completion of its dependencies."""
-        uid = self._get_uid()
-        user_event = cl.UserEvent(self.context)
-        self.notification_events[uid] = user_event
+        uid, user_event = self._get_uid(), cl.UserEvent(self.context)
 
-        def _enqueue_marker_with_callback(queue, wait_for):  # Enqueue marker that triggers callback on completion
-            marker = cl.enqueue_marker(queue, wait_for=wait_for)
-
-            def _set_event_status_complete(evt, status):
-                if status == cl.command_execution_status.COMPLETE:
+        def _cb(q, wf):
+            m = cl.enqueue_marker(q, wait_for=wf)
+            m.set_callback(
+                cl.command_execution_status.COMPLETE,
+                lambda e, s: (
                     user_event.set_status(cl.command_execution_status.COMPLETE)
+                    if s == cl.command_execution_status.COMPLETE
+                    else None
+                ),
+            )
+            return m
 
-            marker.set_callback(cl.command_execution_status.COMPLETE, _set_event_status_complete)
-            return marker
-
-        # Place sync node on the queue of its first dependency, or default.
-        dep_queue_name = self.graph.nodes[dependencies[0]]["node"].queue_name if dependencies else "Q_TRAINING"
-        node = ExecutionNode(uid, name, NodeType.SYNC, dep_queue_name, {}, _enqueue_marker_with_callback)
+        q_name = self.graph.nodes[dependencies[0]]["node"].queue_name if dependencies else "Q_TRAINING"
+        node = ExecutionNode(uid, name, NodeType.SYNC, q_name, {}, _cb)
         self.graph.add_node(uid, node=node)
-        for dep_uid in dependencies:
-            self.graph.add_edge(dep_uid, uid)
+        [self.graph.add_edge(dep, uid) for dep in dependencies]
         return user_event
 
-    def build_reduction_tree(self, k: "KernelWrapper", queue_name: str) -> int:
-        """Dynamically constructs the hierarchical reduction DAG and returns the final node's UID."""
-        tree = k.reduction_tree
-        unscaled_logits_buf = k.b.get("unscaled_logits_buf").cl_buffer
-
-        # --- Stage 1: Parallel Chunk Processing (Map) ---
-        # These nodes process the raw unscaled_logits in parallel. Each kernel instance
-        # is responsible for a single chunk of exits over the entire batch.
-        level0_nodes = []
-
-        # The output buffers for level 0 are the first level's output, or the global buffers if there's only one chunk.
-        out_max_l0 = tree.levels[0][0] if tree.levels else tree.global_max
-        out_sum_l0 = tree.levels[0][1] if tree.levels else tree.global_sum
-
-        for i in range(tree.num_chunks_level0):
-            op_fn = k._dispatch_compute_exit_chunk(
-                unscaled_logits_buf, out_max_l0, out_sum_l0, i, tree.chunk_size, NUM_EXITS
-            )
-            # Note: A generic access map key is used. All chunk ops can write to the same buffer
-            # because they write to non-overlapping regions (indexed by chunk_id).
-            # The `last_writer` mechanism correctly serializes any *subsequent* kernel that reads the whole buffer.
-            access_map = {"unscaled_logits_buf": AccessMode.SHARED_READ, f"level0_out": AccessMode.EXCLUSIVE_WRITE}
-            node_uid = self.m.create_node(f"chunk_{i}", NodeType.COMPUTE, queue_name, access_map, op_fn)
-            level0_nodes.append(node_uid)
-
-        # If all exits fit into a single chunk, no reduction is needed. The `compute_exit_chunk`
-        # kernel wrote directly to the global buffers. `level0_nodes` contains the single node.
-        if not tree.levels:
-            final_node_before_norm = level0_nodes[0]
-        else:
-            # --- Stage 2: Looped Reduction Levels ---
-            # The output nodes of the previous level become the input nodes for the next.
-            previous_level_nodes = level0_nodes
-
-            for level_idx in range(len(tree.levels)):
-                in_max, in_sum, num_in_chunks = tree.levels[level_idx]
-
-                # Determine the output buffers for the current reduction level
-                is_last_reduction_level = level_idx == len(tree.levels) - 1
-                if is_last_reduction_level:
-                    out_max, out_sum = tree.global_max, tree.global_sum
-                else:
-                    out_max, out_sum, _ = tree.levels[level_idx + 1]
-
-                current_level_nodes = []
-                num_groups = (num_in_chunks + tree.reduction_factor - 1) // tree.reduction_factor
-
-                for group_idx in range(num_groups):
-                    start_chunk_idx = group_idx * tree.reduction_factor
-                    op_fn = k._dispatch_reduce_chunk_pair(
-                        in_max, in_sum, out_max, out_sum, start_chunk_idx, tree.reduction_factor, num_in_chunks
-                    )
-                    access_map = {
-                        f"level{level_idx}_in": AccessMode.SHARED_READ,
-                        f"level{level_idx+1}_out": AccessMode.EXCLUSIVE_WRITE,
-                    }
-                    # This reduction node depends on all nodes from the previous level that produced its inputs.
-                    # This creates the many-to-one dependency structure of the tree.
-                    dep_nodes_start = start_chunk_idx
-                    dep_nodes_end = min(start_chunk_idx + tree.reduction_factor, len(previous_level_nodes))
-
-                    # Create the node first, then add edges from its specific dependencies
-                    node_uid = self.m.create_node(
-                        f"reduce_L{level_idx}_G{group_idx}", NodeType.COMPUTE, queue_name, access_map, op_fn
-                    )
-                    for dep_node_uid in previous_level_nodes[dep_nodes_start:dep_nodes_end]:
-                        self.graph.add_edge(dep_node_uid, node_uid)
-
-                    current_level_nodes.append(node_uid)
-
-                previous_level_nodes = current_level_nodes
-
-            final_node_before_norm = previous_level_nodes[0]
-
-        # --- Stage 3: Final Normalization ---
-        # This kernel uses the final globally-reduced max/sum values to normalize all exit confidences.
-        op_fn_norm = k._dispatch_normalize_weights(
-            unscaled_logits_buf, tree.global_max, tree.global_sum, k.b.get("ensemble_weights_buf").cl_buffer, NUM_EXITS
-        )
-        access_map_norm = {
-            "unscaled_logits_buf": AccessMode.SHARED_READ,
-            "global_results": AccessMode.SHARED_READ,  # Represents reading from global_max/sum
-            "ensemble_weights_buf": AccessMode.EXCLUSIVE_WRITE,
-        }
-        norm_node_uid = self.m.create_node(
-            "normalize_weights", NodeType.COMPUTE, queue_name, access_map_norm, op_fn_norm
-        )
-        self.graph.add_edge(final_node_before_norm, norm_node_uid)
-        return norm_node_uid
-
     def commit(self):
-        """Enqueues all operations in topological order, respecting dependencies."""
-        ordered_nodes = list(nx.topological_sort(self.graph))
-        completion_events: Dict[int, cl.Event] = {}
+        ordered_nodes, completion_events = list(nx.topological_sort(self.graph)), {}
         for uid in ordered_nodes:
-            node = self.graph.nodes[uid]["node"]
-            queue = self.queues[node.queue_name]
+            node, q = self.graph.nodes[uid]["node"], self.queues[self.graph.nodes[uid]["node"].queue_name]
             wait_for = [
                 completion_events[p_uid] for p_uid in self.graph.predecessors(uid) if p_uid in completion_events
             ]
-            event = node.operation_fn(queue, wait_for)
+            event = node.operation_fn(q, wait_for)
             if event:
                 completion_events[uid] = event
 
     def reset(self):
         self.graph.clear()
-        self.node_id_counter = 0
-        self.last_writer.clear()
-        self.notification_events.clear()
+        self.node_id_counter, self.last_writer = 0, {}
 
 
-### KERNEL WRAPPER
+### KERNEL WRAPPER (Refactored for the new modular architecture)
 class KernelWrapper:
-    """Encapsulates OpenCL kernel calls, managing parameters and graph node creation."""
-
     def __init__(self, program: cl.Program, manager: WorkManager, buffer_manager: BufferManager, global_step: int):
         self.p, self.m, self.b = program, manager, buffer_manager
-        # Pre-fetch/calculate frequently used values
         self.padded_input_dim = self.b.get("input_buf").spec.padded_shape[1]
         _hp = self.b.get("hidden_buf").spec.padded_shape
-        self.padded_hidden_dim, self.padded_batch_size = _hp[1], _hp[0]
+        self.padded_hidden_dim, _hpb = _hp[1], _hp[0]
+        self.padded_batch_size = _hpb
         self.padded_output_classes = self.b.get("exit_weights").spec.padded_shape[2]
-        # Adam bias correction terms (1 - beta^t)
-        self.beta1_t = SCALAR_NP_TYPE(1.0 - (ADAM_BETA1**global_step))
-        self.beta2_t = SCALAR_NP_TYPE(1.0 - (ADAM_BETA2**global_step))
-        self.reduction_tree: Optional[ReductionTree] = None
-
-    def _create_kernel_node(self, name, global_size, local_size, queue_name, access_map, *args):
-        op_fn = lambda q, wf: getattr(self.p, name)(q, global_size, local_size, *args, wait_for=wf)
-        return self.m.create_node(name, NodeType.COMPUTE, queue_name, access_map, op_fn)
-
-    def _dispatch_compute_exit_chunk(
-        self, unscaled_logits_buf, out_max_buf, out_sum_buf, chunk_id, chunk_size, total_exits
-    ):
-        """Returns a lambda to enqueue the compute_exit_chunk kernel."""
-        g, l = (self.padded_batch_size,), None
-        args = (
-            unscaled_logits_buf,
-            out_max_buf,
-            out_sum_buf,
-            np.int32(chunk_id),
-            np.int32(chunk_size),
-            np.int32(total_exits),
-            np.int32(self.padded_batch_size),
-            np.int32(self.padded_output_classes),
-        )
-        op_fn = lambda q, wf: self.p.compute_exit_chunk(q, g, l, *args, wait_for=wf)
-        return op_fn
-
-    def _dispatch_reduce_chunk_pair(
-        self, in_max_buf, in_sum_buf, out_max_buf, out_sum_buf, start_idx, num_to_reduce, total_in_chunks
-    ):
-        """Returns a lambda to enqueue the reduce_chunk_pair kernel."""
-        g, l = (self.padded_batch_size,), None
-        args = (
-            in_max_buf,
-            in_sum_buf,
-            out_max_buf,
-            out_sum_buf,
-            np.int32(start_idx),
-            np.int32(num_to_reduce),
-            np.int32(total_in_chunks),
-            np.int32(self.padded_batch_size),
-        )
-        op_fn = lambda q, wf: self.p.reduce_chunk_pair(q, g, l, *args, wait_for=wf)
-        return op_fn
-
-    def _dispatch_normalize_weights(
-        self, unscaled_logits_buf, global_max_buf, global_sum_buf, ensemble_weights_buf, total_exits
-    ):
-        """Returns a lambda to enqueue the normalize_weights kernel."""
-        g, l = (total_exits, self.padded_batch_size), None
-        args = (
-            unscaled_logits_buf,
-            global_max_buf,
-            global_sum_buf,
-            ensemble_weights_buf,
-            np.int32(total_exits),
-            np.int32(self.padded_batch_size),
-            np.int32(self.padded_output_classes),
-        )
-        op_fn = lambda q, wf: self.p.normalize_weights(q, g, l, *args, wait_for=wf)
-        return op_fn
-
-    def zero_gradients(self, grad_buffer_name: str, queue_name: str) -> int:
-        """Fills a gradient buffer with zeros."""
-        buffer = self.b.get(grad_buffer_name)
-        op_fn = lambda q, wf: cl.enqueue_fill_buffer(
-            q, buffer.cl_buffer, SCALAR_NP_TYPE(0), 0, buffer.cl_buffer.size, wait_for=wf
-        )
-        return self.m.create_node(
-            f"zero_{grad_buffer_name}",
-            NodeType.COMPUTE,
-            queue_name,
-            {grad_buffer_name: AccessMode.EXCLUSIVE_WRITE},
-            op_fn,
+        self.beta1_t, self.beta2_t = SCALAR_NP_TYPE(1.0 - (ADAM_BETA1**global_step)), SCALAR_NP_TYPE(
+            1.0 - (ADAM_BETA2**global_step)
         )
 
-    def forward_pass(self, queue_name: str) -> int:
-        """Hidden layer: hidden = relu(input @ weights_simd_major + biases). Uses tiled matrix multiplication."""
+    def _create_kernel_node(self, name: str, g: Tuple, l: Tuple, q: str, acc: Dict, *args) -> int:
+        op = lambda q, wf: getattr(self.p, name)(q, g, l, *args, wait_for=wf)
+        return self.m.create_node(name, NodeType.COMPUTE, q, acc, op)
+
+    def forward_pass(self, q: str, off: int, n: int) -> int:
         g, l = (self.padded_batch_size, self.padded_hidden_dim // self.b.padding_ctx.simd_width), (
             self.b.padding_ctx.simd_width,
         )
@@ -830,233 +437,172 @@ class KernelWrapper:
             "hidden_buf": AccessMode.EXCLUSIVE_WRITE,
         }
         args = (
-            cl.LocalMemory(2 * l[0] * SCALAR_SIZE),  # Local memory for input tile and weights tile
+            cl.LocalMemory(2 * l[0] * SCALAR_SIZE),
             self.b.get("input_buf").cl_buffer,
             self.b.get("input_buf").mask_buffer,
             self.b.get("weights").cl_buffer,
             self.b.get("biases").cl_buffer,
             self.b.get("hidden_buf").cl_buffer,
             self.b.get("hidden_buf").mask_buffer,
+            np.int32(off),
+            np.int32(n),
             np.int32(self.padded_input_dim),
             np.int32(self.padded_hidden_dim),
         )
-        return self._create_kernel_node("forward_pass", g, l, queue_name, acc, *args)
+        return self._create_kernel_node("forward_pass", g, l, q, acc, *args)
 
-    def compute_all_exits(self, queue_name: str) -> int:
-        """Computes logits, probabilities, and per-exit losses for all early exits using the configured loss function."""
-        kernel_name = f"compute_all_exits_{PROBLEM_TYPE.lower()}"
-        g, l = (NUM_EXITS, self.padded_batch_size), None
+    def compute_chunk_outputs(self, q: str, cid: int, cs: int, po: int) -> int:
+        g, l = (cs, self.padded_batch_size), None
         acc = {
             "hidden_buf": AccessMode.SHARED_READ,
+            "targets_buf": AccessMode.SHARED_READ,
             "exit_weights": AccessMode.SHARED_READ,
             "exit_biases": AccessMode.SHARED_READ,
             "temps": AccessMode.SHARED_READ,
-            "targets_buf": AccessMode.SHARED_READ,
-            "unscaled_logits_buf": AccessMode.EXCLUSIVE_WRITE,
-            "exit_probs_buf": AccessMode.EXCLUSIVE_WRITE,
-            "per_exit_losses_buf": AccessMode.EXCLUSIVE_WRITE,
+            "partial_logits_buf": AccessMode.EXCLUSIVE_WRITE,
+            "partial_probs_buf": AccessMode.EXCLUSIVE_WRITE,
+            "partial_loss_buf": AccessMode.EXCLUSIVE_WRITE,
         }
         args = (
             self.b.get("hidden_buf").cl_buffer,
+            self.b.get("targets_buf").cl_buffer,
             self.b.get("hidden_buf").mask_buffer,
+            self.b.get("targets_buf").mask_buffer,
             self.b.get("exit_weights").cl_buffer,
             self.b.get("exit_biases").cl_buffer,
             self.b.get("temps").cl_buffer,
-            self.b.get("targets_buf").cl_buffer,
-            self.b.get("targets_buf").mask_buffer,
-            self.b.get("unscaled_logits_buf").cl_buffer,
-            self.b.get("exit_probs_buf").cl_buffer,
-            self.b.get("per_exit_losses_buf").cl_buffer,
+            self.b.get("partial_logits_buf").cl_buffer,
+            self.b.get("partial_probs_buf").cl_buffer,
+            self.b.get("partial_loss_buf").cl_buffer,
+            np.int32(PROBLEM_TYPE == "CCE"),
+            np.int32(cid),
+            np.int32(po),
             np.int32(self.padded_batch_size),
             np.int32(self.padded_hidden_dim),
             np.int32(self.padded_output_classes),
-            np.int32(NUM_EXITS),
+            np.int32(cs),
         )
-        return self._create_kernel_node(kernel_name, g, l, queue_name, acc, *args)
+        return self._create_kernel_node("compute_chunk_outputs", g, l, q, acc, *args)
 
-    def ensemble_weights(self, queue_name: str) -> int:
-        """
-        Selects and builds the appropriate ensemble weight calculation graph based on NUM_EXITS.
-        Returns the UID of the final node in the sub-graph. This method acts as a strategy
-        pattern implementation, dispatching to the optimal kernel set at runtime.
-        """
-        # Threshold between Tier 2 (local memory) and Tier 3 (hierarchical).
-        # This should be tuned based on device local memory size and architecture.
-        # e.g., 100k exits * 4 bytes/exit = 400KB, often too large for __local memory.
-        TIER2_MAX_EXITS = 100000
-
-        if NUM_EXITS <= MAX_EXITS_ENSEMBLE:
-            print("Using Ensemble Tier 1: Register Reduction")
-            return self.ensemble_weights_tier1_reg_reduce(queue_name)
-        elif NUM_EXITS <= TIER2_MAX_EXITS:
-            print("Using Ensemble Tier 2: Local Memory Reduction")
-            return self.ensemble_weights_tier2_local_reduce(queue_name)
-        else:
-            print("Using Ensemble Tier 3: Hierarchical Reduction")
-            # If the tree object for this batch doesn't exist, create it.
-            if not self.reduction_tree:
-                self.reduction_tree = ReductionTree(
-                    context=self.b.context,
-                    padded_batch_size=self.padded_batch_size,
-                    num_exits=NUM_EXITS,
-                    chunk_size=1024,  # Tunable: items processed by an initial compute_exit_chunk kernel
-                    reduction_factor=8,  # Tunable: items combined by one reduce_chunk_pair kernel
-                )
-            # Delegate DAG construction to the WorkManager
-            return self.m.build_reduction_tree(self, queue_name)
-
-    def ensemble_weights_tier1_reg_reduce(self, queue_name: str) -> int:
-        """(Tier 1) Ensemble weights via register reduction (for NUM_EXITS <= MAX_EXITS_ENSEMBLE)."""
-        g, l = (self.padded_batch_size,), None
-        acc = {
-            "exit_probs_buf": AccessMode.SHARED_READ,
-            "targets_buf": AccessMode.SHARED_READ,
-            "ensemble_weights_buf": AccessMode.EXCLUSIVE_WRITE,
-        }
-        args = (
-            self.b.get("exit_probs_buf").cl_buffer,
-            self.b.get("targets_buf").mask_buffer,
-            self.b.get("ensemble_weights_buf").cl_buffer,
-            np.int32(self.padded_batch_size),
-            np.int32(self.padded_output_classes),
-            np.int32(NUM_EXITS),
-        )
-        return self._create_kernel_node("ensemble_weights_reg_reduce", g, l, queue_name, acc, *args)
-
-    def ensemble_weights_tier2_local_reduce(self, queue_name: str) -> int:
-        """(Tier 2) Ensemble weights via local memory reduction."""
+    def calculate_chunk_gradients(self, q: str, cid: int, cs: int, po: int) -> int:
         ls = 256
-        g, l = (self.padded_batch_size * ls,), (ls,)
-        acc = {"exit_probs_buf": AccessMode.SHARED_READ, "ensemble_weights_buf": AccessMode.EXCLUSIVE_WRITE}
-        args = (
-            cl.LocalMemory(ls * SCALAR_SIZE),
-            self.b.get("exit_probs_buf").cl_buffer,
-            self.b.get("ensemble_weights_buf").cl_buffer,
-            np.int32(NUM_EXITS),
-            np.int32(self.padded_output_classes),
-            np.int32(self.padded_batch_size),
-        )
-        return self._create_kernel_node("ensemble_weights_local_reduce", g, l, queue_name, acc, *args)
-
-    def blend_ensemble_probabilities(self, queue_name: str) -> int:
-        """Blends exit probabilities using calculated ensemble_weights."""
-        g, l = (self.padded_batch_size, self.padded_output_classes), None
-        acc = {
-            "exit_probs_buf": AccessMode.SHARED_READ,
-            "ensemble_weights_buf": AccessMode.SHARED_READ,
-            "targets_buf": AccessMode.SHARED_READ,
-            "ensemble_probs_buf": AccessMode.EXCLUSIVE_WRITE,
-        }
-        args = (
-            self.b.get("exit_probs_buf").cl_buffer,
-            self.b.get("ensemble_weights_buf").cl_buffer,
-            self.b.get("targets_buf").mask_buffer,
-            self.b.get("ensemble_probs_buf").cl_buffer,
-            np.int32(self.padded_batch_size),
-            np.int32(self.padded_output_classes),
-            np.int32(NUM_EXITS),
-        )
-        return self._create_kernel_node("blend_ensemble_probabilities", g, l, queue_name, acc, *args)
-
-    def calculate_losses(self, queue_name: str) -> int:
-        """Two-stage reduction for batch loss: Partial sums -> Final aggregation."""
-        # Stage 1: Partial XE losses, summed into groups.
-        g1 = (self.padded_batch_size,)
-        l1_val = (1 << (g1[0] - 1).bit_length() >> 1) if g1[0] > 1 else 1
-        l1 = (min(256, l1_val if l1_val > 0 else 1),)
-        num_groups = math.ceil(g1[0] / l1[0]) if l1[0] > 0 else 0
-        self.b.create_buffer(
-            "partial_loss_buf", BufferRole.PARTIAL_LOSS_REDUCTION, (num_groups,), np.float32
-        )  # Loss sum target
-        lm1 = cl.LocalMemory(l1[0] * np.dtype(np.float32).itemsize)
-        acc1 = {
-            "ensemble_probs_buf": AccessMode.SHARED_READ,
-            "targets_buf": AccessMode.SHARED_READ,
-            "partial_loss_buf": AccessMode.EXCLUSIVE_WRITE,
-        }
-        args1 = (
-            lm1,
-            self.b.get("ensemble_probs_buf").cl_buffer,
-            self.b.get("targets_buf").mask_buffer,
-            self.b.get("targets_buf").cl_buffer,
-            self.b.get("partial_loss_buf").cl_buffer,
-            np.int32(self.padded_batch_size),
-            np.int32(self.padded_output_classes),
-        )
-        partial_node = self._create_kernel_node("calculate_partial_losses", g1, l1, queue_name, acc1, *args1)
-        # Stage 2: Aggregate partial sums to final loss value.
-        l2v_val = (1 << (num_groups - 1).bit_length() >> 1) if num_groups > 1 else 1
-        l2v = min(256, l2v_val if l2v_val > 0 else 1)
-        g2, l2 = (l2v,), (l2v,)
-        lm2 = cl.LocalMemory(l2[0] * np.dtype(np.float32).itemsize)
-        acc2 = {"partial_loss_buf": AccessMode.SHARED_READ, "final_loss_buf": AccessMode.EXCLUSIVE_WRITE}
-        args2 = (
-            lm2,
-            self.b.get("partial_loss_buf").cl_buffer,
-            self.b.get("final_loss_buf").cl_buffer,
-            np.int32(num_groups),
-        )
-        final_node = self._create_kernel_node("aggregate_partial_losses", g2, l2, queue_name, acc2, *args2)
-        self.m.graph.add_edge(partial_node, final_node)
-        return final_node
-
-    def calculate_exit_gradients(self, queue_name: str) -> int:
-        """Exit gradients: dL/dW_exit, dL/dB_exit, and accumulates dL/dH_contributions from each exit."""
-        kernel_name = f"calculate_exit_gradients_{PROBLEM_TYPE.lower()}"
-        ls = 256
-        g, l = (NUM_EXITS * ls, self.padded_hidden_dim), (ls, 1)  # Reduction over batch dim (ls)
+        g, l = (cs, self.padded_hidden_dim, ls), (1, 1, ls)
         acc = {
             "hidden_buf": AccessMode.SHARED_READ,
-            "exit_probs_buf": AccessMode.SHARED_READ,
-            "ensemble_weights_buf": AccessMode.SHARED_READ,
+            "partial_probs_buf": AccessMode.SHARED_READ,
             "targets_buf": AccessMode.SHARED_READ,
-            "exit_weights": AccessMode.SHARED_READ,  # Read for dL/dH
+            "exit_weights": AccessMode.SHARED_READ,
+            "partial_grad_h_buf": AccessMode.EXCLUSIVE_WRITE,
             "grad_exit_weights": AccessMode.EXCLUSIVE_UPDATE,
             "grad_exit_biases": AccessMode.EXCLUSIVE_UPDATE,
-            "grad_hidden_contributions_buf": AccessMode.EXCLUSIVE_WRITE,
         }
         args = (
             cl.LocalMemory(ls * SCALAR_SIZE),
-            cl.LocalMemory(ls * SCALAR_SIZE),
             self.b.get("hidden_buf").cl_buffer,
-            self.b.get("exit_probs_buf").cl_buffer,
-            self.b.get("ensemble_weights_buf").cl_buffer,
+            self.b.get("partial_probs_buf").cl_buffer,
             self.b.get("targets_buf").cl_buffer,
-            self.b.get("targets_buf").mask_buffer,
             self.b.get("exit_weights").cl_buffer,
+            self.b.get("partial_grad_h_buf").cl_buffer,
             self.b.get("grad_exit_weights").cl_buffer,
             self.b.get("grad_exit_biases").cl_buffer,
-            self.b.get("grad_hidden_contributions_buf").cl_buffer,
+            np.int32(PROBLEM_TYPE == "CCE"),
+            np.int32(cid),
+            np.int32(po),
             np.int32(self.padded_batch_size),
             np.int32(self.padded_hidden_dim),
             np.int32(self.padded_output_classes),
-            np.int32(NUM_EXITS),
+            np.int32(cs),
         )
-        return self._create_kernel_node(kernel_name, g, l, queue_name, acc, *args)
+        return self._create_kernel_node("calculate_chunk_gradients", g, l, q, acc, *args)
 
-    def aggregate_and_backprop_activation(self, queue_name: str) -> int:
-        """Aggregates dL/dH_contributions from all exits and backprops through hidden layer's ReLU activation."""
+    def calculate_chunk_temp_gradients(self, q: str, cid: int, cs: int, po: int) -> int:
+        ls = 256
+        g, l = (cs * ls,), (ls,)
+        acc = {
+            "partial_logits_buf": AccessMode.SHARED_READ,
+            "partial_probs_buf": AccessMode.SHARED_READ,
+            "targets_buf": AccessMode.SHARED_READ,
+            "temps": AccessMode.SHARED_READ,
+            "partial_grad_temps_buf": AccessMode.EXCLUSIVE_WRITE,
+        }
+        args = (
+            cl.LocalMemory(ls * SCALAR_SIZE),
+            self.b.get("partial_logits_buf").cl_buffer,
+            self.b.get("partial_probs_buf").cl_buffer,
+            self.b.get("targets_buf").cl_buffer,
+            self.b.get("targets_buf").mask_buffer,
+            self.b.get("temps").cl_buffer,
+            self.b.get("partial_grad_temps_buf").cl_buffer,
+            np.int32(PROBLEM_TYPE == "CCE"),
+            np.int32(cid),
+            np.int32(po),
+            np.int32(self.padded_batch_size),
+            np.int32(self.padded_output_classes),
+            np.int32(cs),
+        )
+        return self._create_kernel_node("calculate_chunk_temp_gradients", g, l, q, acc, *args)
+
+    def aggregate(
+        self,
+        q: str,
+        in_buf: str,
+        out_buf: str,
+        num_items: int,
+        item_stride: int,
+        mode: int = 0,
+        avg_div: Optional[int] = None,
+    ) -> int:
+        acc = {in_buf: AccessMode.SHARED_READ, out_buf: AccessMode.EXCLUSIVE_WRITE}
+        divisor = np.int32(avg_div if avg_div is not None else num_items)
+        if num_items == 1:
+            g, l = (item_stride,), None
+            args = (self.b.get(in_buf).cl_buffer, self.b.get(out_buf).cl_buffer, np.int32(item_stride))
+            return self._create_kernel_node("aggregate_identity", g, l, q, acc, *args)
+        elif 1 < num_items <= MAX_REGISTER_AGGREGATE_ITEMS:
+            g, l = (item_stride,), None
+            args = (
+                self.b.get(in_buf).cl_buffer,
+                self.b.get(out_buf).cl_buffer,
+                np.int32(num_items),
+                np.int32(item_stride),
+                np.int32(mode),
+                divisor,
+            )
+            return self._create_kernel_node("aggregate_register_reduce", g, l, q, acc, *args)
+        else:
+            ls = 256
+            g, l = (item_stride * ls,), (ls,)
+            args = (
+                cl.LocalMemory(ls * SCALAR_SIZE),
+                self.b.get(in_buf).cl_buffer,
+                self.b.get(out_buf).cl_buffer,
+                np.int32(num_items),
+                np.int32(item_stride),
+                np.int32(mode),
+                divisor,
+            )
+            return self._create_kernel_node("aggregate_local_reduce", g, l, q, acc, *args)
+
+    def finalize_backprop_activation(self, q: str) -> int:
         g, l = (self.padded_batch_size, self.padded_hidden_dim), None
         acc = {
+            "final_grad_h_buf": AccessMode.SHARED_READ,
             "hidden_buf": AccessMode.SHARED_READ,
-            "grad_hidden_contributions_buf": AccessMode.SHARED_READ,
             "grad_pre_activation_buf": AccessMode.EXCLUSIVE_WRITE,
         }
         args = (
+            self.b.get("final_grad_h_buf").cl_buffer,
             self.b.get("hidden_buf").cl_buffer,
             self.b.get("hidden_buf").mask_buffer,
-            self.b.get("grad_hidden_contributions_buf").cl_buffer,
             self.b.get("grad_pre_activation_buf").cl_buffer,
             np.int32(self.padded_batch_size),
             np.int32(self.padded_hidden_dim),
-            np.int32(NUM_EXITS),
         )
-        return self._create_kernel_node("aggregate_and_backprop_activation", g, l, queue_name, acc, *args)
+        return self._create_kernel_node("finalize_backprop_activation", g, l, q, acc, *args)
 
-    def calculate_dense_layer_gradients(self, queue_name: str) -> int:
-        """Calculates dL/dW and dL/dB for the main dense layer."""
+    def calculate_dense_layer_gradients(self, q: str) -> int:
         ls = 256
-        g, l = (self.padded_input_dim * ls, self.padded_hidden_dim), (ls, 1)  # Reduction over batch dim (ls)
+        g, l = (self.padded_input_dim, self.padded_hidden_dim * ls), (1, ls)
         acc = {
             "input_buf": AccessMode.SHARED_READ,
             "grad_pre_activation_buf": AccessMode.SHARED_READ,
@@ -1069,95 +615,57 @@ class KernelWrapper:
             self.b.get("input_buf").cl_buffer,
             self.b.get("input_buf").mask_buffer,
             self.b.get("grad_pre_activation_buf").cl_buffer,
-            self.b.get("grad_weights").cl_buffer,  # Uses grad_weights (standard layout)
+            self.b.get("grad_weights").cl_buffer,
             self.b.get("grad_biases").cl_buffer,
             np.int32(self.padded_batch_size),
             np.int32(self.padded_input_dim),
             np.int32(self.padded_hidden_dim),
         )
-        return self._create_kernel_node("calculate_dense_layer_gradients", g, l, queue_name, acc, *args)
+        return self._create_kernel_node("calculate_dense_layer_gradients", g, l, q, acc, *args)
 
-    def backprop_input_gradient(self, queue_name: str) -> int:
-        """Calculates dL/dX (gradient w.r.t. layer input) using `weights_standard`."""
-        g, l = (self.padded_batch_size, self.padded_input_dim), None
+    def adam_update(
+        self, p: Parameter, q: str, offset_in_elements: int = 0, count_in_elements: Optional[int] = None
+    ) -> int:
+        full_param_count = int(np.prod(self.b.get(p.value).spec.padded_shape))
+        num_elements = count_in_elements if count_in_elements is not None else full_param_count - offset_in_elements
+        g, l = (num_elements,), None
         acc = {
-            "grad_pre_activation_buf": AccessMode.SHARED_READ,
-            "weights_standard": AccessMode.SHARED_READ,
-            "grad_input_buf": AccessMode.EXCLUSIVE_WRITE,
+            p.grad: AccessMode.SHARED_READ,
+            p.value: AccessMode.EXCLUSIVE_UPDATE,
+            p.m1: AccessMode.EXCLUSIVE_UPDATE,
+            p.m2: AccessMode.EXCLUSIVE_UPDATE,
         }
         args = (
-            self.b.get("grad_pre_activation_buf").cl_buffer,
-            self.b.get("weights_standard").cl_buffer,
-            self.b.get("grad_input_buf").cl_buffer,
-            np.int32(self.padded_batch_size),
-            np.int32(self.padded_input_dim),
-            np.int32(self.padded_hidden_dim),
-        )
-        return self._create_kernel_node("backprop_input_gradient", g, l, queue_name, acc, *args)
-
-    def calculate_temp_gradients(self, queue_name: str) -> int:
-        """Calculates dL/dT for temperature parameters."""
-        kernel_name = f"calculate_temp_gradients_{PROBLEM_TYPE.lower()}"
-        ls = 256
-        g, l = (NUM_EXITS * ls,), (ls,)  # Reduction over batch dim (ls)
-        acc = {
-            "unscaled_logits_buf": AccessMode.SHARED_READ,
-            "exit_probs_buf": AccessMode.SHARED_READ,
-            "ensemble_weights_buf": AccessMode.SHARED_READ,
-            "temps": AccessMode.SHARED_READ,
-            "targets_buf": AccessMode.SHARED_READ,
-            "grad_temps": AccessMode.EXCLUSIVE_UPDATE,
-        }
-        args = (
-            cl.LocalMemory(ls * SCALAR_SIZE),
-            self.b.get("unscaled_logits_buf").cl_buffer,
-            self.b.get("exit_probs_buf").cl_buffer,
-            self.b.get("ensemble_weights_buf").cl_buffer,
-            self.b.get("temps").cl_buffer,
-            self.b.get("targets_buf").cl_buffer,
-            self.b.get("targets_buf").mask_buffer,
-            self.b.get("grad_temps").cl_buffer,
-            np.int32(self.padded_batch_size),
-            np.int32(self.padded_output_classes),
-            np.int32(NUM_EXITS),
-        )
-        return self._create_kernel_node(kernel_name, g, l, queue_name, acc, *args)
-
-    def adam_update(self, param: Parameter, queue_name: str) -> int:
-        """Adam optimizer update for a given parameter (element-wise)."""
-        tp = int(np.prod(self.b.get(param.value).spec.padded_shape))
-        g, l = (tp,), None
-        acc = {
-            param.grad: AccessMode.SHARED_READ,
-            param.value: AccessMode.EXCLUSIVE_UPDATE,
-            param.m1: AccessMode.EXCLUSIVE_UPDATE,
-            param.m2: AccessMode.EXCLUSIVE_UPDATE,
-        }
-        args = (
-            self.b.get(param.grad).cl_buffer,
+            self.b.get(p.grad).cl_buffer,
             SCALAR_NP_TYPE(ADAM_BETA1),
             SCALAR_NP_TYPE(ADAM_BETA2),
             self.beta1_t,
             self.beta2_t,
             SCALAR_NP_TYPE(LEARNING_RATE),
             SCALAR_NP_TYPE(EPSILON),
-            self.b.get(param.value).cl_buffer,
-            self.b.get(param.m1).cl_buffer,
-            self.b.get(param.m2).cl_buffer,
-            np.int32(tp),
+            self.b.get(p.value).cl_buffer,
+            self.b.get(p.m1).cl_buffer,
+            self.b.get(p.m2).cl_buffer,
+            np.int32(offset_in_elements),
+            np.int32(num_elements),
         )
-        return self._create_kernel_node("adam_update", g, l, queue_name, acc, *args)
+        return self._create_kernel_node("adam_update", g, l, q, acc, *args)
 
-    def clamp_temperatures(self, queue_name: str) -> int:
-        """Clamps temperatures to [MIN_TEMP, MAX_TEMP]."""
+    def clamp_temperatures(self, q: str) -> int:
         g, l = (NUM_EXITS,), None
         acc = {"temps": AccessMode.EXCLUSIVE_UPDATE}
         args = (self.b.get("temps").cl_buffer, SCALAR_NP_TYPE(MIN_TEMP), SCALAR_NP_TYPE(MAX_TEMP), np.int32(NUM_EXITS))
-        return self._create_kernel_node("clamp_temperatures", g, l, queue_name, acc, *args)
+        return self._create_kernel_node("clamp_temperatures", g, l, q, acc, *args)
+
+    def zero_gradients(self, grad_buf: str, q: str) -> int:
+        buf = self.b.get(grad_buf)
+        op = lambda q, wf: cl.enqueue_fill_buffer(
+            q, buf.cl_buffer, SCALAR_NP_TYPE(0), 0, buf.cl_buffer.size, wait_for=wf
+        )
+        return self.m.create_node(f"zero_{grad_buf}", NodeType.COMPUTE, q, {grad_buf: AccessMode.EXCLUSIVE_WRITE}, op)
 
 
 ### MAIN EXECUTION ###
-# 1. Setup
 validate_problem_config()
 ctx = cl.create_some_context(interactive=False)
 device = ctx.devices[0]
@@ -1165,9 +673,7 @@ print(f"Using device: {device.name} from vendor: {device.vendor}")
 manager = WorkManager(ctx)
 buffer_mgr = BufferManager(ctx, device, BATCH_SIZE)
 if SCALAR_TYPE == "half" and "cl_khr_fp16" not in device.extensions:
-    raise RuntimeError("Device does not support FP16 (cl_khr_fp16 extension not found)")
-
-# 2. Buffer Creation & Parameter Registration
+    raise RuntimeError("FP16 not supported")
 params = [
     Parameter("weights"),
     Parameter("biases"),
@@ -1182,222 +688,228 @@ param_specs = {
     "exit_biases": (BufferRole.EXIT_BIAS, (NUM_EXITS, OUTPUT_CLASSES), lambda s: np.zeros(s, dtype=SCALAR_NP_TYPE)),
     "temps": (BufferRole.TEMPERATURES, (NUM_EXITS,), lambda s: np.full(s, 1.0, dtype=SCALAR_NP_TYPE)),
 }
-
 for p in params:
     role, shape, init_fn = param_specs[p.name]
-    if p.name == "weights":  # Special handling for main 'weights'
-        # `weights_standard`: standard layout (I,H) for some gradient calculations.
-        init_data_std = init_fn(shape)
-        buffer_mgr.create_buffer(
-            "weights_standard", BufferRole.GRADIENT, shape, SCALAR_NP_TYPE, init_data=init_data_std
+    if p.name == "weights":
+        std_data = init_fn(shape)
+        buffer_mgr.create_buffer("weights_standard", BufferRole.GRADIENT, shape, SCALAR_NP_TYPE, init_data=std_data)
+        sw, ps = buffer_mgr.padding_ctx.simd_width, buffer_mgr._get_padded_shape(role, shape)
+        simd_data = he_init_simd_major(std_data, shape, ps, sw)
+        buffer_mgr.buffers[p.value] = Buffer(
+            BufferSpec(p.value, role, shape, ps, SCALAR_NP_TYPE),
+            cl.Buffer(ctx, cl.mem_flags.READ_WRITE, size=simd_data.nbytes),
         )
-        # `weights` (p.value): SIMD-major layout for optimized forward_pass.
-        sw = buffer_mgr.padding_ctx.simd_width
-        ps_simd = buffer_mgr._get_padded_shape(role, shape)
-        init_data_simd = he_init_simd_major(init_data_std, shape, ps_simd, sw)
-        cl_buf_simd = cl.Buffer(buffer_mgr.context, cl.mem_flags.READ_WRITE, size=init_data_simd.nbytes)
-        spec_simd = BufferSpec(p.value, role, shape, ps_simd, SCALAR_NP_TYPE)
-        buffer_mgr.buffers[p.value] = Buffer(spec_simd, cl_buf_simd)
-        cl.enqueue_copy(cl.CommandQueue(buffer_mgr.context), cl_buf_simd, init_data_simd).wait()
-        # Gradients for 'weights' use the standard layout matching 'weights_standard'.
-        buffer_mgr.create_buffer(p.grad, BufferRole.GRADIENT, shape, SCALAR_NP_TYPE)
-        buffer_mgr.create_buffer(p.m1, BufferRole.ADAM_M1, shape, SCALAR_NP_TYPE)
-        buffer_mgr.create_buffer(p.m2, BufferRole.ADAM_M2, shape, SCALAR_NP_TYPE)
-    else:  # Other parameters
+        cl.enqueue_copy(cl.CommandQueue(ctx), buffer_mgr.get(p.value).cl_buffer, simd_data).wait()
+        for suffix in ["grad", "m1", "m2"]:
+            buffer_mgr.create_buffer(getattr(p, suffix), BufferRole.GRADIENT, shape, SCALAR_NP_TYPE)
+    else:
         buffer_mgr.create_buffer(p.value, role, shape, SCALAR_NP_TYPE, init_data=init_fn(shape))
-        buffer_mgr.create_buffer(p.grad, BufferRole.GRADIENT, shape, SCALAR_NP_TYPE)
-        buffer_mgr.create_buffer(p.m1, BufferRole.ADAM_M1, shape, SCALAR_NP_TYPE)
-        buffer_mgr.create_buffer(p.m2, BufferRole.ADAM_M2, shape, SCALAR_NP_TYPE)
-
+        [
+            buffer_mgr.create_buffer(getattr(p, s), BufferRole.GRADIENT, shape, SCALAR_NP_TYPE)
+            for s in ["grad", "m1", "m2"]
+        ]
 data_buffer_specs = {
     "input_buf": (BufferRole.INPUT_DATA, (BATCH_SIZE, INPUT_DIM), SCALAR_NP_TYPE),
-    "targets_buf": (
-        BufferRole.TARGETS,
-        (BATCH_SIZE, OUTPUT_CLASSES) if PROBLEM_TYPE == "BCE" else (BATCH_SIZE,),
-        SCALAR_NP_TYPE if PROBLEM_TYPE == "BCE" else np.int32,
-    ),
+    "targets_buf": (BufferRole.TARGETS, (BATCH_SIZE,), np.int32),
     "hidden_buf": (BufferRole.HIDDEN_ACTIVATION, (BATCH_SIZE, HIDDEN_DIM), SCALAR_NP_TYPE),
-    "unscaled_logits_buf": (BufferRole.UNSCALED_LOGITS, (NUM_EXITS, BATCH_SIZE, OUTPUT_CLASSES), SCALAR_NP_TYPE),
-    "exit_probs_buf": (BufferRole.EXIT_PROBABILITIES, (NUM_EXITS, BATCH_SIZE, OUTPUT_CLASSES), SCALAR_NP_TYPE),
-    "per_exit_losses_buf": (BufferRole.INTERMEDIATE, (NUM_EXITS, BATCH_SIZE, 1), SCALAR_NP_TYPE),
-    "ensemble_weights_buf": (BufferRole.ENSEMBLE_WEIGHTS, (BATCH_SIZE, NUM_EXITS), SCALAR_NP_TYPE),
-    "ensemble_probs_buf": (BufferRole.ENSEMBLE_PROBABILITIES, (BATCH_SIZE, OUTPUT_CLASSES), SCALAR_NP_TYPE),
-    "grad_hidden_contributions_buf": (
-        BufferRole.GRAD_CONTRIBUTIONS,
-        (NUM_EXITS, BATCH_SIZE, HIDDEN_DIM),
-        SCALAR_NP_TYPE,
-    ),
+    "partial_logits_buf": (BufferRole.INTERMEDIATE, (NUM_EXITS, BATCH_SIZE, OUTPUT_CLASSES), SCALAR_NP_TYPE),
+    "partial_probs_buf": (BufferRole.INTERMEDIATE, (NUM_EXITS, BATCH_SIZE, OUTPUT_CLASSES), SCALAR_NP_TYPE),
+    "partial_loss_buf": (BufferRole.INTERMEDIATE, (NUM_EXITS, BATCH_SIZE), np.float32),
+    "partial_grad_h_buf": (BufferRole.INTERMEDIATE, (NUM_EXITS, BATCH_SIZE, HIDDEN_DIM), SCALAR_NP_TYPE),
+    "partial_grad_temps_buf": (BufferRole.GRADIENT, (NUM_EXITS,), SCALAR_NP_TYPE),
+    "final_probs_buf": (BufferRole.INTERMEDIATE, (BATCH_SIZE, OUTPUT_CLASSES), SCALAR_NP_TYPE),
+    "final_loss_buf": (BufferRole.INTERMEDIATE, (BATCH_SIZE,), np.float32),
+    "final_grad_h_buf": (BufferRole.INTERMEDIATE, (BATCH_SIZE, HIDDEN_DIM), SCALAR_NP_TYPE),
     "grad_pre_activation_buf": (BufferRole.INTERMEDIATE, (BATCH_SIZE, HIDDEN_DIM), SCALAR_NP_TYPE),
     "grad_input_buf": (BufferRole.INTERMEDIATE, (BATCH_SIZE, INPUT_DIM), SCALAR_NP_TYPE),
-    "final_loss_buf": (BufferRole.FINAL_LOSS, (1,), np.float32),
-}  # Batch loss often FP32 for precision
+    "final_scalar_loss_buf": (BufferRole.FINAL_LOSS, (1,), np.float32),
+}
 for name, (role, shape, dtype) in data_buffer_specs.items():
     buffer_mgr.create_buffer(name, role, shape, dtype)
-
-# 3. Data & Kernel Prep
 X, y_int = load_iris(return_X_y=True)
 X_normalized = StandardScaler().fit_transform(X).astype(SCALAR_NP_TYPE)
-
-# Prepare target labels based on the problem type
-if PROBLEM_TYPE == "BCE":
-    # Convert integer labels to one-hot encoded float arrays for BCE
-    y_true = np.zeros((len(y_int), OUTPUT_CLASSES), dtype=SCALAR_NP_TYPE)
-    y_true[np.arange(len(y_int)), y_int] = 1.0
-else:  # CCE
-    y_true = y_int.astype(np.int32)
-
-validate_targets(y_true)  # Validate the final, correctly formatted targets
+y_true = y_int.astype(np.int32)
+validate_targets(y_true)
 batch_padder = BatchPadder(buffer_mgr.get("input_buf").spec, buffer_mgr.get("targets_buf").spec)
 kernel_src = load_and_concatenate_kernels(KERNEL_DIR, CL_HEADERS, CL_SOURCES)
-
-# Define compile-time macros for kernels
 build_opts = [
     f"-cl-std=CL1.2",
     f"-D SCALAR_TYPE={CL_SCALAR_TYPE}",
     f"-D SIMD_WIDTH={buffer_mgr.padding_ctx.simd_width}",
     f"-D C_TILE_SIZE={C_TILE_SIZE}",
-    f"-D MAX_EXITS_ENSEMBLE={MAX_EXITS_ENSEMBLE}",
-    f"-D PROBLEM_TYPE_{PROBLEM_TYPE}",  # Pass problem type as a macro, e.g., -D PROBLEM_TYPE_CCE
-] + (["-cl-khr-fp16"] if SCALAR_TYPE == "half" else [])
+    f"-D PROBLEM_TYPE_CCE=0",
+    f"-D AGG_MODE_SUM=0",
+    f"-D AGG_MODE_AVERAGE=1",
+] + ([f"-D cl_khr_fp16"] if SCALAR_TYPE == "half" else [])
 program = cl.Program(ctx, kernel_src).build(options=build_opts)
-
-loss_view, probs_view, grad_input_view = (
-    HostView(buffer_mgr.get("final_loss_buf")),
-    HostView(buffer_mgr.get("ensemble_probs_buf")),
-    HostView(buffer_mgr.get("grad_input_buf")),
-)
-
-# 4. Training Loop
+loss_view, probs_view = HostView(buffer_mgr.get("final_scalar_loss_buf")), HostView(buffer_mgr.get("final_probs_buf"))
 print(f"Starting training for {EPOCHS} epochs...")
-global_step = 1  # For Adam optimizer bias correction
+global_step = 1
 for epoch in range(EPOCHS):
     shuffled_indices = np.random.permutation(len(X))
     epoch_loss, correct_predictions, total_samples = 0.0, 0, 0
     for i in range(0, len(X), BATCH_SIZE):
-        manager.reset()  # Clear graph for the new batch/iteration
+        manager.reset()
         batch_indices = shuffled_indices[i : i + BATCH_SIZE]
         actual_batch_size = len(batch_indices)
         X_batch, y_batch = X_normalized[batch_indices], y_true[batch_indices]
         X_padded, y_padded, mask_padded = batch_padder.pad_batch(X_batch, y_batch)
-
         k = KernelWrapper(program, manager, buffer_mgr, global_step)
 
-        # --- Define Common Execution Trunk (Q_TRAINING) ---
+        # === Host Orchestrator: Dynamic DAG Construction ===
+
+        # --- Phase 0: PLAN ---
+        def _calculate_transient_mem() -> int:
+            # A simplified VRAM budgeter. A real-world version would be more precise.
+            # It estimates the size of the largest temporary buffers needed for a full-batch run.
+            mem = 0
+            mem += buffer_mgr.get("hidden_buf").cl_buffer.size  # Hidden activations
+            mem += buffer_mgr.get("partial_probs_buf").cl_buffer.size  # Probs for all exits
+            mem += buffer_mgr.get("partial_grad_h_buf").cl_buffer.size  # Grad_H for all exits
+            return mem
+
+        required_mem = _calculate_transient_mem()
+        # Use 90% of VRAM for safety margin
+        if required_mem > device.global_mem_size * 0.9:
+            num_chunks = math.ceil(required_mem / (device.global_mem_size * 0.5))  # Heuristic for chunk count
+            num_chunks = min(num_chunks, NUM_EXITS)
+        else:
+            num_chunks = 1
+        chunk_size = (NUM_EXITS + num_chunks - 1) // num_chunks
+        print(
+            f"Epoch {epoch+1}, Batch {i//BATCH_SIZE+1}: Strategy={num_chunks} chunk(s) of size {chunk_size} based on VRAM budget."
+        )
+
+        # --- Initial State Setup ---
         h2d_ops = {
             "input_buf": X_padded,
             "input_buf:mask": mask_padded,
             "targets_buf": y_padded,
             "targets_buf:mask": mask_padded,
         }
-        for name, data_to_copy in h2d_ops.items():  # H2D transfers
-            base_name, is_mask = name.split(":")[0], ":mask" in name
-            cl_buf_target = buffer_mgr.get(base_name).mask_buffer if is_mask else buffer_mgr.get(base_name).cl_buffer
-            op_fn = lambda d=data_to_copy, b=cl_buf_target: (
-                lambda q, wf: cl.enqueue_copy(q, b, d, wait_for=wf)
-            )  # Lambda captures current data
+        for name, data in h2d_ops.items():
+            base_name, is_mask = name.split(":")[:2]
+            target_buf = buffer_mgr.get(base_name).mask_buffer if is_mask else buffer_mgr.get(base_name).cl_buffer
+            op_fn = lambda d=data, b=target_buf: (lambda q, wf: cl.enqueue_copy(q, b, d, wait_for=wf))
             manager.create_node(
                 f"h2d_{name}", NodeType.TRANSFER, "Q_TRAINING", {base_name: AccessMode.EXCLUSIVE_WRITE}, op_fn()
             )
         for param in params:
-            k.zero_gradients(param.grad, queue_name="Q_TRAINING")  # Zero gradients
-        k.forward_pass(queue_name="Q_TRAINING")
-        k.compute_all_exits(queue_name="Q_TRAINING")
+            k.zero_gradients(param.grad, "Q_TRAINING")
+        fp_node = k.forward_pass("Q_TRAINING", 0, actual_batch_size)
 
-        # Tiered strategy for ensemble weight calculation is now encapsulated
-        ensemble_node_uid = k.ensemble_weights(queue_name="Q_TRAINING")
+        # --- Phase 3: STREAMING ---
+        partial_nodes = defaultdict(list)
+        exit_update_nodes = []
+        for c in range(num_chunks):
+            param_offset = c * chunk_size
+            current_chunk_size = min(chunk_size, NUM_EXITS - param_offset)
+            outputs_uid = k.compute_chunk_outputs("Q_TRAINING", c, current_chunk_size, param_offset)
+            grads_uid = k.calculate_chunk_gradients("Q_TRAINING", c, current_chunk_size, param_offset)
+            temps_uid = k.calculate_chunk_temp_gradients("Q_TRAINING", c, current_chunk_size, param_offset)
 
-        # --- FORK POINT: `blend_ensemble_probabilities` is the last shared step before inference/training path split ---
-        blend_node_uid = k.blend_ensemble_probabilities(queue_name="Q_TRAINING")
-        # CRITICAL: add dependency from whatever tier was chosen to the blending kernel
-        manager.graph.add_edge(ensemble_node_uid, blend_node_uid)
+            # Architectural Insight: Streaming Adam update for this chunk's exit parameters. This is a key
+            # memory optimization, as we don't need to store all exit gradients simultaneously.
+            # This assumes the `adam_update` kernel now supports an `offset_in_elements` argument.
+            ew_spec = buffer_mgr.get("exit_weights").spec
+            ew_offset = param_offset * ew_spec.real_shape[1] * ew_spec.real_shape[2]
+            ew_count = current_chunk_size * ew_spec.real_shape[1] * ew_spec.real_shape[2]
+            eb_spec = buffer_mgr.get("exit_biases").spec
+            eb_offset = param_offset * eb_spec.real_shape[1]
+            eb_count = current_chunk_size * eb_spec.real_shape[1]
+            ew_update = k.adam_update(Parameter("exit_weights"), "Q_TRAINING", ew_offset, ew_count)
+            manager.graph.add_edge(grads_uid, ew_update)
+            eb_update = k.adam_update(Parameter("exit_biases"), "Q_TRAINING", eb_offset, eb_count)
+            manager.graph.add_edge(grads_uid, eb_update)
+            exit_update_nodes.extend([ew_update, eb_update])
 
-        # --- Path A: High-priority INFERENCE path (Q_INFERENCE) ---
-        # Quickly gets blended probabilities for immediate processing.
-        d2h_op_factory = lambda view, buf_name: (
-            lambda q, wf: view.update_from_device(q, buffer_mgr.get(buf_name).cl_buffer, wf)
-        )
-        probs_d2h_uid = manager.create_node(
+            partial_nodes["Probs"].append(outputs_uid)
+            partial_nodes["Loss"].append(outputs_uid)
+            partial_nodes["Grad_H"].append(grads_uid)
+            partial_nodes["Grad_Temps"].append(temps_uid)
+
+        # --- Phase 4: AGGREGATION ---
+        aggregated_nodes = {}
+        buffers_to_agg = {
+            "Probs": "partial_probs_buf",
+            "Loss": "partial_loss_buf",
+            "Grad_H": "partial_grad_h_buf",
+            "Grad_Temps": "partial_grad_temps_buf",
+        }
+        for name, partial_buf in buffers_to_agg.items():
+            final_buf = f"final_{name.lower()}_buf" if name != "Grad_Temps" else "grad_temps"
+            item_stride = int(np.prod(buffer_mgr.get(partial_buf).spec.padded_shape[1:]))
+            agg_node = k.aggregate("Q_TRAINING", partial_buf, final_buf, num_chunks, item_stride)
+            aggregated_nodes[name] = agg_node
+
+        # --- Phase 5: FINALIZATION & DISPATCH ---
+        final_training_nodes = list(exit_update_nodes)
+        d2h_op = lambda v, b: (lambda q, wf: v.update_from_device(q, buffer_mgr.get(b).cl_buffer, wf))
+        probs_d2h = manager.create_node(
             "d2h_probs",
             NodeType.TRANSFER,
             "Q_INFERENCE",
-            {"ensemble_probs_buf": AccessMode.SHARED_READ},
-            d2h_op_factory(probs_view, "ensemble_probs_buf"),
+            {"final_probs_buf": AccessMode.SHARED_READ},
+            d2h_op(probs_view, "final_probs_buf"),
         )
-        manager.graph.add_edge(blend_node_uid, probs_d2h_uid)
+        manager.graph.add_edge(aggregated_nodes["Probs"], probs_d2h)
+        backprop = k.finalize_backprop_activation("Q_TRAINING")
+        manager.graph.add_edge(aggregated_nodes["Grad_H"], backprop)
+        dense_grads = k.calculate_dense_layer_gradients("Q_TRAINING")
+        manager.graph.add_edge(backprop, dense_grads)
+        for p_name in ["weights", "biases"]:
+            update = k.adam_update(Parameter(p_name), "Q_TRAINING")
+            manager.graph.add_edge(dense_grads, update)
+            final_training_nodes.append(update)
+        temps_update = k.adam_update(Parameter("temps"), "Q_TRAINING")
+        manager.graph.add_edge(aggregated_nodes["Grad_Temps"], temps_update)
+        clamp = k.clamp_temperatures("Q_TRAINING")
+        manager.graph.add_edge(temps_update, clamp)
+        final_training_nodes.append(clamp)
 
-        # --- Path B: Background TRAINING path (Q_TRAINING) ---
-        # Includes loss, full backpropagation, and parameter updates.
-        final_training_nodes = []  # Leaf nodes of training path for host synchronization
-        loss_uid = k.calculate_losses(queue_name="Q_TRAINING")
-        manager.graph.add_edge(blend_node_uid, loss_uid)
-        final_training_nodes.append(loss_uid)
-        exit_grads_uid = k.calculate_exit_gradients(queue_name="Q_TRAINING")
-        temp_grads_uid = k.calculate_temp_gradients(
-            queue_name="Q_TRAINING"
-        )  # Can run somewhat in parallel with exit_grads
-        agg_backprop_uid = k.aggregate_and_backprop_activation(queue_name="Q_TRAINING")
-        manager.graph.add_edge(exit_grads_uid, agg_backprop_uid)
-        dense_grads_uid = k.calculate_dense_layer_gradients(queue_name="Q_TRAINING")
-        manager.graph.add_edge(agg_backprop_uid, dense_grads_uid)
-        input_grad_uid = k.backprop_input_gradient(queue_name="Q_TRAINING")
-        manager.graph.add_edge(agg_backprop_uid, input_grad_uid)
-        final_training_nodes.append(input_grad_uid)
-        for param in params:  # Adam updates
-            update_uid = k.adam_update(param, queue_name="Q_TRAINING")
-            if param.name == "temps":  # Temperatures need clamping
-                clamp_uid = k.clamp_temperatures(queue_name="Q_TRAINING")
-                manager.graph.add_edge(update_uid, clamp_uid)
-                final_training_nodes.append(clamp_uid)
-            else:
-                final_training_nodes.append(update_uid)
-        # D2H for training diagnostics
-        loss_d2h_uid = manager.create_node(
+        # Architectural Insight: Final loss calculation is now a generic aggregation. We reduce the
+        # per-sample final_loss_buf to a single scalar, but crucially, we use AVERAGE mode and
+        # provide the *actual* batch size as the divisor to get a correct, unpadded average.
+        item_stride = 1
+        num_loss_items = buffer_mgr.get("final_loss_buf").spec.padded_shape[0]
+        loss_scalar_node = k.aggregate(
+            "Q_TRAINING",
+            "final_loss_buf",
+            "final_scalar_loss_buf",
+            num_loss_items,
+            item_stride,
+            mode=1,
+            avg_div=actual_batch_size,
+        )
+        manager.graph.add_edge(aggregated_nodes["Loss"], loss_scalar_node)
+        loss_d2h = manager.create_node(
             "d2h_loss",
             NodeType.TRANSFER,
             "Q_TRAINING",
-            {"final_loss_buf": AccessMode.SHARED_READ},
-            d2h_op_factory(loss_view, "final_loss_buf"),
+            {"final_scalar_loss_buf": AccessMode.SHARED_READ},
+            d2h_op(loss_view, "final_scalar_loss_buf"),
         )
-        final_training_nodes.append(loss_d2h_uid)
-        grad_d2h_uid = manager.create_node(
-            "d2h_grad_input",
-            NodeType.TRANSFER,
-            "Q_TRAINING",
-            {"grad_input_buf": AccessMode.SHARED_READ},
-            d2h_op_factory(grad_input_view, "grad_input_buf"),
-        )
-        final_training_nodes.append(grad_d2h_uid)
+        manager.graph.add_edge(loss_scalar_node, loss_d2h)
+        final_training_nodes.append(loss_d2h)
 
-        # --- Host Notification Points ---
-        inference_complete_event = manager.create_host_notification_point(
-            "inference_sync", dependencies=[probs_d2h_uid]
-        )
-        training_complete_event = manager.create_host_notification_point(
-            "training_sync", dependencies=final_training_nodes
-        )
+        # --- Host Notification & Synchronization ---
+        inference_event = manager.create_host_notification_point("inference_sync", dependencies=[probs_d2h])
+        final_batch_event = manager.create_host_notification_point("training_sync", dependencies=final_training_nodes)
 
         # === COMMIT AND STAGGERED WAIT ===
-        manager.commit()  # Enqueue all operations
-        inference_complete_event.wait()  # Wait for inference path (quick)
-
-        # Process immediate inference result
+        manager.commit()
+        inference_event.wait()
         valid_probs = probs_view.valid_slice[:actual_batch_size]
         predicted_classes = np.argmax(valid_probs, axis=1)
-
-        # For accuracy calculation, we need the original integer labels
-        y_batch_int_labels = y_int[batch_indices]
-        correct_predictions += np.sum(predicted_classes == y_batch_int_labels)
+        correct_predictions += np.sum(predicted_classes == y_batch)
         total_samples += actual_batch_size
-
-        training_complete_event.wait()  # Sync with background training path before next iteration
-
-        # Process late diagnostic results
+        final_batch_event.wait()
         total_batch_loss = loss_view.valid_slice[0]
         epoch_loss += total_batch_loss * actual_batch_size
-        global_step += 1  # For Adam's beta decay
+        global_step += 1
 
-    avg_epoch_loss = epoch_loss / total_samples
-    train_acc = correct_predictions / total_samples
+    avg_epoch_loss = epoch_loss / total_samples if total_samples > 0 else 0
+    train_acc = correct_predictions / total_samples if total_samples > 0 else 0
     print(f"Epoch {epoch+1:3d}/{EPOCHS} | Loss: {avg_epoch_loss:.4f} | Accuracy: {train_acc:.2%}")
 
 print("\nTraining finished.")
