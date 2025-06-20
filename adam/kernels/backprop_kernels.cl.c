@@ -5,16 +5,11 @@
 #include "kernels.cl.h"
 #endif
 
-/**
- * @brief (Node 10) Calculates PARTIAL gradients for the shared layer WEIGHTS by processing a CHUNK of the BATCH.
- *
- * This kernel is the first part of the scalable backpropagation (Phase 6). It streams over the batch
- * dimension to compute the partial gradients for the shared layer's weights (SW). The result is
- * fed to the final aggregation stage (Node 11).
- *
- * WORK DISPATCH: A 2D "work-group per gradient" strategy. Work-group (group_id.x, group_id.y) computes
- * the PARTIAL gradient contribution for weight SW[x][y] from this specific batch chunk.
- */
+// --- Implementation: backprop_shared_weights_chunk (Node 10) ---
+// Strategy: A 2D "work-group per gradient" reduction. Each work-group, identified
+// by `(group_id.x, group_id.y)`, computes the partial gradient for a single shared
+// weight `SW[i][j]`. Threads within the group parallelize the summation over the
+// assigned batch chunk, with a final reduction in __local memory.
 __kernel void backprop_shared_weights_chunk(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict input_buf,
@@ -28,8 +23,8 @@ __kernel void backprop_shared_weights_chunk(
     int padded_input_dim,
     int padded_hidden_dim) {
     // Work-group (i_idx, j_idx) computes the gradient for shared weight SW[i_idx][j_idx].
-    const uint i_idx = get_group_id(0); // Input dimension index (0 to padded_input_dim-1)
-    const uint j_idx = get_group_id(1); // Hidden dimension index (0 to padded_hidden_dim-1)
+    const uint i_idx = get_group_id(0); // Input dimension index
+    const uint j_idx = get_group_id(1); // Hidden dimension index
     const uint lid   = get_local_id(0);
     const uint lsize = get_local_size(0);
 
@@ -39,7 +34,7 @@ __kernel void backprop_shared_weights_chunk(
 
     SCALAR_TYPE p_grad_sw = SCALAR_ZERO;
 
-    // Parallel loop over the batch CHUNK.
+    // Parallel loop over the assigned batch CHUNK.
     for (int b_local = lid; b_local < num_batch_samples; b_local += lsize) {
         const uint b_global = batch_offset + b_local;
 
@@ -47,20 +42,27 @@ __kernel void backprop_shared_weights_chunk(
             continue;
         }
 
+        // Upstream gradient for this hidden neuron активация (A).
         const SCALAR_TYPE grad_h = final_grad_h_buf[b_global * padded_hidden_dim + j_idx];
 
+        // To get dL/dZ, we need dL/dA (which is grad_h) and dA/dZ (derivative of activation).
         const uint        h_block                  = j_idx / SIMD_WIDTH;
         const uint        h_lane                   = j_idx % SIMD_WIDTH;
         const uint        padded_hidden_dim_blocks = (padded_hidden_dim + SIMD_WIDTH - 1) / SIMD_WIDTH;
         const uint        physical_hidden_idx      = b_global * padded_hidden_dim_blocks * SIMD_WIDTH + h_block * SIMD_WIDTH + h_lane;
         const SCALAR_TYPE hidden_val               = hidden_buf[physical_hidden_idx];
-        const SCALAR_TYPE d_activation             = select((SCALAR_TYPE)0.0f, (SCALAR_TYPE)1.0f, hidden_val > SCALAR_ZERO);
-        const SCALAR_TYPE dL_dZ_j                  = grad_h * d_activation;
 
+        // Derivative of the ReLU activation function (dA/dZ).
+        const SCALAR_TYPE d_activation = select((SCALAR_TYPE)0.0f, (SCALAR_TYPE)1.0f, hidden_val > SCALAR_ZERO);
+
+        // Gradient w.r.t the pre-activation value Z (dL/dZ = dL/dA * dA/dZ).
+        const SCALAR_TYPE dL_dZ_j = grad_h * d_activation;
+
+        // Final gradient contribution for this weight (dL/dW_ij = dL/dZ_j * dZ_j/dW_ij = dL/dZ_j * X_i).
         p_grad_sw += dL_dZ_j * input_buf[b_global * padded_input_dim + i_idx];
     }
 
-    // Reduction for PARTIAL shared weight gradient
+    // Intra-workgroup reduction for the partial shared weight gradient.
     local_mem[lid] = p_grad_sw;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint s = lsize / 2; s > 0; s >>= 1) {
@@ -75,16 +77,11 @@ __kernel void backprop_shared_weights_chunk(
     }
 }
 
-/**
- * @brief (Node 11) Calculates PARTIAL gradients for the shared layer BIASES by processing a CHUNK of the BATCH.
- *
- * This kernel is the second part of the scalable backpropagation (Phase 6). It performs a dedicated,
- * more efficient 1D reduction to compute the partial gradients for the shared layer's biases (SB).
- * The result is fed to the final aggregation stage (Node 11).
- *
- * WORK DISPATCH: A 1D "work-group per gradient" strategy. Work-group `group_id(0)` computes the
- * PARTIAL gradient contribution for bias SB[j] from this specific batch chunk.
- */
+// --- Implementation: backprop_shared_biases_chunk (Node 11) ---
+// Strategy: A 1D "work-group per gradient" reduction. Each work-group `group_id(0)`
+// computes the partial gradient for a single bias term `SB[j]`. This 1D dispatch
+// is more efficient than a 2D dispatch for a 1D output. Threads sum over the
+// batch chunk, followed by a local memory reduction.
 __kernel void backprop_shared_biases_chunk(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict hidden_buf,
@@ -124,10 +121,11 @@ __kernel void backprop_shared_biases_chunk(
         const SCALAR_TYPE d_activation             = select((SCALAR_TYPE)0.0f, (SCALAR_TYPE)1.0f, hidden_val > SCALAR_ZERO);
         const SCALAR_TYPE dL_dZ_j                  = grad_h * d_activation;
 
+        // Gradient for bias is simply dL/dZ_j, since dZ_j/dB_j = 1.
         p_grad_sb += dL_dZ_j;
     }
 
-    // Reduction for PARTIAL shared bias gradient
+    // Intra-workgroup reduction for the partial shared bias gradient.
     local_mem[lid] = p_grad_sb;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint s = lsize / 2; s > 0; s >>= 1) {
