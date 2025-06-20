@@ -56,6 +56,7 @@ graph TD
     classDef sync_event fill:#ffc0cb,stroke:#C00000,stroke-width:2px,stroke-dasharray: 5 2
     classDef path_a fill:#fef0e6,stroke:#C00000
     classDef path_b fill:#e9eef7,stroke:#2F5496
+    classDef transpose_kernel fill:#FBE5D6,stroke:#ED7D31,stroke-width:2px
 
     %% Phase 0-2: Setup
     subgraph Phase 0-2: Host Setup & Global Params
@@ -76,70 +77,83 @@ graph TD
         K5 --> PARTIAL_Probs_i[PARTIAL Probs 'i']:::partial_data & PARTIAL_Loss_i[PARTIAL Loss 'i']:::partial_data & PARTIAL_Logits_i[PARTIAL Logits 'i']:::partial_data
         PARTIAL_Probs_i & PARTIAL_Logits_i --> K7["(7) calculate_chunk_temp_gradients"]:::kernel --> PARTIAL_Grad_Temps_i[PARTIAL Grad_Temps 'i']:::partial_data
 
-        K6 --> PARTIAL_Grad_H_i[PARTIAL Grad_H 'i']:::partial_data
+        K6 --> PARTIAL_Grad_H_i_AoS["PARTIAL Grad_H 'i'<br/>(AoS Layout)"]:::partial_data
         K6 --> PARTIAL_Grad_ExitW_i[PARTIAL Grad_ExitW 'i']:::partial_data & PARTIAL_Grad_ExitB_i[PARTIAL Grad_ExitB 'i']:::partial_data
     end
 
-    %% Phase 4: Primary Aggregation Engine
-    subgraph Phase 4: Primary Aggregation Engine
-        K8["<b>(8) Aggregate Kernel</b>"]:::host_logic
-        PARTIAL_Probs_i & PARTIAL_Loss_i & PARTIAL_Grad_H_i & PARTIAL_Grad_ExitW_i & PARTIAL_Grad_ExitB_i & PARTIAL_Grad_Temps_i -- All Chunks --> K8
-        K8 --> FINAL_Probs[Final Probs]:::final_data & FINAL_Loss[Final Loss]:::final_data & FINAL_Grad_H[Final Grad_H]:::final_data
-        K8 --> FINAL_Grad_ExitW[Final Grad_ExitW]:::final_data & FINAL_Grad_ExitB[Final Grad_ExitB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
+    %% Phase 4: Data Layout Transformation
+    subgraph "Phase 4: Data Layout Transformation"
+        direction LR
+        PARTIAL_Grad_H_i_AoS -- All Chunks --> K8["<b>(8) transpose_grad_h</b>"]:::transpose_kernel
+        K8 --> PARTIAL_Grad_H_SoA["PARTIAL Grad_H<br/>(SoA Layout)"]:::partial_data
     end
 
-    %% Phase 5: Streaming Shared Layer Backprop
-    subgraph "Phase 5: Streaming Shared Layer Backprop"
-        style "Phase 5: Streaming Shared Layer Backprop" loop_box
-        Input_i[Input Chunk 'i']:::data --> K9["<b>(9) backprop_shared_chunk</b>"]:::kernel
-        hidden_i --> K9
-        FINAL_Grad_H -- slice --> K9
-        K9 --> PARTIAL_Grad_SW_i[PARTIAL Grad_SW 'i']:::partial_data & PARTIAL_Grad_SB_i[PARTIAL Grad_SB 'i']:::partial_data
+    %% Phase 5: Primary Aggregation Engine
+    subgraph Phase 5: Primary Aggregation Engine
+        K9["<b>(9) Aggregate Kernel</b>"]:::host_logic
+        PARTIAL_Probs_i & PARTIAL_Loss_i & PARTIAL_Grad_ExitW_i & PARTIAL_Grad_ExitB_i & PARTIAL_Grad_Temps_i & PARTIAL_Grad_H_SoA -- All Partial Data --> K9
+        K9 --> FINAL_Probs[Final Probs]:::final_data & FINAL_Loss[Final Loss]:::final_data & FINAL_Grad_H[Final Grad_H]:::final_data
+        K9 --> FINAL_Grad_ExitW[Final Grad_ExitW]:::final_data & FINAL_Grad_ExitB[Final Grad_ExitB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
     end
 
-    %% Phase 6: Final Aggregation
-    subgraph Phase 6: Final Aggregation
-        K10["<b>(10) Aggregate Kernel</b>"]:::host_logic
-        PARTIAL_Grad_SW_i & PARTIAL_Grad_SB_i -- All Chunks --> K10
-        K10 --> FINAL_Grad_SW[Final Grad_SW]:::final_data & FINAL_Grad_SB[Final Grad_SB]:::final_data
+    %% Phase 6: Streaming Shared Layer Backprop
+    subgraph "Phase 6: Streaming Shared Layer Backprop"
+        style "Phase 6: Streaming Shared Layer Backprop" loop_box
+        Input_i[Input Chunk 'i']:::data --> K10["<b>(10) backprop_shared_weights_chunk</b>"]:::kernel
+        K10 --> PARTIAL_Grad_SW_i[PARTIAL Grad_SW 'i']:::partial_data
+
+        hidden_i --> K10 & K11
+        FINAL_Grad_H -- slice --> K10 & K11
+
+        K11["<b>(11) backprop_shared_biases_chunk</b>"]:::kernel --> PARTIAL_Grad_SB_i[PARTIAL Grad_SB 'i']:::partial_data
     end
 
-    %% Phase 7: Finalization & Dispatch
-    subgraph "Phase 7: Finalization & Dispatch"
+    %% Phase 7: Final Aggregation
+    subgraph Phase 7: Final Aggregation
+        K12["<b>(12) Aggregate Kernel</b>"]:::host_logic
+        PARTIAL_Grad_SW_i & PARTIAL_Grad_SB_i -- All Chunks --> K12
+        K12 --> FINAL_Grad_SW[Final Grad_SW]:::final_data & FINAL_Grad_SB[Final Grad_SB]:::final_data
+    end
+
+    %% Phase 8: Finalization & Dispatch
+    subgraph "Phase 8: Finalization & Dispatch"
         direction LR
         subgraph "A. Early Exit Path"
             style "A. Early Exit Path" path_a
-            K_D2H["<b>(11) D2H Async Copy</b><br/>(Final Probs)"]:::data --> EV_Inference["<b>inference_event</b>"]:::sync_event
+            K13["<b>(13) D2H Async Copy</b><br/>(Final Probs)"]:::data --> EV_Inference["<b>inference_event</b>"]:::sync_event
         end
         subgraph "B. Training Path (All Updates)"
             style "B. Training Path (All Updates)" path_b
-            K12_shared["(12) adam_update (Shared)"]:::kernel; FINAL_Grad_SW & FINAL_Grad_SB --> K12_shared; K12_shared -- updates --> P_Shared
-            K12_exits["(12) adam_update (Exits)"]:::kernel; FINAL_Grad_ExitW & FINAL_Grad_ExitB --> K12_exits; K12_exits -- updates --> P_Exits
-            K12_temps["(12) adam_update (Temps)"]:::kernel; FINAL_Grad_Temps --> K12_temps; K12_temps -- updates --> P_Temps
-            K12_temps --> K13["(13) clamp_temps"]:::kernel
-            K13 --> EV_Final["<b>final_batch_event</b>"]:::sync_event
+            K14_shared["(14) adam_update (Shared)"]:::kernel; FINAL_Grad_SW & FINAL_Grad_SB --> K14_shared; K14_shared -- updates --> P_Shared
+            K14_exits["(14) adam_update (Exits)"]:::kernel; FINAL_Grad_ExitW & FINAL_Grad_ExitB --> K14_exits; K14_exits -- updates --> P_Exits
+            K14_temps["(14) adam_update (Temps)"]:::kernel; FINAL_Grad_Temps --> K14_temps; K14_temps -- updates --> P_Temps
+            K14_temps --> K15["<b>(15) clamp_temps</b>"]:::kernel
+            K15 --> EV_Final["<b>final_batch_event</b>"]:::sync_event
         end
     end
 
     %% Connections
     HL_1 --> K4; HL_2 --> note_hidden
-    FINAL_Probs --> K_D2H
+    FINAL_Probs --> K13
     EV_Inference --> Host_Act["Host Acts on<br/>Early Result"]:::host_logic
     EV_Final --> Host_Wait_Final["Host Blocks for<br/>Full Batch"]:::host_logic
 ```
 
-#### **Kernel & Synchronization Contracts**
+#### **Final Kernel & Synchronization Contracts**
 
-*   **(4-7) Chunk-Processing Kernels**: Kernels designed for the forward pass and initial gradient computation. Their contract is to operate on a single chunk of data and produce **partial** results for all downstream consumers (probabilities, losses, and gradients).
-*   **(8, 10) `aggregate_*` kernels**: A generic, stateless kernel interface invoked by the host whenever a set of partial results must be consolidated. Its behavior is defined by a `reduction_mode_flag` (e.g., SUM, AVERAGE).
-*   **(9) `backprop_shared_chunk`**: A streamable backpropagation kernel. Its contract is to compute the partial gradients for the shared layer's weights and biases (`PARTIAL_Grad_SW`, `PARTIAL_Grad_SB`) for a single chunk. It consumes the final aggregated `Grad_H` and the chunk's corresponding input features and hidden activations.
-*   **(11) `D2H Async Copy`**: A non-blocking Device-to-Host transfer of the `Final Probs` buffer, whose completion signals the `inference_event`.
-*   **(12) `adam_update`**: A generic optimizer kernel. To ensure mathematical consistency, the architecture mandates that this kernel is only invoked in the final phase, *after* all gradients for the entire batch have been computed and fully aggregated.
-*   **(13) `clamp_temperatures`**: A final utility kernel for parameter constraint.
+*   **(4-7) Chunk-Processing Kernels**: Kernels designed for the forward pass and initial gradient computation. Their contract is to operate on a single chunk of data and produce **partial** results for all downstream consumers.
+    *   *Clarification on (6) `calculate_chunk_gradients`*: It produces `partial_grad_h_out` in a natural "Array of Structures" (AoS) format, requiring a transpose before reduction.
+*   **(8) `transpose_grad_h`**: A data layout transformation kernel. Its contract is to read the AoS-formatted `partial_grad_h_out` buffer and write the data to a new temporary buffer in a "Structure of Arrays" (SoA) layout. This ensures all partial contributions for a single element of `grad_h` are contiguous, preparing the data for efficient aggregation.
+*   **(9, 12) `aggregate_*` kernels**: A generic, stateless kernel interface invoked by the host whenever a set of partial results must be consolidated. For maximum performance, these kernels expect input data in an SoA layout, which the host guarantees by inserting transpose steps like **(8)** where necessary.
+*   **(10) `backprop_shared_weights_chunk`**: A streamable backpropagation kernel for the **shared layer weights**. Its contract is to compute the partial weight gradients (`Grad_SW`) for a single chunk of the batch.
+*   **(11) `backprop_shared_biases_chunk`**: A streamable backpropagation kernel for the **shared layer biases**. Its contract is to compute the partial bias gradients (`Grad_SB`) for a single chunk of the batch.
+*   **(13) `D2H Async Copy`**: A non-blocking Device-to-Host transfer of the `Final Probs` buffer, whose completion signals the `inference_event`.
+*   **(14) `adam_update`**: A generic optimizer kernel. It is invoked in the final phase, *after* all gradients for the entire batch have been computed and fully aggregated.
+*   **(15) `clamp_temperatures`**: A final utility kernel for parameter constraint.
 *   **Host/Device Synchronization Contracts**:
-    *   `inference_event`: Guarantees that the `Final Probs` data is available on the host for consumption.
-    *   `final_batch_event`: Guarantees that all device-side computations for the batch are complete and all parameters have been updated.
-
+  *  `inference_event`: Guarantees that the `Final Probs` data is available on the host for consumption.
+  
+  *  `final_batch_event`: Guarantees that all device-side computations for the batch are complete and all parameters have been updated.
 ---
 
 ### **Validation Scenarios**

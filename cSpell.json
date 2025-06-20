@@ -1,8 +1,10 @@
 {
     "words": [
+        "Backpropagation",
         "CDNA",
         "itemsize",
         "keepdims",
+        "logits",
         "ndarray",
         "padder",
         "probs",

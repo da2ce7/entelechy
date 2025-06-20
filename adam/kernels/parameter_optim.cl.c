@@ -6,7 +6,7 @@
 #endif
 
 /**
- * @brief (Node 12) Implements the Adam optimization step as an embarrassingly parallel map kernel.
+ * @brief (Node 14) Implements the Adam optimization step as an embarrassingly parallel map kernel.
  *
  * This kernel is generic and can be applied to any flattened parameter buffer. Each work-item is
  * assigned to a single parameter and is completely independent.
@@ -72,7 +72,7 @@ __kernel void adam_update(
 }
 
 /**
- * @brief (Node 13) Implements an element-wise clamp operation for the temperature parameters.
+ * @brief (Node 15) Implements an element-wise clamp operation for the temperature parameters.
  *
  * This is a simple, embarrassingly parallel kernel where each work-item is assigned to a single
  * temperature value. It reads the value, clamps it to the specified min/max range using the

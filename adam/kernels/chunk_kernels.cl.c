@@ -17,18 +17,17 @@
  *   the validity mask, a critical dependency for subsequent pipeline stages.
  */
 __kernel void forward_pass(
-    __local SCALAR_TYPE *local_mem,                                // [MEMORY] Local memory for tiling.
-    __global const SCALAR_TYPE *__restrict input_buf,              // [INPUT] The full batch's input feature data.
-    __global const SCALAR_TYPE *__restrict input_mask,             // [INPUT] The full batch's mask for valid samples.
-    __global const SCALAR_TYPE *__restrict weights_simd_major_buf, // [INPUT] SIMD-major weights.
-    __global const SCALAR_TYPE *__restrict biases_buf,             // [INPUT] Biases for the hidden layer.
-    __global SCALAR_TYPE *__restrict hidden_out_buf,               // [OUTPUT] Resulting hidden layer activations for the processed slice.
-    __global SCALAR_TYPE *__restrict hidden_mask_out,              // [OUTPUT] Propagated mask for the hidden layer.
-    int batch_offset,                                              // [PARAM] The starting sample index for this chunk.
-    int num_batch_samples,                                         // [PARAM] The number of samples to process in this chunk.
-    int padded_input_dim,                                          // [PARAM] The padded dimension of the input layer.
-    int padded_hidden_dim                                          // [PARAM] The padded dimension of the hidden layer.
-) {
+    __local SCALAR_TYPE *local_mem,
+    __global const SCALAR_TYPE *__restrict input_buf,
+    __global const SCALAR_TYPE *__restrict input_mask,
+    __global const SCALAR_TYPE *__restrict weights_simd_major_buf,
+    __global const SCALAR_TYPE *__restrict biases_buf,
+    __global SCALAR_TYPE *__restrict hidden_out_buf,
+    __global SCALAR_TYPE *__restrict hidden_mask_out,
+    int batch_offset,
+    int num_batch_samples,
+    int padded_input_dim,
+    int padded_hidden_dim) {
     const uint bid     = get_global_id(0); // Index within the current chunk
     const uint h_block = get_global_id(1); // Hidden dimension block
     const uint lid     = get_local_id(0);  // SIMD-lane index
@@ -84,9 +83,9 @@ __kernel void forward_pass(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // Fused ReLU activation and final store
-    const uint hidden_idx      = effective_bid * padded_hidden_dim + h_block * SIMD_WIDTH + lid;
-    hidden_out_buf[hidden_idx] = fmax(accum, SCALAR_ZERO);
+    const uint padded_hidden_dim_blocks = (padded_hidden_dim + SIMD_WIDTH - 1) / SIMD_WIDTH;
+    const uint hidden_idx               = effective_bid * padded_hidden_dim_blocks * SIMD_WIDTH + h_block * SIMD_WIDTH + lid;
+    hidden_out_buf[hidden_idx]          = fmax(accum, SCALAR_ZERO);
 }
 
 /**
@@ -117,7 +116,8 @@ __kernel void compute_chunk_outputs(
     int batch_size,
     int hidden_dim,
     int output_classes,
-    int chunk_size) {
+    int chunk_size,
+    int padded_hidden_dim) {
     const uint exit_local_idx = get_global_id(0); // Index within this chunk
     const uint batch_idx      = get_global_id(1); // Index within the batch
 
@@ -149,7 +149,7 @@ __kernel void compute_chunk_outputs(
             // Decode the physical layout of the SIMD-aware hidden buffer
             const uint h_block                  = h / SIMD_WIDTH;
             const uint h_lane                   = h % SIMD_WIDTH;
-            const uint padded_hidden_dim_blocks = (hidden_dim + SIMD_WIDTH - 1) / SIMD_WIDTH;
+            const uint padded_hidden_dim_blocks = (padded_hidden_dim + SIMD_WIDTH - 1) / SIMD_WIDTH;
             const uint physical_hidden_idx      = batch_idx * padded_hidden_dim_blocks * SIMD_WIDTH + h_block * SIMD_WIDTH + h_lane;
             logit += hidden_buf[physical_hidden_idx] * exit_weights_buf[exit_global_idx * hidden_dim * output_classes + h * output_classes + c];
         }
@@ -223,21 +223,20 @@ __kernel void compute_chunk_outputs(
 __kernel void calculate_chunk_gradients(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict hidden_buf,
-    __global const SCALAR_TYPE *__restrict partial_probs_buf, // FIX: Renamed from probs_buf for clarity
+    __global const SCALAR_TYPE *__restrict partial_probs_buf,
     __global const void *__restrict targets_buf,
     __global const SCALAR_TYPE *__restrict exit_weights_buf,
-    // --- FIX: Output names and logic corrected to align with PARTIAL data contract ---
     __global SCALAR_TYPE *__restrict partial_grad_h_out,
     __global SCALAR_TYPE *__restrict partial_grad_exit_w_out,
     __global SCALAR_TYPE *__restrict partial_grad_exit_b_out,
-    // ---
     int problem_type_flag,
     int chunk_id,
     int param_offset,
     int batch_size,
     int hidden_dim,
     int output_classes,
-    int chunk_size) {
+    int chunk_size,
+    int padded_hidden_dim) {
     const uint exit_local_idx = get_group_id(0);
     const uint h_idx          = get_group_id(1);
     const uint lid            = get_local_id(0);
@@ -260,7 +259,7 @@ __kernel void calculate_chunk_gradients(
         for (int b = lid; b < batch_size; b += lsize) {
             const uint        h_block                  = h_idx / SIMD_WIDTH;
             const uint        h_lane                   = h_idx % SIMD_WIDTH;
-            const uint        padded_hidden_dim_blocks = (hidden_dim + SIMD_WIDTH - 1) / SIMD_WIDTH;
+            const uint        padded_hidden_dim_blocks = (padded_hidden_dim + SIMD_WIDTH - 1) / SIMD_WIDTH;
             const uint        physical_hidden_idx      = b * padded_hidden_dim_blocks * SIMD_WIDTH + h_block * SIMD_WIDTH + h_lane;
             const SCALAR_TYPE h_val                    = hidden_buf[physical_hidden_idx];
 
@@ -313,7 +312,6 @@ __kernel void calculate_chunk_gradients(
                 barrier(CLK_LOCAL_MEM_FENCE);
             }
             if (lid == 0) {
-                // FIX: Write to the correct slice of the large partial gradient buffer.
                 const uint out_idx               = chunk_relative_exit_idx * hidden_dim * output_classes + h_idx * output_classes + c_global;
                 partial_grad_exit_w_out[out_idx] = local_mem[0];
             }
@@ -328,7 +326,6 @@ __kernel void calculate_chunk_gradients(
                     barrier(CLK_LOCAL_MEM_FENCE);
                 }
                 if (lid == 0) {
-                    // FIX: Write to the correct slice of the large partial gradient buffer.
                     const uint out_idx               = chunk_relative_exit_idx * output_classes + c_global;
                     partial_grad_exit_b_out[out_idx] = local_mem[0];
                 }
@@ -415,9 +412,11 @@ __kernel void calculate_chunk_temp_gradients(
     }
 
     if (lid == 0) {
-        const SCALAR_TYPE total_sum             = local_mem[0];
-        const SCALAR_TYPE temp                  = temps_buf[exit_global_idx];
-        const SCALAR_TYPE final_grad            = total_sum * (-1.0f / (temp * temp));
-        partial_grad_temps_out[exit_global_idx] = final_grad;
+        const SCALAR_TYPE total_sum  = local_mem[0];
+        const SCALAR_TYPE temp       = temps_buf[exit_global_idx];
+        const SCALAR_TYPE final_grad = total_sum * (-1.0f / (temp * temp));
+
+        const uint out_idx              = chunk_id * chunk_size + exit_local_idx;
+        partial_grad_temps_out[out_idx] = final_grad;
     }
 }
