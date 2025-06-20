@@ -173,14 +173,14 @@ __kernel void calculate_chunk_gradients(
     __global SCALAR_TYPE *__restrict partial_grad_h_aos_out,  // [OUT] Shape: (num_chunks, batch_size, h_dim)
     __global SCALAR_TYPE *__restrict partial_grad_exit_w_out, // [OUT] Shape: (total_num_chunks, ...)
     __global SCALAR_TYPE *__restrict partial_grad_exit_b_out, // [OUT] Shape: (total_num_chunks, ...)
-    int problem_type_flag,                                   // [IN scalar: 0|1, Selects CCE or BCE math path]
-    int chunk_id,                                            // [IN scalar: >= 0, The logical index of this chunk, used for reading/writing outputs]
-    int param_offset,                                        // [IN scalar: >= 0, The starting index of this chunk's parameters in global buffers]
-    int full_batch_size,                                     // [IN scalar: > 0, The total number of samples in the complete logical batch]
-    int hidden_dim,                                          // [IN scalar: > 0, The logical dimension of the hidden layer]
-    int output_classes,                                      // [IN scalar: > 0 & <= C_TILE_SIZE, The number of output classes for this chunk's exits]
-    int chunk_size,                                          // [IN scalar: > 0, The number of exits processed by this kernel invocation]
-    int padded_hidden_dim);                                  // [IN scalar: > 0, The physical (padded) dimension of the hidden layer]
+    int problem_type_flag,                                    // [IN scalar: 0|1, Selects CCE or BCE math path]
+    int chunk_id,                                             // [IN scalar: >= 0, The logical index of this chunk, used for reading/writing outputs]
+    int param_offset,                                         // [IN scalar: >= 0, The starting index of this chunk's parameters in global buffers]
+    int full_batch_size,                                      // [IN scalar: > 0, The total number of samples in the complete logical batch]
+    int hidden_dim,                                           // [IN scalar: > 0, The logical dimension of the hidden layer]
+    int output_classes,                                       // [IN scalar: > 0 & <= C_TILE_SIZE, The number of output classes for this chunk's exits]
+    int chunk_size,                                           // [IN scalar: > 0, The number of exits processed by this kernel invocation]
+    int padded_hidden_dim);                                   // [IN scalar: > 0, The physical (padded) dimension of the hidden layer]
 
 /**
  * @brief (Node 7) Computes partial temperature gradients for a chunk of exits.
@@ -222,7 +222,6 @@ __kernel void transpose_grad_h(
 
 /**
  * @brief (Tier 2/3: N is large) Reduces partial results using local memory.
- * This serves as the baseline contract for the aggregation engine.
  */
 __kernel void aggregate_local_reduce(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
@@ -316,6 +315,6 @@ __kernel void clamp_temperatures(
     __global SCALAR_TYPE *__restrict temps_buf, // [IN/OUT] The temperature parameters to be clamped.
     SCALAR_TYPE min_temp,                       // [IN scalar: any, The minimum allowed temperature value]
     SCALAR_TYPE max_temp,                       // [IN scalar: any, The maximum allowed temperature value, must be >= min_temp]
-    int         num_exits);                     // [IN scalar: > 0, The total number of temperature parameters to clamp]
+    int         num_exits);                             // [IN scalar: > 0, The total number of temperature parameters to clamp]
 
 #endif // KERNELS_CL_H
