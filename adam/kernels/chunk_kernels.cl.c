@@ -34,17 +34,22 @@ __kernel void forward_pass(
 
     const uint effective_bid = batch_offset + bid;
 
-    // Propagate validity mask (single-thread write).
+    // Propagate validity mask. Masked samples do not need the barrier, so they exit early.
+    if (input_mask[effective_bid] < (SCALAR_TYPE)0.5f) {
+        if (lid == 0) {
+            hidden_mask_out[effective_bid] = input_mask[effective_bid];
+        }
+        return;
+    }
+    // Only one thread writes the valid mask to avoid a race condition.
     if (lid == 0) {
         hidden_mask_out[effective_bid] = input_mask[effective_bid];
     }
-    if (input_mask[effective_bid] < (SCALAR_TYPE)0.5f) {
-        return;
-    }
 
-    const uint           TILE_SIZE    = SIMD_WIDTH;
-    __local SCALAR_TYPE *tile_input   = local_mem;
-    __local SCALAR_TYPE *tile_weights = local_mem + TILE_SIZE;
+    const uint TILE_SIZE = SIMD_WIDTH;
+    // This partitioning dedicates local memory to a shared input tile (reused by all threads) and the locally-owned weight columns.
+    __local SCALAR_TYPE *tile_input   = local_mem;             // Size: TILE_SIZE
+    __local SCALAR_TYPE *tile_weights = &local_mem[TILE_SIZE]; // Size: TILE_SIZE * TILE_SIZE
 
     // Each thread accumulates its partial dot product for one output neuron.
     SCALAR_TYPE accum = biases_buf[h_block * SIMD_WIDTH + lid];
@@ -138,7 +143,7 @@ __kernel void compute_logits_chunk(
 
     // Compute the dot product of the hidden activation vector and the corresponding weight vector.
     for (int h = 0; h < hidden_dim; h++) {
-        // HARMONIZED: Use the macro for consistent, safe access to the hidden buffer.
+        // Use the macro for consistent, safe access to the hidden buffer.
         const SCALAR_TYPE h_val = hidden_buf[GET_PHYSICAL_HIDDEN_IDX(batch_idx, h, padded_hidden_dim)];
 
         // Get the corresponding weight.
@@ -246,27 +251,34 @@ __kernel void compute_probs_loss_cce_chunk(
     const uint prob_out_idx     = exit_global_idx * total_batch_size * total_output_classes + batch_idx * total_output_classes + class_global_idx;
 
     // --- Masking ---
+    // For masked samples, prob is zero, and the loss remains its pre-initialized zero value.
     if (targets_mask[batch_idx] < 0.5f) {
         partial_probs_out[prob_out_idx] = SCALAR_ZERO;
         return;
     }
 
-    // --- Probability Calculation ---
+    // This kernel fuses probability calculation with a non-atomic scatter-write for the loss, avoiding a separate reduction step entirely.
+
+    // --- Probability Calculation (using pre-computed Softmax parameters) ---
     const uint        params_base_idx  = exit_global_idx * total_batch_size * 2 + batch_idx * 2;
-    const SCALAR_TYPE max_scaled_logit = softmax_params_buf[params_base_idx + 0];
-    const SCALAR_TYPE sum_exp          = softmax_params_buf[params_base_idx + 1];
+    const SCALAR_TYPE max_scaled_logit = softmax_params_buf[params_base_idx + 0]; // For stability
+    const SCALAR_TYPE sum_exp          = softmax_params_buf[params_base_idx + 1]; // Normalizer
     const SCALAR_TYPE logit            = full_logits_buf[prob_out_idx];
     const SCALAR_TYPE temp_inv         = 1.0f / temps_buf[exit_global_idx];
 
     SCALAR_TYPE prob = SCALAR_ZERO;
     if (sum_exp > (SCALAR_TYPE)1e-9f) {
+        // Final Softmax probability: p_i = exp(z_i/T - max(z/T)) / sum(exp(z_j/T - max(z/T)))
         prob = MATH_FN exp((logit * temp_inv) - max_scaled_logit) / sum_exp;
     }
     partial_probs_out[prob_out_idx] = prob;
 
-    // --- CCE Loss Calculation (Scatter Operation) ---
+    // --- CCE Loss Calculation (Scatter Write) ---
+    // Only the single work-item corresponding to the correct class writes the loss for its sample.
+    // This is a safe, race-free operation because each (exit, batch) pair has only one true class.
     const int true_class = targets_cce_buf[batch_idx];
     if (class_global_idx == true_class) {
+        // CCE Loss is -log(p) for the true class.
         const SCALAR_TYPE loss                         = -MATH_FN log(fmax(prob, (SCALAR_TYPE)1e-9f));
         const uint                        loss_out_idx = exit_global_idx * total_batch_size + batch_idx;
         final_loss_out[loss_out_idx]                   = loss;
@@ -309,6 +321,7 @@ __kernel void compute_probs_loss_bce_chunk(
     const uint loss_out_idx    = class_chunk_id * total_exits * total_batch_size + exit_global_idx * total_batch_size + batch_idx;
 
     // --- Masking ---
+    // For masked samples, write zero to both outputs and exit early.
     if (targets_mask[batch_idx] < 0.5f) {
         partial_loss_out[loss_out_idx] = SCALAR_ZERO;
         for (int c_local = 0; c_local < num_classes_in_chunk; ++c_local) {
@@ -319,22 +332,29 @@ __kernel void compute_probs_loss_bce_chunk(
         return;
     }
 
-    // --- Core Logic: Map (Probs) and Reduce (Loss) ---
-    SCALAR_TYPE       partial_loss_sum = SCALAR_ZERO;
-    const SCALAR_TYPE temp_inv         = 1.0f / temps_buf[exit_global_idx];
+    // This kernel efficiently fuses two logical operations: a "map" for probabilities and a "reduce" for loss.
+    SCALAR_TYPE       partial_loss_accum = SCALAR_ZERO;
+    const SCALAR_TYPE temp_inv           = 1.0f / temps_buf[exit_global_idx];
 
+    // Each work-item iterates through its assigned slice of classes.
     for (int c_local = 0; c_local < num_classes_in_chunk; ++c_local) {
         const int         c_global       = class_offset + c_local;
         const uint        logit_prob_idx = exit_global_idx * total_batch_size * total_output_classes + batch_idx * total_output_classes + c_global;
         const SCALAR_TYPE logit          = full_logits_buf[logit_prob_idx];
-        const SCALAR_TYPE prob           = 1.0f / (1.0f + MATH_FN exp(-logit * temp_inv));
 
+        // 1. MAP: Compute and write the probability for each class.
+        const SCALAR_TYPE prob            = 1.0f / (1.0f + MATH_FN exp(-logit * temp_inv));
         partial_probs_out[logit_prob_idx] = prob;
 
+        // 2. REDUCE: Accumulate the BCE loss contribution from this class.
         const SCALAR_TYPE target_val = targets_bce_buf[batch_idx * total_output_classes + c_global];
-        partial_loss_sum -= (target_val * MATH_FN log(fmax(prob, 1e-9f)) + (1.0f - target_val) * MATH_FN log(fmax(1.0f - prob, 1e-9f)));
+        const SCALAR_TYPE term1      = target_val * MATH_FN log(fmax(prob, 1e-9f));
+        const SCALAR_TYPE term2      = (1.0f - target_val) * MATH_FN log(fmax(1.0f - prob, 1e-9f));
+        partial_loss_accum += term1 + term2;
     }
-    partial_loss_out[loss_out_idx] = partial_loss_sum;
+
+    // Write the final, negated partial loss sum for this chunk.
+    partial_loss_out[loss_out_idx] = -partial_loss_accum;
 }
 
 // --- Implementation: calculate_exit_param_grads_chunk (Node 8) ---

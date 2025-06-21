@@ -45,7 +45,7 @@ __kernel void backprop_shared_weights_chunk(
         // Upstream gradient for this hidden neuron activation (A).
         const SCALAR_TYPE grad_h = final_grad_h_buf[b_global * padded_hidden_dim + j_idx];
 
-        // HARMONIZED: Use the macro to reliably get the hidden activation value.
+        // Use the macro to reliably get the hidden activation value.
         const SCALAR_TYPE hidden_val = hidden_buf[GET_PHYSICAL_HIDDEN_IDX(b_global, j_idx, padded_hidden_dim)];
 
         // Derivative of the ReLU activation function (dA/dZ).
@@ -111,7 +111,7 @@ __kernel void backprop_shared_biases_chunk(
 
         const SCALAR_TYPE grad_h = final_grad_h_buf[b_global * padded_hidden_dim + j_idx];
 
-        // HARMONIZED: Use the macro to reliably get the hidden activation value.
+        // Use the macro to reliably get the hidden activation value.
         const SCALAR_TYPE hidden_val   = hidden_buf[GET_PHYSICAL_HIDDEN_IDX(b_global, j_idx, padded_hidden_dim)];
         const SCALAR_TYPE d_activation = select((SCALAR_TYPE)0.0f, (SCALAR_TYPE)1.0f, hidden_val > SCALAR_ZERO);
         const SCALAR_TYPE dL_dZ_j      = grad_h * d_activation;
