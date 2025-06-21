@@ -5,7 +5,7 @@
 #include "kernels.cl.h"
 #endif
 
-// --- Implementation: backprop_shared_weights_chunk (Node 10) ---
+// --- Implementation: backprop_shared_weights_chunk (Node 13) ---
 // Strategy: A 2D "work-group per gradient" reduction. Each work-group, identified
 // by `(group_id.x, group_id.y)`, computes the partial gradient for a single shared
 // weight `SW[i][j]`. Threads within the group parallelize the summation over the
@@ -42,7 +42,7 @@ __kernel void backprop_shared_weights_chunk(
             continue;
         }
 
-        // Upstream gradient for this hidden neuron активация (A).
+        // Upstream gradient for this hidden neuron activation (A).
         const SCALAR_TYPE grad_h = final_grad_h_buf[b_global * padded_hidden_dim + j_idx];
 
         // To get dL/dZ, we need dL/dA (which is grad_h) and dA/dZ (derivative of activation).
@@ -77,7 +77,7 @@ __kernel void backprop_shared_weights_chunk(
     }
 }
 
-// --- Implementation: backprop_shared_biases_chunk (Node 11) ---
+// --- Implementation: backprop_shared_biases_chunk (Node 14) ---
 // Strategy: A 1D "work-group per gradient" reduction. Each work-group `group_id(0)`
 // computes the partial gradient for a single bias term `SB[j]`. This 1D dispatch
 // is more efficient than a 2D dispatch for a 1D output. Threads sum over the

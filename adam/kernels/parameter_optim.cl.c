@@ -5,7 +5,7 @@
 #include "kernels.cl.h"
 #endif
 
-// --- Implementation: adam_update (Node 14) ---
+// --- Implementation: adam_update (Node 17) ---
 // Strategy: An embarrassingly parallel map kernel. Each work-item is assigned
 // to a single parameter and performs the update completely independently.
 // The `param_offset` enables this generic kernel to be dispatched multiple times,
@@ -61,7 +61,7 @@ __kernel void adam_update(
     m2[global_idx] = v_new;
 }
 
-// --- Implementation: clamp_temperatures (Node 15) ---
+// --- Implementation: clamp_temperatures (Node 18) ---
 // Strategy: An embarrassingly parallel map kernel. Each work-item is assigned to
 // a single temperature parameter and performs the clamp operation independently.
 // This is the final operation in the training graph.

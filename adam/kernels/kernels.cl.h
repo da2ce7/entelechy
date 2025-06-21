@@ -78,6 +78,8 @@ inline SCALAR_TYPE clamp(SCALAR_TYPE val, SCALAR_TYPE min_val, SCALAR_TYPE max_v
 inline SCALAR_TYPE select(SCALAR_TYPE a, SCALAR_TYPE b, int c) { return (c) ? b : a; }
 #endif // __OPENCL_VERSION__
 
+#define GET_PHYSICAL_HIDDEN_IDX(b, h, padded_h_dim) ((b) * (((padded_h_dim) + SIMD_WIDTH - 1) / SIMD_WIDTH) * SIMD_WIDTH + (h))
+
 // --- Host-configurable Flags and Enums ---
 
 // Used by kernels to select loss/gradient math (e.g., Softmax vs. Sigmoid).
@@ -86,7 +88,7 @@ inline SCALAR_TYPE select(SCALAR_TYPE a, SCALAR_TYPE b, int c) { return (c) ? b 
 
 // Used by the generic `aggregate_kernel` to select the reduction operation.
 #define AGG_MODE_SUM 0
-#define AGG_MODE_AVERAGE 1 // Placeholder for more complex ops
+#define AGG_MODE_AVERAGE 1
 
 // Common math configuration
 #ifndef USE_FAST_MATH
@@ -101,23 +103,25 @@ inline SCALAR_TYPE select(SCALAR_TYPE a, SCALAR_TYPE b, int c) { return (c) ? b 
 //--------------------------------------------------------------------------------
 /// --- Common Parameter Definitions ---
 ///
-/// @param local_mem            A pointer to __local memory. Its required size is specified
-///                             in each kernel's signature as a [MEMORY size: ...] contract.
-/// @param problem_type_flag    Selects math path (0 for PROBLEM_TYPE_CCE, 1 for PROBLEM_TYPE_BCE).
-/// @param reduction_mode_flag  Selects aggregation op (0 for AGG_MODE_SUM, 1 for AGG_MODE_AVERAGE).
-/// @param chunk_id             The logical identifier for a data chunk [>= 0].
-/// @param param_offset         The starting index for a slice of a larger parameter buffer [>= 0].
-/// @param chunk_size           The number of items (e.g., exits) processed by a chunk [> 0].
-/// @param batch_offset         The starting sample index for a chunk of a larger batch [>= 0].
-/// @param num_batch_samples    The number of samples to process in a given batch chunk [> 0].
-/// @param full_batch_size      The total number of samples in the complete logical batch [> 0].
-/// @param hidden_dim           The logical dimension of the hidden layer [> 0].
-/// @param padded_hidden_dim    The physical memory dimension of the hidden layer [>= hidden_dim].
-/// @param padded_input_dim     The physical memory dimension of the input layer (must be >= logical input dim).
-/// @param output_classes       The number of output classes [> 0, must be <= C_TILE_SIZE in some kernels].
+/// @param local_mem             A pointer to __local memory.
+/// @param problem_type_flag     Selects math path (0 for PROBLEM_TYPE_CCE, 1 for PROBLEM_TYPE_BCE).
+/// @param reduction_mode_flag   Selects aggregation op (0 for AGG_MODE_SUM, 1 for AGG_MODE_AVERAGE).
+/// @param chunk_id              The logical identifier for an exit chunk [>= 0].
+/// @param param_offset          The starting index for a slice of a larger parameter buffer [>= 0].
+/// @param chunk_size            The number of items (e.g., exits) processed by a chunk [> 0].
+/// @param batch_offset          The starting sample index for a batch chunk [>= 0].
+/// @param num_batch_samples     The number of samples to process in a given batch chunk [> 0].
+/// @param class_offset          The starting class index for a class chunk [>= 0].
+/// @param num_classes_in_chunk  The number of classes to process in a class chunk [> 0].
+/// @param full_batch_size       The total number of samples in the complete logical batch [> 0].
+/// @param hidden_dim            The logical dimension of the hidden layer [> 0].
+/// @param padded_hidden_dim     The physical memory dimension of the hidden layer [>= hidden_dim].
+/// @param padded_input_dim      The physical memory dimension of the input layer (must be >= logical input dim).
+/// @param num_total_exits       The total number of exits for the full problem [> 0].
+/// @param total_output_classes  The total number of output classes for the full problem [> 0].
 //--------------------------------------------------------------------------------
 
-// --- Phase 3: Universal Chunk Processing (Forward Pass & Partial Grads) ---
+// --- Phase 4: Shared Layer Forward Pass ---
 
 /**
  * @brief (Node 4) Computes hidden activations for a slice of the input batch.
@@ -136,74 +140,164 @@ __kernel void forward_pass(
     int padded_input_dim,                                          // [IN scalar: > 0, The physical (padded) dimension of the input layer]
     int padded_hidden_dim);                                        // [IN scalar: > 0, The physical (padded) dimension of the hidden layer]
 
-/**
- * @brief (Node 5) Computes partial logits, probabilities, and loss for a chunk of exits.
- * @contract output_classes must be <= C_TILE_SIZE.
- */
-__kernel void compute_chunk_outputs(
-    __global const SCALAR_TYPE *__restrict hidden_buf,       // [IN]  Shape: (full_batch_size, padded_hidden_dim)
-    __global const void *__restrict targets_buf,             // [IN]  Shape: (full_batch_size, ...)
-    __global const SCALAR_TYPE *__restrict hidden_mask,      // [IN]  Shape: (full_batch_size)
-    __global const SCALAR_TYPE *__restrict targets_mask,     // [IN]  Shape: (full_batch_size)
-    __global const SCALAR_TYPE *__restrict exit_weights_buf, // [IN]  Shape: (total_num_exits, hidden_dim, out_classes)
-    __global const SCALAR_TYPE *__restrict exit_biases_buf,  // [IN]  Shape: (total_num_exits, out_classes)
-    __global const SCALAR_TYPE *__restrict temps_buf,        // [IN]  Shape: (total_num_exits)
-    __global SCALAR_TYPE *__restrict partial_logits_out,     // [OUT] Shape: (total_num_chunks, ...)
-    __global SCALAR_TYPE *__restrict partial_probs_out,      // [OUT] Shape: (total_num_chunks, ...)
-    __global SCALAR_TYPE *__restrict partial_loss_out,       // [OUT] Shape: (total_num_chunks, ...)
-    int problem_type_flag,                                   // [IN scalar: 0|1, Selects CCE or BCE math path]
-    int chunk_id,                                            // [IN scalar: >= 0, The logical index of this chunk, used for writing outputs]
-    int param_offset,                                        // [IN scalar: >= 0, The starting index of this chunk's parameters in global buffers]
-    int full_batch_size,                                     // [IN scalar: > 0, The total number of samples in the complete logical batch]
-    int hidden_dim,                                          // [IN scalar: > 0, The logical dimension of the hidden layer]
-    int output_classes,                                      // [IN scalar: > 0 & <= C_TILE_SIZE, The number of output classes for this chunk's exits]
-    int chunk_size,                                          // [IN scalar: > 0, The number of exits processed by this kernel invocation]
-    int padded_hidden_dim);                                  // [IN scalar: > 0, The physical (padded) dimension of the hidden layer]
+// --- Phase 5: Exit Layer Forward Pass & Gradient Computation ---
 
 /**
- * @brief (Node 6) Computes partial gradients for exit parameters and hidden layer contributions.
- * @contract output_classes must be <= C_TILE_SIZE.
+ * @brief (Node 5) Computes a chunk of raw logits for a slice of exits and classes.
+ * @contract First stage of the three-part output computation. This is fully streamable.
+ *           `num_classes_in_chunk` should be <= a hardware-friendly tile size.
  */
-__kernel void calculate_chunk_gradients(
+__kernel void compute_logits_chunk(
+    __global const SCALAR_TYPE *__restrict hidden_buf,       // [IN]  Shape: (full_batch_size, padded_hidden_dim)
+    __global const SCALAR_TYPE *__restrict hidden_mask,      // [IN]  Shape: (full_batch_size)
+    __global const SCALAR_TYPE *__restrict exit_weights_buf, // [IN]  Shape: (total_num_exits, hidden_dim, total_output_classes)
+    __global const SCALAR_TYPE *__restrict exit_biases_buf,  // [IN]  Shape: (total_num_exits, total_output_classes)
+    __global SCALAR_TYPE *__restrict full_logits_out,        // [OUT] Shape: (total_num_exits, full_batch_size, total_output_classes)
+    int chunk_id,                                            // [IN scalar: >= 0, The logical index of the EXIT chunk]
+    int param_offset,                                        // [IN scalar: >= 0, The starting EXIT index for this chunk's parameters]
+    int chunk_size,                                          // [IN scalar: > 0, The number of exits processed by this kernel invocation]
+    int class_offset,                                        // [IN scalar: >= 0, The starting CLASS index for this chunk]
+    int num_classes_in_chunk,                                // [IN scalar: > 0, The number of classes processed by this kernel invocation]
+    int full_batch_size,                                     // [IN scalar: > 0, The total number of samples in the logical batch]
+    int hidden_dim,                                          // [IN scalar: > 0, The logical dimension of the hidden layer]
+    int padded_hidden_dim,                                   // [IN scalar: > 0, The physical (padded) dimension of the hidden layer]
+    int total_output_classes);                               // [IN scalar: > 0, The total number of classes in the full problem]
+
+/**
+ * @brief (Node 6) Reduces the full logit buffer to find normalization terms for Softmax.
+ * @contract Second stage of the three-part output computation. This kernel is a
+ *           synchronization point and is NOT streamable over classes. It runs once
+ *           after all `compute_logits_chunk` calls are complete.
+ */
+__kernel void reduce_logits_for_softmax(
+    __global const SCALAR_TYPE *__restrict full_logits_buf, // [IN]  Shape: (total_num_exits, full_batch_size, total_output_classes)
+    __global const SCALAR_TYPE *__restrict temps_buf,       // [IN]  Shape: (total_num_exits)
+    __global SCALAR_TYPE *__restrict softmax_params_out,    // [OUT] Shape: (total_num_exits, full_batch_size, 2) -> [max_logit, sum_exp]
+    int num_total_exits,                                    // [IN scalar: > 0, The total number of exits in the full problem]
+    int full_batch_size,                                    // [IN scalar: > 0, The total number of samples in the logical batch]
+    int total_output_classes);                              // [IN scalar: > 0, The total number of classes in the full problem]
+
+/**
+ * @brief (Node 7a - CCE Path) Computes probabilities for a class chunk and scatters CCE loss values.
+ * @contract This kernel is only for PROBLEM_TYPE_CCE. Host must zero-initialize final_loss_out.
+ */
+__kernel void compute_probs_loss_cce_chunk(
+    __global const SCALAR_TYPE *__restrict full_logits_buf,    // [IN]
+    __global const SCALAR_TYPE *__restrict softmax_params_buf, // [IN]
+    __global const SCALAR_TYPE *__restrict temps_buf,          // [IN]
+    __global const int *__restrict targets_cce_buf,            // [IN] Specialized for int targets
+    __global const SCALAR_TYPE *__restrict targets_mask,       // [IN]
+    __global SCALAR_TYPE *__restrict partial_probs_out,        // [OUT] Shape: (total_num_exits, full_batch_size, total_output_classes)
+    __global SCALAR_TYPE *__restrict final_loss_out,           // [OUT] Shape: (total_num_exits, full_batch_size)
+    int chunk_id,                                              // [IN scalar] EXIT chunk index
+    int param_offset,                                          // [IN scalar] Starting EXIT index
+    int chunk_size,                                            // [IN scalar] Num exits in this chunk
+    int class_offset,                                          // [IN scalar] Starting CLASS index
+    int num_classes_in_chunk,                                  // [IN scalar]
+    int full_batch_size,                                       // [IN scalar]
+    int total_output_classes);                                 // [IN scalar]
+
+/**
+ * @brief (Node 7b - BCE Path) Computes probabilities for a class chunk and a PARTIAL BCE loss.
+ * @contract This kernel is only for PROBLEM_TYPE_BCE. The partial_loss_out must be aggregated.
+ */
+__kernel void compute_probs_loss_bce_chunk(
+    __global const SCALAR_TYPE *__restrict full_logits_buf, // [IN]
+    __global const SCALAR_TYPE *__restrict temps_buf,       // [IN]
+    __global const SCALAR_TYPE *__restrict targets_bce_buf, // [IN] Specialized for SCALAR_TYPE targets
+    __global const SCALAR_TYPE *__restrict targets_mask,    // [IN]
+    __global SCALAR_TYPE *__restrict partial_probs_out,     // [OUT] Shape: (total_num_exits, full_batch_size, total_output_classes)
+    __global SCALAR_TYPE *__restrict partial_loss_out,      // [OUT] Shape: (num_class_chunks, total_num_exits, full_batch_size)
+    int chunk_id,                                           // [IN scalar] EXIT chunk index
+    int param_offset,                                       // [IN scalar] Starting EXIT index
+    int chunk_size,                                         // [IN scalar] Num exits in this chunk
+    int class_chunk_id,                                     // [IN scalar] CLASS chunk index
+    int class_offset,                                       // [IN scalar] Starting CLASS index
+    int num_classes_in_chunk,                               // [IN scalar]
+    int full_batch_size,                                    // [IN scalar]
+    int total_output_classes,                               // [IN scalar]
+    int num_total_exits);                                   // [IN scalar]
+
+// --- Phase 8-10: Parallel Gradient Computation ---
+
+/**
+ * @brief (Node 8) Computes partial exit param gradients (W, B) for a class chunk.
+ * @contract This kernel is responsible ONLY for the local exit layer gradients.
+ *           It computes the error signal `(prob - target)` on the fly.
+ *           This kernel can run in parallel with Nodes 9 and 10.
+ */
+__kernel void calculate_exit_param_grads_chunk(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
     __global const SCALAR_TYPE *__restrict hidden_buf,        // [IN]  Shape: (full_batch_size, padded_hidden_dim)
-    __global const SCALAR_TYPE *__restrict partial_probs_buf, // [IN]  Shape: (total_num_chunks, ...)
-    __global const void *__restrict targets_buf,              // [IN]  Shape: (full_batch_size, ...)
-    __global const SCALAR_TYPE *__restrict exit_weights_buf,  // [IN]  Shape: (total_num_exits, ...)
-    __global SCALAR_TYPE *__restrict partial_grad_h_aos_out,  // [OUT] Shape: (num_chunks, batch_size, h_dim)
-    __global SCALAR_TYPE *__restrict partial_grad_exit_w_out, // [OUT] Shape: (total_num_chunks, ...)
-    __global SCALAR_TYPE *__restrict partial_grad_exit_b_out, // [OUT] Shape: (total_num_chunks, ...)
-    int problem_type_flag,                                    // [IN scalar: 0|1, Selects CCE or BCE math path]
-    int chunk_id,                                             // [IN scalar: >= 0, The logical index of this chunk, used for reading/writing outputs]
-    int param_offset,                                         // [IN scalar: >= 0, The starting index of this chunk's parameters in global buffers]
-    int full_batch_size,                                      // [IN scalar: > 0, The total number of samples in the complete logical batch]
-    int hidden_dim,                                           // [IN scalar: > 0, The logical dimension of the hidden layer]
-    int output_classes,                                       // [IN scalar: > 0 & <= C_TILE_SIZE, The number of output classes for this chunk's exits]
-    int chunk_size,                                           // [IN scalar: > 0, The number of exits processed by this kernel invocation]
-    int padded_hidden_dim);                                   // [IN scalar: > 0, The physical (padded) dimension of the hidden layer]
+    __global const SCALAR_TYPE *__restrict partial_probs_buf, // [IN]  Shape: (total_num_exits, full_batch_size, total_output_classes)
+    __global const void *__restrict targets_buf,              // [IN]  Shape: (full_batch_size, ...) [Type depends on problem]
+    __global SCALAR_TYPE *__restrict partial_grad_exit_w_out, // [OUT] Shape: (num_class_chunks, num_total_exits, h_dim, total_output_classes)
+    __global SCALAR_TYPE *__restrict partial_grad_exit_b_out, // [OUT] Shape: (num_class_chunks, num_total_exits, total_output_classes)
+    int problem_type_flag,                                    // [IN scalar: 0|1]
+    int chunk_id,                                             // [IN scalar: >= 0, EXIT chunk index]
+    int param_offset,                                         // [IN scalar: >= 0, Starting EXIT index for this chunk]
+    int chunk_size,                                           // [IN scalar: > 0, Num EXITS in this chunk]
+    int class_chunk_id,                                       // [IN scalar: >= 0, CLASS chunk index, for indexing output buffer]
+    int class_offset,                                         // [IN scalar: >= 0, Starting CLASS index for this chunk]
+    int num_classes_in_chunk,                                 // [IN scalar: > 0]
+    int full_batch_size,                                      // [IN scalar: > 0]
+    int hidden_dim,                                           // [IN scalar: > 0]
+    int padded_hidden_dim,                                    // [IN scalar: > 0]
+    int total_output_classes,                                 // [IN scalar: > 0]
+    int num_total_exits);                                     // [IN scalar: > 0]
 
 /**
- * @brief (Node 7) Computes partial temperature gradients for a chunk of exits.
+ * @brief (Node 9) Computes the partial upstream gradient for the hidden layer.
+ * @contract This kernel is responsible ONLY for the `Grad_H` backpropagation.
+ *           It computes the error signal `(prob - target)` on the fly.
+ *           This kernel can run in parallel with Nodes 8 and 10.
+ */
+__kernel void backprop_error_to_hidden_chunk(
+    __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
+    __global const SCALAR_TYPE *__restrict partial_probs_buf, // [IN]  Shape: (total_num_exits, full_batch_size, total_output_classes)
+    __global const void *__restrict targets_buf,              // [IN]  Shape: (full_batch_size, ...) [Type depends on problem]
+    __global const SCALAR_TYPE *__restrict exit_weights_buf,  // [IN]  Shape: (total_num_exits, hidden_dim, total_output_classes)
+    __global SCALAR_TYPE *__restrict partial_grad_h_aos_out,  // [OUT] Shape: (num_class_chunks, num_total_exits, batch_size, h_dim)
+    int problem_type_flag,                                    // [IN scalar: 0|1]
+    int chunk_id,                                             // [IN scalar: >= 0, EXIT chunk index]
+    int param_offset,                                         // [IN scalar: >= 0, Starting EXIT index for this chunk]
+    int chunk_size,                                           // [IN scalar: > 0, Num EXITS in this chunk]
+    int class_chunk_id,                                       // [IN scalar: >= 0, CLASS chunk index, for indexing output buffer]
+    int class_offset,                                         // [IN scalar: >= 0, Starting CLASS index for this chunk]
+    int num_classes_in_chunk,                                 // [IN scalar: > 0]
+    int full_batch_size,                                      // [IN scalar: > 0]
+    int hidden_dim,                                           // [IN scalar: > 0]
+    int total_output_classes,                                 // [IN scalar: > 0]
+    int num_total_exits);                                     // [IN scalar: > 0]
+
+/**
+ * @brief (Node 10) Computes partial temperature gradients for a chunk of exits and classes.
+ * @contract Produces a partial temperature gradient per class-chunk that must be aggregated.
+ *           This kernel can run in parallel with Nodes 8 and 9.
  */
 __kernel void calculate_chunk_temp_gradients(
-    __local SCALAR_TYPE *local_mem,                            // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
-    __global const SCALAR_TYPE *__restrict partial_logits_buf, // [IN]  Shape: (total_num_chunks, ...)
-    __global const SCALAR_TYPE *__restrict partial_probs_buf,  // [IN]  Shape: (total_num_chunks, ...)
-    __global const void *__restrict targets_buf,               // [IN]  Shape: (full_batch_size, ...)
-    __global const SCALAR_TYPE *__restrict targets_mask,       // [IN]  Shape: (full_batch_size)
-    __global const SCALAR_TYPE *__restrict temps_buf,          // [IN]  Shape: (total_num_exits)
-    __global SCALAR_TYPE *__restrict partial_grad_temps_out,   // [OUT] Shape: (total_num_chunks, ...)
-    int problem_type_flag,                                     // [IN scalar: 0|1, Selects CCE or BCE math path]
-    int chunk_id,                                              // [IN scalar: >= 0, The logical index of this chunk, used for reading/writing outputs]
-    int param_offset,                                          // [IN scalar: >= 0, The starting index of this chunk's parameters in global buffers]
-    int full_batch_size,                                       // [IN scalar: > 0, The total number of samples in the complete logical batch]
-    int output_classes,                                        // [IN scalar: > 0, The number of output classes for this chunk's exits]
-    int chunk_size);                                           // [IN scalar: > 0, The number of exits processed by this kernel invocation]
+    __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
+    __global const SCALAR_TYPE *__restrict full_logits_buf,   // [IN]  Shape: (total_num_exits, full_batch_size, total_output_classes)
+    __global const SCALAR_TYPE *__restrict partial_probs_buf, // [IN]  Shape: (total_num_exits, full_batch_size, total_output_classes)
+    __global const void *__restrict targets_buf,              // [IN]  Shape: (full_batch_size, ...)
+    __global const SCALAR_TYPE *__restrict targets_mask,      // [IN]  Shape: (full_batch_size)
+    __global const SCALAR_TYPE *__restrict temps_buf,         // [IN]  Shape: (total_num_exits)
+    __global SCALAR_TYPE *__restrict partial_grad_temps_out,  // [OUT] Shape: (num_class_chunks, total_num_exits)
+    int problem_type_flag,                                    // [IN scalar: 0|1]
+    int chunk_id,                                             // [IN scalar: >= 0, EXIT chunk index]
+    int param_offset,                                         // [IN scalar: >= 0, Starting EXIT index]
+    int chunk_size,                                           // [IN scalar: > 0, Num exits in this chunk]
+    int class_chunk_id,                                       // [IN scalar: >= 0, CLASS chunk index]
+    int class_offset,                                         // [IN scalar: >= 0, Starting CLASS index]
+    int num_classes_in_chunk,                                 // [IN scalar: > 0, The number of classes processed by this chunk]
+    int full_batch_size,                                      // [IN scalar: > 0]
+    int total_output_classes,                                 // [IN scalar: > 0]
+    int num_total_exits);                                     // [IN scalar: > 0]
 
-// --- Phase 4: Data Layout Transformation ---
+// --- Phase 11: Data Layout Transformation ---
 
 /**
- * @brief (Node 8) Transposes a matrix from chunk-major to item-major layout.
+ * @brief (Node 11) Transposes a matrix from chunk-major to item-major layout.
  * @contract Work dispatch must be a 2D grid with local size (C_TILE_SIZE, C_TILE_SIZE, 1).
  * @contract Global size must be a multiple of local size, covering the full matrix.
  */
@@ -214,39 +308,10 @@ __kernel void transpose_grad_h(
     int num_chunks,                                        // [IN scalar: > 0, The number of chunks (input matrix height)]
     int num_items);                                        // [IN scalar: > 0, The number of items per chunk (input matrix width)]
 
-// --- Phase 5 & 7: Generic Tiered Aggregation Engine ---
-
-// Kernels for aggregating partial results, tiered by the number of items (`N`).
-// They share a signature, but differ in their use of parameters and memory.
-// The host orchestrator selects the appropriate kernel based on `N`.
+// --- Phase 12 & 15: Generic Tiered Aggregation Engine ---
 
 /**
- * @brief (Tier 2/3: N is large) Reduces partial results using local memory.
- */
-__kernel void aggregate_local_reduce(
-    __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
-    __global const SCALAR_TYPE *__restrict partial_input_buf, // [IN]  Shape: (num_items_to_reduce, item_stride)
-    __global SCALAR_TYPE *__restrict final_output_buf,        // [OUT] Shape: (item_stride)
-    int num_items_to_reduce,                                  // [IN scalar: > 0, Number of partial results to reduce (N)]
-    int item_stride,                                          // [IN scalar: > 0, Size of one item/tensor in elements]
-    int reduction_mode_flag                                   // [IN scalar: 0|1, The aggregation operation (e.g., SUM or AVERAGE)]
-);
-
-/**
- * @brief (Tier 1: N is small) Reduces partial results using registers.
- * @contract Other parameters follow the baseline contract.
- */
-__kernel void aggregate_register_reduce(
-    __local SCALAR_TYPE *local_mem,                           // [MEMORY (unused)]
-    __global const SCALAR_TYPE *__restrict partial_input_buf, // [IN]  Shape: (num_items_to_reduce, item_stride)
-    __global SCALAR_TYPE *__restrict final_output_buf,        // [OUT] Shape: (item_stride)
-    int num_items_to_reduce,                                  // [IN scalar: > 0, Number of partial results to reduce (N)]
-    int item_stride,                                          // [IN scalar: > 0, Size of one item/tensor in elements]
-    int reduction_mode_flag);                                 // [IN scalar: 0|1, The aggregation operation (e.g., SUM or AVERAGE)]
-
-/**
- * @brief (Tier 0: N=1) Identity pass-through for a single partial result.
- * @contract Input shape `partial_input_buf` is effectively (item_stride).
+ * @brief (Node 12, 15) (Tier 0: N=1) Identity pass-through for a single partial result.
  */
 __kernel void aggregate_identity(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY (unused)]
@@ -257,10 +322,33 @@ __kernel void aggregate_identity(
     int reduction_mode_flag                                   // [IN scalar: unused, Present for signature compatibility]
 );
 
-// --- Phase 6: Streaming Shared Layer Backpropagation ---
+/**
+ * @brief (Node 12, 15) (Tier 1: N is small) Reduces partial results using registers.
+ */
+__kernel void aggregate_register_reduce(
+    __local SCALAR_TYPE *local_mem,                           // [MEMORY (unused)]
+    __global const SCALAR_TYPE *__restrict partial_input_buf, // [IN]  Shape: (num_items_to_reduce, item_stride)
+    __global SCALAR_TYPE *__restrict final_output_buf,        // [OUT] Shape: (item_stride)
+    int num_items_to_reduce,                                  // [IN scalar: > 0, Number of partial results to reduce (N)]
+    int item_stride,                                          // [IN scalar: > 0, Size of one item/tensor in elements]
+    int reduction_mode_flag);                                 // [IN scalar: 0|1, The aggregation operation (e.g., SUM or AVERAGE)]
 
 /**
- * @brief (Node 10) Computes partial gradients for shared layer weights from a batch chunk.
+ * @brief (Node 12, 15) (Tier 2: N is large) Reduces partial results using local memory.
+ */
+__kernel void aggregate_local_reduce(
+    __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
+    __global const SCALAR_TYPE *__restrict partial_input_buf, // [IN]  Shape: (num_items_to_reduce, item_stride)
+    __global SCALAR_TYPE *__restrict final_output_buf,        // [OUT] Shape: (item_stride)
+    int num_items_to_reduce,                                  // [IN scalar: > 0, Number of partial results to reduce (N)]
+    int item_stride,                                          // [IN scalar: > 0, Size of one item/tensor in elements]
+    int reduction_mode_flag                                   // [IN scalar: 0|1, The aggregation operation (e.g., SUM or AVERAGE)]
+);
+
+// --- Phase 13-14: Streaming Shared Layer Backpropagation ---
+
+/**
+ * @brief (Node 13) Computes partial gradients for shared layer weights from a batch chunk.
  */
 __kernel void backprop_shared_weights_chunk(
     __local SCALAR_TYPE *local_mem,                          // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
@@ -276,7 +364,7 @@ __kernel void backprop_shared_weights_chunk(
     int padded_hidden_dim);                                  // [IN scalar: > 0, The physical (padded) dimension of the hidden layer]
 
 /**
- * @brief (Node 11) Computes partial gradients for shared layer biases from a batch chunk.
+ * @brief (Node 14) Computes partial gradients for shared layer biases from a batch chunk.
  */
 __kernel void backprop_shared_biases_chunk(
     __local SCALAR_TYPE *local_mem,                          // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
@@ -289,10 +377,10 @@ __kernel void backprop_shared_biases_chunk(
     int chunk_id,                                            // [IN scalar: >= 0, The logical index of this batch chunk for writing partial results]
     int padded_hidden_dim);                                  // [IN scalar: > 0, The physical (padded) dimension of the hidden layer]
 
-// --- Phase 8: Finalization & Dispatch ---
+// --- Phase 16-18: Finalization & Dispatch ---
 
 /**
- * @brief (Node 14) Applies Adam optimizer update to a slice of a parameter buffer.
+ * @brief (Node 17) Applies Adam optimizer update to a slice of a parameter buffer.
  */
 __kernel void adam_update(
     __global const SCALAR_TYPE *__restrict grad, // [IN]  Final, aggregated gradients for this parameter slice.
@@ -309,7 +397,7 @@ __kernel void adam_update(
     int num_params_to_update);                   // [IN scalar: > 0, The number of parameters to update in this slice]
 
 /**
- * @brief (Node 15) Clamps temperature parameters within a [min, max] range.
+ * @brief (Node 18) Clamps temperature parameters within a [min, max] range.
  */
 __kernel void clamp_temperatures(
     __global SCALAR_TYPE *__restrict temps_buf, // [IN/OUT] The temperature parameters to be clamped.

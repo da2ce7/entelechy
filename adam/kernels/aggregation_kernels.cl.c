@@ -5,7 +5,7 @@
 #include "kernels.cl.h"
 #endif
 
-// --- Implementation: transpose_grad_h (Node 8) ---
+// --- Implementation: transpose_grad_h (Node 11) ---
 // Strategy: A classic two-phase tiled matrix transpose.
 // Phase 1: Threads in a work-group cooperate to read a tile of the source
 // matrix into __local memory with coalesced accesses.
@@ -49,7 +49,7 @@ __kernel void transpose_grad_h(__local SCALAR_TYPE *tile, __global const SCALAR_
     }
 }
 
-// --- Implementation: aggregate_identity (Tier 0) ---
+// --- Implementation: aggregate_identity (Node 12, 15) (Tier 0: N=1) ---
 // Strategy: A simple memory copy. Each work-item maps to one element of the
 // tensor. This provides a near-zero-cost abstraction path for the N=1 case,
 // fulfilling the unified dataflow architecture principle.
@@ -67,7 +67,7 @@ __kernel void aggregate_identity(
     final_output_buf[i] = partial_input_buf[i];
 }
 
-// --- Implementation: aggregate_register_reduce (Tier 1) ---
+// --- Implementation: aggregate_register_reduce (Node 12, 15) (Tier 1: N is small) ---
 // Strategy: A "map" kernel where each work-item computes a single element of
 // the final tensor. The reduction loop is performed entirely in private registers
 // (`accum`), making it highly efficient for a small number of items to reduce.
@@ -98,7 +98,7 @@ __kernel void aggregate_register_reduce(
     final_output_buf[i] = accum;
 }
 
-// --- Implementation: aggregate_local_reduce (Tier 2/3) ---
+// --- Implementation: aggregate_local_reduce (Node 12, 15) (Tier 2: N is large) ---
 // Strategy: A "work-group per element" reduction. Each work-group is responsible
 // for computing one element of the final output tensor. Threads within the group
 // collaboratively sum their assigned partial results, then perform a final, fast
