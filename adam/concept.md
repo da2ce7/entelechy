@@ -63,7 +63,25 @@ graph TD
     classDef grad_path_a fill:#f3e5f5,stroke:#8e24aa
     classDef grad_path_b fill:#e1f5fe,stroke:#0288d1
     classDef grad_path_c fill:#e8f5e9,stroke:#2e7d32
+    classDef fused_kernel_box fill:#f0f4c3,stroke:#afb42b,stroke-width:2px,stroke-dasharray: 5 2
+    classDef logical_step fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray: 2 2
 
+
+    subgraph "Annotation Key: Fused Operations"
+        direction LR
+        subgraph " "
+            LS_Alpha["α"]:::logical_step
+            LS_Beta["β"]:::logical_step
+            LS_Gamma["γ"]:::logical_step
+            LS_Delta["δ"]:::logical_step
+        end
+        subgraph " "
+            Desc_Alpha["Mat-Mul + Bias<br/>(Standard Op Fusion)"]
+            Desc_Beta["Probability Calc + Loss Calc<br/>(Producer-Consumer Fusion)"]
+            Desc_Gamma["Weight Grad + Bias Grad<br/>(Data Reuse Fusion)"]
+            Desc_Delta["Mat-Mul + Bias + ReLU<br/>(Standard Op Fusion)"]
+        end
+    end
 
     %% Phase 0-3: Setup
     subgraph Phase 0-3: Host Setup & Global Params
@@ -71,18 +89,28 @@ graph TD
         P_Shared[Shared Params]:::param; P_Exits[Exit Params]:::param; P_Temps[Temp Params]:::param; Targets[Targets]:::param
     end
 
-    %% Phase 4: Shared Layer Forward Pass
+    %% Phase 4: Shared Layer Forward Pass (Fused)
     subgraph "Phase 4: Shared Layer Forward Pass"
         style "Phase 4: Shared Layer Forward Pass" loop_box
         note_hidden["Note: hidden_i lifecycle<br/>(Cache or Recompute)<br/>managed by Host"]
         HL_2 --> note_hidden
-        K4["(4) forward_pass"]:::kernel --> hidden_i[Hidden Activations<br/>Chunk 'i']:::data
+
+        subgraph K4["(4) forward_pass"]:::fused_kernel_box
+            direction LR
+            L4a["Mat-Mul δ"]:::logical_step --> L4b["Bias Add δ"]:::logical_step --> L4c["ReLU δ"]:::logical_step
+        end
+        HL_1 --> L4a
+        L4c --> hidden_i[Hidden Activations<br/>Chunk 'i']:::data
     end
 
-    %% Phase 5-7: Conditional Exit Layer Forward Pass
+    %% Phase 5-7: Conditional Exit Layer Forward Pass (Fused)
     subgraph "Phase 5-7: Conditional Exit Layer Forward Pass"
-        K5["(5) compute_logits_chunk"]:::kernel --> Full_Logits[Full Logits Buffer]:::full_intermediate
-        hidden_i --> K5
+        subgraph K5["(5) compute_logits_chunk"]:::fused_kernel_box
+             direction LR
+             L5a["Mat-Mul α"]:::logical_step --> L5b["Bias Add α"]:::logical_step
+        end
+        hidden_i --> L5a
+        L5b --> Full_Logits[Full Logits Buffer]:::full_intermediate
 
         HL_3["(7) Host Selects Path<br/>based on problem_type"]:::host_logic
         Full_Logits --> HL_3
@@ -92,30 +120,40 @@ graph TD
             HL_3 --> K6["(6) reduce_logits_for_softmax"]:::kernel
             Full_Logits --> K6
             K6 --> Softmax_Params[Softmax Denominators]:::full_intermediate
-            Softmax_Params --> K7_cce["(7a) compute_probs_loss_cce_chunk"]:::kernel
-            Full_Logits --> K7_cce
-            K7_cce --> FINAL_Loss_CCE[FINAL CCE Loss (no agg needed)]:::final_data
-            K7_cce --> PARTIAL_Probs[PARTIAL Probabilities]:::partial_data
+
+            subgraph K7_cce["(7a) compute_probs_loss_cce_chunk"]:::fused_kernel_box
+                L7a_prob["Prob Calc β"]:::logical_step --> L7a_loss["Loss Calc β"]:::logical_step
+            end
+            Softmax_Params & Full_Logits --> L7a_prob
+            L7a_loss --> FINAL_Loss_CCE[FINAL CCE Loss (no agg needed)]:::final_data
+            L7a_prob --> PARTIAL_Probs[PARTIAL Probabilities]:::partial_data
         end
 
         subgraph BCE Path (Sigmoid)
             style "BCE Path (Sigmoid)" path_bce
-            HL_3 --> K7_bce["(7b) compute_probs_loss_bce_chunk"]:::kernel
-            Full_Logits --> K7_bce
-            K7_bce --> PARTIAL_Loss_BCE[PARTIAL BCE Loss]:::partial_data
-            K7_bce --> PARTIAL_Probs
+            subgraph K7_bce["(7b) compute_probs_loss_bce_chunk"]:::fused_kernel_box
+                L7b_prob["Prob Calc β"]:::logical_step --> L7b_loss["Loss Calc β"]:::logical_step
+            end
+            HL_3 & Full_Logits --> L7b_prob
+            L7b_loss --> PARTIAL_Loss_BCE[PARTIAL BCE Loss]:::partial_data
+            L7b_prob --> PARTIAL_Probs
         end
     end
 
-    %% Phase 8-10: Parallel Gradient Computation
+    %% Phase 8-10: Parallel Gradient Computation (Fused)
     subgraph "Phase 8-10: Parallel Gradient Computation"
         style "Phase 8-10: Parallel Gradient Computation" parallel_group
 
         subgraph "Local Exit Gradients"
             style "Local Exit Gradients" grad_path_a
-            K8["<b>(8) calculate_exit_param_grads_chunk</b>"]:::kernel
-            PARTIAL_Probs & Targets & hidden_i --> K8
-            K8 --> PARTIAL_Grad_ExitW[PARTIAL Grad_ExitW]:::partial_data & PARTIAL_Grad_ExitB[PARTIAL Grad_ExitB]:::partial_data
+            subgraph K8["<b>(8) calculate_exit_param_grads_chunk</b>"]:::fused_kernel_box
+                L8_w["Weight Grad Calc γ"]:::logical_step
+                L8_b["Bias Grad Calc γ"]:::logical_step
+            end
+            PARTIAL_Probs & Targets --> L8_w; PARTIAL_Probs & Targets --> L8_b
+            hidden_i --> L8_w
+            L8_w --> PARTIAL_Grad_ExitW[PARTIAL Grad_ExitW]:::partial_data
+            L8_b --> PARTIAL_Grad_ExitB[PARTIAL Grad_ExitB]:::partial_data
         end
 
         subgraph "Upstream Hidden Gradients"
@@ -133,14 +171,13 @@ graph TD
         end
     end
 
-    %% Phase 11: Data Layout Transformation
+    %% Phase 11-18: Remainder of Graph (Unchanged)
     subgraph "Phase 11: Data Layout Transformation"
         direction LR
         PARTIAL_Grad_H_AoS -- All Chunks --> K11["<b>(11) transpose_grad_h</b>"]:::transpose_kernel
         K11 --> PARTIAL_Grad_H_SoA["PARTIAL Grad_H<br/>(SoA Layout)"]:::partial_data
     end
 
-    %% Phase 12: Primary Aggregation Engine
     subgraph Phase 12: Primary Aggregation
         K12["<b>(12) Aggregate Kernel</b>"]:::host_logic
         PARTIAL_Probs & PARTIAL_Loss_BCE & PARTIAL_Grad_ExitW & PARTIAL_Grad_ExitB & PARTIAL_Grad_Temps & PARTIAL_Grad_H_SoA -- All Partial Data --> K12
@@ -148,26 +185,21 @@ graph TD
         K12 --> FINAL_Grad_ExitW[Final Grad_ExitW]:::final_data & FINAL_Grad_ExitB[Final Grad_ExitB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
     end
 
-    %% Phase 13-14: Streaming Shared Layer Backprop
     subgraph "Phase 13-14: Streaming Shared Layer Backprop"
         style "Phase 13-14: Streaming Shared Layer Backprop" parallel_group
         Input_i[Input Chunk 'i']:::data --> K13["<b>(13) backprop_shared_weights_chunk</b>"]:::kernel
         K13 --> PARTIAL_Grad_SW_i[PARTIAL Grad_SW 'i']:::partial_data
-
         hidden_i --> K13 & K14
         FINAL_Grad_H -- slice --> K13 & K14
-
         K14["<b>(14) backprop_shared_biases_chunk</b>"]:::kernel --> PARTIAL_Grad_SB_i[PARTIAL Grad_SB 'i']:::partial_data
     end
 
-    %% Phase 15: Final Aggregation
     subgraph Phase 15: Final Aggregation
         K15["<b>(15) Aggregate Kernel</b>"]:::host_logic
         PARTIAL_Grad_SW_i & PARTIAL_Grad_SB_i -- All Chunks --> K15
         K15 --> FINAL_Grad_SW[Final Grad_SW]:::final_data & FINAL_Grad_SB[Final Grad_SB]:::final_data
     end
 
-    %% Phase 16-18: Finalization & Dispatch
     subgraph "Phase 16-18: Finalization & Dispatch"
         direction LR
         subgraph "A. Early Exit Path"
@@ -183,7 +215,6 @@ graph TD
     end
 
     %% Connections
-    HL_1 --> K4;
     FINAL_Probs --> K16
     EV_Inference --> Host_Act["Host Acts on<br/>Early Result"]:::host_logic
     EV_Final --> Host_Wait_Final["Host Blocks for<br/>Full Batch"]:::host_logic

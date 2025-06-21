@@ -19,7 +19,7 @@ __kernel void backprop_shared_weights_chunk(
     __global SCALAR_TYPE *__restrict partial_grad_sw_out,
     int batch_offset,
     int num_batch_samples,
-    int chunk_id,
+    int batch_chunk_id,
     int padded_input_dim,
     int padded_hidden_dim) {
     // Work-group (i_idx, j_idx) computes the gradient for shared weight SW[i_idx][j_idx].
@@ -45,12 +45,8 @@ __kernel void backprop_shared_weights_chunk(
         // Upstream gradient for this hidden neuron activation (A).
         const SCALAR_TYPE grad_h = final_grad_h_buf[b_global * padded_hidden_dim + j_idx];
 
-        // To get dL/dZ, we need dL/dA (which is grad_h) and dA/dZ (derivative of activation).
-        const uint        h_block                  = j_idx / SIMD_WIDTH;
-        const uint        h_lane                   = j_idx % SIMD_WIDTH;
-        const uint        padded_hidden_dim_blocks = (padded_hidden_dim + SIMD_WIDTH - 1) / SIMD_WIDTH;
-        const uint        physical_hidden_idx      = b_global * padded_hidden_dim_blocks * SIMD_WIDTH + h_block * SIMD_WIDTH + h_lane;
-        const SCALAR_TYPE hidden_val               = hidden_buf[physical_hidden_idx];
+        // HARMONIZED: Use the macro to reliably get the hidden activation value.
+        const SCALAR_TYPE hidden_val = hidden_buf[GET_PHYSICAL_HIDDEN_IDX(b_global, j_idx, padded_hidden_dim)];
 
         // Derivative of the ReLU activation function (dA/dZ).
         const SCALAR_TYPE d_activation = select((SCALAR_TYPE)0.0f, (SCALAR_TYPE)1.0f, hidden_val > SCALAR_ZERO);
@@ -66,13 +62,15 @@ __kernel void backprop_shared_weights_chunk(
     local_mem[lid] = p_grad_sw;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint s = lsize / 2; s > 0; s >>= 1) {
-        if (lid < s)
+        if (lid < s) {
             local_mem[lid] += local_mem[lid + s];
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
     if (lid == 0) {
-        const uint grad_w_out_idx           = chunk_id * padded_input_dim * padded_hidden_dim + i_idx * padded_hidden_dim + j_idx;
+        // Use the renamed `batch_chunk_id` for clarity.
+        const uint grad_w_out_idx           = batch_chunk_id * padded_input_dim * padded_hidden_dim + i_idx * padded_hidden_dim + j_idx;
         partial_grad_sw_out[grad_w_out_idx] = local_mem[0];
     }
 }
@@ -90,7 +88,7 @@ __kernel void backprop_shared_biases_chunk(
     __global SCALAR_TYPE *__restrict partial_grad_sb_out,
     int batch_offset,
     int num_batch_samples,
-    int chunk_id,
+    int batch_chunk_id,
     int padded_hidden_dim) {
     // Work-group j_idx computes the gradient for shared bias SB[j_idx].
     const uint j_idx = get_group_id(0);
@@ -113,13 +111,10 @@ __kernel void backprop_shared_biases_chunk(
 
         const SCALAR_TYPE grad_h = final_grad_h_buf[b_global * padded_hidden_dim + j_idx];
 
-        const uint        h_block                  = j_idx / SIMD_WIDTH;
-        const uint        h_lane                   = j_idx % SIMD_WIDTH;
-        const uint        padded_hidden_dim_blocks = (padded_hidden_dim + SIMD_WIDTH - 1) / SIMD_WIDTH;
-        const uint        physical_hidden_idx      = b_global * padded_hidden_dim_blocks * SIMD_WIDTH + h_block * SIMD_WIDTH + h_lane;
-        const SCALAR_TYPE hidden_val               = hidden_buf[physical_hidden_idx];
-        const SCALAR_TYPE d_activation             = select((SCALAR_TYPE)0.0f, (SCALAR_TYPE)1.0f, hidden_val > SCALAR_ZERO);
-        const SCALAR_TYPE dL_dZ_j                  = grad_h * d_activation;
+        // HARMONIZED: Use the macro to reliably get the hidden activation value.
+        const SCALAR_TYPE hidden_val   = hidden_buf[GET_PHYSICAL_HIDDEN_IDX(b_global, j_idx, padded_hidden_dim)];
+        const SCALAR_TYPE d_activation = select((SCALAR_TYPE)0.0f, (SCALAR_TYPE)1.0f, hidden_val > SCALAR_ZERO);
+        const SCALAR_TYPE dL_dZ_j      = grad_h * d_activation;
 
         // Gradient for bias is simply dL/dZ_j, since dZ_j/dB_j = 1.
         p_grad_sb += dL_dZ_j;
@@ -129,13 +124,15 @@ __kernel void backprop_shared_biases_chunk(
     local_mem[lid] = p_grad_sb;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint s = lsize / 2; s > 0; s >>= 1) {
-        if (lid < s)
+        if (lid < s) {
             local_mem[lid] += local_mem[lid + s];
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
     if (lid == 0) {
-        const uint grad_b_out_idx           = chunk_id * padded_hidden_dim + j_idx;
+        // Use the renamed `batch_chunk_id` for clarity.
+        const uint grad_b_out_idx           = batch_chunk_id * padded_hidden_dim + j_idx;
         partial_grad_sb_out[grad_b_out_idx] = local_mem[0];
     }
 }

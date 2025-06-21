@@ -11,6 +11,7 @@
 // The `param_offset` enables this generic kernel to be dispatched multiple times,
 // applying updates to distinct slices of the overall parameter set (e.g.,
 // Shared Layer, Exit Layers, Temperatures) each with their own Adam state.
+// NOTE: This kernel's signature was already clear and specific, requiring no changes.
 __kernel void adam_update(
     __global const SCALAR_TYPE *__restrict grad,
     SCALAR_TYPE beta1,
@@ -32,8 +33,7 @@ __kernel void adam_update(
     }
 
     // Map the work-item's local index within this dispatch to the global index
-    // into the full parameter and momentum buffers. This is the key mechanism
-    // that enables sliced updates for different parameter groups.
+    // into the full parameter and momentum buffers.
     const int global_idx = param_offset + local_idx;
 
     const SCALAR_TYPE g      = grad[global_idx];
@@ -65,11 +65,12 @@ __kernel void adam_update(
 // Strategy: An embarrassingly parallel map kernel. Each work-item is assigned to
 // a single temperature parameter and performs the clamp operation independently.
 // This is the final operation in the training graph.
-__kernel void clamp_temperatures(__global SCALAR_TYPE *__restrict temps_buf, SCALAR_TYPE min_temp, SCALAR_TYPE max_temp, int num_exits) {
+__kernel void clamp_temperatures(__global SCALAR_TYPE *__restrict temps_buf, SCALAR_TYPE min_temp, SCALAR_TYPE max_temp, int total_exits) {
 
     const int idx = get_global_id(0);
 
-    if (idx >= num_exits) {
+    // Use the standardized `total_exits` parameter name.
+    if (idx >= total_exits) {
         return;
     }
 
