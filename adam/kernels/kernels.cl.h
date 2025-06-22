@@ -101,7 +101,9 @@ inline SCALAR_TYPE select(SCALAR_TYPE a, SCALAR_TYPE b, int c) { return (c) ? b 
 
 /**
  * @brief (Node 4) Computes hidden activations for a slice of the input batch.
- * @contract The activation function is ReLU.
+ * @contract Applies a (Weights * Input + Bias) transform followed by a ReLU activation.
+ * @usage (Host) Called once for the initial forward pass. May be called a second time
+ *          during backprop if the "recompute hidden" strategy is active.
  */
 __kernel void forward_pass(
     __local SCALAR_TYPE *local_mem,                                // [MEMORY size: SIMD_WIDTH * (1 + SIMD_WIDTH) * sizeof(SCALAR_TYPE)]
@@ -120,6 +122,8 @@ __kernel void forward_pass(
 
 /**
  * @brief (Node 5) Computes a chunk of raw logits for a slice of exits and classes.
+ * @contract Performs a (Weights * Input + Bias) transform to produce raw logits.
+ * @usage (Host) Called in a loop over exit/class chunks.
  */
 __kernel void compute_logits_chunk(
     __global const SCALAR_TYPE *__restrict hidden_buf,       // [IN]  Shape: (total_batch_size, padded_hidden_dim)
@@ -139,6 +143,8 @@ __kernel void compute_logits_chunk(
 
 /**
  * @brief (Node 6) Reduces logits to find normalization terms for numerically stable Softmax.
+ * @contract Finds the max logit and computes the sum of exps for stable Softmax.
+ * @usage (Host) CCE Path Only. Acts as a synchronization point before kernel (7a).
  */
 __kernel void reduce_logits_for_softmax(
     __global const SCALAR_TYPE *__restrict full_logits_buf, // [IN]  Shape: (total_exits, total_batch_size, total_output_classes)
@@ -150,6 +156,9 @@ __kernel void reduce_logits_for_softmax(
 
 /**
  * @brief (Node 7a - CCE Path) Computes probabilities and scatters final CCE loss values.
+ * @contract Computes Softmax probabilities and the final CCE loss. The loss output
+ *           DOES NOT require aggregation due to its scatter-write implementation.
+ * @usage (Host) CCE Path Only. Depends on kernel (6).
  */
 __kernel void compute_probs_loss_cce_chunk(
     __global const SCALAR_TYPE *__restrict full_logits_buf,    // [IN]  Shape: (total_exits, total_batch_size, total_output_classes)
@@ -169,6 +178,9 @@ __kernel void compute_probs_loss_cce_chunk(
 
 /**
  * @brief (Node 7b - BCE Path) Computes probabilities and a PARTIAL BCE loss.
+ * @contract Computes Sigmoid probabilities and a partial BCE loss. The loss output
+ *           REQUIRES aggregation across all class chunks.
+ * @usage (Host) BCE Path Only. The `partial_loss_out` buffer must be aggregated.
  */
 __kernel void compute_probs_loss_bce_chunk(
     __global const SCALAR_TYPE *__restrict full_logits_buf, // [IN]  Shape: (total_exits, total_batch_size, total_output_classes)
@@ -191,6 +203,11 @@ __kernel void compute_probs_loss_bce_chunk(
 
 /**
  * @brief (Node 8) Computes partial exit param gradients (Weights, Biases) for a class chunk.
+ * @contract Computes the (prob - target) error signal internally and produces a
+ *           *partial* gradient via reduction over the batch dimension.
+ *           If `problem_type_flag`=0 (CCE), `targets_buf` is `__global int*`.
+ *           If `problem_type_flag`=1 (BCE), `targets_buf` is `__global SCALAR_TYPE*`.
+ * @usage (Host) Launched in parallel with kernels (9) and (10) for the same chunk.
  */
 __kernel void calculate_exit_param_grads_chunk(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
@@ -214,6 +231,11 @@ __kernel void calculate_exit_param_grads_chunk(
 
 /**
  * @brief (Node 9) Computes the partial upstream gradient for the hidden layer (Grad_H).
+ * @contract Computes the (prob - target) error signal internally and produces a
+ *           *partial* upstream gradient (AoS layout) via reduction over the class dimension.
+ *           If `problem_type_flag`=0 (CCE), `targets_buf` is `__global int*`.
+ *           If `problem_type_flag`=1 (BCE), `targets_buf` is `__global SCALAR_TYPE*`.
+ * @usage (Host) Launched in parallel with kernels (8) and (10) for the same chunk.
  */
 __kernel void backprop_error_to_hidden_chunk(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: (unused)]
@@ -235,6 +257,10 @@ __kernel void backprop_error_to_hidden_chunk(
 
 /**
  * @brief (Node 10) Computes partial temperature gradients for a chunk of classes.
+ * @contract Computes a *partial* temperature gradient via reduction over batch and classes.
+ *           If `problem_type_flag`=0 (CCE), `targets_buf` is `__global int*`.
+ *           If `problem_type_flag`=1 (BCE), `targets_buf` is `__global SCALAR_TYPE*`.
+ * @usage (Host) Launched in parallel with kernels (8) and (9) for the same chunk.
  */
 __kernel void calculate_chunk_temp_gradients(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
@@ -256,21 +282,35 @@ __kernel void calculate_chunk_temp_gradients(
     int total_exits);                                         // [IN scalar: > 0]
 
 // --- Phase 11: Data Layout Transformation ---
-
 /**
- * @brief (Node 11) Transposes a matrix for efficient aggregation access patterns.
+ * @brief (Node 11) Transposes a rectangular slice (chunk) of a matrix.
+ * @contract Reads a sub-matrix from `in_buf` and writes its transpose to a
+ *           corresponding slice in `out_buf`. It uses element-based offsets
+ *           and leading dimension arguments to correctly handle sub-regions
+ *           within larger, potentially padded, parent buffers.
+ * @usage (Host) Generic, streamable transpose. For Grad_H backprop, it's called
+ *           per-chunk immediately after kernel (9) to interleave memory
+ *           operations with compute.
  */
-__kernel void transpose_grad_h(
-    __local SCALAR_TYPE *local_mem,                        // [MEMORY size: C_TILE_SIZE * (C_TILE_SIZE + 1) * sizeof(SCALAR_TYPE)]
-    __global const SCALAR_TYPE *__restrict grad_h_aos_buf, // [IN]  Shape: (num_source_rows, num_source_cols)
-    __global SCALAR_TYPE *__restrict grad_h_soa_buf,       // [OUT] Shape: (num_source_cols, num_source_rows)
-    int num_source_rows,                                   // [IN scalar: > 0, Number of rows in source matrix]
-    int num_source_cols);                                  // [IN scalar: > 0, Number of columns in source matrix]
+__kernel void transpose_chunk(
+    __local SCALAR_TYPE *local_mem,                // [MEMORY size: C_TILE_SIZE * (C_TILE_SIZE + 1) * sizeof(SCALAR_TYPE)]
+    __global const SCALAR_TYPE *__restrict in_buf, // [IN]  Source buffer containing the slice to transpose
+    __global SCALAR_TYPE *__restrict out_buf,      // [OUT] Destination buffer for the transposed slice
+    int in_offset_elements,                        // [IN scalar: >= 0, Start element offset into in_buf for the slice]
+    int out_offset_elements,                       // [IN scalar: >= 0, Start element offset into out_buf for the slice]
+    int num_rows_in_chunk,                         // [IN scalar: > 0, The number of rows in the chunk to process]
+    int num_cols_in_chunk,                         // [IN scalar: > 0, The number of columns in the chunk to process]
+    int in_leading_dim,                            // [IN scalar: > 0, The leading dimension (stride) of the IN buffer]
+    int out_leading_dim);                          // [IN scalar: > 0, The leading dimension (stride) of the OUT buffer]
 
 // --- Phase 12 & 15: Generic Tiered Aggregation Engine ---
 
 /**
  * @brief (Node 12, 15) Tier 0 (N=1): Identity pass-through copy.
+ * @contract Copies `elements_per_partial` elements from input to output.
+ *           `num_partials_to_reduce` must be 1.
+ * @usage (Host) Final consolidation step. For Grad_H, operates on SoA-formatted
+ *           partials from kernel (11).
  */
 __kernel void aggregate_identity(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: (unused)]
@@ -282,6 +322,10 @@ __kernel void aggregate_identity(
 
 /**
  * @brief (Node 12, 15) Tier 1 (N is small): Reduces partial results using registers.
+ * @contract Reduces `num_partials_to_reduce` segments from the input buffer.
+ *           Each work-item handles one element across all partials.
+ * @usage (Host) Final consolidation step. For Grad_H, operates on SoA-formatted
+ *           partials from kernel (11).
  */
 __kernel void aggregate_register_reduce(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: (unused)]
@@ -293,6 +337,10 @@ __kernel void aggregate_register_reduce(
 
 /**
  * @brief (Node 12, 15) Tier 2 (N is large): Reduces partial results using local memory.
+ * @contract Reduces `num_partials_to_reduce` segments from the input buffer.
+ *           Each work-group handles one element across all partials using local memory.
+ * @usage (Host) Final consolidation step. For Grad_H, operates on SoA-formatted
+ *           partials from kernel (11).
  */
 __kernel void aggregate_local_reduce(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
@@ -306,6 +354,9 @@ __kernel void aggregate_local_reduce(
 
 /**
  * @brief (Node 13) Computes partial gradients for shared layer weights from a batch chunk.
+ * @contract Produces a *partial* weight gradient by reducing over a chunk of the batch.
+ *           Implicitly filters gradients using the ReLU derivative (`hidden_buf` > 0).
+ * @usage (Host) Called in a loop over batch chunks. Can be launched in parallel with (14).
  */
 __kernel void backprop_shared_weights_chunk(
     __local SCALAR_TYPE *local_mem,                          // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
@@ -322,6 +373,9 @@ __kernel void backprop_shared_weights_chunk(
 
 /**
  * @brief (Node 14) Computes partial gradients for shared layer biases from a batch chunk.
+ * @contract Produces a *partial* bias gradient by reducing over a chunk of the batch.
+ *           Implicitly filters gradients using the ReLU derivative (`hidden_buf` > 0).
+ * @usage (Host) Called in a loop over batch chunks. Can be launched in parallel with (13).
  */
 __kernel void backprop_shared_biases_chunk(
     __local SCALAR_TYPE *local_mem,                          // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
@@ -338,23 +392,30 @@ __kernel void backprop_shared_biases_chunk(
 
 /**
  * @brief (Node 17) Applies Adam optimizer update to a slice of a parameter buffer.
+ * @contract Performs the complete Adam update, including the bias correction term
+ *           which is calculated INTERNALLY from the global step `t`. Does not use host
+ *           calculated `beta^t`.
+ * @usage (Host) Generic optimizer called once per parameter group after its final
+ *           gradient has been aggregated.
  */
 __kernel void adam_update(
     __global const SCALAR_TYPE *__restrict grad, // [IN]     Shape: (num_params_to_update)
     SCALAR_TYPE beta1,                           // [IN scalar: (0,1), Decay rate for 1st moment]
     SCALAR_TYPE beta2,                           // [IN scalar: (0,1), Decay rate for 2nd moment]
-    SCALAR_TYPE beta1_t,                         // [IN scalar: (0,1), beta1 to the power of t]
-    SCALAR_TYPE beta2_t,                         // [IN scalar: (0,1), beta2 to the power of t]
     SCALAR_TYPE learning_rate,                   // [IN scalar: > 0]
     SCALAR_TYPE epsilon,                         // [IN scalar: > 0]
+    uint        t,                               // [IN scalar: > 0, The current global training step]
     __global SCALAR_TYPE *__restrict param,      // [IN/OUT] Shape: (num_params_to_update)
     __global SCALAR_TYPE *__restrict m1,         // [IN/OUT] Shape: (num_params_to_update), 1st moment vector
     __global SCALAR_TYPE *__restrict m2,         // [IN/OUT] Shape: (num_params_to_update), 2nd moment vector
     int param_offset,                            // [IN scalar: >= 0, Start index for this parameter slice]
-    int num_params_to_update);                   // [IN scalar: > 0, Number of params in this slice]
+    int num_params_to_update                     // [IN scalar: > 0, Number of params in this slice]
+);
 
 /**
  * @brief (Node 18) Clamps temperature parameters within a [min, max] range.
+ * @contract Enforces `param = clamp(param, min_temp, max_temp)`.
+ * @usage (Host) Called only on the temperature buffer, immediately after its Adam update.
  */
 __kernel void clamp_temperatures(
     __global SCALAR_TYPE *__restrict temps_buf, // [IN/OUT] Shape: (total_exits)

@@ -72,7 +72,7 @@ MAX_REGISTER_AGGREGATE_ITEMS: int = 32  # Threshold to switch reduction strategy
 C_TILE_SIZE: int = 16  # Tile size for the matrix transpose kernel
 BACKPROP_STREAM_CHUNK_SIZE: int = 32  # Granularity for shared layer backprop
 ## Max chunk constants for pre-allocating partial gradient buffers.
-MAX_EXIT_CHUNKS: int = 64  # Max number of chunks for exit/class dimension streaming
+MAX_EXIT_CLASS_CHUNKS: int = 64  # Max number of chunks for exit/class dimension streaming
 MAX_BATCH_CHUNKS: int = 64  # Max number of chunks for batch dimension streaming
 
 
@@ -135,6 +135,34 @@ class HostView:
         if not slicing:
             return self.host_data
         return self.host_data[slicing]
+
+
+class BackpropStrategyType(enum.Enum):
+    """Defines the algorithm for handling multi-chunk backpropagation."""
+
+    # Aggregate all chunks, then do one big transpose. For simple cases (num_chunks=1).
+    SEQUENTIAL_MONOLITHIC = 1
+    # Interleave grad calc and transpose ops per chunk for max concurrency.
+    INTERLEAVED_STREAMING = 2
+
+
+@dataclass(frozen=True)
+class ChunkingConfig:
+    """Configuration for chunking a problem across one or more dimensions."""
+
+    num_chunks: int = 1
+    chunk_size: int = 0
+    total_dim: int = 0
+
+
+@dataclass
+class ExecutionPlan:
+    """Holds the strategic decisions for processing one batch."""
+
+    exit_class_chunking: ChunkingConfig
+    batch_chunking: ChunkingConfig
+    exit_backprop_strategy: BackpropStrategyType
+    recompute_hidden: bool = False
 
 
 # --- Utility & Padding Functions ---
@@ -371,8 +399,6 @@ class KernelExecutor:
         self, queue, exit_chunk_id, exit_offset, num_exits, class_chunk_id, class_offset, num_classes, wait_for
     ) -> cl.Event:
         """Placeholder: Launch implementation for BCE would be symmetric to CCE."""
-        # This would be fully implemented for a production system.
-        # For now, we return a pre-completed event if BCE is selected.
         user_event = cl.UserEvent(queue.context)
         user_event.set_status(cl.command_execution_status.COMPLETE)
         return user_event
@@ -381,14 +407,12 @@ class KernelExecutor:
         self, queue, exit_chunk_id, exit_offset, num_exits, class_chunk_id, class_offset, num_classes, wait_for
     ) -> Tuple[cl.Event, cl.Event, cl.Event]:
         lsize = 256
-        # Note: A problem_type_flag of 1 indicates CCE, 0 for BCE in problem code, but C header has 0=CCE.
-        # Assuming header is correct. Python code `PROBLEM_TYPE == "CCE"` is True (1).
         problem_flag = np.int32(0 if PROBLEM_TYPE == "CCE" else 1)
 
         grad_w_evt = self.p.calculate_exit_param_grads_chunk(
             queue,
             (num_exits, HIDDEN_DIM, num_classes),
-            None,  # Let driver choose local size
+            None,
             cl.LocalMemory(lsize * self.scalar_size),
             self.b.get("hidden_buf"),
             self.b.get("partial_probs_out"),
@@ -412,8 +436,8 @@ class KernelExecutor:
         grad_h_evt = self.p.backprop_error_to_hidden_chunk(
             queue,
             (num_exits, BATCH_SIZE, HIDDEN_DIM),
-            None,  # Let driver choose local size
-            cl.LocalMemory(0),  # Unused in kernel
+            None,
+            cl.LocalMemory(0),
             self.b.get("partial_probs_out"),
             self.b.get("targets_buf"),
             self.b.get("exit_weights"),
@@ -456,17 +480,33 @@ class KernelExecutor:
         )
         return grad_w_evt, grad_h_evt, grad_t_evt
 
-    def launch_transpose_grad_h(self, queue, in_buf_name, out_buf_name, num_rows, num_cols, wait_for) -> cl.Event:
-        g = (pad_to_multiple(num_cols, C_TILE_SIZE), pad_to_multiple(num_rows, C_TILE_SIZE))
+    def launch_transpose_chunk(
+        self,
+        queue,
+        in_buf_name: str,
+        out_buf_name: str,
+        in_offset_elements: int,
+        out_offset_elements: int,
+        num_rows_in_chunk: int,
+        num_cols_in_chunk: int,
+        in_leading_dim: int,
+        out_leading_dim: int,
+        wait_for,
+    ) -> cl.Event:
+        g = (pad_to_multiple(num_cols_in_chunk, C_TILE_SIZE), pad_to_multiple(num_rows_in_chunk, C_TILE_SIZE))
         l = (C_TILE_SIZE, C_TILE_SIZE)
         args = (
             cl.LocalMemory(C_TILE_SIZE * (C_TILE_SIZE + 1) * self.scalar_size),
             self.b.get(in_buf_name),
             self.b.get(out_buf_name),
-            np.int32(num_rows),
-            np.int32(num_cols),
+            np.int32(in_offset_elements),
+            np.int32(out_offset_elements),
+            np.int32(num_rows_in_chunk),
+            np.int32(num_cols_in_chunk),
+            np.int32(in_leading_dim),
+            np.int32(out_leading_dim),
         )
-        return self.p.transpose_grad_h(queue, g, l, *args, wait_for=wait_for)
+        return self.p.transpose_chunk(queue, g, l, *args, wait_for=wait_for)
 
     def launch_aggregation(
         self, queue, in_buf_name, out_buf_name, num_partials, elements_per_partial, is_avg, wait_for
@@ -475,7 +515,6 @@ class KernelExecutor:
         mode = np.int32(1 if is_avg else 0)
         in_buf, out_buf = self.b.get(in_buf_name), self.b.get(out_buf_name)
 
-        # Ensure elements_per_partial is a non-zero integer
         elements_per_partial = max(1, int(elements_per_partial))
 
         if num_partials <= 1:
@@ -555,7 +594,7 @@ class KernelExecutor:
         )
         return sw_evt, sb_evt
 
-    def launch_adam_update_and_clamp(self, queue, p: Parameter, grad_ready_event, b1_t, b2_t) -> cl.Event:
+    def launch_adam_update_and_clamp(self, queue, p: Parameter, grad_ready_event, t: int) -> cl.Event:
         num_params = int(np.prod(self.b.get_spec(p.name)[0]))
         update_evt = self.p.adam_update(
             queue,
@@ -564,10 +603,9 @@ class KernelExecutor:
             self.b.get(p.grad),
             SCALAR_NP_TYPE(ADAM_BETA1),
             SCALAR_NP_TYPE(ADAM_BETA2),
-            SCALAR_NP_TYPE(b1_t),
-            SCALAR_NP_TYPE(b2_t),
             SCALAR_NP_TYPE(LEARNING_RATE),
             SCALAR_NP_TYPE(EPSILON),
+            np.uint32(t),
             self.b.get(p.name),
             self.b.get(p.m1),
             self.b.get(p.m2),
@@ -592,15 +630,6 @@ class KernelExecutor:
 # --- Layer 2: Strategic Layer ---
 
 
-@dataclass
-class ExecutionPlan:
-    """Holds the strategic decisions for processing one batch."""
-
-    num_exit_chunks: int = 1
-    num_batch_chunks: int = 1
-    recompute_hidden: bool = False
-
-
 class ExecutionStrategy:
     """Makes high-level strategic decisions based on resources and problem size."""
 
@@ -611,41 +640,60 @@ class ExecutionStrategy:
 
     def create_plan_for_batch(self, batch_size: int) -> ExecutionPlan:
         # --- Estimate memory for persistent intermediate buffers ---
-        # These are buffers that must live for a large portion of the batch.
         hidden_size = self.b.get_byte_size("hidden_buf")
         logits_size = self.b.get_byte_size("full_logits_out")
         probs_size = self.b.get_byte_size("partial_probs_out")
-
-        ## Use the correct (large) size for the chunked partial grad_h.
         grad_h_aos_size = self.b.get_byte_size("partial_grad_h_aos_out")
-
-        # Estimate memory for one full, unchunked pass
-        required_fwd_mem = logits_size + probs_size
-        required_bwd_mem = grad_h_aos_size  # grad_h is the largest partial grad
+        required_mem_for_exit_path = logits_size + probs_size + grad_h_aos_size
 
         # --- Make Strategic Decisions ---
-        plan = ExecutionPlan()
+        recompute_hidden = False
+        num_exit_class_chunks = 1
 
-        # Decision 1: Do we need to stream the exit/class dimension?
-        if required_fwd_mem + required_bwd_mem > self.vram_budget:
-            # Not enough memory to hold all intermediate buffers. Must stream.
-            num_chunks = math.ceil((required_fwd_mem + required_bwd_mem) / self.vram_budget)
-            plan.num_exit_chunks = min(num_chunks, MAX_EXIT_CHUNKS)
-            print(f"INFO: High memory pressure. Streaming exits in {plan.num_exit_chunks} chunks.")
+        # Decision 1: Determine exit/class chunking
+        if required_mem_for_exit_path > self.vram_budget:
+            effective_vram_budget = self.vram_budget - self.b.get_byte_size("hidden_buf")
+            num_chunks = math.ceil(required_mem_for_exit_path / max(1, effective_vram_budget))
+            num_exit_class_chunks = min(num_chunks, MAX_EXIT_CLASS_CHUNKS)
 
-        # Decision 2: Do we need to recompute hidden activations?
-        # This is for the "Behemoth" case: network is so fat that just the
-        # hidden activations are too large to keep during backprop.
-        if hidden_size + max(required_fwd_mem, required_bwd_mem) > self.vram_budget:
-            plan.recompute_hidden = True
-            print(f"INFO: Extreme memory pressure. `hidden` buffer will be recomputed.")
+        exit_class_cfg = ChunkingConfig(
+            num_chunks=num_exit_class_chunks,
+            chunk_size=(OUTPUT_CLASSES + num_exit_class_chunks - 1) // num_exit_class_chunks,
+            total_dim=OUTPUT_CLASSES,
+        )
 
-        # Decision 3: Determine batch streaming chunks for shared layer backprop.
-        # This is based on a fixed chunk size for now, but could also be memory-based.
-        plan.num_batch_chunks = (batch_size + BACKPROP_STREAM_CHUNK_SIZE - 1) // BACKPROP_STREAM_CHUNK_SIZE
-        plan.num_batch_chunks = min(plan.num_batch_chunks, MAX_BATCH_CHUNKS)
+        # Decision 2: Choose backprop algorithm based on chunking
+        backprop_strategy = (
+            BackpropStrategyType.INTERLEAVED_STREAMING
+            if exit_class_cfg.num_chunks > 1
+            else BackpropStrategyType.SEQUENTIAL_MONOLITHIC
+        )
 
-        return plan
+        # Decision 3: Do we need to recompute hidden activations?
+        mem_without_hidden = required_mem_for_exit_path / exit_class_cfg.num_chunks
+        if hidden_size + mem_without_hidden > self.vram_budget:
+            recompute_hidden = True
+
+        # Decision 4: Determine batch streaming chunks for shared layer backprop
+        num_batch_chunks = (batch_size + BACKPROP_STREAM_CHUNK_SIZE - 1) // BACKPROP_STREAM_CHUNK_SIZE
+        batch_cfg = ChunkingConfig(
+            num_chunks=min(num_batch_chunks, MAX_BATCH_CHUNKS),
+            chunk_size=BACKPROP_STREAM_CHUNK_SIZE,
+            total_dim=batch_size,
+        )
+        if backprop_strategy == BackpropStrategyType.INTERLEAVED_STREAMING:
+            print(f"INFO: High memory pressure. Streaming exits/classes in {exit_class_cfg.num_chunks} chunks.")
+            print("  - Strategy: INTERLEAVED_STREAMING backprop for Grad_H.")
+
+        if recompute_hidden:
+            print("INFO: Extreme memory pressure. `hidden` buffer will be recomputed.")
+
+        return ExecutionPlan(
+            exit_class_chunking=exit_class_cfg,
+            batch_chunking=batch_cfg,
+            exit_backprop_strategy=backprop_strategy,
+            recompute_hidden=recompute_hidden,
+        )
 
 
 # --- Layer 3: Execution Layer ---
@@ -674,6 +722,7 @@ class BatchProcessor:
         return list(set(deps))
 
     def run(self, plan: ExecutionPlan):
+        print(f"  - Executing Plan: {plan}")
         self._upload_data()
         self._zero_gradients()
         fwd_pass_deps = self._get_deps("input_ready", "grads_zeroed")
@@ -694,22 +743,19 @@ class BatchProcessor:
         self.events["targets_ready"] = self.executor.enqueue_write_buffer(self.queue, "targets_buf", self.y_batch, None)
 
     def _zero_gradients(self):
-        # Get all buffers that start with 'grad_' or 'partial_grad_'
         grad_names = [name for name in self.executor.b.buffers if "grad_" in name]
         zero_events = [self.executor.enqueue_fill_buffer(self.queue, name, 0, None) for name in grad_names]
         self.events["grads_zeroed"] = cl.WaitForEvents(zero_events)
 
     def _execute_exit_path(self, plan: ExecutionPlan):
-        exit_chunk_size = (NUM_EXITS + plan.num_exit_chunks - 1) // plan.num_exit_chunks
-        class_chunk_size = (OUTPUT_CLASSES + plan.num_exit_chunks - 1) // plan.num_exit_chunks
-
+        cfg = plan.exit_class_chunking
         hidden_deps = self._get_deps("hidden_ready")
-        for i in range(plan.num_exit_chunks):
-            exit_offset, exit_size = i * exit_chunk_size, min(exit_chunk_size, NUM_EXITS - i * exit_chunk_size)
-            class_offset, class_size = i * class_chunk_size, min(
-                class_chunk_size, OUTPUT_CLASSES - i * class_chunk_size
-            )
-            if exit_size <= 0 or class_size <= 0:
+
+        for i in range(cfg.num_chunks):
+            # For simplicity, exit chunks and class chunks are tied together.
+            exit_offset, exit_size = i * cfg.chunk_size, min(cfg.chunk_size, NUM_EXITS - i * cfg.chunk_size)
+            class_offset, class_size = i * cfg.chunk_size, min(cfg.chunk_size, OUTPUT_CLASSES - i * cfg.chunk_size)
+            if exit_size <= 0 and class_size <= 0:
                 continue
 
             self.event_lists["logit_chunks_ready"].append(
@@ -719,216 +765,247 @@ class BatchProcessor:
             )
         self.events["all_logits_ready"] = cl.WaitForEvents(self.event_lists["logit_chunks_ready"])
 
-        ## Create a per-chunk event list to manage dependencies correctly.
         prob_loss_events = []
-
         if PROBLEM_TYPE == "CCE":
             self.events["softmax_params_ready"] = self.executor.launch_reduce_for_softmax(
                 self.queue, self._get_deps("all_logits_ready")
             )
+        prob_loss_deps = self._get_deps("softmax_params_ready", "targets_ready", "all_logits_ready")
 
-        prob_loss_deps = self._get_deps("softmax_params_ready", "targets_ready")
-
-        for i in range(plan.num_exit_chunks):
-            exit_offset, exit_size = i * exit_chunk_size, min(exit_chunk_size, NUM_EXITS - i * exit_chunk_size)
-            class_offset, class_size = i * class_chunk_size, min(
-                class_chunk_size, OUTPUT_CLASSES - i * class_chunk_size
-            )
-            if exit_size <= 0 or class_size <= 0:
+        for i in range(cfg.num_chunks):
+            exit_offset, exit_size = i * cfg.chunk_size, min(cfg.chunk_size, NUM_EXITS - i * cfg.chunk_size)
+            class_offset, class_size = i * cfg.chunk_size, min(cfg.chunk_size, OUTPUT_CLASSES - i * cfg.chunk_size)
+            if exit_size <= 0 and class_size <= 0:
                 continue
-
-            if PROBLEM_TYPE == "CCE":
-                evt = self.executor.launch_compute_probs_loss_cce_chunk(
-                    self.queue, i, exit_offset, exit_size, class_offset, class_size, prob_loss_deps
-                )
-                prob_loss_events.append(evt)
-            else:  # BCE Path
-                evt = self.executor.launch_compute_probs_loss_bce_chunk(
-                    self.queue, i, exit_offset, exit_size, i, class_offset, class_size, prob_loss_deps
-                )
-                prob_loss_events.append(evt)
+            evt = self.executor.launch_compute_probs_loss_cce_chunk(
+                self.queue, i, exit_offset, exit_size, class_offset, class_size, prob_loss_deps
+            )
+            prob_loss_events.append(evt)
         self.events["all_prob_loss_chunks_ready"] = cl.WaitForEvents(prob_loss_events)
 
-        grad_base_deps = self._get_deps("hidden_ready", "all_logits_ready", "targets_ready")
-        for i in range(plan.num_exit_chunks):
-            exit_offset, exit_size = i * exit_chunk_size, min(exit_chunk_size, NUM_EXITS - i * exit_chunk_size)
-            class_offset, class_size = i * class_chunk_size, min(
-                class_chunk_size, OUTPUT_CLASSES - i * class_chunk_size
-            )
-            if exit_size <= 0 or class_size <= 0:
+        grad_base_deps = self._get_deps(
+            "hidden_ready", "all_logits_ready", "targets_ready", "all_prob_loss_chunks_ready"
+        )
+        for i in range(cfg.num_chunks):
+            exit_offset, exit_size = i * cfg.chunk_size, min(cfg.chunk_size, NUM_EXITS - i * cfg.chunk_size)
+            class_offset, class_size = i * cfg.chunk_size, min(cfg.chunk_size, OUTPUT_CLASSES - i * cfg.chunk_size)
+            if exit_size <= 0 and class_size <= 0:
                 continue
 
-            ## Depend only on the current chunk's prob/loss event.
-            grad_deps = grad_base_deps + [prob_loss_events[i]]
-
             w, h, t = self.executor.launch_parallel_exit_grads(
-                self.queue, i, exit_offset, exit_size, i, class_offset, class_size, grad_deps
+                self.queue, i, exit_offset, exit_size, i, class_offset, class_size, grad_base_deps
             )
             self.event_lists["partial_grad_w_ready"].append(w)
             self.event_lists["partial_grad_h_ready"].append(h)
             self.event_lists["partial_grad_t_ready"].append(t)
 
-        self.events["all_partials_ready"] = cl.WaitForEvents(
-            self.event_lists["partial_grad_w_ready"]
-            + self.event_lists["partial_grad_h_ready"]
-            + self.event_lists["partial_grad_t_ready"]
-        )
+        if plan.exit_backprop_strategy == BackpropStrategyType.INTERLEAVED_STREAMING:
+            self._execute_interleaved_grad_h_transpose(plan)
+
+    def _execute_interleaved_grad_h_transpose(self, plan: ExecutionPlan):
+        """Implements the high-performance Grad_H path by interleaving transpose operations."""
+        cfg = plan.exit_class_chunking
+        aos_buf_name = "partial_grad_h_aos_out"
+        soa_buf_name = "partial_grad_h_soa_out"
+        aos_chunk_elements = NUM_EXITS * BATCH_SIZE * HIDDEN_DIM
+        soa_chunk_elements = BATCH_SIZE * HIDDEN_DIM * NUM_EXITS
+
+        transposed_events = []
+        for i in range(cfg.num_chunks):
+            grad_h_chunk_ready_event = self.event_lists["partial_grad_h_ready"][i]
+
+            # Transpose the (E, B*H) slice from the AoS buffer
+            evt = self.executor.launch_transpose_chunk(
+                self.queue,
+                aos_buf_name,
+                soa_buf_name,
+                in_offset_elements=i * aos_chunk_elements,
+                out_offset_elements=i * soa_chunk_elements,
+                num_rows_in_chunk=NUM_EXITS,
+                num_cols_in_chunk=BATCH_SIZE * HIDDEN_DIM,
+                in_leading_dim=BATCH_SIZE * HIDDEN_DIM,
+                out_leading_dim=NUM_EXITS,
+                wait_for=[grad_h_chunk_ready_event],
+            )
+            transposed_events.append(evt)
+        self.event_lists["partial_grad_h_soa_ready"] = transposed_events
 
     def _aggregate_and_backprop_shared(self, plan: ExecutionPlan):
-        ## Correctly aggregate all partial results and implement recompute strategy.
+        num_exit_class_chunks = plan.exit_class_chunking.num_chunks
 
-        # --- Aggregate Phase 1 (Exit Layer Gradients) ---
-        num_exit_chunks = plan.num_exit_chunks
+        b = self.executor.b
+        get_elem_count = lambda name: int(np.prod(b.get_spec(name)[0]))
 
-        # Aggregate partial probabilities
+        # --- Aggregate Phase 1 (Exit Layer & Other Gradients) ---
         self.events["final_probs_ready"] = self.executor.launch_aggregation(
             self.queue,
             "partial_probs_out",
             "final_probs_buf",
-            num_partials=num_exit_chunks,
-            elements_per_partial=self.executor.b.get("final_probs_buf").size // num_exit_chunks,
-            is_avg=False,
-            wait_for=self._get_deps("all_prob_loss_chunks_ready"),
+            num_exit_class_chunks,
+            get_elem_count("final_probs_buf"),
+            False,
+            self._get_deps("all_prob_loss_chunks_ready"),
         )
-
-        # Aggregate Exit Weights and Biases Gradients
         self.final_grad_events["grad_exit_weights"] = self.executor.launch_aggregation(
             self.queue,
             "partial_grad_exit_w_out",
             "grad_exit_weights",
-            num_partials=num_exit_chunks,
-            elements_per_partial=self.executor.b.get("grad_exit_weights").size,
-            is_avg=False,
-            wait_for=self.event_lists["partial_grad_w_ready"],
+            num_exit_class_chunks,
+            get_elem_count("grad_exit_weights"),
+            False,
+            self.event_lists["partial_grad_w_ready"],
         )
         self.final_grad_events["grad_exit_biases"] = self.executor.launch_aggregation(
             self.queue,
             "partial_grad_exit_b_out",
             "grad_exit_biases",
-            num_partials=num_exit_chunks,
-            elements_per_partial=self.executor.b.get("grad_exit_biases").size,
-            is_avg=False,
-            wait_for=self.event_lists["partial_grad_w_ready"],
+            num_exit_class_chunks,
+            get_elem_count("grad_exit_biases"),
+            False,
+            self.event_lists["partial_grad_w_ready"],
         )
-
-        # Aggregate Temperature Gradients
         self.final_grad_events["grad_temps"] = self.executor.launch_aggregation(
             self.queue,
             "partial_grad_temps_out",
             "grad_temps",
-            num_partials=num_exit_chunks,
-            elements_per_partial=self.executor.b.get("grad_temps").size,
-            is_avg=False,
-            wait_for=self.event_lists["partial_grad_t_ready"],
+            num_exit_class_chunks,
+            get_elem_count("grad_temps"),
+            False,
+            self.event_lists["partial_grad_t_ready"],
         )
 
-        # Aggregate and Transform Hidden Gradients (Grad_H)
-        agg_h_evt = self.executor.launch_aggregation(
+        # --- Aggregate and Transform Hidden Gradients (Grad_H) ---
+        # This multi-stage process correctly reduces Grad_H using only generic kernels.
+        if plan.exit_backprop_strategy == BackpropStrategyType.INTERLEAVED_STREAMING:
+            # Stage 1: Aggregate the transposed partials (SoA) along the CLASS chunk dimension
+            agg_soa_evt = self.executor.launch_aggregation(
+                self.queue,
+                "partial_grad_h_soa_out",
+                "aggregated_grad_h_soa",
+                num_exit_class_chunks,
+                get_elem_count("aggregated_grad_h_soa"),
+                False,
+                self.event_lists["partial_grad_h_soa_ready"],
+            )
+            prev_evt = agg_soa_evt
+        else:  # Monolithic Path: grad_h -> transpose -> reduce
+            agg_aos_evt = self.executor.launch_aggregation(
+                self.queue,
+                "partial_grad_h_aos_out",
+                "aggregated_grad_h_aos_buf",
+                num_exit_class_chunks,
+                get_elem_count("aggregated_grad_h_aos_buf"),
+                False,
+                self.event_lists["partial_grad_h_ready"],
+            )
+            prev_evt = self.executor.launch_transpose_chunk(
+                self.queue,
+                "aggregated_grad_h_aos_buf",
+                "aggregated_grad_h_soa",
+                0,
+                0,
+                NUM_EXITS,
+                BATCH_SIZE * HIDDEN_DIM,
+                BATCH_SIZE * HIDDEN_DIM,
+                NUM_EXITS,
+                wait_for=[agg_aos_evt],
+            )
+
+        # Stage 2: Transpose the aggregated SoA buffer to prepare for reduction over the EXIT dimension.
+        # This turns (B*H, E) into (E, B*H), making 'E' the outermost dimension.
+        transpose_agg_evt = self.executor.launch_transpose_chunk(
             self.queue,
-            "partial_grad_h_aos_out",
-            "aggregated_grad_h_aos_buf",
-            num_partials=num_exit_chunks,
-            elements_per_partial=self.executor.b.get("aggregated_grad_h_aos_buf").size,
-            is_avg=False,
-            wait_for=self.event_lists["partial_grad_h_ready"],
+            "aggregated_grad_h_soa",
+            "transposed_aggregated_grad_h_soa",
+            0,
+            0,
+            BATCH_SIZE * HIDDEN_DIM,
+            NUM_EXITS,
+            NUM_EXITS,
+            BATCH_SIZE * HIDDEN_DIM,
+            wait_for=[prev_evt],
         )
 
-        transpose_evt = self.executor.launch_transpose_grad_h(
-            self.queue,
-            "aggregated_grad_h_aos_buf",
-            "grad_h_soa_buf",
-            num_rows=NUM_EXITS,
-            num_cols=(BATCH_SIZE * HIDDEN_DIM),
-            wait_for=[agg_h_evt],
-        )
-
+        # Stage 3: Reduce over the EXIT dimension to get the final Grad_H.
         self.events["final_grad_h_ready"] = self.executor.launch_aggregation(
             self.queue,
-            "grad_h_soa_buf",
+            "transposed_aggregated_grad_h_soa",
             "final_grad_h_buf",
-            num_partials=NUM_EXITS,
-            elements_per_partial=(BATCH_SIZE * HIDDEN_DIM),
-            is_avg=False,
-            wait_for=[transpose_evt],
+            NUM_EXITS,
+            get_elem_count("final_grad_h_buf"),
+            False,
+            [transpose_agg_evt],
         )
 
         # --- Backprop Shared Layer ---
         backprop_deps = self._get_deps("final_grad_h_ready")
-
-        ## Implement Recompute vs. Cache strategy for `hidden_buf`.
         if plan.recompute_hidden:
-            print("  - Recomputing hidden activations for backprop.")
-            # Simple recompute: re-run full forward pass. More advanced would be chunked recompute.
             recompute_event = self.executor.launch_forward_pass(
-                self.queue, 0, self.X_batch.shape[0], wait_for=self._get_deps("input_ready")
+                self.queue, 0, self.X_batch.shape[0], self._get_deps("input_ready")
             )
             backprop_deps.append(recompute_event)
         else:
             backprop_deps.extend(self._get_deps("hidden_ready"))
 
-        for i in range(plan.num_batch_chunks):
-            offset = i * BACKPROP_STREAM_CHUNK_SIZE
-            size = min(BACKPROP_STREAM_CHUNK_SIZE, BATCH_SIZE - offset)
+        cfg = plan.batch_chunking
+        for i in range(cfg.num_chunks):
+            offset = i * cfg.chunk_size
+            size = min(cfg.chunk_size, cfg.total_dim - offset)
             if size <= 0:
                 continue
             sw, sb = self.executor.launch_backprop_shared_chunk(self.queue, i, offset, size, backprop_deps)
             self.event_lists["partial_grad_sw_ready"].append(sw)
             self.event_lists["partial_grad_sb_ready"].append(sb)
 
-        # Aggregate Shared Layer Gradients
+        # Aggregate Shared Layer Gradients (AVERAGE reduction over batch chunks)
         self.final_grad_events["grad_weights"] = self.executor.launch_aggregation(
             self.queue,
             "partial_grad_sw_out",
             "grad_weights",
-            num_partials=plan.num_batch_chunks,
-            elements_per_partial=self.executor.b.get("grad_weights").size,
-            is_avg=True,
-            wait_for=self.event_lists["partial_grad_sw_ready"],
+            cfg.num_chunks,
+            get_elem_count("grad_weights"),
+            True,
+            self.event_lists["partial_grad_sw_ready"],
         )
-
         self.final_grad_events["grad_biases"] = self.executor.launch_aggregation(
             self.queue,
             "partial_grad_sb_out",
             "grad_biases",
-            num_partials=plan.num_batch_chunks,
-            elements_per_partial=self.executor.b.get("grad_biases").size,
-            is_avg=True,
-            wait_for=self.event_lists["partial_grad_sb_ready"],
+            cfg.num_chunks,
+            get_elem_count("grad_biases"),
+            True,
+            self.event_lists["partial_grad_sb_ready"],
         )
 
     def _finalize_and_update(self):
         self.events["d2h_probs_ready"] = self.host_probs_view.enqueue_read(
             self.queue, self.executor.b.get("final_probs_buf"), self._get_deps("final_probs_ready")
         )
-        b1_t, b2_t = (ADAM_BETA1**self.global_step), (ADAM_BETA2**self.global_step)
         for p in self.orchestrator.params:
             if p.grad not in self.final_grad_events:
-                # This can happen if a parameter group has no gradients in this step
                 continue
             grad_ready_event = self.final_grad_events[p.grad]
             self.event_lists["updates_done"].append(
-                self.executor.launch_adam_update_and_clamp(self.queue, p, grad_ready_event, b1_t, b2_t)
+                self.executor.launch_adam_update_and_clamp(self.queue, p, grad_ready_event, self.global_step)
             )
         self.events["all_updates_done"] = cl.WaitForEvents(self.event_lists["updates_done"])
 
     def get_sync_points(self) -> Tuple[cl.UserEvent, cl.UserEvent]:
         inference_event, final_batch_event = cl.UserEvent(self.ctx), cl.UserEvent(self.ctx)
+
+        def set_event_status(status, user_data_event):
+            user_data_event.set_status(cl.command_execution_status.COMPLETE)
+
         d2h_event = self.events.get("d2h_probs_ready")
         if d2h_event:
-            cl.enqueue_barrier_with_wait_list([d2h_event]).set_callback(
-                cl.command_execution_status.COMPLETE,
-                lambda s, u: inference_event.set_status(cl.command_execution_status.COMPLETE),
-            )
-        else:  # Always complete inference event if no copy back happened
+            d2h_event.set_callback(cl.command_execution_status.COMPLETE, set_event_status, inference_event)
+        else:
             inference_event.set_status(cl.command_execution_status.COMPLETE)
 
         final_event = self.events.get("all_updates_done")
         if final_event:
-            cl.enqueue_barrier_with_wait_list([final_event]).set_callback(
-                cl.command_execution_status.COMPLETE,
-                lambda s, u: final_batch_event.set_status(cl.command_execution_status.COMPLETE),
-            )
-        else:  # Always complete final event
+            final_event.set_callback(cl.command_execution_status.COMPLETE, set_event_status, final_batch_event)
+        else:
             final_batch_event.set_status(cl.command_execution_status.COMPLETE)
 
         return inference_event, final_batch_event
@@ -985,7 +1062,6 @@ class TrainingOrchestrator:
         return cl.Program(self.ctx, kernel_src).build(options=build_opts)
 
     def _setup_buffers(self):
-        # Create trainable parameters and their Adam optimizer states
         for p in self.params:
             shape = self.param_shapes[p.name]
             init_fn = (
@@ -1003,11 +1079,7 @@ class TrainingOrchestrator:
             self.buffer_mgr.create_buffer(p.m1, BufferRole.ADAM_MOMENTUM, padded_shape, dtype)
             self.buffer_mgr.create_buffer(p.m2, BufferRole.ADAM_MOMENTUM, padded_shape, dtype)
 
-        # Create all intermediate, mask, and target buffers
         dtype_map = {"targets_buf": np.int32} if PROBLEM_TYPE == "CCE" else {}
-
-        ## Define buffer shapes correctly, especially for partial gradients.
-        ## These buffers now have a leading dimension for storing chunked results.
         int_buffers = {
             "input_buf": (BufferRole.INPUT, (BATCH_SIZE, INPUT_DIM)),
             "input_mask": (BufferRole.MASK, (BATCH_SIZE,)),
@@ -1022,25 +1094,41 @@ class TrainingOrchestrator:
             "final_probs_buf": (BufferRole.INTERMEDIATE, (NUM_EXITS, BATCH_SIZE, OUTPUT_CLASSES)),
             "final_loss_out": (BufferRole.INTERMEDIATE, (NUM_EXITS, BATCH_SIZE)),
             "softmax_params_out": (BufferRole.INTERMEDIATE, (NUM_EXITS, BATCH_SIZE, 2)),
-            # Partial gradient buffers now sized for worst-case chunking
             "partial_grad_exit_w_out": (
                 BufferRole.PARTIAL_GRADIENT,
-                (MAX_EXIT_CHUNKS, *self.param_shapes["exit_weights"]),
+                (MAX_EXIT_CLASS_CHUNKS, *self.param_shapes["exit_weights"]),
             ),
             "partial_grad_exit_b_out": (
                 BufferRole.PARTIAL_GRADIENT,
-                (MAX_EXIT_CHUNKS, *self.param_shapes["exit_biases"]),
+                (MAX_EXIT_CLASS_CHUNKS, *self.param_shapes["exit_biases"]),
             ),
-            "partial_grad_temps_out": (BufferRole.PARTIAL_GRADIENT, (MAX_EXIT_CHUNKS, *self.param_shapes["temps"])),
-            "partial_grad_h_aos_out": (
+            "partial_grad_temps_out": (
                 BufferRole.PARTIAL_GRADIENT,
-                (MAX_EXIT_CHUNKS, NUM_EXITS, BATCH_SIZE, HIDDEN_DIM),
+                (MAX_EXIT_CLASS_CHUNKS, *self.param_shapes["temps"]),
             ),
             "partial_grad_sw_out": (BufferRole.PARTIAL_GRADIENT, (MAX_BATCH_CHUNKS, *self.param_shapes["weights"])),
             "partial_grad_sb_out": (BufferRole.PARTIAL_GRADIENT, (MAX_BATCH_CHUNKS, *self.param_shapes["biases"])),
-            # Buffers for multi-step gradient calculations (e.g., aggregate -> transpose -> aggregate)
-            "aggregated_grad_h_aos_buf": (BufferRole.PARTIAL_GRADIENT, (NUM_EXITS, BATCH_SIZE, HIDDEN_DIM)),
-            "grad_h_soa_buf": (BufferRole.PARTIAL_GRADIENT, (BATCH_SIZE * HIDDEN_DIM, NUM_EXITS)),
+            # Buffers for multi-stage Grad_H calculation
+            "partial_grad_h_aos_out": (
+                BufferRole.PARTIAL_GRADIENT,
+                (MAX_EXIT_CLASS_CHUNKS, NUM_EXITS, BATCH_SIZE, HIDDEN_DIM),
+            ),
+            "partial_grad_h_soa_out": (
+                BufferRole.PARTIAL_GRADIENT,
+                (MAX_EXIT_CLASS_CHUNKS, BATCH_SIZE * HIDDEN_DIM, NUM_EXITS),
+            ),  # Interleaved transpose target
+            "aggregated_grad_h_aos_buf": (
+                BufferRole.INTERMEDIATE,
+                (NUM_EXITS, BATCH_SIZE, HIDDEN_DIM),
+            ),  # For monolithic path
+            "aggregated_grad_h_soa": (
+                BufferRole.INTERMEDIATE,
+                (BATCH_SIZE * HIDDEN_DIM, NUM_EXITS),
+            ),  # Intermediate for both paths
+            "transposed_aggregated_grad_h_soa": (
+                BufferRole.INTERMEDIATE,
+                (NUM_EXITS, BATCH_SIZE * HIDDEN_DIM),
+            ),  # To prep for final reduction
             "final_grad_h_buf": (BufferRole.FINAL_GRADIENT, (BATCH_SIZE, HIDDEN_DIM)),
         }
         for name, (role, shape) in int_buffers.items():
@@ -1051,11 +1139,9 @@ class TrainingOrchestrator:
         from sklearn.preprocessing import StandardScaler, OneHotEncoder
 
         X, y = load_iris(return_X_y=True)
-        # Ensure data matches our network dimensions
         X = X[:, :INPUT_DIM].astype(SCALAR_NP_TYPE)
         y = y[y < OUTPUT_CLASSES]
         X = X[: y.shape[0]]
-
         X = StandardScaler().fit_transform(X).astype(SCALAR_NP_TYPE)
 
         print(f"\n--- Starting training for {EPOCHS} epochs ---")
@@ -1064,25 +1150,22 @@ class TrainingOrchestrator:
             start_idx = (epoch * BATCH_SIZE) % full_batch_size
             end_idx = start_idx + BATCH_SIZE
             indices = np.arange(start_idx, end_idx) % full_batch_size
-
             X_batch, y_batch_int = X[indices], y[indices]
+            y_b = (
+                y_batch_int.astype(np.int32)
+                if PROBLEM_TYPE == "CCE"
+                else OneHotEncoder().fit_transform(y_batch_int.reshape(-1, 1)).toarray().astype(SCALAR_NP_TYPE)
+            )
 
-            if PROBLEM_TYPE == "CCE":
-                y_b = y_batch_int.astype(np.int32)
-            else:  # BCE
-                y_b = OneHotEncoder().fit_transform(y_batch_int.reshape(-1, 1)).toarray().astype(SCALAR_NP_TYPE)
-
-            print(f"Epoch {self.global_step:4d} | Batch Size: {X_batch.shape[0]}")
+            print(f"Epoch {(self.global_step):_} | Batch Size: {X_batch.shape[0]}")
             plan = self.strategy.create_plan_for_batch(X_batch.shape[0])
             processor = BatchProcessor(self, X_batch, y_b)
             inference_event, final_event = processor.run(plan)
 
             inference_event.wait()
             valid_probs = processor.host_probs_view.get()
-
-            # Note: For logging simplicity, accuracy is based on the first exit's predictions.
             predicted_classes = np.argmax(valid_probs[0, :, :], axis=1)
-            accuracy = np.mean(predicted_classes == y_batch_int)
+            accuracy = np.mean(predicted_classes == y_batch_int) if y_batch_int.size > 0 else 0.0
 
             print(f"  - Inference Latency Path Complete. Accuracy: {accuracy:.2%}")
             final_event.wait()
@@ -1094,7 +1177,6 @@ class TrainingOrchestrator:
 if __name__ == "__main__":
     try:
         # Create dummy kernel files if they don't exist, to allow the script to run.
-        # In a real scenario, these files would contain the actual OpenCL kernel code.
         for fname in [
             "kernels.cl.h",
             "chunk_kernels.cl.c",

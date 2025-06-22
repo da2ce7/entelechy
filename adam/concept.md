@@ -6,6 +6,10 @@
 2.  **Modular, "Dumb" Kernels:** Kernels are simple, single-purpose modules. The architecture avoids complex branching ("smart" kernels) and monolithic designs in favor of composability.
 3.  **Trust the Driver:** Simple kernels are composed into a logical Directed Acyclic Graph (DAG). The architecture trusts the OpenCL driver to handle low-level optimizations like kernel fusion. The number of nodes in the DAG is a non-goal.
 4.  **Unified Dataflow:** The architecture follows a single, logical "always stream" pipeline. Performance and efficiency for problems of any scale is an emergent property of this unified design, not a separate, hard-coded path.
+5.  **Architectural Hierarchy:** This system is developed under a strict hierarchy of artifacts to ensure conceptual integrity.
+    *   **1. Design Document (This Document):** The highest authority and source of truth for conceptual correctness.
+    *   **2. Kernel Header Contract:** The binding technical contract between host and device. It must be in deep resonance with the design document.
+    *   **3. Host Code Implementation:** The lowest authority. It must be rigorously implemented to conform to the kernel header's contract. The header is *never* modified to suit the host code; the host code *always* yields to the contract.
 
 ---
 
@@ -86,7 +90,9 @@ graph TD
     %% Phase 0-3: Setup
     subgraph Phase 0-3: Host Setup & Global Params
         HL_0[Start Batch]:::host_logic --> HL_1["1. VRAM Budgeting & Chunking"]:::host_logic --> HL_2["2. Activation Lifecycle & Problem Type"]:::host_logic
-        P_Shared[Shared Params]:::param; P_Exits[Exit Params]:::param; P_Temps[Temp Params]:::param; Targets[Targets]:::param
+        P_Shared[Shared Params]:::param; P_Exits[Exit Params]:::param; P_Temps[Temp Params]:::param;
+        P_Step[Global Step 't']:::param
+        Targets[Targets]:::param
     end
 
     %% Phase 4: Shared Layer Forward Pass (Fused)
@@ -140,9 +146,9 @@ graph TD
         end
     end
 
-    %% Phase 8-10: Parallel Gradient Computation (Fused)
-    subgraph "Phase 8-10: Parallel Gradient Computation"
-        style "Phase 8-10: Parallel Gradient Computation" parallel_group
+    %% Phase 8-11: Parallel Gradient Computation & Transformation
+    subgraph "Phase 8-11: Parallel Gradient Path (Chunk-Based)"
+        style "Phase 8-11: Parallel Gradient Path (Chunk-Based)" parallel_group
 
         subgraph "Local Exit Gradients"
             style "Local Exit Gradients" grad_path_a
@@ -152,15 +158,17 @@ graph TD
             end
             PARTIAL_Probs & Targets --> L8_w; PARTIAL_Probs & Targets --> L8_b
             hidden_i --> L8_w
-            L8_w --> PARTIAL_Grad_ExitW[PARTIAL Grad_ExitW]:::partial_data
-            L8_b --> PARTIAL_Grad_ExitB[PARTIAL Grad_ExitB]:::partial_data
+            L8_w --> PARTIAL_Grad_ExitW[PARTIAL Grad_EW]:::partial_data
+            L8_b --> PARTIAL_Grad_ExitB[PARTIAL Grad_EB]:::partial_data
         end
 
-        subgraph "Upstream Hidden Gradients"
-            style "Upstream Hidden Gradients" grad_path_b
+        subgraph "Upstream Hidden Gradients & Transformation"
+            style "Upstream Hidden Gradients & Transformation" grad_path_b
             K9["<b>(9) backprop_error_to_hidden_chunk</b>"]:::kernel
             PARTIAL_Probs & Targets & P_Exits --> K9
             K9 --> PARTIAL_Grad_H_AoS["PARTIAL Grad_H<br/>(AoS Layout)"]:::partial_data
+            PARTIAL_Grad_H_AoS --> K11["<b>(11) transpose_chunk</b><br/>(on partial Grad_H)"]:::transpose_kernel
+            K11 --> PARTIAL_Grad_H_SoA["PARTIAL Grad_H<br/>(SoA Layout)"]:::partial_data
         end
 
         subgraph "Temperature Gradients"
@@ -171,18 +179,13 @@ graph TD
         end
     end
 
-    %% Phase 11-18: Remainder of Graph (Unchanged)
-    subgraph "Phase 11: Data Layout Transformation"
-        direction LR
-        PARTIAL_Grad_H_AoS -- All Chunks --> K11["<b>(11) transpose_grad_h</b>"]:::transpose_kernel
-        K11 --> PARTIAL_Grad_H_SoA["PARTIAL Grad_H<br/>(SoA Layout)"]:::partial_data
-    end
 
+    %% Phase 12-18: Remainder of Graph
     subgraph Phase 12: Primary Aggregation
         K12["<b>(12) Aggregate Kernel</b>"]:::host_logic
         PARTIAL_Probs & PARTIAL_Loss_BCE & PARTIAL_Grad_ExitW & PARTIAL_Grad_ExitB & PARTIAL_Grad_Temps & PARTIAL_Grad_H_SoA -- All Partial Data --> K12
         K12 --> FINAL_Probs[Final Probs]:::final_data & FINAL_BCE_Loss[Final BCE Loss]:::final_data & FINAL_Grad_H[Final Grad_H]:::final_data
-        K12 --> FINAL_Grad_ExitW[Final Grad_ExitW]:::final_data & FINAL_Grad_ExitB[Final Grad_ExitB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
+        K12 --> FINAL_Grad_ExitW[Final Grad_EW]:::final_data & FINAL_Grad_ExitB[Final Grad_EB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
     end
 
     subgraph "Phase 13-14: Streaming Shared Layer Backprop"
@@ -207,8 +210,11 @@ graph TD
         end
         subgraph "B. Training Path (All Updates)"
             K17_shared["(17) adam_update (Shared)"]:::kernel; FINAL_Grad_SW & FINAL_Grad_SB --> K17_shared; K17_shared -- updates --> P_Shared
+            P_Step --> K17_shared
             K17_exits["(17) adam_update (Exits)"]:::kernel; FINAL_Grad_ExitW & FINAL_Grad_ExitB --> K17_exits; K17_exits -- updates --> P_Exits
+            P_Step --> K17_exits
             K17_temps["(17) adam_update (Temps)"]:::kernel; FINAL_Grad_Temps --> K17_temps; K17_temps -- updates --> P_Temps
+            P_Step --> K17_temps
             K17_temps --> K18["<b>(18) clamp_temps</b>"]:::kernel
             K18 --> EV_Final["<b>final_batch_event</b>"]:::sync_event
         end
@@ -218,6 +224,7 @@ graph TD
     FINAL_Probs --> K16
     EV_Inference --> Host_Act["Host Acts on<br/>Early Result"]:::host_logic
     EV_Final --> Host_Wait_Final["Host Blocks for<br/>Full Batch"]:::host_logic
+
 ```
 
 ### **Final Kernel & Synchronization Contracts**
@@ -232,39 +239,43 @@ graph TD
 -   **(9) `backprop_error_to_hidden_chunk`**: A streamable kernel computing the **partial** upstream gradient for the hidden layer (`Grad_H`) for a class chunk. It computes the `(prob - target)` error signal on the fly and performs a reduction over the class dimension.
 -   **(10) `calculate_chunk_temp_gradients`**: A streamable kernel computing **partial** gradients for the temperature parameters.
 -   ---
--   **(11) `transpose_grad_h`**: A data layout transformation kernel. Reads the AoS-formatted `Grad_H` and writes it in an SoA layout for efficient aggregation.
--   **(12) `aggregate_*` kernels**: Generic, stateless kernel interface invoked to consolidate all partial results from the exit layer backpropagation (Probs, BCE Loss, Grads W, B, H, Temps).
+-   **(11) `transpose_chunk`**: **(Generic Utility).** A streamable kernel that transposes a rectangular slice (chunk) of a matrix. Its fundamental architectural purpose is **latency hiding**. For the `Grad_H` backpropagation path, this kernel is enqueued on a **per-chunk** basis immediately following its corresponding `backprop_error_to_hidden_chunk` (9) call. This fine-grained dependency allows the GPU's out-of-order scheduler to overlap the memory-bound transpose of chunk *N* with the compute-bound gradient calculations of chunk *N+1*, maximizing hardware occupancy and scaling efficiency.
+-   **(12) `aggregate_*` kernels**: Generic, stateless kernel interface invoked to consolidate all partial results. This includes Probs, BCE Loss, Grads W, B, Temps, and crucially, the **SoA-formatted** partial `Grad_H` results from the parallel transpose step.
 -   **(13) `backprop_shared_weights_chunk`**: A streamable backpropagation kernel for shared layer weights, computing partial gradients for a batch chunk.
 -   **(14) `backprop_shared_biases_chunk`**: A streamable backpropagation kernel for shared layer biases, computing partial gradients for a batch chunk.
 -   **(15) `aggregate_*` kernels**: The same generic kernel interface, invoked to consolidate partial gradients from the shared layer (`Grad_SW`, `Grad_SB`).
 -   **(16) `D2H Async Copy`**: A non-blocking Device-to-Host transfer of the `Final Probs` buffer, whose completion signals the `inference_event`.
--   **(17) `adam_update`**: Generic optimizer kernel, invoked multiple times for different parameter groups.
+-   **(17) `adam_update`**: Generic optimizer kernel, invoked multiple times for different parameter groups. This kernel is passed the global training step `t` and performs the Adam bias correction calculation internally (`sqrt(1 - beta2^t) / (1 - beta1^t)`). This approach guarantees numerical stability for training runs of any length (i.e., scaling across the epoch dimension) by avoiding the host-side calculation of `beta^t`, which can suffer from precision loss at large `t`.
 -   **(18) `clamp_temperatures`**: Final utility kernel for parameter constraint.
 -   **Host/Device Synchronization Contracts**:
     -   `inference_event`: Guarantees `Final Probs` data is available on the host.
     -   `final_batch_event`: Guarantees all device computations and parameter updates for the batch are complete.
 
----
 
 ### **Validation Scenarios**
 
-The architecture's unified and modular dataflow robustly handles all scenarios:
+The architecture's unified dataflow is validated by its robust and efficient handling of a wide spectrum of computational challenges, with each scenario probing a distinct scalability dimension.
 
--   **Scenario: The Iris Case (Tiny Problem, `num_*_chunks=1`)**
-    -   **Behavior:** The host sets all chunk counts to 1. All "streaming" loops run once. The parallel gradient kernels (8, 9, 10) are launched sequentially, and aggregation kernels (12, 15) become near-zero-cost `aggregate_identity` copies. The graph functions identically to a non-streaming design, proving its universality.
+-   **Scenario: The Iris Case (Tiny Problem)**
+    -   **Insight:** Demonstrates **universality**. For a problem that fits entirely in memory, the "always stream" design gracefully degrades. With all `num_*_chunks=1`, streaming loops run once and aggregation becomes a near-zero-cost identity copy, proving the architecture functions efficiently at any scale without special-casing.
+
+-   **Scenario: The Marathon (Massive `epochs`)**
+    -   **Insight:** Guarantees **long-term stability**. The system avoids numerical underflow in the Adam optimizer by delegating the sensitive `beta**t` calculation to the `(17) adam_update` kernel. By passing the `global_step` `t` as a simple integer, the architecture ensures the optimizer is mathematically correct and stable indefinitely, proving scalability across the time dimension.
+
+-   **Scenario: The Hydra (Massive `num_exits`)**
+    -   **Insight:** Validates **scalability of the core multi-exit design**. When faced with a huge number of exit paths, the host orchestrator chunks the problem along the exit dimension (`num_exit_chunks > 1`). Kernels for logits, probabilities, and gradients (5-10) are designed to process these exit chunks in parallel streams, which are then consolidated by the aggregation engine.
+
+-   **Scenario: The Behemoth (Massive `hidden_dim`)**
+    -   **Insight:** Proves **scalability through strategic compute/memory trade-offs**. When a deep or wide shared layer makes the intermediate `hidden_i` buffer the memory bottleneck, the host makes a critical choice: **Cache** `hidden_i` for speed if memory allows, or **Recompute** it on-the-fly during backpropagation to guarantee scalability for any network size.
 
 -   **Scenario: The Lexicon (Massive `output_classes`)**
-    -   **Behavior:** The host identifies the class dimension as the memory bottleneck and sets `num_class_chunks` to a large value.
-        -   **Forward Pass:** The three-stage softmax pipeline (5, 6, 7a) is critical. It materializes a massive `Full_Logits` buffer in chunks to enable the operation, with Node 6 acting as the essential synchronization point and bottleneck.
-        -   **Backward Pass:** The parallel gradient kernels (8, 9, 10) are streamed over the class chunks. For example, `(9) backprop_error_to_hidden_chunk` performs many small, independent reductions to build up pieces of the final `Grad_H` buffer.
-        -   **Aggregation:** The primary aggregation kernel (12) is called to sum a huge number of partial gradient results from all three parallel paths, demonstrating its scalability.
+    -   **Insight:** Achieves **maximum hardware occupancy via interleaved compute and memory operations**. When class count is the bottleneck, the host orchestrates a fine-grained parallel workload for each class chunk. The compute-bound gradient kernels (8, 9, 10) and the memory-bound `transpose_chunk` (11) for a given chunk are enqueued back-to-back without barriers. This allows the GPU's out-of-order scheduler to execute the transpose of chunk *N* concurrently with the gradient calculations of chunk *N+1*. This strategic interleaving of independent compute and memory tasks is the core mechanism for hiding latency and maximizing throughput.
 
--   **Scenario: Maximizing GPU Throughput (The General Case)**
-    -   **Behavior:** The architecture's modularity shines in Phase 8-10. The host enqueues kernels (8), (9), and (10) back-to-back without any intervening synchronization.
-    -   **Parallel Execution:** This creates three independent, concurrent workloads. A proficient OpenCL driver and GPU scheduler will interleave the execution of work-groups from all three kernels. If a work-group from kernel (9) stalls on memory, a ready work-group from (8) or (10) can be scheduled, maximizing hardware occupancy and hiding memory latency. This improves overall throughput compared to a monolithic kernel that would have to execute its internal stages serially. A similar parallel execution occurs for kernels (13) and (14).
+-   **Scenario: The Data Tsunami (Massive `batch_size`)**
+    -   **Insight:** Validates the **two-phase streaming backpropagation strategy**. For an extremely large batch, `backprop_shared_weights_chunk` (13) and `backprop_shared_biases_chunk` (14) stream over the batch dimension, computing partial gradients which are then averaged. This contrasts with earlier phases that reduce *over* the batch, showing a sophisticated dataflow tailored to memory access patterns.
 
--   **Scenario: The Behemoth (Few Exits, Fat Network)**
-    -   **Behavior:** The host determines the memory bottleneck is the intermediate `hidden_i` activation buffer. It streams along the batch dimension (`num_batch_chunks` > 1) and makes a strategic choice: **Recompute** `hidden_i` during backpropagation if VRAM is tight, or **Cache** it after Phase 4. This explicitly trades compute for memory, guaranteeing scalability.
+-   **Scenario: The Colossus (Holistic Stress Test)**
+    -   **Insight:** Tests the **synergy of all scaling strategies under compound memory pressure**. This case presents a network where no single dimension is the bottleneck, but the combination of large `num_exits`, `hidden_dim`, `output_classes`, and `batch_size` collectively exceeds VRAM. The host orchestrator is forced to **compose a multi-faceted execution plan**: it will apply chunking over exits/classes (Phases 5-12) and then apply chunking over the batch (Phases 13-14) sequentially within a single training step. It may also engage the `Recompute` strategy for hidden activations. This proves the system's ability to handle not just asymmetric but also large, symmetric workloads through a flexible, phased approach.
 
--   **Scenario: The Live Dashboard (Low-Latency Reporting)**
-    -   **Behavior:** The event-based design decouples latency from throughput. The host dispatches the full training batch, then immediately performs a non-blocking wait on the `inference_event`. The moment final probabilities are aggregated (end of Phase 12) and copied (Node 16), the host can fetch them. This happens in parallel while the GPU continues with the expensive shared layer backpropagation (Phases 13-18), delivering the earliest possible result to the application.
+-   **Scenario: The Live Dashboard (Live Inference While Training)**
+    -   **Insight:** Fulfills **application-level responsiveness requirements**. The event-based design (`inference_event`) decouples user-facing results from the full training step. An application can act on inference probabilities the moment they are available, while the GPU continues the expensive shared-layer backpropagation and parameter updates in the background.
