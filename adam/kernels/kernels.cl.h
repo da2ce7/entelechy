@@ -76,6 +76,7 @@ inline int         get_num_groups(int dim) { return 1; }
 inline void        barrier(int flags) { (void)flags; }
 inline SCALAR_TYPE clamp(SCALAR_TYPE val, SCALAR_TYPE min_val, SCALAR_TYPE max_val) { return fmin(fmax(val, min_val), max_val); }
 inline SCALAR_TYPE select(SCALAR_TYPE a, SCALAR_TYPE b, int c) { return (c) ? b : a; }
+inline SCALAR_TYPE pown(SCALAR_TYPE base, int exp) { return pow(base, (SCALAR_TYPE)exp); }
 #endif // __OPENCL_VERSION__
 
 // Computes the flattened 1D index for a hidden unit, assuming a row-major memory layout.

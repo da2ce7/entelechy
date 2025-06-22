@@ -5,46 +5,58 @@
 #include "kernels.cl.h"
 #endif
 
-// --- Implementation: transpose_grad_h (Node 11) ---
-// Strategy: A classic two-phase tiled matrix transpose.
-// Phase 1: Threads in a work-group cooperate to read a tile of the source
-// matrix into __local memory with coalesced accesses.
-// Phase 2: After a barrier, threads write from the __local tile to the
-// destination matrix, using transposed indices to perform the transpose.
-__kernel void
-transpose_grad_h(__local SCALAR_TYPE *tile, __global const SCALAR_TYPE *__restrict grad_h_aos_buf, __global SCALAR_TYPE *__restrict grad_h_soa_buf, int num_source_rows, int num_source_cols) {
+// --- Implementation: transpose_chunk (Node 11) ---
+// Strategy: A fully generic, tiled matrix transpose utility. This kernel is a
+// cornerstone of the latency-hiding strategy for the backpropagation path.
+// By operating on abstract chunks with specified offsets and leading dimensions,
+// it can be enqueued immediately after its preceding compute kernel on a per-chunk
+// basis. This allows the GPU's out-of-order scheduler to overlap this memory-bound
+// operation for chunk N with the compute-bound operations for chunk N+1,
+// maximizing hardware utilization.
+__kernel void transpose_chunk(
+    __local SCALAR_TYPE *local_mem,
+    __global const SCALAR_TYPE *__restrict in_buf,
+    __global SCALAR_TYPE *__restrict out_buf,
+    int in_offset_elements,
+    int out_offset_elements,
+    int num_rows_in_chunk,
+    int num_cols_in_chunk,
+    int in_leading_dim,
+    int out_leading_dim) {
 
 #define TILE_DIM C_TILE_SIZE
-// Pad the tile dimension by 1 to prevent local memory bank conflicts.
+// Pad the tile dimension by 1 to prevent local memory bank conflicts when transposing.
 #define PADDED_TILE_DIM (TILE_DIM + 1)
 
-    // Tile indices based on the work-group's position in the grid
-    const int tile_x = get_group_id(0);
-    const int tile_y = get_group_id(1);
+    // Phase 1: Coalesced Read from Global (Source) to Local Memory
+    //
+    // Work-item's logical (x, y) coordinates within the source chunk.
+    const int x_in = get_group_id(0) * TILE_DIM + get_local_id(0);
+    const int y_in = get_group_id(1) * TILE_DIM + get_local_id(1);
 
-    // Thread indices within the local work-group (the tile)
-    const int local_x = get_local_id(0);
-    const int local_y = get_local_id(1);
-
-    // --- Phase 1: Coalesced Read from Global (Source) to Local Memory ---
-    const int x_in = tile_x * TILE_DIM + local_x;
-    const int y_in = tile_y * TILE_DIM + local_y;
-
-    if (x_in < num_source_cols && y_in < num_source_rows) {
-        const int in_idx = y_in * num_source_cols + x_in;
-        // Use the padded dimension to avoid bank conflicts when reading back.
-        tile[local_y * PADDED_TILE_DIM + local_x] = grad_h_aos_buf[in_idx];
+    // Boundary check to ensure we only read from within the source chunk's bounds.
+    if (x_in < num_cols_in_chunk && y_in < num_rows_in_chunk) {
+        // Calculate the physical 1D index into the global input buffer using the
+        // provided offset and leading dimension (stride).
+        const int in_idx                                               = in_offset_elements + (y_in * in_leading_dim) + x_in;
+        local_mem[get_local_id(1) * PADDED_TILE_DIM + get_local_id(0)] = in_buf[in_idx];
     }
 
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // --- Phase 2: Coalesced Write from Local to Global (Destination) Memory ---
-    const int x_out = tile_y * TILE_DIM + local_x;
-    const int y_out = tile_x * TILE_DIM + local_y;
+    // Phase 2: Coalesced Write from Local to Global (Destination) Memory
+    //
+    // Transpose the local coordinates to find the logical (x, y) coordinates
+    // for the destination chunk.
+    const int x_out = get_group_id(1) * TILE_DIM + get_local_id(0);
+    const int y_out = get_group_id(0) * TILE_DIM + get_local_id(1);
 
-    if (x_out < num_source_rows && y_out < num_source_cols) {
-        const int out_idx       = y_out * num_source_rows + x_out;
-        grad_h_soa_buf[out_idx] = tile[local_x * PADDED_TILE_DIM + local_y];
+    // Boundary check against the transposed dimensions of the chunk.
+    if (x_out < num_rows_in_chunk && y_out < num_cols_in_chunk) {
+        // Calculate the physical 1D index into the global output buffer using its
+        // distinct offset and leading dimension.
+        const int out_idx = out_offset_elements + (y_out * out_leading_dim) + x_out;
+        out_buf[out_idx]  = local_mem[get_local_id(0) * PADDED_TILE_DIM + get_local_id(1)];
     }
 }
 

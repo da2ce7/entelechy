@@ -9,17 +9,20 @@
 // Strategy: An embarrassingly parallel map kernel. Each work-item is assigned
 // to a single parameter and performs the update completely independently.
 // The `param_offset` enables this generic kernel to be dispatched multiple times,
-// applying updates to distinct slices of the overall parameter set (e.g.,
-// Shared Layer, Exit Layers, Temperatures) each with their own Adam state.
-// NOTE: This kernel's signature was already clear and specific, requiring no changes.
+// applying updates to distinct slices of the overall parameter set.
+//
+// By accepting the raw global step `t`, this kernel guarantees numerical stability
+// for training runs of any length. It performs the sensitive bias correction
+// power calculation (`beta**t`) on the device, avoiding potential host-side
+// precision loss when `t` becomes very large, as described in the
+// "Marathon" validation scenario.
 __kernel void adam_update(
     __global const SCALAR_TYPE *__restrict grad,
     SCALAR_TYPE beta1,
     SCALAR_TYPE beta2,
-    SCALAR_TYPE beta1_t,
-    SCALAR_TYPE beta2_t,
     SCALAR_TYPE learning_rate,
     SCALAR_TYPE epsilon,
+    uint        t,
     __global SCALAR_TYPE *__restrict param,
     __global SCALAR_TYPE *__restrict m1,
     __global SCALAR_TYPE *__restrict m2,
@@ -46,6 +49,10 @@ __kernel void adam_update(
     // Update biased second raw moment estimate (v_t).
     const SCALAR_TYPE v_new = beta2 * v_prev + (1.0f - beta2) * (g * g);
 
+    // Perform bias correction calculation internally for maximum numerical stability.
+    const SCALAR_TYPE beta1_t = pown(beta1, (int)t);
+    const SCALAR_TYPE beta2_t = pown(beta2, (int)t);
+
     // Compute bias-corrected first moment estimate (m_hat_t).
     const SCALAR_TYPE m_hat = m_new / (1.0f - beta1_t);
 
@@ -53,7 +60,7 @@ __kernel void adam_update(
     const SCALAR_TYPE v_hat = v_new / (1.0f - beta2_t);
 
     // Update the parameter.
-    const SCALAR_TYPE param_update = learning_rate * m_hat / (sqrt(v_hat) + epsilon);
+    const SCALAR_TYPE param_update = learning_rate * m_hat / (MATH_FN sqrt(v_hat) + epsilon);
     param[global_idx] -= param_update;
 
     // Store the updated momentum values.
