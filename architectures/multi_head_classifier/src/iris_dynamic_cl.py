@@ -147,14 +147,7 @@ class HostView:
         return self.host_data[slicing]
 
 
-class BackpropStrategyType(enum.Enum):
-    """Defines the algorithm for handling multi-chunk backpropagation."""
-
-    SEQUENTIAL_MONOLITHIC = 1
-    INTERLEAVED_STREAMING = 2
-
-
-# --- NEW ABSTRACTIONS: The 2D Tiling System ---
+# --- 2D Tiling System ---
 
 
 @dataclass(frozen=True)
@@ -227,7 +220,6 @@ class ExecutionPlan:
 
     grid: ExecutionGrid
     shared_layer_batch_chunking: ChunkingConfig
-    module_backprop_strategy: BackpropStrategyType
     recompute_hidden: bool = False
 
 
@@ -529,8 +521,6 @@ class KernelExecutor:
         """A specialized method to correctly launch transpose_chunk for a Grad_H tile."""
         in_buf, out_buf = "partial_grad_h_aos_out", "partial_grad_h_soa_out"
         in_spec, out_spec = self.b.get_spec(in_buf)[0], self.b.get_spec(out_buf)[0]
-        # Partial AoS Buffer has a flat layout per tile: (MAX_TILES, N, B, H)
-        # We transpose a (num_modules_in_tile, (B*H)) slice
         rows = tile.num_modules_in_tile
         cols = BATCH_SIZE * HIDDEN_DIM
         in_offset = tile.flat_tile_id * (in_spec[1] * in_spec[2] * in_spec[3])
@@ -610,6 +600,28 @@ class KernelExecutor:
                 mode,
                 wait_for=wait_for,
             )
+
+    def launch_reduce_grad_h_over_modules(self, queue: cl.CommandQueue, wait_for) -> cl.Event:
+        """Launches the specialized kernel (13) to reduce Grad_H over the module dimension."""
+        lsize = 256
+        total_elements = BATCH_SIZE * self.padded_hidden_dim
+        gsize = pad_to_multiple(total_elements, lsize)
+
+        # Retrieve the physical padded dimension from the buffer manager's spec.
+        # This makes the kernel call robust to the padding rules applied during
+        # buffer creation, fulfilling the updated contract.
+        in_buf_spec = self.b.get_spec("agg_grad_h_module_major_buf")
+        padded_total_modules = in_buf_spec[0][-1]
+
+        args = (
+            cl.LocalMemory(lsize * self.scalar_size),
+            self.b.get("agg_grad_h_module_major_buf"),
+            self.b.get("final_grad_h_buf"),
+            np.int32(total_elements),
+            np.int32(NUM_MODULES),  # The logical module count for the loop.
+            np.int32(padded_total_modules),  # The physical stride for memory access.
+        )
+        return self.p.reduce_grad_h_over_modules(queue, (gsize,), (lsize,), *args, wait_for=wait_for)
 
     def launch_backprop_shared_chunk(self, queue, chunk_id, offset, num_samples, wait_for) -> Tuple[cl.Event, cl.Event]:
         lsize = 256
@@ -716,11 +728,6 @@ class ExecutionStrategy:
                 raise MemoryError("Cannot create a tile small enough for device VRAM.")
         grid = ExecutionGrid(num_m_chunks, num_c_chunks, NUM_MODULES, OUTPUT_CLASSES)
 
-        backprop_strategy = (
-            BackpropStrategyType.INTERLEAVED_STREAMING
-            if grid.num_class_chunks > 1
-            else BackpropStrategyType.SEQUENTIAL_MONOLITHIC
-        )
         mem_per_tile_final = full_problem_mem / grid.total_tiles
         recompute_hidden = (hidden_size + mem_per_tile_final) > self.vram_budget
         num_batch_chunks = (batch_size + BACKPROP_STREAM_CHUNK_SIZE - 1) // BACKPROP_STREAM_CHUNK_SIZE
@@ -729,12 +736,11 @@ class ExecutionStrategy:
         print(
             f"INFO: Determined a {grid.num_module_chunks}x{grid.num_class_chunks} tiling grid ({grid.total_tiles} total tiles)."
         )
-        if backprop_strategy == BackpropStrategyType.INTERLEAVED_STREAMING:
-            print("  - Strategy: INTERLEAVED_STREAMING backprop for Grad_H.")
+        print("  - Strategy: Unified INTERLEAVED_STREAMING backprop for Grad_H.")
         if recompute_hidden:
             print("INFO: Extreme memory pressure. `hidden` buffer will be recomputed.")
 
-        return ExecutionPlan(grid, batch_cfg, backprop_strategy, recompute_hidden)
+        return ExecutionPlan(grid, batch_cfg, recompute_hidden)
 
 
 # --- Layer 3: Execution Layer ---
@@ -808,7 +814,7 @@ class BatchProcessor:
         self.events["all_prob_loss_chunks_ready"] = cl.WaitForEvents(self.event_lists["prob_loss_chunks_ready"])
 
     def _launch_tile_downstream_work(self, tile: WorkTile, plan: ExecutionPlan):
-        """(New Helper) Launches all kernels for a tile that come AFTER the logit/softmax sync point."""
+        """Launches all kernels for a tile that come AFTER the logit/softmax sync point."""
         prob_loss_deps = self._get_deps("softmax_params_ready", "targets_ready", "all_logits_ready")
         prob_loss_evt = self.executor.launch_compute_probs_loss_cce_chunk(self.queue, tile, prob_loss_deps)
         self.event_lists["prob_loss_chunks_ready"].append(prob_loss_evt)
@@ -817,15 +823,17 @@ class BatchProcessor:
         w_grad, h_grad, t_grad = self.executor.launch_parallel_module_grads(self.queue, tile, grad_base_deps)
         self.event_lists["partial_grad_w_ready"].append(w_grad)
         self.event_lists["partial_grad_t_ready"].append(t_grad)
-        if plan.module_backprop_strategy == BackpropStrategyType.INTERLEAVED_STREAMING:
-            transpose_evt = self.executor.launch_grad_h_transpose_for_tile(self.queue, tile, wait_for=[h_grad])
-            self.event_lists["partial_grad_h_soa_ready"].append(transpose_evt)
-        else:
-            self.event_lists["partial_grad_h_ready"].append(h_grad)
+
+        # ---- The Unified Path ----
+        # The interleaved transpose-as-you-go approach is always optimal and is required by the aggregation logic.
+        transpose_evt = self.executor.launch_grad_h_transpose_for_tile(self.queue, tile, wait_for=[h_grad])
+        self.event_lists["partial_grad_h_soa_ready"].append(transpose_evt)
 
     def _aggregate_and_backprop_shared(self, plan: ExecutionPlan):
         b = self.executor.b
         get_elem = lambda name: int(np.prod(b.get_spec(name)[0]))
+
+        # --- Aggregate all partials from the module/class grid ---
         self.events["final_probs_ready"] = self.executor.launch_aggregation(
             self.queue,
             "partial_probs_out",
@@ -863,62 +871,22 @@ class BatchProcessor:
             self.event_lists["partial_grad_t_ready"],
         )
 
-        if plan.module_backprop_strategy == BackpropStrategyType.INTERLEAVED_STREAMING:
-            agg_soa_evt = self.executor.launch_aggregation(
-                self.queue,
-                "partial_grad_h_soa_out",
-                "aggregated_grad_h_soa",
-                plan.grid.total_tiles,
-                get_elem("aggregated_grad_h_soa"),
-                False,
-                self.event_lists["partial_grad_h_soa_ready"],
-            )
-            prev_evt = agg_soa_evt
-        else:
-            agg_aos_evt = self.executor.launch_aggregation(
-                self.queue,
-                "partial_grad_h_aos_out",
-                "aggregated_grad_h_aos_buf",
-                plan.grid.total_tiles,
-                get_elem("aggregated_grad_h_aos_buf"),
-                False,
-                self.event_lists["partial_grad_h_ready"],
-            )
-            prev_evt = self.executor.launch_transpose_chunk(
-                self.queue,
-                "aggregated_grad_h_aos_buf",
-                "aggregated_grad_h_soa",
-                0,
-                0,
-                NUM_MODULES,
-                BATCH_SIZE * HIDDEN_DIM,
-                BATCH_SIZE * HIDDEN_DIM,
-                NUM_MODULES,
-                wait_for=[agg_aos_evt],
-            )
-
-        transpose_agg_evt = self.executor.launch_transpose_chunk(
+        # --- Path for Grad_H ---
+        agg_grad_h_evt = self.executor.launch_aggregation(
             self.queue,
-            "aggregated_grad_h_soa",
-            "transposed_aggregated_grad_h_soa",
-            0,
-            0,
-            BATCH_SIZE * HIDDEN_DIM,
-            NUM_MODULES,
-            NUM_MODULES,
-            BATCH_SIZE * HIDDEN_DIM,
-            wait_for=[prev_evt],
-        )
-        self.events["final_grad_h_ready"] = self.executor.launch_aggregation(
-            self.queue,
-            "transposed_aggregated_grad_h_soa",
-            "final_grad_h_buf",
-            NUM_MODULES,
-            get_elem("final_grad_h_buf"),
+            "partial_grad_h_soa_out",
+            "agg_grad_h_module_major_buf",
+            plan.grid.total_tiles,
+            get_elem("agg_grad_h_module_major_buf"),
             False,
-            [transpose_agg_evt],
+            self.event_lists["partial_grad_h_soa_ready"],  # Depends on the SoA partials
         )
 
+        self.events["final_grad_h_ready"] = self.executor.launch_reduce_grad_h_over_modules(
+            self.queue, wait_for=[agg_grad_h_evt]
+        )
+
+        # --- Streaming backprop for the shared layer ---
         backprop_deps = self._get_deps("final_grad_h_ready")
         if plan.recompute_hidden:
             backprop_deps.append(
@@ -936,6 +904,7 @@ class BatchProcessor:
             self.event_lists["partial_grad_sw_ready"].append(sw)
             self.event_lists["partial_grad_sb_ready"].append(sb)
 
+        # --- Final aggregation for shared layer gradients ---
         self.final_grad_events["grad_weights"] = self.executor.launch_aggregation(
             self.queue,
             "partial_grad_sw_out",
@@ -1083,9 +1052,10 @@ class TrainingOrchestrator:
                 BufferRole.PARTIAL_GRADIENT,
                 (MAX_TOTAL_TILES, BATCH_SIZE * HIDDEN_DIM, NUM_MODULES),
             ),
-            "aggregated_grad_h_aos_buf": (BufferRole.INTERMEDIATE, (NUM_MODULES, BATCH_SIZE, HIDDEN_DIM)),
-            "aggregated_grad_h_soa": (BufferRole.INTERMEDIATE, (BATCH_SIZE * HIDDEN_DIM, NUM_MODULES)),
-            "transposed_aggregated_grad_h_soa": (BufferRole.INTERMEDIATE, (NUM_MODULES, BATCH_SIZE * HIDDEN_DIM)),
+            # This buffer now holds the result of aggregating the partial SoA chunks.
+            # Its layout is (B*H, M), making it ready for the specialized reduction kernel.
+            "agg_grad_h_module_major_buf": (BufferRole.INTERMEDIATE, (BATCH_SIZE * HIDDEN_DIM, NUM_MODULES)),
+            # This is the final destination for the upstream gradient.
             "final_grad_h_buf": (BufferRole.FINAL_GRADIENT, (BATCH_SIZE, HIDDEN_DIM)),
         }
         for name, (role, shape) in int_buffers.items():

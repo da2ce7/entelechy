@@ -245,30 +245,31 @@ graph TD
     EV_Final --> Host_Wait_Final["Host Blocks for<br/>Full Batch"]:::host_logic
 ```
 
+
 ### **Final Kernel & Synchronization Contracts**
 
 - **(4) `forward_pass`**: Computes hidden activations for a chunk of the input batch.
-- **(5) `compute_logits_chunk`**: A streamable kernel computing raw logits for a chunk of `Classifier Module` instances and classes.
-- **(6) `reduce_logits_for_softmax`**: **Invoked when `Operating Mode` is `CCE`.** A synchronization kernel that computes stable Softmax normalization terms.
-- **(7a) `compute_probs_loss_cce_chunk`**: **Invoked when `Operating Mode` is `CCE`.** Streamable kernel computing probabilities and final CCE loss.
-- **(7b) `compute_probs_loss_bce_chunk`**: **Invoked when `Operating Mode` is `BCE`.** Streamable kernel computing probabilities and partial BCE loss.
+- **(5) `compute_logits_chunk`**: A streamable kernel computing raw logits. It is designed to be **robust to memory padding**, using physical strides to correctly navigate the module-level weight and bias buffers.
+- **(6) `reduce_logits_for_softmax`**: **Invoked when `Operating Mode` is `CCE`.** A synchronization kernel that computes stable Softmax normalization terms. It is designed to be **robust to memory padding**, using physical strides to correctly navigate its input buffers.
+- **(7a) `compute_probs_loss_cce_chunk`**: **Invoked when `OperatingMode` is `CCE`.** A streamable kernel computing probabilities and final CCE loss. It is designed to be **robust to memory padding**, using physical strides to correctly navigate its input buffers.
+- **(7b) `compute_probs_loss_bce_chunk`**: **Invoked when `OperatingMode` is `BCE`.** A streamable kernel computing probabilities and partial BCE loss. It is designed to be **robust to memory padding**, using physical strides to correctly navigate its input buffers.
 
 ---
 
-- **(8) `calculate_module_param_grads_chunk`**: A streamable kernel computing **partial** gradients for module weights and biases (`Grad_ModW`, `Grad_ModB`). It computes the `(prob - target)` error signal on the fly.
-- **(9) `backprop_error_to_hidden_chunk`**: A streamable kernel computing the **partial** upstream gradient for the hidden layer (`Grad_H`).
-- **(10) `calculate_chunk_temp_gradients`**: A streamable kernel computing **partial** gradients for the temperature parameters.
+- **(8) `calculate_module_param_grads_chunk`**: A streamable kernel computing **partial** gradients for module weights and biases. It is designed to be **robust to memory padding**, using physical strides to navigate its input buffers. It computes the `(prob - target)` error signal on the fly.
+- **(9) `backprop_error_to_hidden_chunk`**: A streamable kernel computing the **partial** upstream gradient for the hidden layer (`Grad_H`). It is designed to be **robust to memory padding**, using physical strides to navigate the module weight buffer.
+- **(10) `calculate_chunk_temp_gradients`**: A streamable kernel computing **partial** gradients for the temperature parameters. It is designed to be **robust to memory padding**, using physical strides to correctly navigate its input buffers.
 
 ---
 
 - **(11) `transpose_chunk`**: **(Generic Utility).** A streamable kernel whose purpose is **latency hiding**. It is enqueued on a per-chunk basis to overlap memory-bound transpose operations with compute-bound gradient calculations.
 - **(12) `aggregate_*` kernels**: Generic, stateless kernel interface invoked to consolidate all partial results from the module/class chunking phase. For `Grad_H`, it produces an intermediate `Aggregated_Grad_H` buffer which requires further reduction.
-- **(13) `reduce_grad_h_over_modules`**: **(New)** A specialized reduction kernel that sums the module-major `Aggregated Grad_H` buffer across the module dimension to produce the final `Final_Grad_H`.
+- **(13) `reduce_grad_h_over_modules`**: A specialized reduction kernel that sums the module-major `Aggregated Grad_H` buffer. It is designed to be **robust to memory padding**, using physical strides to correctly navigate the buffer and sum contributions across the logical module dimension, producing the final `Final_Grad_H`.
 - **(14) `backprop_shared_weights_chunk`**: A streamable backpropagation kernel for shared layer weights, computing partial gradients for a batch chunk.
 - **(15) `backprop_shared_biases_chunk`**: A streamable backpropagation kernel for shared layer biases, computing partial gradients for a batch chunk.
 - **(16) `aggregate_*` kernels**: The same generic kernel interface, invoked to consolidate partial gradients from the shared layer.
 - **(17) `D2H Async Copy`**: A non-blocking Device-to-Host transfer of the `Final Probs` buffer, whose completion signals the `inference_event`.
-- **(18) `adam_update`**: Generic optimizer kernel, invoked multiple times for different parameter groups. It accepts the global step `t` to guarantee numerical stability.
+- **(18) `adam_update`**: Generic optimizer kernel, invoked multiple times for different parameter groups. It accepts the global step `t` to guarantee numerical stability and relies on the host to provide **parameter, gradient, and momentum buffers with identical physical layouts** for correct operation.
 - **(19) `clamp_temperatures`**: Final utility kernel for parameter constraint.
 - **Host/Device Synchronization Contracts**:
   - `inference_event`: Guarantees the **complete, aggregated `Final Probs` tensor, representing results from all `Classifier Heads`**, is available on the host.

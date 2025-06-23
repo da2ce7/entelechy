@@ -93,10 +93,10 @@ __kernel void forward_pass(
 }
 
 // --- Implementation: compute_logits_chunk (Node 5) ---
-// Strategy: A pure "map" kernel dispatched with a 3D grid. Each work-item is
-// responsible for computing exactly one logit value. The three dimensions of the
-// grid map to (module, batch_sample, class). This is the first, fully streamable
-// stage in the three-part softmax pipeline.
+// Strategy: A pure 3D "map" kernel where each work-item computes one logit. It
+// is designed to be padding-aware, using the physical stride of the class
+// dimension (`padded_total_output_classes`) for all memory index calculations.
+// This ensures correct addressing into buffers that are padded for performance.
 __kernel void compute_logits_chunk(
     __global const SCALAR_TYPE *__restrict hidden_buf,
     __global const SCALAR_TYPE *__restrict hidden_mask,
@@ -111,114 +111,109 @@ __kernel void compute_logits_chunk(
     int total_batch_size,
     int hidden_dim,
     int padded_hidden_dim,
-    int total_output_classes) {
+    int total_output_classes,
+    int padded_total_output_classes) {
 
-    // Map the 3D work-item grid to the logical problem space.
-    const uint module_local_idx = get_global_id(0); // Index within the current EXIT chunk
-    const uint batch_idx        = get_global_id(1); // Global batch index
-    const uint class_local_idx  = get_global_id(2); // Index within the current CLASS chunk
+    // Map the 3D work-item grid to the logical (module, batch, class) space.
+    const uint module_local_idx = get_global_id(0);
+    const uint batch_idx        = get_global_id(1);
+    const uint class_local_idx  = get_global_id(2);
 
-    // --- Boundary Checks ---
+    // Boundary check against the logical chunk dimensions.
     if (module_local_idx >= num_modules_in_chunk || batch_idx >= total_batch_size || class_local_idx >= num_classes_in_chunk) {
         return;
     }
 
-    // Convert local chunk indices to global indices.
+    // Establish global (module, class) coordinates for this work-item.
     const uint module_global_idx = module_param_offset + module_local_idx;
     const uint class_global_idx  = class_offset + class_local_idx;
 
-    // The output index for this specific work-item's logit.
-    const uint out_idx = module_global_idx * total_batch_size * total_output_classes + batch_idx * total_output_classes + class_global_idx;
+    // CRITICAL: Use the physical stride `padded_total_output_classes` for correct addressing.
+    const long out_idx = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes + class_global_idx;
 
-    // --- Masking ---
-    // For padded or invalid samples, skip computation and write a zero logit.
+    // Skip computation for masked-out samples.
     if (hidden_mask[batch_idx] < 0.5f) {
         full_logits_out[out_idx] = SCALAR_ZERO;
         return;
     }
 
-    // --- Core Computation: Dot Product ---
-    // Initialize the accumulator with the bias for the assigned (module, class).
-    SCALAR_TYPE logit = module_biases_buf[module_global_idx * total_output_classes + class_global_idx];
+    // Initialize accumulator with the bias, using the physical stride.
+    SCALAR_TYPE logit = module_biases_buf[(long)module_global_idx * padded_total_output_classes + class_global_idx];
 
-    // Compute the dot product of the hidden activation vector and the corresponding weight vector.
+    // Compute the dot product using the physical stride for the weight lookup.
     for (int h = 0; h < hidden_dim; h++) {
-        // Use the macro for consistent, safe access to the hidden buffer.
-        const SCALAR_TYPE h_val = hidden_buf[GET_PHYSICAL_HIDDEN_IDX(batch_idx, h, padded_hidden_dim)];
-
-        // Get the corresponding weight.
-        const uint        weight_idx = module_global_idx * hidden_dim * total_output_classes + h * total_output_classes + class_global_idx;
+        const SCALAR_TYPE h_val      = hidden_buf[GET_PHYSICAL_HIDDEN_IDX(batch_idx, h, padded_hidden_dim)];
+        const long        weight_idx = (long)module_global_idx * hidden_dim * padded_total_output_classes + (long)h * padded_total_output_classes + class_global_idx;
         const SCALAR_TYPE w_val      = module_weights_buf[weight_idx];
-
         logit += h_val * w_val;
     }
 
-    // Write the final computed logit to the full global buffer.
     full_logits_out[out_idx] = logit;
 }
 
 // --- Implementation: reduce_logits_for_softmax (Node 6) ---
 // Strategy: A 2D "map" kernel where each work-item (module, batch_sample) performs
-// an independent reduction over the entire class dimension for that sample. This
-// kernel is the essential synchronization point in the class-streaming pipeline.
-// A two-pass algorithm is used for numerical stability when calculating the sum
-// of exponentials.
+// a stable two-pass reduction over the class dimension. It is padding-aware, using
+// the physical class stride for correct memory addressing into the logit buffer.
 __kernel void reduce_logits_for_softmax(
     __global const SCALAR_TYPE *__restrict full_logits_buf,
     __global const SCALAR_TYPE *__restrict temps_buf,
     __global SCALAR_TYPE *__restrict softmax_params_out,
     int total_modules,
     int total_batch_size,
-    int total_output_classes) {
+    int total_output_classes,
+    int padded_total_output_classes) {
 
-    // Map the 2D work-item grid to the (module, batch) problem space.
+    // Map work-item to a (module, batch) pair.
     const uint module_idx = get_global_id(0);
     const uint batch_idx  = get_global_id(1);
 
-    // Boundary checks
     if (module_idx >= total_modules || batch_idx >= total_batch_size) {
         return;
     }
 
-    // Base index for all data related to this specific (module, batch) pair.
-    const uint base_in_idx  = module_idx * total_batch_size * total_output_classes + batch_idx * total_output_classes;
+    // CRITICAL: Calculate base input index using the physical stride.
+    const long base_in_idx = (long)module_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes;
+    // Output index is unaffected by class padding as its last dimension is 2.
     const uint base_out_idx = module_idx * total_batch_size * 2 + batch_idx * 2;
 
-    // Fetch the temperature for this module once.
     const SCALAR_TYPE temp     = temps_buf[module_idx];
     const SCALAR_TYPE temp_inv = 1.0f / temp;
 
-    // --- Pass 1: Find the maximum of the temperature-scaled logits ---
-    // This is essential for numerical stability of the `exp` function in the next pass.
+    // --- Pass 1: Find max logit for numerical stability ---
+    // This is essential for the stability of the `exp` function in the next pass.
     SCALAR_TYPE max_scaled_logit = -FLT_MAX;
+    // The loop iterates over the LOGICAL number of classes.
     for (int c = 0; c < total_output_classes; c++) {
+        // The indexing is now correct because base_in_idx used the physical stride.
         const SCALAR_TYPE logit = full_logits_buf[base_in_idx + c];
         max_scaled_logit        = fmax(max_scaled_logit, logit * temp_inv);
     }
 
-    // For cases where all logits are -inf (e.g., masked sample), prevent max_scaled_logit from being -FLT_MAX.
+    // For cases where all logits are -inf (e.g., a masked sample), this prevents `max_scaled_logit`
+    // from propagating a -FLT_MAX, which could lead to NaNs in later calculations.
     if (max_scaled_logit == -FLT_MAX) {
         max_scaled_logit = 0.0f;
     }
 
-    // --- Pass 2: Calculate the sum of exponentials using the max_scaled_logit for stability ---
+    // --- Pass 2: Calculate sum of exponentials using the max for stability ---
     SCALAR_TYPE sum_exp = SCALAR_ZERO;
     for (int c = 0; c < total_output_classes; c++) {
         const SCALAR_TYPE logit = full_logits_buf[base_in_idx + c];
-        // Subtracting the max before exponentiating prevents overflow to +inf and improves precision for small values.
+        // The log-sum-exp trick: subtracting the max before `exp` prevents overflow to +inf
+        // and improves precision for values that would otherwise underflow to zero.
         sum_exp += MATH_FN exp((logit * temp_inv) - max_scaled_logit);
     }
 
-    // Write the two resulting parameters to the output buffer.
     softmax_params_out[base_out_idx + 0] = max_scaled_logit;
     softmax_params_out[base_out_idx + 1] = sum_exp;
 }
 
-// --- Implementation: compute_probs_loss_cce_chunk (Node 7 - CCE Path) ---
-// Strategy: A pure 3D "map" kernel dispatched with a grid corresponding to
-// (module, batch_sample, class). Each work-item is responsible for one probability
-// value. If a work-item's class matches the target class for its sample, it
-// performs a "scatter" write of the final CCE loss value.
+// --- Implementation: compute_probs_loss_cce_chunk (Node 7a - CCE Path) ---
+// Strategy: A 3D "map" kernel where each work-item computes one probability. It's
+// padding-aware, using the physical class stride for correct addressing. The
+// work-item matching the target class performs a race-free "scatter" write of
+// the final CCE loss, eliminating the need for a separate reduction.
 __kernel void compute_probs_loss_cce_chunk(
     __global const SCALAR_TYPE *__restrict full_logits_buf,
     __global const SCALAR_TYPE *__restrict softmax_params_buf,
@@ -233,31 +228,30 @@ __kernel void compute_probs_loss_cce_chunk(
     int class_offset,
     int num_classes_in_chunk,
     int total_batch_size,
-    int total_output_classes) {
+    int total_output_classes,
+    int padded_total_output_classes) {
 
-    // Map the 3D work-item grid to the logical problem space.
+    // Map the 3D work-item grid to the logical (module, batch, class) space.
     const uint module_local_idx = get_global_id(0);
     const uint batch_idx        = get_global_id(1);
     const uint class_local_idx  = get_global_id(2);
 
-    // --- Boundary Checks ---
+    // Boundary check against the logical chunk dimensions.
     if (module_local_idx >= num_modules_in_chunk || batch_idx >= total_batch_size || class_local_idx >= num_classes_in_chunk) {
         return;
     }
 
-    // Convert local chunk indices to global indices.
     const uint module_global_idx = module_param_offset + module_local_idx;
     const uint class_global_idx  = class_offset + class_local_idx;
-    const uint prob_out_idx      = module_global_idx * total_batch_size * total_output_classes + batch_idx * total_output_classes + class_global_idx;
 
-    // --- Masking ---
-    // For masked samples, prob is zero, and the loss remains its pre-initialized zero value.
+    // CRITICAL: Use the physical stride for correct index calculation into class-dimensioned buffers.
+    const long prob_out_idx = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes + class_global_idx;
+
+    // Skip computation for masked-out samples.
     if (sample_mask[batch_idx] < 0.5f) {
         partial_probs_out[prob_out_idx] = SCALAR_ZERO;
         return;
     }
-
-    // This kernel fuses probability calculation with a non-atomic scatter-write for the loss, avoiding a separate reduction step entirely.
 
     // --- Probability Calculation (using pre-computed Softmax parameters) ---
     const uint        params_base_idx  = module_global_idx * total_batch_size * 2 + batch_idx * 2;
@@ -268,29 +262,27 @@ __kernel void compute_probs_loss_cce_chunk(
 
     SCALAR_TYPE prob = SCALAR_ZERO;
     if (sum_exp > (SCALAR_TYPE)1e-9f) {
-        // Final Softmax probability: p_i = exp(z_i/T - max(z/T)) / sum(exp(z_j/T - max(z/T)))
         prob = MATH_FN exp((logit * temp_inv) - max_scaled_logit) / sum_exp;
     }
     partial_probs_out[prob_out_idx] = prob;
 
     // --- CCE Loss Calculation (Scatter Write) ---
-    // Only the single work-item corresponding to the correct class writes the loss for its sample.
-    // This is a safe, race-free operation because each (module, batch) pair has only one true class.
+    // This kernel fuses probability calculation with a non-atomic scatter-write for the loss, avoiding a separate reduction step.
+    // The single work-item matching the true class writes the loss for its sample. This is a safe, race-free operation
+    // because each (module, batch_sample) pair has exactly one true class, ensuring no two work-items write to the same address.
     const int true_class = targets_cce_buf[batch_idx];
     if (class_global_idx == true_class) {
-        // CCE Loss is -log(p) for the true class.
         const SCALAR_TYPE loss                         = -MATH_FN log(fmax(prob, (SCALAR_TYPE)1e-9f));
         const uint                        loss_out_idx = module_global_idx * total_batch_size + batch_idx;
         final_loss_out[loss_out_idx]                   = loss;
     }
 }
 
-// --- Implementation: compute_probs_loss_bce_chunk (Node 7 - BCE Path) ---
-// Strategy: A 2D "map-reduce" kernel dispatched with a grid corresponding to
-// (module, batch_sample). Each work-item is responsible for one sample of one module.
-// It performs two tasks: 1) it maps sigmoid probabilities to the output buffer for its
-// assigned class chunk, and 2) it reduces the BCE loss contributions from that
-// class chunk into a single partial loss value.
+// --- Implementation: compute_probs_loss_bce_chunk (Node 7b - BCE Path) ---
+// Strategy: A 2D "map-reduce" kernel where each work-item processes one
+// (module, batch_sample) pair. It maps probability values for a class chunk
+// while reducing the corresponding BCE loss. The kernel is padding-aware, using
+// the physical class stride for all memory addressing.
 __kernel void compute_probs_loss_bce_chunk(
     __global const SCALAR_TYPE *__restrict full_logits_buf,
     __global const SCALAR_TYPE *__restrict temps_buf,
@@ -306,13 +298,14 @@ __kernel void compute_probs_loss_bce_chunk(
     int num_classes_in_chunk,
     int total_batch_size,
     int total_output_classes,
+    int padded_total_output_classes,
     int total_modules) {
 
-    // Map the 2D work-item grid to the (module, batch) problem space.
+    // Map work-item to a (module, batch) pair within the current module chunk.
     const uint module_local_idx = get_global_id(0);
     const uint batch_idx        = get_global_id(1);
 
-    // --- Boundary Checks ---
+    // Boundary check against the logical work dimensions.
     if (module_local_idx >= num_modules_in_chunk || batch_idx >= total_batch_size) {
         return;
     }
@@ -320,34 +313,37 @@ __kernel void compute_probs_loss_bce_chunk(
     const uint module_global_idx = module_param_offset + module_local_idx;
     const uint loss_out_idx      = class_chunk_id * total_modules * total_batch_size + module_global_idx * total_batch_size + batch_idx;
 
-    // --- Masking ---
-    // For masked samples, write zero to both outputs and module early.
+    // Skip computation for masked samples.
     if (sample_mask[batch_idx] < 0.5f) {
         partial_loss_out[loss_out_idx] = SCALAR_ZERO;
         for (int c_local = 0; c_local < num_classes_in_chunk; ++c_local) {
             const int  c_global             = class_offset + c_local;
-            const uint prob_out_idx         = module_global_idx * total_batch_size * total_output_classes + batch_idx * total_output_classes + c_global;
+            const long prob_out_idx         = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes + c_global;
             partial_probs_out[prob_out_idx] = SCALAR_ZERO;
         }
         return;
     }
 
-    // This kernel efficiently fuses two logical operations: a "map" for probabilities and a "reduce" for loss.
     SCALAR_TYPE       partial_loss_accum = SCALAR_ZERO;
     const SCALAR_TYPE temp_inv           = 1.0f / temps_buf[module_global_idx];
 
-    // Each work-item iterates through its assigned slice of classes.
+    // Each work-item iterates through its assigned slice of classes, fusing two operations:
+    // 1. MAP: Computing and writing the Sigmoid probability for each class.
+    // 2. REDUCE: Accumulating the BCE loss contributions from each class.
     for (int c_local = 0; c_local < num_classes_in_chunk; ++c_local) {
-        const int         c_global       = class_offset + c_local;
-        const uint        logit_prob_idx = module_global_idx * total_batch_size * total_output_classes + batch_idx * total_output_classes + c_global;
-        const SCALAR_TYPE logit          = full_logits_buf[logit_prob_idx];
+        const int c_global = class_offset + c_local;
+        // CRITICAL: All class-dimensioned buffers are indexed using the physical stride.
+        const long logit_prob_idx = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes + c_global;
+        const long target_idx     = (long)batch_idx * padded_total_output_classes + c_global;
 
-        // 1. MAP: Compute and write the probability for each class.
+        const SCALAR_TYPE logit = full_logits_buf[logit_prob_idx];
+
+        // 1. MAP: Compute and write the Sigmoid probability.
         const SCALAR_TYPE prob            = 1.0f / (1.0f + MATH_FN exp(-logit * temp_inv));
         partial_probs_out[logit_prob_idx] = prob;
 
-        // 2. REDUCE: Accumulate the BCE loss contribution from this class.
-        const SCALAR_TYPE target_val = targets_bce_buf[batch_idx * total_output_classes + c_global];
+        // 2. REDUCE: Accumulate the BCE loss.
+        const SCALAR_TYPE target_val = targets_bce_buf[target_idx];
         const SCALAR_TYPE term1      = target_val * MATH_FN log(fmax(prob, 1e-9f));
         const SCALAR_TYPE term2      = (1.0f - target_val) * MATH_FN log(fmax(1.0f - prob, 1e-9f));
         partial_loss_accum += term1 + term2;
@@ -358,12 +354,11 @@ __kernel void compute_probs_loss_bce_chunk(
 }
 
 // --- Implementation: calculate_module_param_grads_chunk (Node 8) ---
-// Strategy: "Work-group per gradient component" reduction. A 3D dispatch grid
-// is used, where each work-group is responsible for computing a single gradient
-// component for dL/dW_ehc and dL/dB_ec (where e=module, h=hidden, c=class).
-// Threads within a work-group parallelize the summation over the entire batch
-// dimension. Two sequential reductions using __local memory are performed to
-// safely compute bias and weight gradients without race conditions.
+// Strategy: A "work-group per gradient component" reduction. Each work-group
+// computes one scalar gradient value (e.g., dL/dW_ehc) by reducing over the
+// batch dimension. The kernel is padding-aware, using the physical class stride
+// for all indexing. A two-stage reduction over local memory ensures bias and
+// weight gradients are computed without race conditions.
 __kernel void calculate_module_param_grads_chunk(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict hidden_buf,
@@ -383,6 +378,7 @@ __kernel void calculate_module_param_grads_chunk(
     int hidden_dim,
     int padded_hidden_dim,
     int total_output_classes,
+    int padded_total_output_classes,
     int total_modules) {
 
     const uint module_local_idx = get_group_id(0);
@@ -391,7 +387,7 @@ __kernel void calculate_module_param_grads_chunk(
     const uint lid              = get_local_id(0);
     const uint lsize            = get_local_size(0);
 
-    // --- Boundary Checks ---
+    // Boundary check against the logical chunk dimensions.
     if (module_local_idx >= num_modules_in_chunk || h_idx >= hidden_dim || class_local_idx >= num_classes_in_chunk) {
         return;
     }
@@ -402,15 +398,13 @@ __kernel void calculate_module_param_grads_chunk(
     SCALAR_TYPE p_grad_w = SCALAR_ZERO;
     SCALAR_TYPE p_grad_b = SCALAR_ZERO;
 
-    // --- Parallel Summation over the Batch Dimension ---
-    // Each thread calculates its local contribution to the gradients.
+    // Threads in the work-group sum contributions over the batch dimension.
     for (int b = lid; b < total_batch_size; b += lsize) {
-        // Ensure gradients are not computed for padded batch items.
         if (sample_mask[b] < 0.5f) {
             continue;
         }
-
-        const uint        prob_idx = module_global_idx * total_batch_size * total_output_classes + b * total_output_classes + class_global_idx;
+        // CRITICAL: Use physical stride for class-dimensioned buffer access.
+        const long        prob_idx = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)b * padded_total_output_classes + class_global_idx;
         const SCALAR_TYPE prob     = partial_probs_buf[prob_idx];
         SCALAR_TYPE       d_loss_d_logit;
 
@@ -419,65 +413,61 @@ __kernel void calculate_module_param_grads_chunk(
             d_loss_d_logit                  = select(prob, prob - 1.0f, class_global_idx == targets_cce[b]);
         } else { // PROBLEM_TYPE_BCE
             const __global SCALAR_TYPE *targets_bce = (__global SCALAR_TYPE *)targets_buf;
-            d_loss_d_logit                          = prob - targets_bce[b * total_output_classes + class_global_idx];
+            d_loss_d_logit                          = prob - targets_bce[(long)b * padded_total_output_classes + class_global_idx];
         }
 
         const SCALAR_TYPE h_val = hidden_buf[GET_PHYSICAL_HIDDEN_IDX(b, h_idx, padded_hidden_dim)];
         p_grad_w += d_loss_d_logit * h_val;
 
-        // Bias gradient component is only needed once per (module, class).
-        // It's arbitrarily but deterministically computed by threads with h_idx=0.
+        // Bias gradient only needs to be computed once per (module, class).
+        // It's arbitrarily but deterministically handled by threads with h_idx=0.
         if (h_idx == 0) {
             p_grad_b += d_loss_d_logit;
         }
     }
 
-    // --- serialized Intra-Workgroup Reductions ---
+    // --- Two-Stage Local Memory Reduction ---
 
-    // STAGE 1: Reduce Bias Gradient (only h_idx=0 threads participate).
-    // These threads use the shared local_mem first to calculate their result.
+    // STAGE 1: Reduce bias gradient (only h_idx=0 threads participate).
     if (h_idx == 0) {
         local_mem[lid] = p_grad_b;
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
-            if (lid < stride) {
+            if (lid < stride)
                 local_mem[lid] += local_mem[lid + stride];
-            }
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         if (lid == 0) {
-            const uint out_idx                 = class_chunk_id * (total_modules * total_output_classes) + module_global_idx * (total_output_classes) + class_global_idx;
+            const long out_idx                 = (long)class_chunk_id * (total_modules * padded_total_output_classes) + (long)module_global_idx * (padded_total_output_classes) + class_global_idx;
             partial_grad_module_b_out[out_idx] = local_mem[0];
         }
     }
 
-    // SYNCHRONIZATION POINT: All threads in the work-group must wait here.
-    // This ensures Stage 1 is complete before anyone starts Stage 2, preventing
-    // the weight gradient calculation from corrupting the bias gradient calculation.
+    // SYNCHRONIZATION POINT: All threads must wait here. This ensures Stage 1 is complete
+    // before Stage 2 begins, preventing the weight gradient calculation from corrupting
+    // the bias gradient reduction which reuses the same local memory.
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // STAGE 2: Reduce Weight Gradient (all threads participate).
-    // Now that local_mem is free, all threads use it to reduce the weight gradient.
+    // STAGE 2: Reduce weight gradient (all threads participate).
     local_mem[lid] = p_grad_w;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
+        if (lid < stride)
             local_mem[lid] += local_mem[lid + stride];
-        }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     if (lid == 0) {
-        const uint out_idx
-            = class_chunk_id * (total_modules * hidden_dim * total_output_classes) + module_global_idx * (hidden_dim * total_output_classes) + h_idx * (total_output_classes) + class_global_idx;
+        const long out_idx = (long)class_chunk_id * (total_modules * hidden_dim * padded_total_output_classes) + (long)module_global_idx * (hidden_dim * padded_total_output_classes)
+                             + (long)h_idx * (padded_total_output_classes) + class_global_idx;
         partial_grad_module_w_out[out_idx] = local_mem[0];
     }
 }
 
 // --- Implementation: backprop_error_to_hidden_chunk (Node 9) ---
-// Strategy: A pure 3D "map" kernel. Each work-item is dispatched to compute
-// one output value in the partial Grad_H tensor. The grid dimensions map to
-// (module_chunk, batch_sample, hidden_neuron). Each work-item performs a small,
-// independent reduction (a sum) over the classes within its assigned class_chunk.
+// Strategy: A 3D "map" kernel where each work-item computes one scalar value
+// in the partial Grad_H tensor. It performs an independent reduction over its
+// assigned class chunk and is padding-aware, using the physical class stride
+// for correct memory addressing.
 __kernel void backprop_error_to_hidden_chunk(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict partial_probs_buf,
@@ -495,22 +485,24 @@ __kernel void backprop_error_to_hidden_chunk(
     int total_batch_size,
     int hidden_dim,
     int total_output_classes,
+    int padded_total_output_classes,
     int total_modules) {
 
-    // Map the 3D work-item grid to the logical problem space.
+    // Map the 3D work-item grid to the logical (module, batch, hidden) space.
     const uint module_local_idx = get_global_id(0);
     const uint batch_idx        = get_global_id(1);
     const uint h_idx            = get_global_id(2);
 
-    // --- Boundary Checks ---
+    // Boundary check against the logical work dimensions.
     if (module_local_idx >= num_modules_in_chunk || batch_idx >= total_batch_size || h_idx >= hidden_dim) {
         return;
     }
 
     const uint module_global_idx = module_param_offset + module_local_idx;
-    const uint out_idx           = class_chunk_id * (total_modules * total_batch_size * hidden_dim) + module_global_idx * (total_batch_size * hidden_dim) + batch_idx * hidden_dim + h_idx;
+    // Output buffer is not dimensioned by class, so its index is safe from class padding.
+    const uint out_idx = class_chunk_id * (total_modules * total_batch_size * hidden_dim) + module_global_idx * (total_batch_size * hidden_dim) + batch_idx * hidden_dim + h_idx;
 
-    // Correctly handle padded batch items by writing a zero gradient and exiting.
+    // Skip computation for masked-out samples.
     if (sample_mask[batch_idx] < 0.5f) {
         partial_grad_h_aos_out[out_idx] = SCALAR_ZERO;
         return;
@@ -520,8 +512,8 @@ __kernel void backprop_error_to_hidden_chunk(
     SCALAR_TYPE grad_h_accum = SCALAR_ZERO;
     for (int c_local = 0; c_local < num_classes_in_chunk; ++c_local) {
         const int c_global = class_offset + c_local;
-
-        const uint        prob_idx = module_global_idx * total_batch_size * total_output_classes + batch_idx * total_output_classes + c_global;
+        // CRITICAL: Use physical stride for all class-dimensioned buffer access.
+        const long        prob_idx = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes + c_global;
         const SCALAR_TYPE prob     = partial_probs_buf[prob_idx];
         SCALAR_TYPE       d_loss_d_logit;
 
@@ -530,23 +522,22 @@ __kernel void backprop_error_to_hidden_chunk(
             d_loss_d_logit                  = select(prob, prob - 1.0f, c_global == targets_cce[batch_idx]);
         } else { // PROBLEM_TYPE_BCE
             const __global SCALAR_TYPE *targets_bce = (__global SCALAR_TYPE *)targets_buf;
-            d_loss_d_logit                          = prob - targets_bce[batch_idx * total_output_classes + c_global];
+            d_loss_d_logit                          = prob - targets_bce[(long)batch_idx * padded_total_output_classes + c_global];
         }
 
-        const uint        weight_idx = module_global_idx * hidden_dim * total_output_classes + h_idx * total_output_classes + c_global;
+        const long        weight_idx = (long)module_global_idx * hidden_dim * padded_total_output_classes + (long)h_idx * padded_total_output_classes + c_global;
         const SCALAR_TYPE weight_val = module_weights_buf[weight_idx];
         grad_h_accum += d_loss_d_logit * weight_val;
     }
 
-    // --- Write Final Partial Gradient ---
     partial_grad_h_aos_out[out_idx] = grad_h_accum;
 }
 
 // --- Implementation: calculate_chunk_temp_gradients (Node 10) ---
-// Strategy: "Work-group per module" reduction. A work-group is responsible for
-// computing the partial temperature gradient for one module, based on the contribution
-// from the current class chunk. Threads parallelize the summation over the batch,
-// followed by a final reduction using __local memory.
+// Strategy: A "work-group per module" reduction. Each work-group computes a
+// partial temperature gradient for one module by reducing over the batch and
+// class chunk dimensions. The kernel is padding-aware, using the physical class
+// stride for all memory addressing.
 __kernel void calculate_chunk_temp_gradients(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict full_logits_buf,
@@ -564,6 +555,7 @@ __kernel void calculate_chunk_temp_gradients(
     int num_classes_in_chunk,
     int total_batch_size,
     int total_output_classes,
+    int padded_total_output_classes,
     int total_modules) {
 
     const uint module_local_idx = get_group_id(0);
@@ -577,33 +569,37 @@ __kernel void calculate_chunk_temp_gradients(
     const uint  module_global_idx = module_param_offset + module_local_idx;
     SCALAR_TYPE p_grad_sum        = SCALAR_ZERO;
 
+    // Threads in the work-group sum contributions over the batch dimension.
     for (int b = lid; b < total_batch_size; b += lsize) {
         if (sample_mask[b] < 0.5f) {
             continue;
         }
 
+        // For each sample, sum the gradient contribution across the class chunk.
+        // This value represents SUM_c( (p_c - y_c) * z_c ) for one sample.
         SCALAR_TYPE grad_contribution_for_sample = SCALAR_ZERO;
         for (int c_local = 0; c_local < num_classes_in_chunk; c_local++) {
-            const int         c_global = class_offset + c_local;
-            const uint        base_idx = module_global_idx * total_batch_size * total_output_classes + b * total_output_classes + c_global;
+            const int c_global = class_offset + c_local;
+            // CRITICAL: Use physical stride for all class-dimensioned buffer access.
+            const long        base_idx = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)b * padded_total_output_classes + c_global;
             const SCALAR_TYPE prob     = partial_probs_buf[base_idx];
-            SCALAR_TYPE       d_loss_d_logit;
+            SCALAR_TYPE       d_loss_d_logit; // This is (p_c - y_c)
 
             if (problem_type_flag == PROBLEM_TYPE_CCE) {
                 const __global int *targets_cce = (__global int *)targets_buf;
                 d_loss_d_logit                  = select(prob, prob - 1.0f, c_global == targets_cce[b]);
             } else { // PROBLEM_TYPE_BCE
                 const __global SCALAR_TYPE *targets_bce = (__global SCALAR_TYPE *)targets_buf;
-                d_loss_d_logit                          = prob - targets_bce[b * total_output_classes + c_global];
+                d_loss_d_logit                          = prob - targets_bce[(long)b * padded_total_output_classes + c_global];
             }
 
-            const SCALAR_TYPE unscaled_logit = full_logits_buf[base_idx];
+            const SCALAR_TYPE unscaled_logit = full_logits_buf[base_idx]; // This is z_c
             grad_contribution_for_sample += d_loss_d_logit * unscaled_logit;
         }
         p_grad_sum += grad_contribution_for_sample;
     }
 
-    // --- Intra-Workgroup Reduction ---
+    // Reduce the partial sums from each thread using local memory.
     local_mem[lid] = p_grad_sum;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
@@ -612,8 +608,12 @@ __kernel void calculate_chunk_temp_gradients(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
+
+    // First thread writes the final result for the work-group.
     if (lid == 0) {
-        const SCALAR_TYPE total_sum_for_chunk = local_mem[0];
+        // The derivative of loss w.r.t temperature T is:
+        // dL/dT = dL/d(logits) * d(logits)/dT = SUM_c( (p_c - y_c) * z_c ) * (-1/T^2)
+        const SCALAR_TYPE total_sum_for_chunk = local_mem[0]; // Represents SUM_b( SUM_c( (p_c - y_c) * z_c ) )
         const SCALAR_TYPE temp                = temps_buf[module_global_idx];
         const SCALAR_TYPE final_partial_grad  = total_sum_for_chunk * (-1.0f / (temp * temp));
         const uint        out_idx             = class_chunk_id * total_modules + module_global_idx;

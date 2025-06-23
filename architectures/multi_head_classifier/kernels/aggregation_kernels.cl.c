@@ -158,58 +158,43 @@ __kernel void aggregate_local_reduce(
         final_output_buf[element_idx] = result;
     }
 }
-
 // --- Implementation: reduce_grad_h_over_modules (Node 13) ---
-// Strategy: A specialized, high-performance reduction kernel designed to solve a
-// unique structural challenge in the architecture. It acts as the "join" operation
-// for the multi-head parallel compute fork. Its sole purpose is to consume the
-// intermediate `Aggregated Grad_H` buffer, which is an architectural artifact with
-// a specific (B*H, M) layout, and reduce it to the final (B, H) upstream gradient.
-//
-// Like `aggregate_local_reduce`, this kernel uses a "work-group per element"
-// strategy. Each work-group is responsible for computing a single element of the
-// final gradient tensor. This approach is highly efficient because all threads
-// within a work-group collaboratively sum over the `total_modules` dimension,
-// which is contiguous in memory, ensuring fully coalesced global memory reads.
-// This single, purpose-built kernel is significantly more efficient than the
-// previous aggregate-transpose-aggregate method, reducing both VRAM pressure
-// and execution latency.
+// Strategy: A padding-aware reduction kernel serving as the "join" for the
+// multi-head fork. Each work-group computes one output element, reducing over
+// the module dimension. This ensures coalesced global memory reads from the
+// input buffer, even when its physical stride (`padded_total_modules`) differs
+// from its logical dimension (`total_modules`) due to memory alignment.
 __kernel void reduce_grad_h_over_modules(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict aggregated_grad_h_soa,
     __global SCALAR_TYPE *__restrict final_grad_h_buf,
     int total_elements,
-    int total_modules) {
+    int total_modules,
+    int padded_total_modules) {
 
-    // Each work-group computes a single element of the final output tensor.
     const int element_idx = get_group_id(0);
     const int lid         = get_local_id(0);
     const int lsize       = get_local_size(0);
 
-    // This work-group is responsible for element_idx, so it only needs to check
-    // if it's within the bounds of the final output tensor.
+    // Guard against excess work-groups.
     if (element_idx >= total_elements) {
         return;
     }
 
     SCALAR_TYPE accum = SCALAR_ZERO;
 
-    // Calculate the base pointer for the "row" of data corresponding to this element_idx.
-    // This row contains the gradient contributions from all `total_modules`.
-    const __global SCALAR_TYPE *base_input_ptr = aggregated_grad_h_soa + (long)element_idx * total_modules;
+    // Get the start of the row using the physical stride to handle padding.
+    const __global SCALAR_TYPE *row_start_ptr = aggregated_grad_h_soa + (long)element_idx * padded_total_modules;
 
-    // Each work-item in the group sums a strided slice of the `total_modules` values.
-    // This access pattern is perfectly coalesced as consecutive threads (lids)
-    // read from consecutive memory locations.
+    // Sum over the LOGICAL number of modules, skipping any padding elements.
     for (int i = lid; i < total_modules; i += lsize) {
-        accum += base_input_ptr[i];
+        accum += row_start_ptr[i];
     }
 
-    // Store the thread's partial sum in local memory.
+    // Perform a standard parallel reduction within the work-group.
     local_mem[lid] = accum;
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Perform a standard parallel reduction within the work-group using local memory.
     for (uint s = lsize / 2; s > 0; s >>= 1) {
         if (lid < s) {
             local_mem[lid] += local_mem[lid + s];
@@ -217,7 +202,7 @@ __kernel void reduce_grad_h_over_modules(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // The first thread in the work-group writes the final, fully-summed result.
+    // First thread writes the final result.
     if (lid == 0) {
         final_grad_h_buf[element_idx] = local_mem[0];
     }
