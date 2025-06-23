@@ -374,6 +374,8 @@ class KernelExecutor:
         self.simd_width = self.b.simd_width
         self.padded_hidden_dim = self.b.get_spec("hidden_buf")[0][1]
         self.padded_input_dim = self.b.get_spec("input_buf")[0][1]
+        # Cache the physical class dimension for reuse, as it's the stride for many buffers.
+        self.padded_output_classes = self.b.get_spec("full_logits_out")[0][2]
         self.scalar_size = SCALAR_NP_TYPE().itemsize
 
     def enqueue_write_buffer(self, queue, name, data, wait_for) -> cl.Event:
@@ -421,6 +423,7 @@ class KernelExecutor:
             np.int32(HIDDEN_DIM),
             np.int32(self.padded_hidden_dim),
             np.int32(OUTPUT_CLASSES),
+            np.int32(self.padded_output_classes),
         )
         return self.p.compute_logits_chunk(queue, g, l, *args, wait_for=wait_for)
 
@@ -433,6 +436,7 @@ class KernelExecutor:
             np.int32(NUM_MODULES),
             np.int32(BATCH_SIZE),
             np.int32(OUTPUT_CLASSES),
+            np.int32(self.padded_output_classes),
         )
         return self.p.reduce_logits_for_softmax(queue, g, l, *args, wait_for=wait_for)
 
@@ -453,6 +457,7 @@ class KernelExecutor:
             np.int32(tile.num_classes_in_tile),
             np.int32(BATCH_SIZE),
             np.int32(OUTPUT_CLASSES),
+            np.int32(self.padded_output_classes),
         )
         return self.p.compute_probs_loss_cce_chunk(queue, g, l, *args, wait_for=wait_for)
 
@@ -472,6 +477,7 @@ class KernelExecutor:
             np.int32(HIDDEN_DIM),
             np.int32(self.padded_hidden_dim),
             np.int32(OUTPUT_CLASSES),
+            np.int32(self.padded_output_classes),
             np.int32(NUM_MODULES),
         )
         grad_w_evt = self.p.calculate_module_param_grads_chunk(
@@ -604,22 +610,19 @@ class KernelExecutor:
     def launch_reduce_grad_h_over_modules(self, queue: cl.CommandQueue, wait_for) -> cl.Event:
         """Launches the specialized kernel (13) to reduce Grad_H over the module dimension."""
         lsize = 256
-        total_elements = BATCH_SIZE * self.padded_hidden_dim
-        gsize = pad_to_multiple(total_elements, lsize)
-
-        # Retrieve the physical padded dimension from the buffer manager's spec.
-        # This makes the kernel call robust to the padding rules applied during
-        # buffer creation, fulfilling the updated contract.
         in_buf_spec = self.b.get_spec("agg_grad_h_module_major_buf")
-        padded_total_modules = in_buf_spec[0][-1]
+        total_elements = in_buf_spec[0][0]
+        padded_total_modules = in_buf_spec[0][1]
+
+        gsize = pad_to_multiple(total_elements, lsize)
 
         args = (
             cl.LocalMemory(lsize * self.scalar_size),
             self.b.get("agg_grad_h_module_major_buf"),
             self.b.get("final_grad_h_buf"),
             np.int32(total_elements),
-            np.int32(NUM_MODULES),  # The logical module count for the loop.
-            np.int32(padded_total_modules),  # The physical stride for memory access.
+            np.int32(NUM_MODULES),
+            np.int32(padded_total_modules),
         )
         return self.p.reduce_grad_h_over_modules(queue, (gsize,), (lsize,), *args, wait_for=wait_for)
 
