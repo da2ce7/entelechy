@@ -1,4 +1,4 @@
-### **Architectural Concept: A Unified, Memory-Aware Streaming Engine**
+### **Architectural Concept: A Unified, Memory-Aware Streaming Classification Engine**
 
 #### **Guiding Principles**
 
@@ -17,11 +17,11 @@
 
 #### **1. Modular, Chunk-Based Compute Kernels**
 
-The architecture is built upon a foundation of modular, reusable kernels that operate on "chunks" of a larger problem. The system can chunk work across multiple dimensions (e.g., number of heads, batch size, number of classes) as needed. To ensure mathematical consistency across all scales, any kernel that computes gradients produces **partial results** which are passed to the aggregation engine. Kernels are kept simple, often with a single responsibility (e.g., mapping, reduction over a single dimension), which simplifies maintenance and exposes opportunities for parallel execution.
+The architecture is built upon a foundation of modular, reusable kernels that operate on "chunks" of a larger problem. The system can chunk work across multiple dimensions (e.g., number of modules, batch size, number of classes) as needed. Each `Classifier Module`, for instance, is configured with an **`Operating Mode`** (`CCE` for single-label or `BCE` for multi-label tasks), which instructs the Host Orchestrator on which specific computational path to construct using these kernels.
 
 #### **2. The Generic, Tiered Aggregation Engine**
 
-The heart of the architecture is a powerful, generic aggregation engine that replaces all specialized reduction logic. The host orchestrator chooses **one** of three specialist kernels based _only_ on the number of items (`N`) to be reduced. This engine is a pure, reusable component invoked multiple times within a single training step to consolidate various partial results (probabilities, losses, and gradients).
+The heart of the architecture is a powerful, generic aggregation engine that replaces all specialized reduction logic. The host orchestrator chooses **one** of three specialist kernels based _only_ on the number of items (`N`) to be reduced. This engine is a pure, reusable component invoked multiple times within a single training step to consolidate various partial results.
 
 #### **3. Asynchronous Host Interaction**
 
@@ -36,17 +36,22 @@ This allows a host application to act on the complete forward-pass results as so
 
 The host logic is a sophisticated but straightforward orchestrator responsible for resource management and DAG construction. For each batch, it performs a series of strategic assessments:
 
-1.  **Memory Assessment & Chunk Definition:** It compares the memory required for the complete problem against available device memory to determine the optimal chunking strategy. This includes defining `num_head_chunks`, `num_batch_chunks`, and `num_class_chunks` to ensure all intermediate buffers fit in VRAM.
-2.  **Intermediate Activation Strategy:** Crucially, it manages the lifecycle of intermediate hidden activations (`hidden_i`). Based on memory pressure, it selects the optimal strategy to balance performance and scalability:
-    - **Cache (Space > Time):** If memory allows, it caches `hidden_i` buffers in VRAM for reuse during the backpropagation phase.
-    - **Recompute (Time > Space):** Under extreme memory pressure (e.g., a massive shared layer), it discards `hidden_i` after its initial use and recomputes it on the fly during backpropagation. This guarantees scalability for any problem size.
-3.  **DAG Construction & Parallel Dispatch:** It builds the multi-phase computational graph by enqueuing kernels. For logically independent tasks (e.g., the gradient calculations in Phase 8-10), it enqueues them back-to-back without synchronization, explicitly creating parallel workloads for the GPU to schedule.
+1.  **Memory Assessment & Chunk Definition:** It compares the memory required for the complete problem against available device memory to determine the optimal chunking strategy. This includes defining `num_module_chunks`, `num_batch_chunks`, and `num_class_chunks`.
+
+2.  **DAG Construction & Parallel Dispatch:** It builds the multi-phase computational graph by enqueuing kernels according to the selected mode and chunking strategy. For logically independent tasks, it enqueues them back-to-back without synchronization to create parallel workloads.
+
+3.  **SIMD-Aware Weight Layout:** To fully exploit vector processing capabilities on the device and ensure coalesced memory access, the Host Orchestrator is responsible for transforming the shared layer weights into a SIMD-friendly "Struct of Arrays" (SoA) layout before enqueuing kernel (4). This pre-processing step rearranges the weights from a logical `(hidden_dim, input_dim)` matrix to a physical `(hidden_dim/SIMD_WIDTH, input_dim, SIMD_WIDTH)` buffer. This data layout is a concrete expression of the **Primacy of Memory Strategy** principle and is a non-negotiable part of the contract with the `forward_pass` kernel.
+
+4.  **`Operating Mode` & Activation Lifecycle:** It determines the base computational graph by reading the `Classifier Module`'s configured `Operating Mode` (`CCE` or `BCE`). It then manages the lifecycle of intermediate hidden activations (`hidden_i`), selecting the optimal strategy:
+
+    - **Cache (Space > Time):** If memory allows, it caches `hidden_i` buffers in VRAM for reuse during backpropagation.
+    - **Recompute (Time > Space):** Under extreme memory pressure, it discards `hidden_i` and recomputes it on the fly during backpropagation.
+
+5.  **DAG Construction & Parallel Dispatch:** It builds the multi-phase computational graph by enqueuing kernels according to the selected mode and chunking strategy. For logically independent tasks, it enqueues them back-to-back without synchronization to create parallel workloads.
 
 ---
 
-### **Multi-Head Classifier Architectural Blueprint & Data Contracts**
-
-#### **Detailed Dataflow Graph**
+### **Architectural Blueprint & Data Contracts for a Multi-Head Classifier**
 
 ```mermaid
 graph TD
@@ -71,26 +76,30 @@ graph TD
     classDef logical_step fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray: 2 2
 
 
-    subgraph "Annotation Key: Fused Operations"
-        direction LR
-        subgraph " "
-            LS_Alpha["α"]:::logical_step
-            LS_Beta["β"]:::logical_step
-            LS_Gamma["γ"]:::logical_step
-            LS_Delta["δ"]:::logical_step
+    subgraph "Annotation Keys"
+      direction LR
+        subgraph "Terminology Key"
+            TermNote["Note: 'Module' refers to the system<br/>implementation of an ML 'Head'."]
         end
-        subgraph " "
-            Desc_Alpha["Mat-Mul + Bias<br/>(Standard Op Fusion)"]
-            Desc_Beta["Probability Calc + Loss Calc<br/>(Producer-Consumer Fusion)"]
-            Desc_Gamma["Weight Grad + Bias Grad<br/>(Data Reuse Fusion)"]
-            Desc_Delta["Mat-Mul + Bias + ReLU<br/>(Standard Op Fusion)"]
+        subgraph "Fused Operation Key"
+            direction LR
+            subgraph " "
+                LS_Alpha["α"]:::logical_step; LS_Beta["β"]:::logical_step
+                LS_Gamma["γ"]:::logical_step; LS_Delta["δ"]:::logical_step
+            end
+            subgraph " "
+                Desc_Alpha["Mat-Mul + Bias<br/>(Standard Op Fusion)"]
+                Desc_Beta["Probability Calc + Loss Calc<br/>(Producer-Consumer Fusion)"]
+                Desc_Gamma["Weight Grad + Bias Grad<br/>(Data Reuse Fusion)"]
+                Desc_Delta["Mat-Mul + Bias + ReLU<br/>(Standard Op Fusion)"]
+            end
         end
     end
 
     %% Phase 0-3: Setup
     subgraph Phase 0-3: Host Setup & Global Params
-        HL_0[Start Batch]:::host_logic --> HL_1["1. VRAM Budgeting & Chunking"]:::host_logic --> HL_2["2. Activation Lifecycle & Problem Type"]:::host_logic
-        P_Shared[Shared Params]:::param; P_Heads[Head Params]:::param; P_Temps[Temp Params]:::param;
+        HL_0[Start Batch]:::host_logic --> HL_1["1. VRAM Budgeting & Chunking"]:::host_logic --> HL_2["2. Read Operating Mode & Manage Activations"]:::host_logic
+        P_Shared[Shared Params]:::param; P_ClassifierModule[Classifier Module Params]:::param; P_Temps[Temp Params]:::param;
         P_Step[Global Step 't']:::param
         Targets[Targets]:::param
     end
@@ -109,8 +118,8 @@ graph TD
         L4c --> hidden_i[Hidden Activations<br/>Chunk 'i']:::data
     end
 
-    %% Phase 5-7: Classifier Heads Forward Pass (Fused)
-    subgraph "Phase 5-7: Classifier Heads Forward Pass"
+    %% Phase 5-7: Classifier Module Forward Pass (Fused)
+    subgraph "Phase 5-7: Forward Pass for Classifier Head (as a Module)"
         subgraph K5["(5) compute_logits_chunk"]:::fused_kernel_box
              direction LR
              L5a["Mat-Mul α"]:::logical_step --> L5b["Bias Add α"]:::logical_step
@@ -118,11 +127,11 @@ graph TD
         hidden_i --> L5a
         L5b --> Full_Logits[Full Logits Buffer]:::full_intermediate
 
-        HL_3["(7) Host Selects Path<br/>based on problem_type"]:::host_logic
+        HL_3["(7) Host Selects Path<br/>based on Operating Mode (CCE/BCE)"]:::host_logic
         Full_Logits --> HL_3
 
-        subgraph CCE Path (Softmax)
-            style "CCE Path (Softmax)" path_cce
+        subgraph "Operating Mode: CCE (Softmax Path)"
+            style "Operating Mode: CCE (Softmax Path)" path_cce
             HL_3 --> K6["(6) reduce_logits_for_softmax"]:::kernel
             Full_Logits --> K6
             K6 --> Softmax_Params[Softmax Denominators]:::full_intermediate
@@ -135,8 +144,8 @@ graph TD
             L7a_prob --> PARTIAL_Probs[PARTIAL Probabilities]:::partial_data
         end
 
-        subgraph BCE Path (Sigmoid)
-            style "BCE Path (Sigmoid)" path_bce
+        subgraph "Operating Mode: BCE (Sigmoid Path)"
+            style "Operating Mode: BCE (Sigmoid Path)" path_bce
             subgraph K7_bce["(7b) compute_probs_loss_bce_chunk"]:::fused_kernel_box
                 L7b_prob["Prob Calc β"]:::logical_step --> L7b_loss["Loss Calc β"]:::logical_step
             end
@@ -150,22 +159,22 @@ graph TD
     subgraph "Phase 8-11: Parallel Gradient Path (Chunk-Based)"
         style "Phase 8-11: Parallel Gradient Path (Chunk-Based)" parallel_group
 
-        subgraph "Local Head Gradients"
-            style "Local Head Gradients" grad_path_a
-            subgraph K8["<b>(8) calculate_head_param_grads_chunk</b>"]:::fused_kernel_box
+        subgraph "Gradients for Classifier Module"
+            style "Gradients for Classifier Module" grad_path_a
+            subgraph K8["<b>(8) calculate_module_param_grads_chunk</b>"]:::fused_kernel_box
                 L8_w["Weight Grad Calc γ"]:::logical_step
                 L8_b["Bias Grad Calc γ"]:::logical_step
             end
             PARTIAL_Probs & Targets --> L8_w; PARTIAL_Probs & Targets --> L8_b
             hidden_i --> L8_w
-            L8_w --> PARTIAL_Grad_HeadW[PARTIAL Grad_HW]:::partial_data
-            L8_b --> PARTIAL_Grad_HeadB[PARTIAL Grad_HB]:::partial_data
+            L8_w --> PARTIAL_Grad_ModW[PARTIAL Grad_ModW]:::partial_data
+            L8_b --> PARTIAL_Grad_ModB[PARTIAL Grad_ModB]:::partial_data
         end
 
         subgraph "Upstream Hidden Gradients & Transformation"
             style "Upstream Hidden Gradients & Transformation" grad_path_b
             K9["<b>(9) backprop_error_to_hidden_chunk</b>"]:::kernel
-            PARTIAL_Probs & Targets & P_Heads --> K9
+            PARTIAL_Probs & Targets & P_ClassifierModule --> K9
             K9 --> PARTIAL_Grad_H_AoS["PARTIAL Grad_H<br/>(AoS Layout)"]:::partial_data
             PARTIAL_Grad_H_AoS --> K11["<b>(11) transpose_chunk</b><br/>(on partial Grad_H)"]:::transpose_kernel
             K11 --> PARTIAL_Grad_H_SoA["PARTIAL Grad_H<br/>(SoA Layout)"]:::partial_data
@@ -183,9 +192,9 @@ graph TD
     %% Phase 12-18: Remainder of Graph
     subgraph Phase 12: Primary Aggregation
         K12["<b>(12) Aggregate Kernel</b>"]:::host_logic
-        PARTIAL_Probs & PARTIAL_Loss_BCE & PARTIAL_Grad_HeadW & PARTIAL_Grad_HeadB & PARTIAL_Grad_Temps & PARTIAL_Grad_H_SoA -- All Partial Data --> K12
+        PARTIAL_Probs & PARTIAL_Loss_BCE & PARTIAL_Grad_ModW & PARTIAL_Grad_ModB & PARTIAL_Grad_Temps & PARTIAL_Grad_H_SoA -- All Partial Data --> K12
         K12 --> FINAL_Probs[Final Probs]:::final_data & FINAL_BCE_Loss[Final BCE Loss]:::final_data & FINAL_Grad_H[Final Grad_H]:::final_data
-        K12 --> FINAL_Grad_HeadW[Final Grad_HW]:::final_data & FINAL_Grad_HeadB[Final Grad_HB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
+        K12 --> FINAL_Grad_ModW[Final Grad_ModW]:::final_data & FINAL_Grad_ModB[Final Grad_ModB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
     end
 
     subgraph "Phase 13-14: Streaming Shared Layer Backprop"
@@ -211,8 +220,8 @@ graph TD
         subgraph "B. Training Path (All Updates)"
             K17_shared["(17) adam_update (Shared)"]:::kernel; FINAL_Grad_SW & FINAL_Grad_SB --> K17_shared; K17_shared -- updates --> P_Shared
             P_Step --> K17_shared
-            K17_heads["(17) adam_update (Heads)"]:::kernel; FINAL_Grad_HeadW & FINAL_Grad_HeadB --> K17_heads; K17_heads -- updates --> P_Heads
-            P_Step --> K17_heads
+            K17_module["(17) adam_update (ClassifierModule)"]:::kernel; FINAL_Grad_ModW & FINAL_Grad_ModB --> K17_module; K17_module -- updates --> P_ClassifierModule
+            P_Step --> K17_module
             K17_temps["(17) adam_update (Temps)"]:::kernel; FINAL_Grad_Temps --> K17_temps; K17_temps -- updates --> P_Temps
             P_Step --> K17_temps
             K17_temps --> K18["<b>(18) clamp_temps</b>"]:::kernel
@@ -227,65 +236,71 @@ graph TD
 
 ```
 
-### **Final Multi-Head Classifier Kernel & Synchronization Contracts**
+### **Final Kernel & Synchronization Contracts**
 
 - **(4) `forward_pass`**: Computes hidden activations for a chunk of the input batch.
-- **(5) `compute_logits_chunk`**: A streamable kernel computing raw logits for a chunk of classifier heads and classes.
-- **(6) `reduce_logits_for_softmax`**: **CCE Path Only.** Synchronization kernel that computes stable Softmax normalization terms. Skipped on the BCE path.
-- **(7a) `compute_probs_loss_cce_chunk`**: **CCE Path Only.** Streamable kernel computing probabilities and final CCE loss (via scatter-write).
-- **(7b) `compute_probs_loss_bce_chunk`**: **BCE Path Only.** Streamable kernel computing probabilities and partial BCE loss.
+- **(5) `compute_logits_chunk`**: A streamable kernel computing raw logits for a chunk of `Classifier Module` instances and classes.
+- **(6) `reduce_logits_for_softmax`**: **Invoked when `Operating Mode` is `CCE`.** A synchronization kernel that computes stable Softmax normalization terms.
+- **(7a) `compute_probs_loss_cce_chunk`**: **Invoked when `Operating Mode` is `CCE`.** Streamable kernel computing probabilities and final CCE loss.
+- **(7b) `compute_probs_loss_bce_chunk`**: **Invoked when `Operating Mode` is `BCE`.** Streamable kernel computing probabilities and partial BCE loss.
 
 ---
 
-- **(8) `calculate_head_param_grads_chunk`**: A streamable kernel computing **partial** gradients for head weights and biases (`Grad_HW`, `Grad_HB`) for a class chunk. It computes the `(prob - target)` error signal on the fly and performs a reduction over the batch dimension.
-- **(9) `backprop_error_to_hidden_chunk`**: A streamable kernel computing the **partial** upstream gradient for the hidden layer (`Grad_H`) for a class chunk. It computes the `(prob - target)` error signal on the fly and performs a reduction over the class dimension.
+- **(8) `calculate_module_param_grads_chunk`**: A streamable kernel computing **partial** gradients for module weights and biases (`Grad_ModW`, `Grad_ModB`). It computes the `(prob - target)` error signal on the fly.
+- **(9) `backprop_error_to_hidden_chunk`**: A streamable kernel computing the **partial** upstream gradient for the hidden layer (`Grad_H`).
 - **(10) `calculate_chunk_temp_gradients`**: A streamable kernel computing **partial** gradients for the temperature parameters.
 
 ---
 
-- **(11) `transpose_chunk`**: **(Generic Utility).** A streamable kernel that transposes a rectangular slice (chunk) of a matrix. Its fundamental architectural purpose is **latency hiding**. For the `Grad_H` backpropagation path, this kernel is enqueued on a **per-chunk** basis immediately following its corresponding `backprop_error_to_hidden_chunk` (9) call. This fine-grained dependency allows the GPU's out-of-order scheduler to overlap the memory-bound transpose of chunk _N_ with the compute-bound gradient calculations of chunk _N+1_, maximizing hardware occupancy and scaling efficiency.
-- **(12) `aggregate_*` kernels**: Generic, stateless kernel interface invoked to consolidate all partial results. This includes Probs, BCE Loss, Grads W, B, Temps, and crucially, the **SoA-formatted** partial `Grad_H` results from the parallel transpose step.
+- **(11) `transpose_chunk`**: **(Generic Utility).** A streamable kernel whose purpose is **latency hiding**. It is enqueued on a per-chunk basis to overlap memory-bound transpose operations with compute-bound gradient calculations.
+- **(12) `aggregate_*` kernels**: Generic, stateless kernel interface invoked to consolidate all partial results (Probs, BCE Loss, Gradients).
 - **(13) `backprop_shared_weights_chunk`**: A streamable backpropagation kernel for shared layer weights, computing partial gradients for a batch chunk.
 - **(14) `backprop_shared_biases_chunk`**: A streamable backpropagation kernel for shared layer biases, computing partial gradients for a batch chunk.
-- **(15) `aggregate_*` kernels**: The same generic kernel interface, invoked to consolidate partial gradients from the shared layer (`Grad_SW`, `Grad_SB`).
+- **(15) `aggregate_*` kernels**: The same generic kernel interface, invoked to consolidate partial gradients from the shared layer.
 - **(16) `D2H Async Copy`**: A non-blocking Device-to-Host transfer of the `Final Probs` buffer, whose completion signals the `inference_event`.
-- **(17) `adam_update`**: Generic optimizer kernel, invoked multiple times for different parameter groups. This kernel is passed the global training step `t` and performs the Adam bias correction calculation internally (`sqrt(1 - beta2^t) / (1 - beta1^t)`). This approach guarantees numerical stability for training runs of any length (i.e., scaling across the epoch dimension) by avoiding the host-side calculation of `beta^t`, which can suffer from precision loss at large `t`.
+- **(17) `adam_update`**: Generic optimizer kernel, invoked multiple times for different parameter groups. It accepts the global step `t` to guarantee numerical stability.
 - **(18) `clamp_temperatures`**: Final utility kernel for parameter constraint.
 - **Host/Device Synchronization Contracts**:
-  - `inference_event`: Guarantees the **complete, aggregated `Final Probs` tensor from all classifier heads** is available on the host. Its signaling marks the completion of the full forward pass and its data transfer, but explicitly _does not_ depend on the completion of the backward pass.
+  - `inference_event`: Guarantees the **complete, aggregated `Final Probs` tensor, representing results from all `Classifier Heads`**, is available on the host.
   - `final_batch_event`: Guarantees all device computations and parameter updates for the batch are complete.
 
-### **Multi-Head Classifier Validation Scenarios**
-
-The architecture's unified dataflow is validated by its robust and efficient handling of a wide spectrum of computational challenges, with each scenario probing a distinct scalability dimension.
+### **Validation Scenarios**
 
 - **Scenario: The Iris Case (Tiny Problem)**
 
-  - **Insight:** Demonstrates **universality**. For a problem that fits entirely in memory, the "always stream" design gracefully degrades. With all `num_*_chunks=1`, streaming loops run once and aggregation becomes a near-zero-cost identity copy, proving the architecture functions efficiently at any scale without special-casing.
+  - **Insight:** Demonstrates **universality**. For a model with a single, small `Classifier Head`, the "always stream" design gracefully degrades. With `num_*_chunks=1`, aggregation becomes a near-zero-cost identity copy, proving efficient function at any scale.
 
 - **Scenario: The Marathon (Massive `epochs`)**
 
-  - **Insight:** Guarantees **long-term stability**. The system avoids numerical underflow in the Adam optimizer by delegating the sensitive `beta**t` calculation to the `(17) adam_update` kernel. By passing the `global_step` `t` as a simple integer, the architecture ensures the optimizer is mathematically correct and stable indefinitely, proving scalability across the time dimension.
+  - **Insight:** Guarantees **long-term stability** by delegating the sensitive `beta**t` calculation to the `(17) adam_update` kernel, avoiding host-side precision loss and ensuring the optimizer is mathematically correct indefinitely.
 
 - **Scenario: The Hydra (Massive `num_heads`)**
 
-  - **Insight:** Validates **scalability of the core multi-head design**. When faced with a huge number of classifier heads, the host orchestrator chunks the problem along the head dimension (`num_head_chunks > 1`). Kernels for logits, probabilities, and gradients (5-10) are designed to process these chunks in parallel streams, which are then consolidated by the aggregation engine.
+  - **Insight:** Validates **scalability of the core multi-head design**.
+    - **Problem (ML Lens):** A model is designed with a massive number of independent `Classifier Heads`.
+    - **Solution (System Lens):** The architecture treats each `Head` as a generic `Module`, chunking computation over the "module" dimension (`num_module_chunks > 1`) and streaming the work in parallel.
 
 - **Scenario: The Behemoth (Massive `hidden_dim`)**
 
-  - **Insight:** Proves **scalability through strategic compute/memory trade-offs**. When a deep or wide shared layer makes the intermediate `hidden_i` buffer the memory bottleneck, the host makes a critical choice: **Cache** `hidden_i` for speed if memory allows, or **Recompute** it on-the-fly during backpropagation to guarantee scalability for any network size.
+  - **Insight:** Proves **scalability through strategic compute/memory trade-offs**. When the intermediate `hidden_i` buffer is a bottleneck, the host chooses to **Cache** or **Recompute** it, guaranteeing that any network size can train.
 
 - **Scenario: The Lexicon (Massive `output_classes`)**
 
-  - **Insight:** Achieves **maximum hardware occupancy via interleaved compute and memory operations**. When class count is the bottleneck, the host orchestrates a fine-grained parallel workload for each class chunk. The compute-bound gradient kernels (8, 9, 10) and the memory-bound `transpose_chunk` (11) for a given chunk are enqueued back-to-back without barriers. This allows the GPU's out-of-order scheduler to execute the transpose of chunk _N_ concurrently with the gradient calculations of chunk _N+1_. This strategic interleaving of independent compute and memory tasks is the core mechanism for hiding latency and maximizing throughput.
+  - **Insight:** Achieves **maximum hardware occupancy via interleaved compute and memory operations**.
+    - **Problem (ML Lens):** A `Classifier Head` must predict from millions of classes (a common `CCE Mode` scenario).
+    - **Solution (System Lens):** Within the `Classifier Module`'s execution path, the host orchestrates a fine-grained parallel workload. The compute-bound gradient kernels (8, 9, 10) for chunk _N+1_ are enqueued to run concurrently with the memory-bound `transpose_chunk` (11) of chunk _N_, hiding latency.
 
 - **Scenario: The Data Tsunami (Massive `batch_size`)**
 
-  - **Insight:** Validates the **two-phase streaming backpropagation strategy**. For an extremely large batch, `backprop_shared_weights_chunk` (13) and `backprop_shared_biases_chunk` (14) stream over the batch dimension, computing partial gradients which are then averaged. This contrasts with earlier phases that reduce _over_ the batch, showing a sophisticated dataflow tailored to memory access patterns.
+  - **Insight:** Validates the **two-phase streaming backpropagation strategy**. For large batches, backpropagation for the shared layer (13, 14) streams over the batch dimension, in contrast to earlier phases, showing a sophisticated dataflow tailored to memory patterns.
 
 - **Scenario: The Colossus (Holistic Stress Test)**
 
-  - **Insight:** Tests the **synergy of all scaling strategies under compound memory pressure**. This case presents a network where no single dimension is the bottleneck, but the combination of large `num_heads`, `hidden_dim`, `output_classes`, and `batch_size` collectively exceeds VRAM. The host orchestrator is forced to **compose a multi-faceted execution plan**: it will apply chunking over heads/classes (Phases 5-12) and then apply chunking over the batch (Phases 13-14) sequentially within a single training step. It may also engage the `Recompute` strategy for hidden activations. This proves the system's ability to handle not just asymmetric but also large, symmetric workloads through a flexible, phased approach.
+  - **Insight:** Tests the **synergy of all scaling strategies under compound memory pressure**.
+    - **Problem (ML Lens):** The model is large across many dimensions (many `Heads`, large `hidden_dim`, many `classes`, large `batch_size`).
+    - **Solution (System Lens):** The host composes a multi-faceted plan. First, it constructs the base DAG according to each `Module`'s `Operating Mode`. Then, it applies chunking over `Modules`/classes (Phases 5-12) and over the batch (Phases 13-14) sequentially. It may also engage the `Recompute` strategy for activations, proving its ability to handle complex, symmetric workloads.
 
 - **Scenario: The Responsive Dashboard (Asynchronous Result Retrieval)**
-  - **Insight:** Fulfills application-level responsiveness requirements by strictly **decoupling the forward-pass result from the backward-pass latency**. The architecture computes results for **all classifier heads** and aggregates them into a single, final probability tensor. The `inference_event` fires immediately after this complete result is transferred to the host (16), allowing an application to act on the full, multi-head inference. This occurs while the GPU proceeds independently with the computationally intensive backpropagation (Phases 13-14), final aggregation (15), and parameter updates (17-18). This mechanism ensures the application receives results with minimum delay.
+  - **Insight:** Fulfills application-level needs by **decoupling forward-pass results from backward-pass latency**.
+    - **Problem (ML Lens):** An application needs inference results from all `Classifier Heads` immediately.
+    - **Solution (System Lens):** The `inference_event` fires as soon as the complete probability tensor is ready (16), while the GPU proceeds independently with backpropagation (13-15) and optimizer updates (17-18).

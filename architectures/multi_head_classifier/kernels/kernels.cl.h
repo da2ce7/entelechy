@@ -119,28 +119,28 @@ __kernel void forward_pass(
     int padded_input_dim,                                          // [IN scalar: > 0, Padded input dimension]
     int padded_hidden_dim);                                        // [IN scalar: > 0, Padded hidden dimension]
 
-// --- Phase 5-7: Head Layer Forward Pass & Loss ---
+// --- Phase 5-7: Module Layer Forward Pass & Loss ---
 
 /**
- * @brief (Node 5) Computes a chunk of raw logits for a slice of heads and classes.
+ * @brief (Node 5) Computes a chunk of raw logits for a slice of modules and classes.
  * @contract Performs a (Weights * Input + Bias) transform to produce raw logits.
- * @usage (Host) Called in a loop over head/class chunks.
+ * @usage (Host) Called in a loop over module/class chunks.
  */
 __kernel void compute_logits_chunk(
-    __global const SCALAR_TYPE *__restrict hidden_buf,       // [IN]  Shape: (total_batch_size, padded_hidden_dim)
-    __global const SCALAR_TYPE *__restrict hidden_mask,      // [IN]  Shape: (total_batch_size)
-    __global const SCALAR_TYPE *__restrict head_weights_buf, // [IN]  Shape: (total_heads, hidden_dim, total_output_classes)
-    __global const SCALAR_TYPE *__restrict head_biases_buf,  // [IN]  Shape: (total_heads, total_output_classes)
-    __global SCALAR_TYPE *__restrict full_logits_out,        // [OUT] Shape: (total_heads, total_batch_size, total_output_classes)
-    int head_chunk_id,                                       // [IN scalar: >= 0, Logical EXIT chunk index]
-    int head_param_offset,                                   // [IN scalar: >= 0, Starting EXIT index for this chunk]
-    int num_heads_in_chunk,                                  // [IN scalar: > 0, Number of heads in this chunk]
-    int class_offset,                                        // [IN scalar: >= 0, Starting CLASS index for this chunk]
-    int num_classes_in_chunk,                                // [IN scalar: > 0, Number of classes in this chunk]
-    int total_batch_size,                                    // [IN scalar: > 0]
-    int hidden_dim,                                          // [IN scalar: > 0]
-    int padded_hidden_dim,                                   // [IN scalar: > 0]
-    int total_output_classes);                               // [IN scalar: > 0]
+    __global const SCALAR_TYPE *__restrict hidden_buf,         // [IN]  Shape: (total_batch_size, padded_hidden_dim)
+    __global const SCALAR_TYPE *__restrict hidden_mask,        // [IN]  Shape: (total_batch_size)
+    __global const SCALAR_TYPE *__restrict module_weights_buf, // [IN]  Shape: (total_modules, hidden_dim, total_output_classes)
+    __global const SCALAR_TYPE *__restrict module_biases_buf,  // [IN]  Shape: (total_modules, total_output_classes)
+    __global SCALAR_TYPE *__restrict full_logits_out,          // [OUT] Shape: (total_modules, total_batch_size, total_output_classes)
+    int module_chunk_id,                                       // [IN scalar: >= 0, Logical EXIT chunk index]
+    int module_param_offset,                                   // [IN scalar: >= 0, Starting EXIT index for this chunk]
+    int num_modules_in_chunk,                                  // [IN scalar: > 0, Number of modules in this chunk]
+    int class_offset,                                          // [IN scalar: >= 0, Starting CLASS index for this chunk]
+    int num_classes_in_chunk,                                  // [IN scalar: > 0, Number of classes in this chunk]
+    int total_batch_size,                                      // [IN scalar: > 0]
+    int hidden_dim,                                            // [IN scalar: > 0]
+    int padded_hidden_dim,                                     // [IN scalar: > 0]
+    int total_output_classes);                                 // [IN scalar: > 0]
 
 /**
  * @brief (Node 6) Reduces logits to find normalization terms for numerically stable Softmax.
@@ -148,10 +148,10 @@ __kernel void compute_logits_chunk(
  * @usage (Host) CCE Path Only. Acts as a synchronization point before kernel (7a).
  */
 __kernel void reduce_logits_for_softmax(
-    __global const SCALAR_TYPE *__restrict full_logits_buf, // [IN]  Shape: (total_heads, total_batch_size, total_output_classes)
-    __global const SCALAR_TYPE *__restrict temps_buf,       // [IN]  Shape: (total_heads)
-    __global SCALAR_TYPE *__restrict softmax_params_out,    // [OUT] Shape: (total_heads, total_batch_size, 2) -> [max_logit, sum_exp]
-    int total_heads,                                        // [IN scalar: > 0]
+    __global const SCALAR_TYPE *__restrict full_logits_buf, // [IN]  Shape: (total_modules, total_batch_size, total_output_classes)
+    __global const SCALAR_TYPE *__restrict temps_buf,       // [IN]  Shape: (total_modules)
+    __global SCALAR_TYPE *__restrict softmax_params_out,    // [OUT] Shape: (total_modules, total_batch_size, 2) -> [max_logit, sum_exp]
+    int total_modules,                                      // [IN scalar: > 0]
     int total_batch_size,                                   // [IN scalar: > 0]
     int total_output_classes);                              // [IN scalar: > 0]
 
@@ -162,16 +162,16 @@ __kernel void reduce_logits_for_softmax(
  * @usage (Host) CCE Path Only. Depends on kernel (6).
  */
 __kernel void compute_probs_loss_cce_chunk(
-    __global const SCALAR_TYPE *__restrict full_logits_buf,    // [IN]  Shape: (total_heads, total_batch_size, total_output_classes)
-    __global const SCALAR_TYPE *__restrict softmax_params_buf, // [IN]  Shape: (total_heads, total_batch_size, 2)
-    __global const SCALAR_TYPE *__restrict temps_buf,          // [IN]  Shape: (total_heads)
+    __global const SCALAR_TYPE *__restrict full_logits_buf,    // [IN]  Shape: (total_modules, total_batch_size, total_output_classes)
+    __global const SCALAR_TYPE *__restrict softmax_params_buf, // [IN]  Shape: (total_modules, total_batch_size, 2)
+    __global const SCALAR_TYPE *__restrict temps_buf,          // [IN]  Shape: (total_modules)
     __global const int *__restrict targets_cce_buf,            // [IN]  Shape: (total_batch_size)
     __global const SCALAR_TYPE *__restrict targets_mask,       // [IN]  Shape: (total_batch_size)
-    __global SCALAR_TYPE *__restrict partial_probs_out,        // [OUT] Shape: (total_heads, total_batch_size, total_output_classes)
-    __global SCALAR_TYPE *__restrict final_loss_out,           // [OUT] Shape: (total_heads, total_batch_size)
-    int head_chunk_id,                                         // [IN scalar: >= 0]
-    int head_param_offset,                                     // [IN scalar: >= 0]
-    int num_heads_in_chunk,                                    // [IN scalar: > 0]
+    __global SCALAR_TYPE *__restrict partial_probs_out,        // [OUT] Shape: (total_modules, total_batch_size, total_output_classes)
+    __global SCALAR_TYPE *__restrict final_loss_out,           // [OUT] Shape: (total_modules, total_batch_size)
+    int module_chunk_id,                                       // [IN scalar: >= 0]
+    int module_param_offset,                                   // [IN scalar: >= 0]
+    int num_modules_in_chunk,                                  // [IN scalar: > 0]
     int class_offset,                                          // [IN scalar: >= 0]
     int num_classes_in_chunk,                                  // [IN scalar: > 0]
     int total_batch_size,                                      // [IN scalar: > 0]
@@ -184,51 +184,52 @@ __kernel void compute_probs_loss_cce_chunk(
  * @usage (Host) BCE Path Only. The `partial_loss_out` buffer must be aggregated.
  */
 __kernel void compute_probs_loss_bce_chunk(
-    __global const SCALAR_TYPE *__restrict full_logits_buf, // [IN]  Shape: (total_heads, total_batch_size, total_output_classes)
-    __global const SCALAR_TYPE *__restrict temps_buf,       // [IN]  Shape: (total_heads)
+    __global const SCALAR_TYPE *__restrict full_logits_buf, // [IN]  Shape: (total_modules, total_batch_size, total_output_classes)
+    __global const SCALAR_TYPE *__restrict temps_buf,       // [IN]  Shape: (total_modules)
     __global const SCALAR_TYPE *__restrict targets_bce_buf, // [IN]  Shape: (total_batch_size, total_output_classes)
     __global const SCALAR_TYPE *__restrict targets_mask,    // [IN]  Shape: (total_batch_size)
-    __global SCALAR_TYPE *__restrict partial_probs_out,     // [OUT] Shape: (total_heads, total_batch_size, total_output_classes)
-    __global SCALAR_TYPE *__restrict partial_loss_out,      // [OUT] Shape: (num_class_chunks, total_heads, total_batch_size)
-    int head_chunk_id,                                      // [IN scalar: >= 0]
-    int head_param_offset,                                  // [IN scalar: >= 0]
-    int num_heads_in_chunk,                                 // [IN scalar: > 0]
+    __global SCALAR_TYPE *__restrict partial_probs_out,     // [OUT] Shape: (total_modules, total_batch_size, total_output_classes)
+    __global SCALAR_TYPE *__restrict partial_loss_out,      // [OUT] Shape: (num_class_chunks, total_modules, total_batch_size)
+    int module_chunk_id,                                    // [IN scalar: >= 0]
+    int module_param_offset,                                // [IN scalar: >= 0]
+    int num_modules_in_chunk,                               // [IN scalar: > 0]
     int class_chunk_id,                                     // [IN scalar: >= 0]
     int class_offset,                                       // [IN scalar: >= 0]
     int num_classes_in_chunk,                               // [IN scalar: > 0]
     int total_batch_size,                                   // [IN scalar: > 0]
     int total_output_classes,                               // [IN scalar: > 0]
-    int total_heads);                                       // [IN scalar: > 0]
+    int total_modules);                                     // [IN scalar: > 0]
 
 // --- Phase 8-10: Parallel Gradient Computation ---
 
 /**
- * @brief (Node 8) Computes partial head param gradients (Weights, Biases) for a class chunk.
+ * @brief (Node 8) Computes partial module param gradients (Weights, Biases) for a class chunk.
  * @contract Computes the (prob - target) error signal internally and produces a
  *           *partial* gradient via reduction over the batch dimension.
  *           If `problem_type_flag`=0 (CCE), `targets_buf` is `__global int*`.
  *           If `problem_type_flag`=1 (BCE), `targets_buf` is `__global SCALAR_TYPE*`.
  * @usage (Host) Launched in parallel with kernels (9) and (10) for the same chunk.
  */
-__kernel void calculate_head_param_grads_chunk(
-    __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
-    __global const SCALAR_TYPE *__restrict hidden_buf,        // [IN]  Shape: (total_batch_size, padded_hidden_dim)
-    __global const SCALAR_TYPE *__restrict partial_probs_buf, // [IN]  Shape: (total_heads, total_batch_size, total_output_classes)
-    __global const void *__restrict targets_buf,              // [IN]  Shape: Generic, cast based on problem_type_flag
-    __global SCALAR_TYPE *__restrict partial_grad_head_w_out, // [OUT] Shape: (num_class_chunks, total_heads, h_dim, total_output_classes)
-    __global SCALAR_TYPE *__restrict partial_grad_head_b_out, // [OUT] Shape: (num_class_chunks, total_heads, total_output_classes)
-    int problem_type_flag,                                    // [IN scalar: 0|1, CCE or BCE]
-    int head_chunk_id,                                        // [IN scalar: >= 0]
-    int head_param_offset,                                    // [IN scalar: >= 0]
-    int num_heads_in_chunk,                                   // [IN scalar: > 0]
-    int class_chunk_id,                                       // [IN scalar: >= 0]
-    int class_offset,                                         // [IN scalar: >= 0]
-    int num_classes_in_chunk,                                 // [IN scalar: > 0]
-    int total_batch_size,                                     // [IN scalar: > 0]
-    int hidden_dim,                                           // [IN scalar: > 0]
-    int padded_hidden_dim,                                    // [IN scalar: > 0]
-    int total_output_classes,                                 // [IN scalar: > 0]
-    int total_heads);                                         // [IN scalar: > 0]
+__kernel void calculate_module_param_grads_chunk(
+    __local SCALAR_TYPE *local_mem,                             // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
+    __global const SCALAR_TYPE *__restrict hidden_buf,          // [IN]  Shape: (total_batch_size, padded_hidden_dim)
+    __global const SCALAR_TYPE *__restrict partial_probs_buf,   // [IN]  Shape: (total_modules, total_batch_size, total_output_classes)
+    __global const void *__restrict targets_buf,                // [IN]  Shape: Generic, cast based on problem_type_flag
+    __global const SCALAR_TYPE *__restrict targets_mask,        // [IN]  Shape: (total_batch_size)
+    __global SCALAR_TYPE *__restrict partial_grad_module_w_out, // [OUT] Shape: (num_class_chunks, total_modules, h_dim, total_output_classes)
+    __global SCALAR_TYPE *__restrict partial_grad_module_b_out, // [OUT] Shape: (num_class_chunks, total_modules, total_output_classes)
+    int problem_type_flag,                                      // [IN scalar: 0|1, CCE or BCE]
+    int module_chunk_id,                                        // [IN scalar: >= 0]
+    int module_param_offset,                                    // [IN scalar: >= 0]
+    int num_modules_in_chunk,                                   // [IN scalar: > 0]
+    int class_chunk_id,                                         // [IN scalar: >= 0]
+    int class_offset,                                           // [IN scalar: >= 0]
+    int num_classes_in_chunk,                                   // [IN scalar: > 0]
+    int total_batch_size,                                       // [IN scalar: > 0]
+    int hidden_dim,                                             // [IN scalar: > 0]
+    int padded_hidden_dim,                                      // [IN scalar: > 0]
+    int total_output_classes,                                   // [IN scalar: > 0]
+    int total_modules);                                         // [IN scalar: > 0]
 
 /**
  * @brief (Node 9) Computes the partial upstream gradient for the hidden layer (Grad_H).
@@ -239,22 +240,23 @@ __kernel void calculate_head_param_grads_chunk(
  * @usage (Host) Launched in parallel with kernels (8) and (10) for the same chunk.
  */
 __kernel void backprop_error_to_hidden_chunk(
-    __local SCALAR_TYPE *local_mem,                           // [MEMORY size: (unused)]
-    __global const SCALAR_TYPE *__restrict partial_probs_buf, // [IN]  Shape: (total_heads, total_batch_size, total_output_classes)
-    __global const void *__restrict targets_buf,              // [IN]  Shape: Generic, cast based on problem_type_flag
-    __global const SCALAR_TYPE *__restrict head_weights_buf,  // [IN]  Shape: (total_heads, hidden_dim, total_output_classes)
-    __global SCALAR_TYPE *__restrict partial_grad_h_aos_out,  // [OUT] Shape: (num_class_chunks, total_heads, total_batch_size, hidden_dim)
-    int problem_type_flag,                                    // [IN scalar: 0|1, CCE or BCE]
-    int head_chunk_id,                                        // [IN scalar: >= 0]
-    int head_param_offset,                                    // [IN scalar: >= 0]
-    int num_heads_in_chunk,                                   // [IN scalar: > 0]
-    int class_chunk_id,                                       // [IN scalar: >= 0]
-    int class_offset,                                         // [IN scalar: >= 0]
-    int num_classes_in_chunk,                                 // [IN scalar: > 0]
-    int total_batch_size,                                     // [IN scalar: > 0]
-    int hidden_dim,                                           // [IN scalar: > 0]
-    int total_output_classes,                                 // [IN scalar: > 0]
-    int total_heads);                                         // [IN scalar: > 0]
+    __local SCALAR_TYPE *local_mem,                            // [MEMORY size: (unused)]
+    __global const SCALAR_TYPE *__restrict partial_probs_buf,  // [IN]  Shape: (total_modules, total_batch_size, total_output_classes)
+    __global const void *__restrict targets_buf,               // [IN]  Shape: Generic, cast based on problem_type_flag
+    __global const SCALAR_TYPE *__restrict targets_mask,       // [IN]  Shape: (total_batch_size)
+    __global const SCALAR_TYPE *__restrict module_weights_buf, // [IN]  Shape: (total_modules, hidden_dim, total_output_classes)
+    __global SCALAR_TYPE *__restrict partial_grad_h_aos_out,   // [OUT] Shape: (num_class_chunks, total_modules, total_batch_size, hidden_dim)
+    int problem_type_flag,                                     // [IN scalar: 0|1, CCE or BCE]
+    int module_chunk_id,                                       // [IN scalar: >= 0]
+    int module_param_offset,                                   // [IN scalar: >= 0]
+    int num_modules_in_chunk,                                  // [IN scalar: > 0]
+    int class_chunk_id,                                        // [IN scalar: >= 0]
+    int class_offset,                                          // [IN scalar: >= 0]
+    int num_classes_in_chunk,                                  // [IN scalar: > 0]
+    int total_batch_size,                                      // [IN scalar: > 0]
+    int hidden_dim,                                            // [IN scalar: > 0]
+    int total_output_classes,                                  // [IN scalar: > 0]
+    int total_modules);                                        // [IN scalar: > 0]
 
 /**
  * @brief (Node 10) Computes partial temperature gradients for a chunk of classes.
@@ -265,22 +267,22 @@ __kernel void backprop_error_to_hidden_chunk(
  */
 __kernel void calculate_chunk_temp_gradients(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
-    __global const SCALAR_TYPE *__restrict full_logits_buf,   // [IN]  Shape: (total_heads, total_batch_size, total_output_classes)
-    __global const SCALAR_TYPE *__restrict partial_probs_buf, // [IN]  Shape: (total_heads, total_batch_size, total_output_classes)
+    __global const SCALAR_TYPE *__restrict full_logits_buf,   // [IN]  Shape: (total_modules, total_batch_size, total_output_classes)
+    __global const SCALAR_TYPE *__restrict partial_probs_buf, // [IN]  Shape: (total_modules, total_batch_size, total_output_classes)
     __global const void *__restrict targets_buf,              // [IN]  Shape: Generic, cast based on problem_type_flag
     __global const SCALAR_TYPE *__restrict targets_mask,      // [IN]  Shape: (total_batch_size)
-    __global const SCALAR_TYPE *__restrict temps_buf,         // [IN]  Shape: (total_heads)
-    __global SCALAR_TYPE *__restrict partial_grad_temps_out,  // [OUT] Shape: (num_class_chunks, total_heads)
+    __global const SCALAR_TYPE *__restrict temps_buf,         // [IN]  Shape: (total_modules)
+    __global SCALAR_TYPE *__restrict partial_grad_temps_out,  // [OUT] Shape: (num_class_chunks, total_modules)
     int problem_type_flag,                                    // [IN scalar: 0|1, CCE or BCE]
-    int head_chunk_id,                                        // [IN scalar: >= 0]
-    int head_param_offset,                                    // [IN scalar: >= 0]
-    int num_heads_in_chunk,                                   // [IN scalar: > 0]
+    int module_chunk_id,                                      // [IN scalar: >= 0]
+    int module_param_offset,                                  // [IN scalar: >= 0]
+    int num_modules_in_chunk,                                 // [IN scalar: > 0]
     int class_chunk_id,                                       // [IN scalar: >= 0]
     int class_offset,                                         // [IN scalar: >= 0]
     int num_classes_in_chunk,                                 // [IN scalar: > 0]
     int total_batch_size,                                     // [IN scalar: > 0]
     int total_output_classes,                                 // [IN scalar: > 0]
-    int total_heads);                                         // [IN scalar: > 0]
+    int total_modules);                                       // [IN scalar: > 0]
 
 // --- Phase 11: Data Layout Transformation ---
 /**
@@ -419,9 +421,9 @@ __kernel void adam_update(
  * @usage (Host) Called only on the temperature buffer, immediately after its Adam update.
  */
 __kernel void clamp_temperatures(
-    __global SCALAR_TYPE *__restrict temps_buf, // [IN/OUT] Shape: (total_heads)
+    __global SCALAR_TYPE *__restrict temps_buf, // [IN/OUT] Shape: (total_modules)
     SCALAR_TYPE min_temp,                       // [IN scalar: Minimum allowed temperature value]
     SCALAR_TYPE max_temp,                       // [IN scalar: Maximum allowed temperature value]
-    int         total_heads);                           // [IN scalar: > 0, The number of temperatures to clamp]
+    int         total_modules);                         // [IN scalar: > 0, The number of temperatures to clamp]
 
 #endif // KERNELS_CL_H

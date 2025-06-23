@@ -72,12 +72,12 @@ __kernel void adam_update(
 // Strategy: An embarrassingly parallel map kernel. Each work-item is assigned to
 // a single temperature parameter and performs the clamp operation independently.
 // This is the final operation in the training graph.
-__kernel void clamp_temperatures(__global SCALAR_TYPE *__restrict temps_buf, SCALAR_TYPE min_temp, SCALAR_TYPE max_temp, int total_heads) {
+__kernel void clamp_temperatures(__global SCALAR_TYPE *__restrict temps_buf, SCALAR_TYPE min_temp, SCALAR_TYPE max_temp, int total_modules) {
 
     const int idx = get_global_id(0);
 
-    // Use the standardized `total_heads` parameter name.
-    if (idx >= total_heads) {
+    // Use the standardized `total_modules` parameter name.
+    if (idx >= total_modules) {
         return;
     }
 
