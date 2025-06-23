@@ -109,7 +109,7 @@ inline SCALAR_TYPE pown(SCALAR_TYPE base, int exp) { return pow(base, (SCALAR_TY
 __kernel void forward_pass(
     __local SCALAR_TYPE *local_mem,                                // [MEMORY size: SIMD_WIDTH * (1 + SIMD_WIDTH) * sizeof(SCALAR_TYPE)]
     __global const SCALAR_TYPE *__restrict input_buf,              // [IN]  Shape: (total_batch_size, padded_input_dim)
-    __global const SCALAR_TYPE *__restrict input_mask,             // [IN]  Shape: (total_batch_size)
+    __global const SCALAR_TYPE *__restrict sample_mask,             // [IN]  Shape: (total_batch_size)
     __global const SCALAR_TYPE *__restrict weights_simd_major_buf, // [IN]  Shape: (padded_hidden_dim/SW, padded_input_dim, SW)
     __global const SCALAR_TYPE *__restrict biases_buf,             // [IN]  Shape: (padded_hidden_dim)
     __global SCALAR_TYPE *__restrict hidden_out_buf,               // [OUT] Shape: (total_batch_size, padded_hidden_dim)
@@ -166,7 +166,7 @@ __kernel void compute_probs_loss_cce_chunk(
     __global const SCALAR_TYPE *__restrict softmax_params_buf, // [IN]  Shape: (total_modules, total_batch_size, 2)
     __global const SCALAR_TYPE *__restrict temps_buf,          // [IN]  Shape: (total_modules)
     __global const int *__restrict targets_cce_buf,            // [IN]  Shape: (total_batch_size)
-    __global const SCALAR_TYPE *__restrict targets_mask,       // [IN]  Shape: (total_batch_size)
+    __global const SCALAR_TYPE *__restrict sample_mask,       // [IN]  Shape: (total_batch_size)
     __global SCALAR_TYPE *__restrict partial_probs_out,        // [OUT] Shape: (total_modules, total_batch_size, total_output_classes)
     __global SCALAR_TYPE *__restrict final_loss_out,           // [OUT] Shape: (total_modules, total_batch_size)
     int module_chunk_id,                                       // [IN scalar: >= 0]
@@ -187,7 +187,7 @@ __kernel void compute_probs_loss_bce_chunk(
     __global const SCALAR_TYPE *__restrict full_logits_buf, // [IN]  Shape: (total_modules, total_batch_size, total_output_classes)
     __global const SCALAR_TYPE *__restrict temps_buf,       // [IN]  Shape: (total_modules)
     __global const SCALAR_TYPE *__restrict targets_bce_buf, // [IN]  Shape: (total_batch_size, total_output_classes)
-    __global const SCALAR_TYPE *__restrict targets_mask,    // [IN]  Shape: (total_batch_size)
+    __global const SCALAR_TYPE *__restrict sample_mask,    // [IN]  Shape: (total_batch_size)
     __global SCALAR_TYPE *__restrict partial_probs_out,     // [OUT] Shape: (total_modules, total_batch_size, total_output_classes)
     __global SCALAR_TYPE *__restrict partial_loss_out,      // [OUT] Shape: (num_class_chunks, total_modules, total_batch_size)
     int module_chunk_id,                                    // [IN scalar: >= 0]
@@ -215,7 +215,7 @@ __kernel void calculate_module_param_grads_chunk(
     __global const SCALAR_TYPE *__restrict hidden_buf,          // [IN]  Shape: (total_batch_size, padded_hidden_dim)
     __global const SCALAR_TYPE *__restrict partial_probs_buf,   // [IN]  Shape: (total_modules, total_batch_size, total_output_classes)
     __global const void *__restrict targets_buf,                // [IN]  Shape: Generic, cast based on problem_type_flag
-    __global const SCALAR_TYPE *__restrict targets_mask,        // [IN]  Shape: (total_batch_size)
+    __global const SCALAR_TYPE *__restrict sample_mask,        // [IN]  Shape: (total_batch_size)
     __global SCALAR_TYPE *__restrict partial_grad_module_w_out, // [OUT] Shape: (num_class_chunks, total_modules, h_dim, total_output_classes)
     __global SCALAR_TYPE *__restrict partial_grad_module_b_out, // [OUT] Shape: (num_class_chunks, total_modules, total_output_classes)
     int problem_type_flag,                                      // [IN scalar: 0|1, CCE or BCE]
@@ -243,7 +243,7 @@ __kernel void backprop_error_to_hidden_chunk(
     __local SCALAR_TYPE *local_mem,                            // [MEMORY size: (unused)]
     __global const SCALAR_TYPE *__restrict partial_probs_buf,  // [IN]  Shape: (total_modules, total_batch_size, total_output_classes)
     __global const void *__restrict targets_buf,               // [IN]  Shape: Generic, cast based on problem_type_flag
-    __global const SCALAR_TYPE *__restrict targets_mask,       // [IN]  Shape: (total_batch_size)
+    __global const SCALAR_TYPE *__restrict sample_mask,       // [IN]  Shape: (total_batch_size)
     __global const SCALAR_TYPE *__restrict module_weights_buf, // [IN]  Shape: (total_modules, hidden_dim, total_output_classes)
     __global SCALAR_TYPE *__restrict partial_grad_h_aos_out,   // [OUT] Shape: (num_class_chunks, total_modules, total_batch_size, hidden_dim)
     int problem_type_flag,                                     // [IN scalar: 0|1, CCE or BCE]
@@ -270,7 +270,7 @@ __kernel void calculate_chunk_temp_gradients(
     __global const SCALAR_TYPE *__restrict full_logits_buf,   // [IN]  Shape: (total_modules, total_batch_size, total_output_classes)
     __global const SCALAR_TYPE *__restrict partial_probs_buf, // [IN]  Shape: (total_modules, total_batch_size, total_output_classes)
     __global const void *__restrict targets_buf,              // [IN]  Shape: Generic, cast based on problem_type_flag
-    __global const SCALAR_TYPE *__restrict targets_mask,      // [IN]  Shape: (total_batch_size)
+    __global const SCALAR_TYPE *__restrict sample_mask,      // [IN]  Shape: (total_batch_size)
     __global const SCALAR_TYPE *__restrict temps_buf,         // [IN]  Shape: (total_modules)
     __global SCALAR_TYPE *__restrict partial_grad_temps_out,  // [OUT] Shape: (num_class_chunks, total_modules)
     int problem_type_flag,                                    // [IN scalar: 0|1, CCE or BCE]
@@ -366,7 +366,7 @@ __kernel void backprop_shared_weights_chunk(
     __global const SCALAR_TYPE *__restrict input_buf,        // [IN]  Shape: (total_batch_size, padded_input_dim)
     __global const SCALAR_TYPE *__restrict hidden_buf,       // [IN]  Shape: (total_batch_size, padded_hidden_dim)
     __global const SCALAR_TYPE *__restrict final_grad_h_buf, // [IN]  Shape: (total_batch_size, padded_hidden_dim)
-    __global const SCALAR_TYPE *__restrict input_mask,       // [IN]  Shape: (total_batch_size)
+    __global const SCALAR_TYPE *__restrict sample_mask,       // [IN]  Shape: (total_batch_size)
     __global SCALAR_TYPE *__restrict partial_grad_sw_out,    // [OUT] Shape: (num_batch_chunks, padded_input_dim, padded_hidden_dim)
     int batch_offset,                                        // [IN scalar: >= 0, Start sample index]
     int num_batch_samples,                                   // [IN scalar: > 0, Number of samples in chunk]
@@ -384,7 +384,7 @@ __kernel void backprop_shared_biases_chunk(
     __local SCALAR_TYPE *local_mem,                          // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
     __global const SCALAR_TYPE *__restrict hidden_buf,       // [IN]  Shape: (total_batch_size, padded_hidden_dim)
     __global const SCALAR_TYPE *__restrict final_grad_h_buf, // [IN]  Shape: (total_batch_size, padded_hidden_dim)
-    __global const SCALAR_TYPE *__restrict input_mask,       // [IN]  Shape: (total_batch_size)
+    __global const SCALAR_TYPE *__restrict sample_mask,       // [IN]  Shape: (total_batch_size)
     __global SCALAR_TYPE *__restrict partial_grad_sb_out,    // [OUT] Shape: (num_batch_chunks, padded_hidden_dim)
     int batch_offset,                                        // [IN scalar: >= 0, Start sample index]
     int num_batch_samples,                                   // [IN scalar: > 0, Number of samples in chunk]

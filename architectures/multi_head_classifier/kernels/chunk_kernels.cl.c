@@ -14,7 +14,7 @@
 __kernel void forward_pass(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict input_buf,
-    __global const SCALAR_TYPE *__restrict input_mask,
+    __global const SCALAR_TYPE *__restrict sample_mask,
     __global const SCALAR_TYPE *__restrict weights_simd_major_buf,
     __global const SCALAR_TYPE *__restrict biases_buf,
     __global SCALAR_TYPE *__restrict hidden_out_buf,
@@ -35,15 +35,15 @@ __kernel void forward_pass(
     const uint effective_bid = batch_offset + bid;
 
     // Propagate validity mask. Masked samples do not need the barrier, so they exit early.
-    if (input_mask[effective_bid] < (SCALAR_TYPE)0.5f) {
+    if (sample_mask[effective_bid] < (SCALAR_TYPE)0.5f) {
         if (lid == 0) {
-            hidden_mask_out[effective_bid] = input_mask[effective_bid];
+            hidden_mask_out[effective_bid] = sample_mask[effective_bid];
         }
         return;
     }
     // Only one thread writes the valid mask to avoid a race condition.
     if (lid == 0) {
-        hidden_mask_out[effective_bid] = input_mask[effective_bid];
+        hidden_mask_out[effective_bid] = sample_mask[effective_bid];
     }
 
     const uint TILE_SIZE = SIMD_WIDTH;
@@ -224,7 +224,7 @@ __kernel void compute_probs_loss_cce_chunk(
     __global const SCALAR_TYPE *__restrict softmax_params_buf,
     __global const SCALAR_TYPE *__restrict temps_buf,
     __global const int *__restrict targets_cce_buf,
-    __global const SCALAR_TYPE *__restrict targets_mask,
+    __global const SCALAR_TYPE *__restrict sample_mask,
     __global SCALAR_TYPE *__restrict partial_probs_out,
     __global SCALAR_TYPE *__restrict final_loss_out,
     int module_chunk_id,
@@ -252,7 +252,7 @@ __kernel void compute_probs_loss_cce_chunk(
 
     // --- Masking ---
     // For masked samples, prob is zero, and the loss remains its pre-initialized zero value.
-    if (targets_mask[batch_idx] < 0.5f) {
+    if (sample_mask[batch_idx] < 0.5f) {
         partial_probs_out[prob_out_idx] = SCALAR_ZERO;
         return;
     }
@@ -295,7 +295,7 @@ __kernel void compute_probs_loss_bce_chunk(
     __global const SCALAR_TYPE *__restrict full_logits_buf,
     __global const SCALAR_TYPE *__restrict temps_buf,
     __global const SCALAR_TYPE *__restrict targets_bce_buf,
-    __global const SCALAR_TYPE *__restrict targets_mask,
+    __global const SCALAR_TYPE *__restrict sample_mask,
     __global SCALAR_TYPE *__restrict partial_probs_out,
     __global SCALAR_TYPE *__restrict partial_loss_out,
     int module_chunk_id,
@@ -322,7 +322,7 @@ __kernel void compute_probs_loss_bce_chunk(
 
     // --- Masking ---
     // For masked samples, write zero to both outputs and module early.
-    if (targets_mask[batch_idx] < 0.5f) {
+    if (sample_mask[batch_idx] < 0.5f) {
         partial_loss_out[loss_out_idx] = SCALAR_ZERO;
         for (int c_local = 0; c_local < num_classes_in_chunk; ++c_local) {
             const int  c_global             = class_offset + c_local;
@@ -369,7 +369,7 @@ __kernel void calculate_module_param_grads_chunk(
     __global const SCALAR_TYPE *__restrict hidden_buf,
     __global const SCALAR_TYPE *__restrict partial_probs_buf,
     __global const void *__restrict targets_buf,
-    __global const SCALAR_TYPE *__restrict targets_mask,
+    __global const SCALAR_TYPE *__restrict sample_mask,
     __global SCALAR_TYPE *__restrict partial_grad_module_w_out,
     __global SCALAR_TYPE *__restrict partial_grad_module_b_out,
     int problem_type_flag,
@@ -406,7 +406,7 @@ __kernel void calculate_module_param_grads_chunk(
     // Each thread calculates its local contribution to the gradients.
     for (int b = lid; b < total_batch_size; b += lsize) {
         // Ensure gradients are not computed for padded batch items.
-        if (targets_mask[b] < 0.5f) {
+        if (sample_mask[b] < 0.5f) {
             continue;
         }
 
@@ -482,7 +482,7 @@ __kernel void backprop_error_to_hidden_chunk(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict partial_probs_buf,
     __global const void *__restrict targets_buf,
-    __global const SCALAR_TYPE *__restrict targets_mask,
+    __global const SCALAR_TYPE *__restrict sample_mask,
     __global const SCALAR_TYPE *__restrict module_weights_buf,
     __global SCALAR_TYPE *__restrict partial_grad_h_aos_out,
     int problem_type_flag,
@@ -511,7 +511,7 @@ __kernel void backprop_error_to_hidden_chunk(
     const uint out_idx           = class_chunk_id * (total_modules * total_batch_size * hidden_dim) + module_global_idx * (total_batch_size * hidden_dim) + batch_idx * hidden_dim + h_idx;
 
     // Correctly handle padded batch items by writing a zero gradient and exiting.
-    if (targets_mask[batch_idx] < 0.5f) {
+    if (sample_mask[batch_idx] < 0.5f) {
         partial_grad_h_aos_out[out_idx] = SCALAR_ZERO;
         return;
     }
@@ -552,7 +552,7 @@ __kernel void calculate_chunk_temp_gradients(
     __global const SCALAR_TYPE *__restrict full_logits_buf,
     __global const SCALAR_TYPE *__restrict partial_probs_buf,
     __global const void *__restrict targets_buf,
-    __global const SCALAR_TYPE *__restrict targets_mask,
+    __global const SCALAR_TYPE *__restrict sample_mask,
     __global const SCALAR_TYPE *__restrict temps_buf,
     __global SCALAR_TYPE *__restrict partial_grad_temps_out,
     int problem_type_flag,
@@ -578,7 +578,7 @@ __kernel void calculate_chunk_temp_gradients(
     SCALAR_TYPE p_grad_sum        = SCALAR_ZERO;
 
     for (int b = lid; b < total_batch_size; b += lsize) {
-        if (targets_mask[b] < 0.5f) {
+        if (sample_mask[b] < 0.5f) {
             continue;
         }
 

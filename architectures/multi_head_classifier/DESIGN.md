@@ -102,6 +102,7 @@ graph TD
         P_Shared[Shared Params]:::param; P_ClassifierModule[Classifier Module Params]:::param; P_Temps[Temp Params]:::param;
         P_Step[Global Step 't']:::param
         Targets[Targets]:::param
+        SampleMask[Sample Mask]:::param
     end
 
     %% Phase 4: Shared Layer Forward Pass (Fused)
@@ -115,7 +116,9 @@ graph TD
             L4a["Mat-Mul δ"]:::logical_step --> L4b["Bias Add δ"]:::logical_step --> L4c["ReLU δ"]:::logical_step
         end
         HL_1 --> L4a
+        SampleMask --> L4a
         L4c --> hidden_i[Hidden Activations<br/>Chunk 'i']:::data
+        L4c --> hidden_mask[Hidden Mask]:::data
     end
 
     %% Phase 5-7: Classifier Module Forward Pass (Fused)
@@ -124,7 +127,7 @@ graph TD
              direction LR
              L5a["Mat-Mul α"]:::logical_step --> L5b["Bias Add α"]:::logical_step
         end
-        hidden_i --> L5a
+        hidden_i & hidden_mask --> L5a
         L5b --> Full_Logits[Full Logits Buffer]:::full_intermediate
 
         HL_3["(7) Host Selects Path<br/>based on Operating Mode (CCE/BCE)"]:::host_logic
@@ -140,6 +143,7 @@ graph TD
                 L7a_prob["Prob Calc β"]:::logical_step --> L7a_loss["Loss Calc β"]:::logical_step
             end
             Softmax_Params & Full_Logits --> L7a_prob
+            SampleMask --> L7a_loss
             L7a_loss --> FINAL_Loss_CCE[FINAL CCE Loss (no agg needed)]:::final_data
             L7a_prob --> PARTIAL_Probs[PARTIAL Probabilities]:::partial_data
         end
@@ -150,6 +154,7 @@ graph TD
                 L7b_prob["Prob Calc β"]:::logical_step --> L7b_loss["Loss Calc β"]:::logical_step
             end
             HL_3 & Full_Logits --> L7b_prob
+            SampleMask --> L7b_loss
             L7b_loss --> PARTIAL_Loss_BCE[PARTIAL BCE Loss]:::partial_data
             L7b_prob --> PARTIAL_Probs
         end
@@ -165,7 +170,7 @@ graph TD
                 L8_w["Weight Grad Calc γ"]:::logical_step
                 L8_b["Bias Grad Calc γ"]:::logical_step
             end
-            PARTIAL_Probs & Targets --> L8_w; PARTIAL_Probs & Targets --> L8_b
+            PARTIAL_Probs & Targets & SampleMask --> L8_w; PARTIAL_Probs & Targets & SampleMask --> L8_b
             hidden_i --> L8_w
             L8_w --> PARTIAL_Grad_ModW[PARTIAL Grad_ModW]:::partial_data
             L8_b --> PARTIAL_Grad_ModB[PARTIAL Grad_ModB]:::partial_data
@@ -174,7 +179,7 @@ graph TD
         subgraph "Upstream Hidden Gradients & Transformation"
             style "Upstream Hidden Gradients & Transformation" grad_path_b
             K9["<b>(9) backprop_error_to_hidden_chunk</b>"]:::kernel
-            PARTIAL_Probs & Targets & P_ClassifierModule --> K9
+            PARTIAL_Probs & Targets & P_ClassifierModule & SampleMask --> K9
             K9 --> PARTIAL_Grad_H_AoS["PARTIAL Grad_H<br/>(AoS Layout)"]:::partial_data
             PARTIAL_Grad_H_AoS --> K11["<b>(11) transpose_chunk</b><br/>(on partial Grad_H)"]:::transpose_kernel
             K11 --> PARTIAL_Grad_H_SoA["PARTIAL Grad_H<br/>(SoA Layout)"]:::partial_data
@@ -183,7 +188,7 @@ graph TD
         subgraph "Temperature Gradients"
             style "Temperature Gradients" grad_path_c
             K10["<b>(10) calculate_chunk_temp_gradients</b>"]:::kernel
-            PARTIAL_Probs & Full_Logits & Targets & P_Temps --> K10
+            PARTIAL_Probs & Full_Logits & Targets & P_Temps & SampleMask --> K10
             K10 --> PARTIAL_Grad_Temps[PARTIAL Grad_Temps]:::partial_data
         end
     end
@@ -199,11 +204,12 @@ graph TD
 
     subgraph "Phase 13-14: Streaming Shared Layer Backprop"
         style "Phase 13-14: Streaming Shared Layer Backprop" parallel_group
-        Input_i[Input Chunk 'i']:::data --> K13["<b>(13) backprop_shared_weights_chunk</b>"]:::kernel
+        Input_i[Input Chunk 'i']:::data & SampleMask --> K13["<b>(13) backprop_shared_weights_chunk</b>"]:::kernel
         K13 --> PARTIAL_Grad_SW_i[PARTIAL Grad_SW 'i']:::partial_data
         hidden_i --> K13 & K14
         FINAL_Grad_H -- slice --> K13 & K14
-        K14["<b>(14) backprop_shared_biases_chunk</b>"]:::kernel --> PARTIAL_Grad_SB_i[PARTIAL Grad_SB 'i']:::partial_data
+        SampleMask --> K14["<b>(14) backprop_shared_biases_chunk</b>"]:::kernel
+        K14 --> PARTIAL_Grad_SB_i[PARTIAL Grad_SB 'i']:::partial_data
     end
 
     subgraph Phase 15: Final Aggregation
@@ -233,7 +239,6 @@ graph TD
     FINAL_Probs --> K16
     EV_Inference --> Host_Act["Host Acts on<br/>Full Forward Result"]:::host_logic
     EV_Final --> Host_Wait_Final["Host Blocks for<br/>Full Batch"]:::host_logic
-
 ```
 
 ### **Final Kernel & Synchronization Contracts**

@@ -15,7 +15,7 @@ __kernel void backprop_shared_weights_chunk(
     __global const SCALAR_TYPE *__restrict input_buf,
     __global const SCALAR_TYPE *__restrict hidden_buf,
     __global const SCALAR_TYPE *__restrict final_grad_h_buf,
-    __global const SCALAR_TYPE *__restrict input_mask,
+    __global const SCALAR_TYPE *__restrict sample_mask,
     __global SCALAR_TYPE *__restrict partial_grad_sw_out,
     int batch_offset,
     int num_batch_samples,
@@ -38,7 +38,7 @@ __kernel void backprop_shared_weights_chunk(
     for (int b_local = lid; b_local < num_batch_samples; b_local += lsize) {
         const uint b_global = batch_offset + b_local;
 
-        if (input_mask[b_global] < 0.5f) {
+        if (sample_mask[b_global] < 0.5f) {
             continue;
         }
 
@@ -84,7 +84,7 @@ __kernel void backprop_shared_biases_chunk(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict hidden_buf,
     __global const SCALAR_TYPE *__restrict final_grad_h_buf,
-    __global const SCALAR_TYPE *__restrict input_mask,
+    __global const SCALAR_TYPE *__restrict sample_mask,
     __global SCALAR_TYPE *__restrict partial_grad_sb_out,
     int batch_offset,
     int num_batch_samples,
@@ -105,7 +105,7 @@ __kernel void backprop_shared_biases_chunk(
     for (int b_local = lid; b_local < num_batch_samples; b_local += lsize) {
         const uint b_global = batch_offset + b_local;
 
-        if (input_mask[b_global] < 0.5f) {
+        if (sample_mask[b_global] < 0.5f) {
             continue;
         }
 
