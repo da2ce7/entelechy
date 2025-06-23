@@ -1,3 +1,4 @@
+# iris_dynamic_cl.py
 #
 # A Unified, Memory-Aware Streaming Engine
 # ========================================
@@ -72,7 +73,7 @@ MAX_REGISTER_AGGREGATE_ITEMS: int = 32  # Threshold to switch reduction strategy
 C_TILE_SIZE: int = 16  # Tile size for the matrix transpose kernel
 BACKPROP_STREAM_CHUNK_SIZE: int = 32  # Granularity for shared layer backprop
 ## Max chunk constants for pre-allocating partial gradient buffers.
-MAX_EXIT_CLASS_CHUNKS: int = 64  # Max number of chunks for exit/class dimension streaming
+MAX_EXIT_CLASS_CHUNKS: int = 64  # Max number of chunks for head/class dimension streaming
 MAX_BATCH_CHUNKS: int = 64  # Max number of chunks for batch dimension streaming
 
 
@@ -159,9 +160,9 @@ class ChunkingConfig:
 class ExecutionPlan:
     """Holds the strategic decisions for processing one batch."""
 
-    exit_class_chunking: ChunkingConfig
+    head_class_chunking: ChunkingConfig
     batch_chunking: ChunkingConfig
-    exit_backprop_strategy: BackpropStrategyType
+    head_backprop_strategy: BackpropStrategyType
     recompute_hidden: bool = False
 
 
@@ -340,18 +341,18 @@ class KernelExecutor:
         return self.p.forward_pass(queue, g, l, *args, wait_for=wait_for)
 
     def launch_compute_logits_chunk(
-        self, queue, exit_chunk_id, exit_offset, num_exits, class_offset, num_classes, wait_for
+        self, queue, head_chunk_id, head_offset, num_heads, class_offset, num_classes, wait_for
     ) -> cl.Event:
-        g, l = (num_exits, BATCH_SIZE, num_classes), None
+        g, l = (num_heads, BATCH_SIZE, num_classes), None
         args = (
             self.b.get("hidden_buf"),
             self.b.get("hidden_mask"),
-            self.b.get("exit_weights"),
-            self.b.get("exit_biases"),
+            self.b.get("head_weights"),
+            self.b.get("head_biases"),
             self.b.get("full_logits_out"),
-            np.int32(exit_chunk_id),
-            np.int32(exit_offset),
-            np.int32(num_exits),
+            np.int32(head_chunk_id),
+            np.int32(head_offset),
+            np.int32(num_heads),
             np.int32(class_offset),
             np.int32(num_classes),
             np.int32(BATCH_SIZE),
@@ -374,9 +375,9 @@ class KernelExecutor:
         return self.p.reduce_logits_for_softmax(queue, g, l, *args, wait_for=wait_for)
 
     def launch_compute_probs_loss_cce_chunk(
-        self, queue, exit_chunk_id, exit_offset, num_exits, class_offset, num_classes, wait_for
+        self, queue, head_chunk_id, head_offset, num_heads, class_offset, num_classes, wait_for
     ) -> cl.Event:
-        g, l = (num_exits, BATCH_SIZE, num_classes), None
+        g, l = (num_heads, BATCH_SIZE, num_classes), None
         args = (
             self.b.get("full_logits_out"),
             self.b.get("softmax_params_out"),
@@ -385,9 +386,9 @@ class KernelExecutor:
             self.b.get("input_mask"),
             self.b.get("partial_probs_out"),
             self.b.get("final_loss_out"),
-            np.int32(exit_chunk_id),
-            np.int32(exit_offset),
-            np.int32(num_exits),
+            np.int32(head_chunk_id),
+            np.int32(head_offset),
+            np.int32(num_heads),
             np.int32(class_offset),
             np.int32(num_classes),
             np.int32(BATCH_SIZE),
@@ -396,33 +397,33 @@ class KernelExecutor:
         return self.p.compute_probs_loss_cce_chunk(queue, g, l, *args, wait_for=wait_for)
 
     def launch_compute_probs_loss_bce_chunk(
-        self, queue, exit_chunk_id, exit_offset, num_exits, class_chunk_id, class_offset, num_classes, wait_for
+        self, queue, head_chunk_id, head_offset, num_heads, class_chunk_id, class_offset, num_classes, wait_for
     ) -> cl.Event:
         """Placeholder: Launch implementation for BCE would be symmetric to CCE."""
         user_event = cl.UserEvent(queue.context)
         user_event.set_status(cl.command_execution_status.COMPLETE)
         return user_event
 
-    def launch_parallel_exit_grads(
-        self, queue, exit_chunk_id, exit_offset, num_exits, class_chunk_id, class_offset, num_classes, wait_for
+    def launch_parallel_head_grads(
+        self, queue, head_chunk_id, head_offset, num_heads, class_chunk_id, class_offset, num_classes, wait_for
     ) -> Tuple[cl.Event, cl.Event, cl.Event]:
         lsize = 256
         problem_flag = np.int32(0 if PROBLEM_TYPE == "CCE" else 1)
 
-        grad_w_evt = self.p.calculate_exit_param_grads_chunk(
+        grad_w_evt = self.p.calculate_head_param_grads_chunk(
             queue,
-            (num_exits, HIDDEN_DIM, num_classes),
+            (num_heads, HIDDEN_DIM, num_classes),
             None,
             cl.LocalMemory(lsize * self.scalar_size),
             self.b.get("hidden_buf"),
             self.b.get("partial_probs_out"),
             self.b.get("targets_buf"),
-            self.b.get("partial_grad_exit_w_out"),
-            self.b.get("partial_grad_exit_b_out"),
+            self.b.get("partial_grad_head_w_out"),
+            self.b.get("partial_grad_head_b_out"),
             problem_flag,
-            np.int32(exit_chunk_id),
-            np.int32(exit_offset),
-            np.int32(num_exits),
+            np.int32(head_chunk_id),
+            np.int32(head_offset),
+            np.int32(num_heads),
             np.int32(class_chunk_id),
             np.int32(class_offset),
             np.int32(num_classes),
@@ -435,17 +436,17 @@ class KernelExecutor:
         )
         grad_h_evt = self.p.backprop_error_to_hidden_chunk(
             queue,
-            (num_exits, BATCH_SIZE, HIDDEN_DIM),
+            (num_heads, BATCH_SIZE, HIDDEN_DIM),
             None,
             cl.LocalMemory(0),
             self.b.get("partial_probs_out"),
             self.b.get("targets_buf"),
-            self.b.get("exit_weights"),
+            self.b.get("head_weights"),
             self.b.get("partial_grad_h_aos_out"),
             problem_flag,
-            np.int32(exit_chunk_id),
-            np.int32(exit_offset),
-            np.int32(num_exits),
+            np.int32(head_chunk_id),
+            np.int32(head_offset),
+            np.int32(num_heads),
             np.int32(class_chunk_id),
             np.int32(class_offset),
             np.int32(num_classes),
@@ -457,7 +458,7 @@ class KernelExecutor:
         )
         grad_t_evt = self.p.calculate_chunk_temp_gradients(
             queue,
-            (num_exits * lsize,),
+            (num_heads * lsize,),
             (lsize,),
             cl.LocalMemory(lsize * self.scalar_size),
             self.b.get("full_logits_out"),
@@ -467,9 +468,9 @@ class KernelExecutor:
             self.b.get("temps"),
             self.b.get("partial_grad_temps_out"),
             problem_flag,
-            np.int32(exit_chunk_id),
-            np.int32(exit_offset),
-            np.int32(num_exits),
+            np.int32(head_chunk_id),
+            np.int32(head_offset),
+            np.int32(num_heads),
             np.int32(class_chunk_id),
             np.int32(class_offset),
             np.int32(num_classes),
@@ -644,33 +645,33 @@ class ExecutionStrategy:
         logits_size = self.b.get_byte_size("full_logits_out")
         probs_size = self.b.get_byte_size("partial_probs_out")
         grad_h_aos_size = self.b.get_byte_size("partial_grad_h_aos_out")
-        required_mem_for_exit_path = logits_size + probs_size + grad_h_aos_size
+        required_mem_for_head_path = logits_size + probs_size + grad_h_aos_size
 
         # --- Make Strategic Decisions ---
         recompute_hidden = False
-        num_exit_class_chunks = 1
+        num_head_class_chunks = 1
 
-        # Decision 1: Determine exit/class chunking
-        if required_mem_for_exit_path > self.vram_budget:
+        # Decision 1: Determine head/class chunking
+        if required_mem_for_head_path > self.vram_budget:
             effective_vram_budget = self.vram_budget - self.b.get_byte_size("hidden_buf")
-            num_chunks = math.ceil(required_mem_for_exit_path / max(1, effective_vram_budget))
-            num_exit_class_chunks = min(num_chunks, MAX_EXIT_CLASS_CHUNKS)
+            num_chunks = math.ceil(required_mem_for_head_path / max(1, effective_vram_budget))
+            num_head_class_chunks = min(num_chunks, MAX_EXIT_CLASS_CHUNKS)
 
-        exit_class_cfg = ChunkingConfig(
-            num_chunks=num_exit_class_chunks,
-            chunk_size=(OUTPUT_CLASSES + num_exit_class_chunks - 1) // num_exit_class_chunks,
+        head_class_cfg = ChunkingConfig(
+            num_chunks=num_head_class_chunks,
+            chunk_size=(OUTPUT_CLASSES + num_head_class_chunks - 1) // num_head_class_chunks,
             total_dim=OUTPUT_CLASSES,
         )
 
         # Decision 2: Choose backprop algorithm based on chunking
         backprop_strategy = (
             BackpropStrategyType.INTERLEAVED_STREAMING
-            if exit_class_cfg.num_chunks > 1
+            if head_class_cfg.num_chunks > 1
             else BackpropStrategyType.SEQUENTIAL_MONOLITHIC
         )
 
         # Decision 3: Do we need to recompute hidden activations?
-        mem_without_hidden = required_mem_for_exit_path / exit_class_cfg.num_chunks
+        mem_without_hidden = required_mem_for_head_path / head_class_cfg.num_chunks
         if hidden_size + mem_without_hidden > self.vram_budget:
             recompute_hidden = True
 
@@ -682,16 +683,16 @@ class ExecutionStrategy:
             total_dim=batch_size,
         )
         if backprop_strategy == BackpropStrategyType.INTERLEAVED_STREAMING:
-            print(f"INFO: High memory pressure. Streaming exits/classes in {exit_class_cfg.num_chunks} chunks.")
+            print(f"INFO: High memory pressure. Streaming heads/classes in {head_class_cfg.num_chunks} chunks.")
             print("  - Strategy: INTERLEAVED_STREAMING backprop for Grad_H.")
 
         if recompute_hidden:
             print("INFO: Extreme memory pressure. `hidden` buffer will be recomputed.")
 
         return ExecutionPlan(
-            exit_class_chunking=exit_class_cfg,
+            head_class_chunking=head_class_cfg,
             batch_chunking=batch_cfg,
-            exit_backprop_strategy=backprop_strategy,
+            head_backprop_strategy=backprop_strategy,
             recompute_hidden=recompute_hidden,
         )
 
@@ -729,7 +730,7 @@ class BatchProcessor:
         self.events["hidden_ready"] = self.executor.launch_forward_pass(
             self.queue, 0, self.X_batch.shape[0], wait_for=fwd_pass_deps
         )
-        self._execute_exit_path(plan)
+        self._execute_head_path(plan)
         self._aggregate_and_backprop_shared(plan)
         self._finalize_and_update()
         return self.get_sync_points()
@@ -747,20 +748,20 @@ class BatchProcessor:
         zero_events = [self.executor.enqueue_fill_buffer(self.queue, name, 0, None) for name in grad_names]
         self.events["grads_zeroed"] = cl.WaitForEvents(zero_events)
 
-    def _execute_exit_path(self, plan: ExecutionPlan):
-        cfg = plan.exit_class_chunking
+    def _execute_head_path(self, plan: ExecutionPlan):
+        cfg = plan.head_class_chunking
         hidden_deps = self._get_deps("hidden_ready")
 
         for i in range(cfg.num_chunks):
-            # For simplicity, exit chunks and class chunks are tied together.
-            exit_offset, exit_size = i * cfg.chunk_size, min(cfg.chunk_size, NUM_EXITS - i * cfg.chunk_size)
+            # For simplicity, head chunks and class chunks are tied together.
+            head_offset, head_size = i * cfg.chunk_size, min(cfg.chunk_size, NUM_EXITS - i * cfg.chunk_size)
             class_offset, class_size = i * cfg.chunk_size, min(cfg.chunk_size, OUTPUT_CLASSES - i * cfg.chunk_size)
-            if exit_size <= 0 and class_size <= 0:
+            if head_size <= 0 and class_size <= 0:
                 continue
 
             self.event_lists["logit_chunks_ready"].append(
                 self.executor.launch_compute_logits_chunk(
-                    self.queue, i, exit_offset, exit_size, class_offset, class_size, hidden_deps
+                    self.queue, i, head_offset, head_size, class_offset, class_size, hidden_deps
                 )
             )
         self.events["all_logits_ready"] = cl.WaitForEvents(self.event_lists["logit_chunks_ready"])
@@ -773,12 +774,12 @@ class BatchProcessor:
         prob_loss_deps = self._get_deps("softmax_params_ready", "targets_ready", "all_logits_ready")
 
         for i in range(cfg.num_chunks):
-            exit_offset, exit_size = i * cfg.chunk_size, min(cfg.chunk_size, NUM_EXITS - i * cfg.chunk_size)
+            head_offset, head_size = i * cfg.chunk_size, min(cfg.chunk_size, NUM_EXITS - i * cfg.chunk_size)
             class_offset, class_size = i * cfg.chunk_size, min(cfg.chunk_size, OUTPUT_CLASSES - i * cfg.chunk_size)
-            if exit_size <= 0 and class_size <= 0:
+            if head_size <= 0 and class_size <= 0:
                 continue
             evt = self.executor.launch_compute_probs_loss_cce_chunk(
-                self.queue, i, exit_offset, exit_size, class_offset, class_size, prob_loss_deps
+                self.queue, i, head_offset, head_size, class_offset, class_size, prob_loss_deps
             )
             prob_loss_events.append(evt)
         self.events["all_prob_loss_chunks_ready"] = cl.WaitForEvents(prob_loss_events)
@@ -787,24 +788,24 @@ class BatchProcessor:
             "hidden_ready", "all_logits_ready", "targets_ready", "all_prob_loss_chunks_ready"
         )
         for i in range(cfg.num_chunks):
-            exit_offset, exit_size = i * cfg.chunk_size, min(cfg.chunk_size, NUM_EXITS - i * cfg.chunk_size)
+            head_offset, head_size = i * cfg.chunk_size, min(cfg.chunk_size, NUM_EXITS - i * cfg.chunk_size)
             class_offset, class_size = i * cfg.chunk_size, min(cfg.chunk_size, OUTPUT_CLASSES - i * cfg.chunk_size)
-            if exit_size <= 0 and class_size <= 0:
+            if head_size <= 0 and class_size <= 0:
                 continue
 
-            w, h, t = self.executor.launch_parallel_exit_grads(
-                self.queue, i, exit_offset, exit_size, i, class_offset, class_size, grad_base_deps
+            w, h, t = self.executor.launch_parallel_head_grads(
+                self.queue, i, head_offset, head_size, i, class_offset, class_size, grad_base_deps
             )
             self.event_lists["partial_grad_w_ready"].append(w)
             self.event_lists["partial_grad_h_ready"].append(h)
             self.event_lists["partial_grad_t_ready"].append(t)
 
-        if plan.exit_backprop_strategy == BackpropStrategyType.INTERLEAVED_STREAMING:
+        if plan.head_backprop_strategy == BackpropStrategyType.INTERLEAVED_STREAMING:
             self._execute_interleaved_grad_h_transpose(plan)
 
     def _execute_interleaved_grad_h_transpose(self, plan: ExecutionPlan):
         """Implements the high-performance Grad_H path by interleaving transpose operations."""
-        cfg = plan.exit_class_chunking
+        cfg = plan.head_class_chunking
         aos_buf_name = "partial_grad_h_aos_out"
         soa_buf_name = "partial_grad_h_soa_out"
         aos_chunk_elements = NUM_EXITS * BATCH_SIZE * HIDDEN_DIM
@@ -831,36 +832,36 @@ class BatchProcessor:
         self.event_lists["partial_grad_h_soa_ready"] = transposed_events
 
     def _aggregate_and_backprop_shared(self, plan: ExecutionPlan):
-        num_exit_class_chunks = plan.exit_class_chunking.num_chunks
+        num_head_class_chunks = plan.head_class_chunking.num_chunks
 
         b = self.executor.b
         get_elem_count = lambda name: int(np.prod(b.get_spec(name)[0]))
 
-        # --- Aggregate Phase 1 (Exit Layer & Other Gradients) ---
+        # --- Aggregate Phase 1 (Head Layer & Other Gradients) ---
         self.events["final_probs_ready"] = self.executor.launch_aggregation(
             self.queue,
             "partial_probs_out",
             "final_probs_buf",
-            num_exit_class_chunks,
+            num_head_class_chunks,
             get_elem_count("final_probs_buf"),
             False,
             self._get_deps("all_prob_loss_chunks_ready"),
         )
-        self.final_grad_events["grad_exit_weights"] = self.executor.launch_aggregation(
+        self.final_grad_events["grad_head_weights"] = self.executor.launch_aggregation(
             self.queue,
-            "partial_grad_exit_w_out",
-            "grad_exit_weights",
-            num_exit_class_chunks,
-            get_elem_count("grad_exit_weights"),
+            "partial_grad_head_w_out",
+            "grad_head_weights",
+            num_head_class_chunks,
+            get_elem_count("grad_head_weights"),
             False,
             self.event_lists["partial_grad_w_ready"],
         )
-        self.final_grad_events["grad_exit_biases"] = self.executor.launch_aggregation(
+        self.final_grad_events["grad_head_biases"] = self.executor.launch_aggregation(
             self.queue,
-            "partial_grad_exit_b_out",
-            "grad_exit_biases",
-            num_exit_class_chunks,
-            get_elem_count("grad_exit_biases"),
+            "partial_grad_head_b_out",
+            "grad_head_biases",
+            num_head_class_chunks,
+            get_elem_count("grad_head_biases"),
             False,
             self.event_lists["partial_grad_w_ready"],
         )
@@ -868,7 +869,7 @@ class BatchProcessor:
             self.queue,
             "partial_grad_temps_out",
             "grad_temps",
-            num_exit_class_chunks,
+            num_head_class_chunks,
             get_elem_count("grad_temps"),
             False,
             self.event_lists["partial_grad_t_ready"],
@@ -876,13 +877,13 @@ class BatchProcessor:
 
         # --- Aggregate and Transform Hidden Gradients (Grad_H) ---
         # This multi-stage process correctly reduces Grad_H using only generic kernels.
-        if plan.exit_backprop_strategy == BackpropStrategyType.INTERLEAVED_STREAMING:
+        if plan.head_backprop_strategy == BackpropStrategyType.INTERLEAVED_STREAMING:
             # Stage 1: Aggregate the transposed partials (SoA) along the CLASS chunk dimension
             agg_soa_evt = self.executor.launch_aggregation(
                 self.queue,
                 "partial_grad_h_soa_out",
                 "aggregated_grad_h_soa",
-                num_exit_class_chunks,
+                num_head_class_chunks,
                 get_elem_count("aggregated_grad_h_soa"),
                 False,
                 self.event_lists["partial_grad_h_soa_ready"],
@@ -893,7 +894,7 @@ class BatchProcessor:
                 self.queue,
                 "partial_grad_h_aos_out",
                 "aggregated_grad_h_aos_buf",
-                num_exit_class_chunks,
+                num_head_class_chunks,
                 get_elem_count("aggregated_grad_h_aos_buf"),
                 False,
                 self.event_lists["partial_grad_h_ready"],
@@ -1030,15 +1031,15 @@ class TrainingOrchestrator:
         self.params: List[Parameter] = [
             Parameter("weights", BufferRole.SHARED_WEIGHTS),
             Parameter("biases", BufferRole.SHARED_BIAS),
-            Parameter("exit_weights", BufferRole.EXIT_WEIGHTS),
-            Parameter("exit_biases", BufferRole.EXIT_BIAS),
+            Parameter("head_weights", BufferRole.EXIT_WEIGHTS),
+            Parameter("head_biases", BufferRole.EXIT_BIAS),
             Parameter("temps", BufferRole.TEMPERATURES),
         ]
         self.param_shapes: Dict[str, Tuple] = {
             "weights": (INPUT_DIM, HIDDEN_DIM),
             "biases": (HIDDEN_DIM,),
-            "exit_weights": (NUM_EXITS, HIDDEN_DIM, OUTPUT_CLASSES),
-            "exit_biases": (NUM_EXITS, OUTPUT_CLASSES),
+            "head_weights": (NUM_EXITS, HIDDEN_DIM, OUTPUT_CLASSES),
+            "head_biases": (NUM_EXITS, OUTPUT_CLASSES),
             "temps": (NUM_EXITS,),
         }
 
@@ -1094,13 +1095,13 @@ class TrainingOrchestrator:
             "final_probs_buf": (BufferRole.INTERMEDIATE, (NUM_EXITS, BATCH_SIZE, OUTPUT_CLASSES)),
             "final_loss_out": (BufferRole.INTERMEDIATE, (NUM_EXITS, BATCH_SIZE)),
             "softmax_params_out": (BufferRole.INTERMEDIATE, (NUM_EXITS, BATCH_SIZE, 2)),
-            "partial_grad_exit_w_out": (
+            "partial_grad_head_w_out": (
                 BufferRole.PARTIAL_GRADIENT,
-                (MAX_EXIT_CLASS_CHUNKS, *self.param_shapes["exit_weights"]),
+                (MAX_EXIT_CLASS_CHUNKS, *self.param_shapes["head_weights"]),
             ),
-            "partial_grad_exit_b_out": (
+            "partial_grad_head_b_out": (
                 BufferRole.PARTIAL_GRADIENT,
-                (MAX_EXIT_CLASS_CHUNKS, *self.param_shapes["exit_biases"]),
+                (MAX_EXIT_CLASS_CHUNKS, *self.param_shapes["head_biases"]),
             ),
             "partial_grad_temps_out": (
                 BufferRole.PARTIAL_GRADIENT,

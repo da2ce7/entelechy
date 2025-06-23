@@ -17,7 +17,7 @@
 
 #### **1. Modular, Chunk-Based Compute Kernels**
 
-The architecture is built upon a foundation of modular, reusable kernels that operate on "chunks" of a larger problem. The system can chunk work across multiple dimensions (e.g., number of exit heads, batch size, number of classes) as needed. To ensure mathematical consistency across all scales, any kernel that computes gradients produces **partial results** which are passed to the aggregation engine. Kernels are kept simple, often with a single responsibility (e.g., mapping, reduction over a single dimension), which simplifies maintenance and exposes opportunities for parallel execution.
+The architecture is built upon a foundation of modular, reusable kernels that operate on "chunks" of a larger problem. The system can chunk work across multiple dimensions (e.g., number of heads, batch size, number of classes) as needed. To ensure mathematical consistency across all scales, any kernel that computes gradients produces **partial results** which are passed to the aggregation engine. Kernels are kept simple, often with a single responsibility (e.g., mapping, reduction over a single dimension), which simplifies maintenance and exposes opportunities for parallel execution.
 
 #### **2. The Generic, Tiered Aggregation Engine**
 
@@ -36,7 +36,7 @@ This allows a host application to act on the complete forward-pass results as so
 
 The host logic is a sophisticated but straightforward orchestrator responsible for resource management and DAG construction. For each batch, it performs a series of strategic assessments:
 
-1.  **Memory Assessment & Chunk Definition:** It compares the memory required for the complete problem against available device memory to determine the optimal chunking strategy. This includes defining `num_exit_chunks`, `num_batch_chunks`, and `num_class_chunks` to ensure all intermediate buffers fit in VRAM.
+1.  **Memory Assessment & Chunk Definition:** It compares the memory required for the complete problem against available device memory to determine the optimal chunking strategy. This includes defining `num_head_chunks`, `num_batch_chunks`, and `num_class_chunks` to ensure all intermediate buffers fit in VRAM.
 2.  **Intermediate Activation Strategy:** Crucially, it manages the lifecycle of intermediate hidden activations (`hidden_i`). Based on memory pressure, it selects the optimal strategy to balance performance and scalability:
     - **Cache (Space > Time):** If memory allows, it caches `hidden_i` buffers in VRAM for reuse during the backpropagation phase.
     - **Recompute (Time > Space):** Under extreme memory pressure (e.g., a massive shared layer), it discards `hidden_i` after its initial use and recomputes it on the fly during backpropagation. This guarantees scalability for any problem size.
@@ -90,7 +90,7 @@ graph TD
     %% Phase 0-3: Setup
     subgraph Phase 0-3: Host Setup & Global Params
         HL_0[Start Batch]:::host_logic --> HL_1["1. VRAM Budgeting & Chunking"]:::host_logic --> HL_2["2. Activation Lifecycle & Problem Type"]:::host_logic
-        P_Shared[Shared Params]:::param; P_Exits[Exit Params]:::param; P_Temps[Temp Params]:::param;
+        P_Shared[Shared Params]:::param; P_Heads[Head Params]:::param; P_Temps[Temp Params]:::param;
         P_Step[Global Step 't']:::param
         Targets[Targets]:::param
     end
@@ -158,14 +158,14 @@ graph TD
             end
             PARTIAL_Probs & Targets --> L8_w; PARTIAL_Probs & Targets --> L8_b
             hidden_i --> L8_w
-            L8_w --> PARTIAL_Grad_ExitW[PARTIAL Grad_EW]:::partial_data
-            L8_b --> PARTIAL_Grad_ExitB[PARTIAL Grad_EB]:::partial_data
+            L8_w --> PARTIAL_Grad_HeadW[PARTIAL Grad_HW]:::partial_data
+            L8_b --> PARTIAL_Grad_HeadB[PARTIAL Grad_HB]:::partial_data
         end
 
         subgraph "Upstream Hidden Gradients & Transformation"
             style "Upstream Hidden Gradients & Transformation" grad_path_b
             K9["<b>(9) backprop_error_to_hidden_chunk</b>"]:::kernel
-            PARTIAL_Probs & Targets & P_Exits --> K9
+            PARTIAL_Probs & Targets & P_Heads --> K9
             K9 --> PARTIAL_Grad_H_AoS["PARTIAL Grad_H<br/>(AoS Layout)"]:::partial_data
             PARTIAL_Grad_H_AoS --> K11["<b>(11) transpose_chunk</b><br/>(on partial Grad_H)"]:::transpose_kernel
             K11 --> PARTIAL_Grad_H_SoA["PARTIAL Grad_H<br/>(SoA Layout)"]:::partial_data
@@ -183,9 +183,9 @@ graph TD
     %% Phase 12-18: Remainder of Graph
     subgraph Phase 12: Primary Aggregation
         K12["<b>(12) Aggregate Kernel</b>"]:::host_logic
-        PARTIAL_Probs & PARTIAL_Loss_BCE & PARTIAL_Grad_ExitW & PARTIAL_Grad_ExitB & PARTIAL_Grad_Temps & PARTIAL_Grad_H_SoA -- All Partial Data --> K12
+        PARTIAL_Probs & PARTIAL_Loss_BCE & PARTIAL_Grad_HeadW & PARTIAL_Grad_HeadB & PARTIAL_Grad_Temps & PARTIAL_Grad_H_SoA -- All Partial Data --> K12
         K12 --> FINAL_Probs[Final Probs]:::final_data & FINAL_BCE_Loss[Final BCE Loss]:::final_data & FINAL_Grad_H[Final Grad_H]:::final_data
-        K12 --> FINAL_Grad_ExitW[Final Grad_EW]:::final_data & FINAL_Grad_ExitB[Final Grad_EB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
+        K12 --> FINAL_Grad_HeadW[Final Grad_HW]:::final_data & FINAL_Grad_HeadB[Final Grad_HB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
     end
 
     subgraph "Phase 13-14: Streaming Shared Layer Backprop"
@@ -211,8 +211,8 @@ graph TD
         subgraph "B. Training Path (All Updates)"
             K17_shared["(17) adam_update (Shared)"]:::kernel; FINAL_Grad_SW & FINAL_Grad_SB --> K17_shared; K17_shared -- updates --> P_Shared
             P_Step --> K17_shared
-            K17_exits["(17) adam_update (Heads)"]:::kernel; FINAL_Grad_ExitW & FINAL_Grad_ExitB --> K17_exits; K17_exits -- updates --> P_Exits
-            P_Step --> K17_exits
+            K17_heads["(17) adam_update (Heads)"]:::kernel; FINAL_Grad_HeadW & FINAL_Grad_HeadB --> K17_heads; K17_heads -- updates --> P_Heads
+            P_Step --> K17_heads
             K17_temps["(17) adam_update (Temps)"]:::kernel; FINAL_Grad_Temps --> K17_temps; K17_temps -- updates --> P_Temps
             P_Step --> K17_temps
             K17_temps --> K18["<b>(18) clamp_temps</b>"]:::kernel
@@ -237,7 +237,7 @@ graph TD
 
 ---
 
-- **(8) `calculate_head_param_grads_chunk`**: A streamable kernel computing **partial** gradients for head weights and biases (`Grad_EW`, `Grad_EB`) for a class chunk. It computes the `(prob - target)` error signal on the fly and performs a reduction over the batch dimension.
+- **(8) `calculate_head_param_grads_chunk`**: A streamable kernel computing **partial** gradients for head weights and biases (`Grad_HW`, `Grad_HB`) for a class chunk. It computes the `(prob - target)` error signal on the fly and performs a reduction over the batch dimension.
 - **(9) `backprop_error_to_hidden_chunk`**: A streamable kernel computing the **partial** upstream gradient for the hidden layer (`Grad_H`) for a class chunk. It computes the `(prob - target)` error signal on the fly and performs a reduction over the class dimension.
 - **(10) `calculate_chunk_temp_gradients`**: A streamable kernel computing **partial** gradients for the temperature parameters.
 
@@ -269,7 +269,7 @@ The architecture's unified dataflow is validated by its robust and efficient han
 
 - **Scenario: The Hydra (Massive `num_heads`)**
 
-  - **Insight:** Validates **scalability of the core multi-head design**. When faced with a huge number of classifier heads, the host orchestrator chunks the problem along the head/exit dimension (`num_exit_chunks > 1`). Kernels for logits, probabilities, and gradients (5-10) are designed to process these chunks in parallel streams, which are then consolidated by the aggregation engine.
+  - **Insight:** Validates **scalability of the core multi-head design**. When faced with a huge number of classifier heads, the host orchestrator chunks the problem along the head dimension (`num_head_chunks > 1`). Kernels for logits, probabilities, and gradients (5-10) are designed to process these chunks in parallel streams, which are then consolidated by the aggregation engine.
 
 - **Scenario: The Behemoth (Massive `hidden_dim`)**
 
