@@ -5,7 +5,7 @@
 #include "kernels.cl.h"
 #endif
 
-// --- Implementation: backprop_shared_weights_chunk (Node 13) ---
+// --- Implementation: backprop_shared_weights_chunk (Node 14) ---
 // Strategy: A 2D "work-group per gradient" reduction. Each work-group, identified
 // by `(group_id.x, group_id.y)`, computes the partial gradient for a single shared
 // weight `SW[i][j]`. Threads within the group parallelize the summation over the
@@ -75,7 +75,7 @@ __kernel void backprop_shared_weights_chunk(
     }
 }
 
-// --- Implementation: backprop_shared_biases_chunk (Node 14) ---
+// --- Implementation: backprop_shared_biases_chunk (Node 15) ---
 // Strategy: A 1D "work-group per gradient" reduction. Each work-group `group_id(0)`
 // computes the partial gradient for a single bias term `SB[j]`. This 1D dispatch
 // is more efficient than a 2D dispatch for a 1D output. Threads sum over the
