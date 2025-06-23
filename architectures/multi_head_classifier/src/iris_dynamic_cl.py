@@ -80,6 +80,13 @@ MAX_BATCH_CHUNKS: int = 64  # Max number of chunks for batch dimension streaming
 # --- Core Data Abstractions ---
 
 
+class LayoutType(enum.Enum):
+    """Defines the physical memory layout strategy for a buffer."""
+
+    AoS = 1  # Array of Structs: Standard, logical row-major layout
+    SoA = 2  # Struct of Arrays: SIMD-optimized, transformed layout
+
+
 class BufferRole(enum.Enum):
     """Defines the semantic purpose of a buffer, driving its memory padding strategy."""
 
@@ -104,6 +111,7 @@ class Parameter:
 
     name: str
     role: BufferRole
+    layout: LayoutType = LayoutType.AoS  # Default to standard layout
 
     @property
     def grad(self) -> str:
@@ -263,28 +271,64 @@ class BufferManager:
         self.byte_sizes: Dict[str, int] = {}
 
     def create_buffer(
-        self, name: str, role: BufferRole, real_shape: Tuple, dtype: np.dtype, init_data: Optional[np.ndarray] = None
+        self,
+        name: str,
+        role: BufferRole,
+        layout: LayoutType,
+        logical_shape: Tuple,
+        dtype: np.dtype,
+        init_data: Optional[np.ndarray] = None,
     ) -> None:
-        """Creates a buffer with memory padding determined by its semantic role."""
-        padding_func = PADDING_RULES.get(role, _pad_none)
-        padded_shape = padding_func(real_shape, self.simd_width)
-        byte_size = int(np.prod(padded_shape) * dtype().itemsize) if padded_shape else 4
-        byte_size = max(byte_size, 4)  # Ensure buffer is never zero-sized
+        """
+        Creates a buffer, handling padding and memory layout transformation
+        based on its declared role and layout type.
+        """
+        physical_data = init_data
+        physical_shape = logical_shape
 
+        if layout == LayoutType.SoA:
+            if len(logical_shape) != 2:
+                raise ValueError(f"SoA layout is only supported for 2D matrices, but shape is {logical_shape}")
+
+            # This logic now lives securely inside the BufferManager
+            padded_i = pad_to_multiple(logical_shape[0], self.simd_width)
+            padded_h = pad_to_multiple(logical_shape[1], self.simd_width)
+
+            padded_aos = np.zeros((padded_i, padded_h), dtype=dtype)
+            if init_data is not None:
+                padded_aos[: logical_shape[0], : logical_shape[1]] = init_data
+
+            # The AoS -> SoA transpose: (I, H) -> (H/SW, I, SW)
+            transformed_data = padded_aos.T.reshape(padded_h // self.simd_width, self.simd_width, padded_i).transpose(
+                0, 2, 1
+            )
+            physical_data = transformed_data
+            physical_shape = transformed_data.shape  # The physical shape is now different!
+
+        # Apply standard memory padding based on role
+        # Note: Padding is applied to the *physical* shape.
+        padding_func = PADDING_RULES.get(role, _pad_none)
+        padded_shape = padding_func(physical_shape, self.simd_width)
+
+        # Finalize host buffer and create the cl.Buffer
+        byte_size = int(np.prod(padded_shape) * dtype().itemsize) if padded_shape else 4
+        byte_size = max(byte_size, 4)
         mem_flags = cl.mem_flags.READ_WRITE
         hostbuf = None
-        if init_data is not None:
+
+        if physical_data is not None:
             mem_flags |= cl.mem_flags.COPY_HOST_PTR
-            padded_data = np.zeros(padded_shape, dtype=dtype)
-            slicing = tuple(slice(0, d) for d in real_shape)
-            if slicing:
-                padded_data[slicing] = init_data
-            else:  # Scalar case
-                padded_data = init_data
-            hostbuf = padded_data
+            # If padding added more elements, we need a bigger host buffer
+            if physical_data.shape != padded_shape:
+                hostbuf = np.zeros(padded_shape, dtype=dtype)
+                slicing = tuple(slice(0, d) for d in physical_data.shape)
+                hostbuf[slicing] = physical_data
+            else:
+                hostbuf = physical_data
 
         buf = cl.Buffer(self.context, mem_flags, size=byte_size, hostbuf=hostbuf)
         self.buffers[name] = buf
+        # Store the FINAL PADDED PHYSICAL shape as the official spec
         self.specs[name] = (padded_shape, dtype)
         self.byte_sizes[name] = byte_size
 
@@ -418,6 +462,7 @@ class KernelExecutor:
             self.b.get("hidden_buf"),
             self.b.get("partial_probs_out"),
             self.b.get("targets_buf"),
+            self.b.get("sample_mask"),
             self.b.get("partial_grad_module_w_out"),
             self.b.get("partial_grad_module_b_out"),
             problem_flag,
@@ -438,9 +483,10 @@ class KernelExecutor:
             queue,
             (num_modules, BATCH_SIZE, HIDDEN_DIM),
             None,
-            cl.LocalMemory(0),
+            cl.LocalMemory(0),  # unused
             self.b.get("partial_probs_out"),
             self.b.get("targets_buf"),
+            self.b.get("sample_mask"),
             self.b.get("module_weights"),
             self.b.get("partial_grad_h_aos_out"),
             problem_flag,
@@ -1029,11 +1075,11 @@ class TrainingOrchestrator:
         self.program = self._compile_kernels()
 
         self.params: List[Parameter] = [
-            Parameter("weights", BufferRole.SHARED_WEIGHTS),
-            Parameter("biases", BufferRole.SHARED_BIAS),
-            Parameter("module_weights", BufferRole.MODULE_WEIGHTS),
-            Parameter("module_biases", BufferRole.MODULE_BIAS),
-            Parameter("temps", BufferRole.TEMPERATURES),
+            Parameter("weights", BufferRole.SHARED_WEIGHTS, layout=LayoutType.SoA),
+            Parameter("biases", BufferRole.SHARED_BIAS, layout=LayoutType.AoS),
+            Parameter("module_weights", BufferRole.MODULE_WEIGHTS, layout=LayoutType.AoS),
+            Parameter("module_biases", BufferRole.MODULE_BIAS, layout=LayoutType.AoS),
+            Parameter("temps", BufferRole.TEMPERATURES, layout=LayoutType.AoS),
         ]
         self.param_shapes: Dict[str, Tuple] = {
             "weights": (INPUT_DIM, HIDDEN_DIM),
@@ -1063,8 +1109,9 @@ class TrainingOrchestrator:
         return cl.Program(self.ctx, kernel_src).build(options=build_opts)
 
     def _setup_buffers(self):
+        # --- Create main parameter buffers ---
         for p in self.params:
-            shape = self.param_shapes[p.name]
+            logical_shape = self.param_shapes[p.name]
             init_fn = (
                 np.zeros
                 if "bias" in p.name
@@ -1074,12 +1121,21 @@ class TrainingOrchestrator:
                     else (lambda s: np.random.randn(*s).astype(SCALAR_NP_TYPE) * 0.01)
                 )
             )
-            self.buffer_mgr.create_buffer(p.name, p.role, shape, SCALAR_NP_TYPE, init_fn(shape))
-            padded_shape, dtype = self.buffer_mgr.get_spec(p.name)
-            self.buffer_mgr.create_buffer(p.grad, BufferRole.FINAL_GRADIENT, padded_shape, dtype)
-            self.buffer_mgr.create_buffer(p.m1, BufferRole.ADAM_MOMENTUM, padded_shape, dtype)
-            self.buffer_mgr.create_buffer(p.m2, BufferRole.ADAM_MOMENTUM, padded_shape, dtype)
+            # The orchestrator's call is now clean and declarative.
+            # It provides the logical shape and lets the manager handle the physical reality.
+            self.buffer_mgr.create_buffer(
+                p.name, p.role, p.layout, logical_shape, SCALAR_NP_TYPE, init_fn(logical_shape)
+            )
 
+            # --- Create Optimizer and Gradient Buffers ---
+            # These are always created with an AoS layout, using the PHYSICAL shape
+            # of the parameter they track.
+            physical_shape, dtype = self.buffer_mgr.get_spec(p.name)
+            self.buffer_mgr.create_buffer(p.grad, BufferRole.FINAL_GRADIENT, LayoutType.AoS, physical_shape, dtype)
+            self.buffer_mgr.create_buffer(p.m1, BufferRole.ADAM_MOMENTUM, LayoutType.AoS, physical_shape, dtype)
+            self.buffer_mgr.create_buffer(p.m2, BufferRole.ADAM_MOMENTUM, LayoutType.AoS, physical_shape, dtype)
+
+        # --- Create Intermediate Buffers ---
         dtype_map = {"targets_buf": np.int32} if PROBLEM_TYPE == "CCE" else {}
         int_buffers = {
             "input_buf": (BufferRole.INPUT, (BATCH_SIZE, INPUT_DIM)),
@@ -1133,7 +1189,7 @@ class TrainingOrchestrator:
             "final_grad_h_buf": (BufferRole.FINAL_GRADIENT, (BATCH_SIZE, HIDDEN_DIM)),
         }
         for name, (role, shape) in int_buffers.items():
-            self.buffer_mgr.create_buffer(name, role, shape, dtype_map.get(name, SCALAR_NP_TYPE))
+            self.buffer_mgr.create_buffer(name, role, LayoutType.AoS, shape, dtype_map.get(name, SCALAR_NP_TYPE))
 
     def train(self):
         from sklearn.datasets import load_iris
