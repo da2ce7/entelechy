@@ -1,18 +1,19 @@
+
 ## **Architectural Concept: A Unified, Memory-Aware Streaming Classification Engine**
 
 ---
 
 ### **Guiding Principles**
 
-1. **Primacy of Memory Strategy:** The singular goal of the host-side orchestration is to ensure the core computation executes in the fastest possible memory tier (Registers > Local > Global). This principle drives all design decisions, prioritizing memory efficiency over computational complexity.
-2. **Modular, "Dumb" Kernels:** Kernels are simple, single-purpose modules. The architecture avoids complex branching ("smart" kernels) and monolithic designs in favor of composability, ensuring flexibility and ease of optimization.
-3. **Trust the Driver:** Simple kernels are composed into a logical Directed Acyclic Graph (DAG). The architecture trusts the OpenCL driver to handle low-level optimizations like kernel fusion. The number of nodes in the DAG is a non-goal, emphasizing adaptability over rigid structure.
-4. **Unified Execution Model:** All workflows follow Act (forward pass) then Learn (backpropagation) sequencing, manifesting as either **Sequential Execution Mode**—where Act-Learn phases execute contiguously for pre-labeled batches—or **Event-Triggered Execution Mode**—where Learn-phase execution awaits an external readiness signal post-Act. This split-phase approach ensures consistency across all use cases, enabling predictable behavior and optimized inter-phase pipelining.
-5. **Architectural Hierarchy:** This system is developed under a strict hierarchy of artifacts to ensure conceptual integrity:
-   - **1. Design Document (This Document):** The highest authority and source of truth for conceptual correctness.
-   - **2. Kernel Header Contract:** The binding technical contract between host and device, resonating deeply with the design document.
-   - **3. Host Code Implementation:** The lowest authority, rigorously conforming to the kernel header's contract. The header is never modified to suit the host code; the host code always yields to the contract.
-6. **No Silent Monoliths:** All executions manifest externally as an Act/Learn split, even if phases are contiguous, ensuring consistency and enabling inter-phase optimization. This design choice eliminates silent assumptions of single-pass execution, reinforcing the architecture’s phased nature.
+1.  **Primacy of Memory Strategy:** The singular goal of the host-side orchestration is to ensure the core computation executes in the fastest possible memory tier (Registers > Local > Global). This principle drives all design decisions, prioritizing memory efficiency over computational complexity.
+2.  **Modular, "Dumb" Kernels:** Kernels are simple, single-purpose modules. The architecture avoids complex branching ("smart" kernels) and monolithic designs in favor of composability, ensuring flexibility and ease of optimization.
+3.  **Trust the Driver:** Simple kernels are composed into a logical Directed Acyclic Graph (DAG). The architecture trusts the OpenCL driver to handle low-level optimizations like kernel fusion. The number of nodes in the DAG is a non-goal, emphasizing adaptability over rigid structure.
+4.  **Unified Execution Model:** All workflows follow Act (forward pass) then Learn (backpropagation) sequencing, manifesting as either **Sequential Execution Mode**—where Act-Learn phases execute contiguously for pre-labeled batches—or **Event-Triggered Execution Mode**—where Learn-phase execution awaits an external readiness signal post-Act. This split-phase approach ensures consistency across all use cases, enabling predictable behavior and optimized inter-phase pipelining.
+5.  **Architectural Hierarchy:** This system is developed under a strict hierarchy of artifacts to ensure conceptual integrity:
+    - **1. Design Document (This Document):** The highest authority and source of truth for conceptual correctness.
+    - **2. Kernel Header Contract:** The binding technical contract between host and device, resonating deeply with the design document.
+    - **3. Host Code Implementation:** The lowest authority, rigorously conforming to the kernel header's contract. The header is never modified to suit the host code; the host code always yields to the contract.
+6.  **No Silent Monoliths:** All executions manifest externally as an Act/Learn split, even if phases are contiguous, ensuring consistency and enabling inter-phase optimization. This design choice eliminates silent assumptions of single-pass execution, reinforcing the architecture’s phased nature.
 
 ---
 
@@ -26,12 +27,18 @@ The architecture is built upon a foundation of modular, reusable kernels that op
 
 At the core of the architecture lies a powerful aggregation engine that implements a **recursive, multi-stage reduction tree**. Rather than generating all `N` partial results before aggregation, this model employs a divide-and-conquer strategy to keep the GPU saturated while minimizing VRAM usage. Governed by a host-configurable parameter, `K`—termed the **Reduction Batch Size**—this engine defines the width of the parallel kernel front at each reduction stage. The process unfolds as follows:
 
-1. The Host Orchestrator renders the base `N` partial results in batches of `K`.
-2. After each batch of `K` partials is computed, they are immediately reduced by an `aggregate_*` kernel into a single "Level 1" intermediate result.
-3. This sequence repeats `N/K` times, transforming a large problem of `N` "Level 0" results into a smaller set of `N/K` "Level 1" results.
-4. The host recursively applies this logic to the "Level 1" results, reducing them in batches of `K` into "Level 2" results, continuing until a single final tensor emerges.
+1.  The Host Orchestrator renders the base `N` partial results in batches of `K`.
+2.  After each batch of `K` partials is computed, they are immediately reduced by an `aggregate_*` kernel into a single "Level 1" intermediate result.
+3.  This sequence repeats `N/K` times, transforming a large problem of `N` "Level 0" results into a smaller set of `N/K` "Level 1" results.
+4.  The host recursively applies this logic to the "Level 1" results, reducing them in batches of `K` into "Level 2" results, continuing until a single final tensor emerges.
 
-This `log_K(N)` strategy breaks the `O(N)` memory dependency of a flat aggregation model, enabling scalability to problems of arbitrary size.
+To further optimize memory access patterns, the engine employs a tiered selection of reduction kernels based on the number of partials (`N`) being aggregated at any given stage:
+
+- **Tier 0 (N=1):** A zero-copy `aggregate_identity` pass-through is used, simply renaming a buffer handle or performing a direct copy if required.
+- **Tier 1 (Small N):** An `aggregate_register_reduce` kernel is dispatched. This kernel is optimized for a small number of inputs that can be held and summed entirely in the GPU's registers, avoiding any local memory overhead.
+- **Tier 2 (Large N):** The workhorse `aggregate_local_reduce` kernel is used. It performs a highly parallelized reduction using shared local memory, making it efficient for consolidating a large number of partial results.
+
+The Host Orchestrator is responsible for selecting the optimal kernel at each step of the reduction, ensuring that even the aggregation logic itself adheres to the "Primacy of Memory" principle. This `log_K(N)` strategy breaks the `O(N)` memory dependency of a flat aggregation model, enabling scalability to problems of arbitrary size.
 
 #### **3. Asynchronous Host Interaction**
 
@@ -46,20 +53,20 @@ This phased structure enables scenarios where predictions are acted upon before 
 
 The host logic serves as a sophisticated yet straightforward orchestrator, responsible for resource management and DAG construction. For each batch, it performs strategic assessments to optimize execution:
 
-1. **Memory Assessment & Chunk Definition:** The orchestrator compares the memory required for the complete problem against available device memory, determining an optimal chunking strategy. This includes defining `num_module_chunks`, `num_batch_chunks`, and `num_class_chunks` to balance compute and memory demands.
-2. **Operating Mode & Activation Lifecycle:** The orchestrator reads the `Classifier Module`'s configured `Operating Mode` (`CCE` or `BCE`) to shape the computational graph. It manages the lifecycle of intermediate hidden activations (`hidden_i`), selecting between:
-   - **Cache Strategy (Space > Time):** Retains intermediate buffers in VRAM for reuse during the Learn phase, minimizing recomputation when memory allows.
-   - **Recompute Strategy (Time > Space):** Discards intermediates post-Act to free VRAM, regenerating them during the Learn phase under memory pressure.
-3. **SIMD-Aware Weight Layout:** To exploit vector processing capabilities and ensure coalesced memory access, the orchestrator transforms shared layer weights into a SIMD-friendly "Struct of Arrays" (SoA) layout before enqueuing kernel (4). Weights shift from a logical `(hidden_dim, input_dim)` matrix to a physical `(hidden_dim/SIMD_WIDTH, input_dim, SIMD_WIDTH)` buffer, embodying the **Primacy of Memory Strategy** as a non-negotiable contract with the `forward_pass` kernel.
-4. **DAG Construction & Parallel Dispatch:** The orchestrator constructs the multi-phase computational graph, enqueuing kernels according to the selected mode and chunking strategy. Logically independent tasks are enqueued back-to-back without synchronization, fostering parallel workloads.
-5. **Reduction Planning & Rendering:** For tasks requiring aggregation over a large number of chunks (`N`), the orchestrator acts as a **Reduction Planner**, analyzing problem size and VRAM to set an optimal **Reduction Batch Size (`K`)**. It renders the full `log_K(N)` reduction tree, orchestrating iterative stages of computation and aggregation while managing intermediate buffer lifecycles.
-6. **Phase Staging Policies:** The orchestrator governs phase intervals through:
-   - **Temporal Sequencing:** Backward kernels are emitted only after `inference_event`, ensuring phase separation.
-   - **Transition Policy Selection:**
-     - **Sequential Execution Mode:** Learn kernels are enqueued immediately post-`inference_event` for pre-labeled data, maintaining contiguous execution while preserving the Act/Learn split.
-     - **Event-Triggered Execution Mode:** Learn kernels await an external readiness signal for live data, accommodating real-world delays.
-   - **Buffer Lifetime Optimization:** The choice between Cache or Recompute strategies for intermediates (`hidden_i`, `Partial_Probs`) hinges on delay duration and VRAM pressure, balancing efficiency and resource availability.
-   - **Task Interleaving:** Phases from distinct batches progress concurrently via priority queues, maximizing GPU utilization.
+1.  **Memory Assessment & Chunk Definition:** The orchestrator compares the memory required for the complete problem against available device memory, determining an optimal chunking strategy. This includes defining `num_module_chunks`, `num_batch_chunks`, and `num_class_chunks` to balance compute and memory demands.
+2.  **Operating Mode & Activation Lifecycle:** The orchestrator reads the `Classifier Module`'s configured `Operating Mode` (`CCE` or `BCE`) to shape the computational graph. It manages the lifecycle of intermediate hidden activations (`hidden_i`), selecting between:
+    - **Cache Strategy (Space > Time):** Retains intermediate buffers in VRAM for reuse during the Learn phase, minimizing recomputation when memory allows.
+    - **Recompute Strategy (Time > Space):** Discards intermediates post-Act to free VRAM, regenerating them during the Learn phase under memory pressure.
+3.  **SIMD-Aware Weight Layout:** To exploit vector processing capabilities and ensure coalesced memory access, the orchestrator transforms shared layer weights into a SIMD-friendly "Struct of Arrays" (SoA) layout before enqueuing kernel (4). Weights shift from a logical `(hidden_dim, input_dim)` matrix to a physical `(hidden_dim/SIMD_WIDTH, input_dim, SIMD_WIDTH)` buffer, embodying the **Primacy of Memory Strategy** as a non-negotiable contract with the `forward_pass` kernel.
+4.  **DAG Construction & Parallel Dispatch:** The orchestrator constructs the multi-phase computational graph, enqueuing kernels according to the selected mode and chunking strategy. Logically independent tasks are enqueued back-to-back without synchronization, fostering parallel workloads.
+5.  **Reduction Planning & Rendering:** For tasks requiring aggregation over a large number of chunks (`N`), the orchestrator acts as a **Reduction Planner**, analyzing problem size and VRAM to set an optimal **Reduction Batch Size (`K`)**. It renders the full `log_K(N)` reduction tree, orchestrating iterative stages of computation and aggregation while managing intermediate buffer lifecycles.
+6.  **Phase Staging Policies:** The orchestrator governs phase intervals through:
+    - **Temporal Sequencing:** Backward kernels are emitted only after `inference_event`, ensuring phase separation.
+    - **Transition Policy Selection:**
+      - **Sequential Execution Mode:** Learn kernels are enqueued immediately post-`inference_event` for pre-labeled data, maintaining contiguous execution while preserving the Act/Learn split.
+      - **Event-Triggered Execution Mode:** Learn kernels await an external readiness signal for live data, accommodating real-world delays.
+    - **Buffer Lifetime Optimization:** The choice between Cache or Recompute strategies for intermediates (`hidden_i`, `Partial_Probs`) hinges on delay duration and VRAM pressure, balancing efficiency and resource availability.
+    - **Task Interleaving:** Phases from distinct batches progress concurrently via priority queues, maximizing GPU utilization.
 
 Enforcing an Act/Learn split even for pre-labeled data guarantees consistency in event handling across all use cases, ensuring predictable behavior and enabling optimized inter-phase pipelining.
 
@@ -203,44 +210,51 @@ graph TD
     %% Phase 8-19: Learn Phase
     subgraph "PHASE 2: LEARN"
         Host_Act -.->|Host trigger| K8_Start["K8 Start Trigger"]:::host_logic
-        subgraph "Phase 8-11: Parallel Gradient Path (Chunk-Based)"
-            style "Phase 8-11: Parallel Gradient Path (Chunk-Based)" parallel_group
 
-            subgraph "Gradients for Classifier Module"
-                style "Gradients for Classifier Module" grad_path_a
-                subgraph K8["<b>(8) calculate_module_param_grads_chunk</b>"]:::fused_kernel_box
-                    L8_w["Weight Grad Calc γ"]:::logical_step
-                    L8_b["Bias Grad Calc γ"]:::logical_step
+        subgraph "Phase 8-11: Per-Tile Streamable Gradient Computation"
+            style "Phase 8-11: Per-Tile Streamable Gradient Computation" loop_box
+            note_grad_loop["Note: Executes for each tile<br/>in the Execution Grid (N total tiles)"]:::host_logic
+
+            subgraph "Parallel Gradient Path (Chunk-Based)"
+                style "Parallel Gradient Path (Chunk-Based)" parallel_group
+
+                subgraph "Gradients for Classifier Module"
+                    style "Gradients for Classifier Module" grad_path_a
+                    subgraph K8["<b>(8) calculate_module_param_grads_chunk</b>"]:::fused_kernel_box
+                        L8_w["Weight Grad Calc γ"]:::logical_step
+                        L8_b["Bias Grad Calc γ"]:::logical_step
+                    end
+                    PARTIAL_Probs & Targets & SampleMask --> L8_w; PARTIAL_Probs & Targets & SampleMask --> L8_b
+                    hidden_i --> L8_w
+                    L8_w --> PARTIAL_Grad_ModW[PARTIAL Grad_ModW]:::partial_data
+                    L8_b --> PARTIAL_Grad_ModB[PARTIAL Grad_ModB]:::partial_data
                 end
-                PARTIAL_Probs & Targets & SampleMask --> L8_w; PARTIAL_Probs & Targets & SampleMask --> L8_b
-                hidden_i --> L8_w
-                L8_w --> PARTIAL_Grad_ModW[PARTIAL Grad_ModW]:::partial_data
-                L8_b --> PARTIAL_Grad_ModB[PARTIAL Grad_ModB]:::partial_data
-            end
 
-            subgraph "Upstream Hidden Gradients & Transformation"
-                style "Upstream Hidden Gradients & Transformation" grad_path_b
-                K9["<b>(9) backprop_error_to_hidden_chunk</b>"]:::kernel
-                PARTIAL_Probs & Targets & P_ClassifierModule & SampleMask --> K9
-                K9 --> PARTIAL_Grad_H_AoS["PARTIAL Grad_H<br/>(AoS Layout)"]:::partial_data
-                PARTIAL_Grad_H_AoS --> K11["<b>(11) transpose_chunk</b><br/>(on partial Grad_H)"]:::transpose_kernel
-                K11 --> PARTIAL_Grad_H_SoA["PARTIAL Grad_H<br/>(SoA Layout)"]:::partial_data
-            end
+                subgraph "Upstream Hidden Gradients & Transformation"
+                    style "Upstream Hidden Gradients & Transformation" grad_path_b
+                    K9["<b>(9) backprop_error_to_hidden_chunk</b>"]:::kernel
+                    PARTIAL_Probs & Targets & P_ClassifierModule & SampleMask --> K9
+                    K9 --> PARTIAL_Grad_H_AoS["PARTIAL Grad_H<br/>(AoS Layout)"]:::partial_data
+                    PARTIAL_Grad_H_AoS --> K11["<b>(11) transpose_chunk</b><br/>(on partial Grad_H)"]:::transpose_kernel
+                    K11 --> PARTIAL_Grad_H_SoA["PARTIAL Grad_H<br/>(SoA Layout)"]:::partial_data
+                end
 
-            subgraph "Temperature Gradients"
-                style "Temperature Gradients" grad_path_c
-                K10["<b>(10) calculate_chunk_temp_gradients</b>"]:::kernel
-                PARTIAL_Probs & Full_Logits & Targets & P_Temps & SampleMask --> K10
-                K10 --> PARTIAL_Grad_Temps[PARTIAL Grad_Temps]:::partial_data
+                subgraph "Temperature Gradients"
+                    style "Temperature Gradients" grad_path_c
+                    K10["<b>(10) calculate_chunk_temp_gradients</b>"]:::kernel
+                    PARTIAL_Probs & Full_Logits & Targets & P_Temps & SampleMask --> K10
+                    K10 --> PARTIAL_Grad_Temps[PARTIAL Grad_Temps]:::partial_data
+                end
             end
         end
 
-        subgraph "Phase 12: Recursive Aggregation Tree (log_K(N) Stages)"
-            direction LR
-            style "Phase 12: Recursive Aggregation Tree (log_K(N) Stages)" loop_box
-            K_Recursive_12["(8, 9, 10, agg) ...<br/>Iterative Reduction"]:::host_logic
+        subgraph "Phase 12: Recursive Reduction Engine"
+             style "Phase 12: Recursive Reduction Engine" loop_box
+             K_Recursive_12["<b>(12) Recursive Reduction Engine</b><br/>(Processes N partials in batches of K)"]:::host_logic
         end
-        PARTIAL_Probs & PARTIAL_Loss_BCE & PARTIAL_Grad_ModW & PARTIAL_Grad_ModB & PARTIAL_Grad_Temps & PARTIAL_Grad_H_SoA -- All Partial Data --> K_Recursive_12
+
+        PARTIAL_Probs & PARTIAL_Loss_BCE & PARTIAL_Grad_ModW & PARTIAL_Grad_ModB & PARTIAL_Grad_Temps & PARTIAL_Grad_H_SoA -- "Streamed Partial Results" --> K_Recursive_12
+
         K_Recursive_12 --> FINAL_Probs[Final Probs]:::final_data & FINAL_BCE_Loss[Final BCE Loss]:::final_data & AGG_Grad_H_SoA["Aggregated Grad_H<br/>(B*H, M Layout)"]:::full_intermediate
         K_Recursive_12 --> FINAL_Grad_ModW[Final Grad_ModW]:::final_data & FINAL_Grad_ModB[Final Grad_ModB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
 
@@ -346,9 +360,11 @@ graph TD
 - **(11) `transpose_chunk`**: A streamable kernel designed for latency hiding, overlapping memory-bound transpose operations with compute-bound gradient calculations.
   - **Contract:** Rearranges data layouts (e.g., `Partial_Grad_H`) as needed across phases, supporting both Act and Learn operations.
   - **Phase Compatibility Note:** Designed for both Act and Learn Phase execution (phase-agnostic utility).
-- **(12) `aggregate_*` kernels**: Generic, stateless kernel interface serving as the engine for the **Recursive Halving Renderer**. It consolidates `K` partial results (`Level L`) into a single higher-level result (`Level L+1`) iteratively, producing intermediates like `Aggregated_Grad_H` requiring separate reduction.
-  - **Contract:** Executes reductions across Act and Learn phases, adapting to the orchestrator’s staging.
-  - **Phase Compatibility Note:** Designed for both Act and Learn Phase execution (phase-agnostic utility).
+- **(12) `aggregate_*` kernels**: A suite of stateless reduction kernels serving as the engine for the **Recursive, Tiered Aggregation Engine**. The host selects the optimal kernel based on the number of partials (`N`) to reduce.
+  - **Contract (Tier 0 - `aggregate_identity`):** For `N=1`, performs a no-op or direct copy, serving as the terminal base case for the reduction tree.
+  - **Contract (Tier 1 - `aggregate_register_reduce`):** For small `N` (e.g., N <= 32), consolidates partials using register-only operations for minimal overhead.
+  - **Contract (Tier 2 - `aggregate_local_reduce`):** For large `N`, uses shared local memory for scalable, parallel reduction of many partials.
+    All kernels are robust to memory padding and can be configured for summation or averaging. They are designed for both Act and Learn Phase execution as a phase-agnostic utility.
 - **(16) `aggregate_*` kernels**: The same generic kernel interface, consolidating partial gradients from the shared layer during streaming backpropagation (14, 15).
   - **Contract:** Reduces chunked gradients into final forms, specific to Learn-phase aggregation.
   - **Phase Compatibility Note:** Designed for Learn Phase execution.
@@ -367,7 +383,7 @@ graph TD
 
   - **Description:** A classic supervised learning task using the Iris dataset, where a batch of pre-labeled flower measurements is processed in a single training step. The system executes the Act phase (forward pass) and immediately triggers the Learn phase (backpropagation) with no delay.
   - **Validation Focus:** Measures the end-to-end latency of processing the batch, ensuring the split-phase model's overhead is minimal (e.g., less than 1% additional runtime compared to a monolithic baseline). This confirms efficiency for small, high-throughput problems.
-  - **Key Insight:** Proves that the split-phase architecture seamlessly supports traditional batch training with negligible overhead, making it ideal for sequential execution.
+  - **Key Insight:** Proves the success of the **unified execution model**. By demonstrating negligible overhead (<1%), it confirms that the Act/Learn split is not a costly abstraction but a foundational primitive that gracefully and efficiently handles both fully-labeled sequential batches and event-triggered asynchronous workflows under a single, consistent paradigm.
 
 - **Scenario: The Real-Time Trader (Event-Triggered Execution Mode Validation)**
 
@@ -396,5 +412,4 @@ graph TD
   - **Insight:** Validates the **two-phase streaming backpropagation strategy**. For large batches, backpropagation streams over the batch dimension, feeding partial results into a **Recursive Halving Renderer**, optimizing memory patterns.
 
 - **Scenario: The Colossus (Holistic Stress Test)**
-
   - **Insight:** Tests the **synergy of all scaling strategies** under compound memory pressure. The host composes a dynamic plan, chunking the batch dimension, invoking the **Recursive Halving Renderer** for module/class dimensions, and using the `Recompute` strategy for activations.
