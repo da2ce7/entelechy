@@ -482,7 +482,7 @@ class KernelExecutor:
             256,
             np.int32(0 if PROBLEM_TYPE == "CCE" else 1),
             (
-                problem_flag,
+                p,
                 np.int32(tile.module_chunk_idx),
                 np.int32(tile.module_offset),
                 np.int32(tile.num_modules_in_tile),
