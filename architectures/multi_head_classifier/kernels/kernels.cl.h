@@ -3,6 +3,27 @@
 #ifndef KERNELS_CL_H
 #define KERNELS_CL_H
 
+// --- Architectural Contract Note ---
+// This header constitutes the sole and sufficient technical contract
+// for interaction between host and device implementations:
+//
+// 1. **Device Specification:**
+//    Kernels are defined as stateless computational units. Their behavior,
+//    memory layouts, and interface constraints are fully specified here.
+//    Device implementations require no external context beyond this document.
+//
+// 2. **Host Interface:**
+//    Kernel invocation parameters, buffer semantics, and synchronization
+//    requirements are exhaustively defined. Host code requires no knowledge
+//    of device internals or optimization strategies beyond these specifications.
+//
+// Explicitly out of scope:
+// - Host orchestration logic (e.g., task graphs, reduction strategies)
+// - Device hardware optimizations (e.g., register allocation, vectorization)
+//
+// Adherence to this contract ensures strict separation of concerns and
+// bidirectional implementation independence.
+
 // Check for OpenCL environment (target: OpenCL 1.2 without atomics)
 #ifdef __OPENCL_VERSION__
 // Require OpenCL 1.2 or later
@@ -103,8 +124,7 @@ inline SCALAR_TYPE pown(SCALAR_TYPE base, int exp) { return pow(base, (SCALAR_TY
 /**
  * @brief (Node 4) Computes hidden activations for a slice of the input batch.
  * @contract Applies a (Weights * Input + Bias) transform followed by a ReLU activation.
- * @usage (Host) Called once for the initial forward pass. May be called a second time
- *          during backprop if the "recompute hidden" strategy is active.
+ * @usage (Host) Generic forward pass kernel.
  */
 __kernel void forward_pass(
     __local SCALAR_TYPE *local_mem,                                // [MEMORY size: SIMD_WIDTH * (1 + SIMD_WIDTH) * sizeof(SCALAR_TYPE)]
@@ -219,7 +239,6 @@ __kernel void compute_probs_loss_bce_chunk(
  *           `padded_total_output_classes` to correctly navigate all class-dimensioned buffers.
  *           If `problem_type_flag`=0 (CCE), `targets_buf` is `__global int*`.
  *           If `problem_type_flag`=1 (BCE), `targets_buf` is `__global SCALAR_TYPE*`.
- * @usage (Host) Launched in parallel with kernels (9) and (10) for the same chunk.
  */
 __kernel void calculate_module_param_grads_chunk(
     __local SCALAR_TYPE *local_mem,                             // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
@@ -250,7 +269,6 @@ __kernel void calculate_module_param_grads_chunk(
  *           `padded_total_output_classes` to correctly navigate all class-dimensioned buffers.
  *           If `problem_type_flag`=0 (CCE), `targets_buf` is `__global int*`.
  *           If `problem_type_flag`=1 (BCE), `targets_buf` is `__global SCALAR_TYPE*`.
- * @usage (Host) Launched in parallel with kernels (8) and (10) for the same chunk.
  */
 __kernel void backprop_error_to_hidden_chunk(
     __local SCALAR_TYPE *local_mem,                            // [MEMORY size: (unused)]
@@ -279,7 +297,6 @@ __kernel void backprop_error_to_hidden_chunk(
  *           `padded_total_output_classes` to correctly navigate all class-dimensioned buffers.
  *           If `problem_type_flag`=0 (CCE), `targets_buf` is `__global int*`.
  *           If `problem_type_flag`=1 (BCE), `targets_buf` is `__global SCALAR_TYPE*`.
- * @usage (Host) Launched in parallel with kernels (8) and (9) for the same chunk.
  */
 __kernel void calculate_chunk_temp_gradients(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
@@ -309,9 +326,7 @@ __kernel void calculate_chunk_temp_gradients(
  *           corresponding slice in `out_buf`. It uses element-based offsets
  *           and leading dimension arguments to correctly handle sub-regions
  *           within larger, potentially padded, parent buffers.
- * @usage (Host) Generic, streamable transpose. For Grad_H backprop, it's called
- *           per-chunk immediately after kernel (9) to interleave memory
- *           operations with compute.
+ * @usage (Host) Generic, streamable matrix transpose utility.
  */
 __kernel void transpose_chunk(
     __local SCALAR_TYPE *local_mem,                // [MEMORY size: C_TILE_SIZE * (C_TILE_SIZE + 1) * sizeof(SCALAR_TYPE)]
@@ -330,7 +345,9 @@ __kernel void transpose_chunk(
  * @brief (Node 12, 16) Tier 0 (N=1): Identity pass-through copy.
  * @contract Copies `elements_per_partial` elements from input to output.
  *           `num_partials_to_reduce` must be 1.
- * @usage (Host) Final consolidation step.
+ * @usage (Host) A pass-through copy kernel. Used when only one partial input needs to be
+ *           moved to the final output buffer, representing the terminal base case
+ *           for any reduction operation.
  */
 __kernel void aggregate_identity(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: (unused)]
@@ -344,7 +361,9 @@ __kernel void aggregate_identity(
  * @brief (Node 12, 16) Tier 1 (N is small): Reduces partial results using registers.
  * @contract Reduces `num_partials_to_reduce` segments from the input buffer.
  *           Each work-item handles one element across all partials.
- * @usage (Host) Final consolidation step.
+ * @usage (Host) A generic reduction kernel for consolidating a small number of partial
+ *           results. It is optimized to perform the reduction summation primarily
+ *           within registers, making it efficient for small `num_partials_to_reduce`.
  */
 __kernel void aggregate_register_reduce(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: (unused)]
@@ -358,7 +377,10 @@ __kernel void aggregate_register_reduce(
  * @brief (Node 12, 16) Tier 2 (N is large): Reduces partial results using local memory.
  * @contract Reduces `num_partials_to_reduce` segments from the input buffer.
  *           Each work-group handles one element across all partials using local memory.
- * @usage (Host) Final consolidation step.
+ * @usage (Host) A generic, scalable reduction kernel for consolidating a large number
+ *           of partial results. It uses local memory to perform an efficient
+ *           parallel reduction within each work-group, making it the workhorse
+ *           for any large-scale aggregation task.
  */
 __kernel void aggregate_local_reduce(
     __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]

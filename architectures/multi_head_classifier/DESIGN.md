@@ -19,9 +19,18 @@
 
 The architecture is built upon a foundation of modular, reusable kernels that operate on "chunks" of a larger problem. The system can chunk work across multiple dimensions (e.g., number of modules, batch size, number of classes) as needed. Each `Classifier Module`, for instance, is configured with an **`Operating Mode`** (`CCE` for single-label or `BCE` for multi-label tasks), which instructs the Host Orchestrator on which specific computational path to construct using these kernels.
 
-#### **2. The Generic, Tiered Aggregation Engine**
+#### **2. The Recursive, Tiered Aggregation Engine**
 
-The heart of the architecture is a powerful, generic aggregation engine that replaces all specialized reduction logic. The host orchestrator chooses **one** of three specialist kernels based _only_ on the number of items (`N`) to be reduced. This engine is a pure, reusable component invoked multiple times within a single training step to consolidate various partial results.
+The heart of the architecture is a powerful aggregation engine that implements a **recursive, multi-stage reduction tree**. Instead of generating all `N` partial results before aggregating, this model uses a classic divide-and-conquer strategy to keep the GPU saturated and VRAM usage minimal.
+
+It is governed by a new host-configurable parameter, `K` (the **Reduction Batch Size**), which defines the width of the parallel kernel front at each reduction stage. The process is as follows:
+
+1.  The Host Orchestrator renders the base `N` partial results in batches of `K`.
+2.  After each batch of `K` partials is computed, they are **immediately reduced** by an `aggregate_*` kernel into a single "Level 1" intermediate result.
+3.  This process is repeated `N/K` times, converting a large problem of `N` "Level 0" results into a much smaller problem of `N/K` "Level 1" results.
+4.  The host then **recursively applies this same logic** to the buffer of "Level 1" results, reducing them in batches of `K` to create "Level 2" results, and so on, until a single final tensor remains.
+
+This `log_K(N)` strategy breaks the `O(N)` memory dependency of a flat aggregation model and allows the system to scale to problems of arbitrary size.
 
 #### **3. Asynchronous Host Interaction**
 
@@ -37,17 +46,12 @@ This allows a host application to act on the complete forward-pass results as so
 The host logic is a sophisticated but straightforward orchestrator responsible for resource management and DAG construction. For each batch, it performs a series of strategic assessments:
 
 1.  **Memory Assessment & Chunk Definition:** It compares the memory required for the complete problem against available device memory to determine the optimal chunking strategy. This includes defining `num_module_chunks`, `num_batch_chunks`, and `num_class_chunks`.
-
-2.  **DAG Construction & Parallel Dispatch:** It builds the multi-phase computational graph by enqueuing kernels according to the selected mode and chunking strategy. For logically independent tasks, it enqueues them back-to-back without synchronization to create parallel workloads.
-
-3.  **SIMD-Aware Weight Layout:** To fully exploit vector processing capabilities on the device and ensure coalesced memory access, the Host Orchestrator is responsible for transforming the shared layer weights into a SIMD-friendly "Struct of Arrays" (SoA) layout before enqueuing kernel (4). This pre-processing step rearranges the weights from a logical `(hidden_dim, input_dim)` matrix to a physical `(hidden_dim/SIMD_WIDTH, input_dim, SIMD_WIDTH)` buffer. This data layout is a concrete expression of the **Primacy of Memory Strategy** principle and is a non-negotiable part of the contract with the `forward_pass` kernel.
-
-4.  **`Operating Mode` & Activation Lifecycle:** It determines the base computational graph by reading the `Classifier Module`'s configured `Operating Mode` (`CCE` or `BCE`). It then manages the lifecycle of intermediate hidden activations (`hidden_i`), selecting the optimal strategy:
-
+2.  **`Operating Mode` & Activation Lifecycle:** It determines the base computational graph by reading the `Classifier Module`'s configured `Operating Mode` (`CCE` or `BCE`). It then manages the lifecycle of intermediate hidden activations (`hidden_i`), selecting the optimal strategy:
     - **Cache (Space > Time):** If memory allows, it caches `hidden_i` buffers in VRAM for reuse during backpropagation.
     - **Recompute (Time > Space):** Under extreme memory pressure, it discards `hidden_i` and recomputes it on the fly during backpropagation.
-
-5.  **DAG Construction & Parallel Dispatch:** It builds the multi-phase computational graph by enqueuing kernels according to the selected mode and chunking strategy. For logically independent tasks, it enqueues them back-to-back without synchronization to create parallel workloads.
+3.  **SIMD-Aware Weight Layout:** To fully exploit vector processing capabilities on the device and ensure coalesced memory access, the Host Orchestrator is responsible for transforming the shared layer weights into a SIMD-friendly "Struct of Arrays" (SoA) layout before enqueuing kernel (4). This pre-processing step rearranges the weights from a logical `(hidden_dim, input_dim)` matrix to a physical `(hidden_dim/SIMD_WIDTH, input_dim, SIMD_WIDTH)` buffer. This data layout is a concrete expression of the **Primacy of Memory Strategy** principle and is a non-negotiable part of the contract with the `forward_pass` kernel.
+4.  **DAG Construction & Parallel Dispatch:** It builds the multi-phase computational graph by enqueuing kernels according to the selected mode and chunking strategy. For logically independent tasks, it enqueues them back-to-back without synchronization to create parallel workloads.
+5.  **Reduction Planning & Rendering:** For any task requiring aggregation over a large number of chunks (`N`), the host acts as a **Reduction Planner**. It analyzes the problem size and available VRAM to determine an optimal **Reduction Batch Size (`K`)**. It then renders the full `log_K(N)` reduction tree, orchestrating the iterative stages of partial computation and aggregation while managing the lifecycle of intermediate result buffers on the device.
 
 ### **Architectural Blueprint & Data Contracts for a Multi-Head Classifier**
 
@@ -97,7 +101,7 @@ graph TD
 
     %% Phase 0-3: Setup
     subgraph Phase 0-3: Host Setup & Global Params
-        HL_0[Start Batch]:::host_logic --> HL_1["1. VRAM Budgeting & Chunking"]:::host_logic --> HL_2["2. Read Operating Mode & Manage Activations"]:::host_logic
+        HL_0[Start Batch]:::host_logic --> HL_1["1. VRAM Budgeting & Chunking"]:::host_logic --> HL_2["2. Read Mode, Manage Activations,<br/>& Plan Reductions"]:::host_logic
         P_Shared[Shared Params]:::param; P_ClassifierModule[Classifier Module Params]:::param; P_Temps[Temp Params]:::param;
         P_Step[Global Step 't']:::param
         Targets[Targets]:::param
@@ -192,14 +196,16 @@ graph TD
         end
     end
 
-
     %% Phase 12-19: Remainder of Graph
-    subgraph Phase 12: Primary Generic Aggregation
-        K12["<b>(12) Aggregate Kernel</b>"]:::host_logic
-        PARTIAL_Probs & PARTIAL_Loss_BCE & PARTIAL_Grad_ModW & PARTIAL_Grad_ModB & PARTIAL_Grad_Temps & PARTIAL_Grad_H_SoA -- All Partial Data --> K12
-        K12 --> FINAL_Probs[Final Probs]:::final_data & FINAL_BCE_Loss[Final BCE Loss]:::final_data & AGG_Grad_H_SoA["Aggregated Grad_H<br/>(B*H, M Layout)"]:::full_intermediate
-        K12 --> FINAL_Grad_ModW[Final Grad_ModW]:::final_data & FINAL_Grad_ModB[Final Grad_ModB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
+    subgraph "Phase 12: Recursive Aggregation Tree (log_K(N) Stages)"
+        direction LR
+        style "Phase 12: Recursive Aggregation Tree (log_K(N) Stages)" loop_box
+        K_Recursive_12["(8, 9, 10, agg) ...<br/>Iterative Reduction"]:::host_logic
     end
+    PARTIAL_Probs & PARTIAL_Loss_BCE & PARTIAL_Grad_ModW & PARTIAL_Grad_ModB & PARTIAL_Grad_Temps & PARTIAL_Grad_H_SoA -- All Partial Data --> K_Recursive_12
+    K_Recursive_12 --> FINAL_Probs[Final Probs]:::final_data & FINAL_BCE_Loss[Final BCE Loss]:::final_data & AGG_Grad_H_SoA["Aggregated Grad_H<br/>(B*H, M Layout)"]:::full_intermediate
+    K_Recursive_12 --> FINAL_Grad_ModW[Final Grad_ModW]:::final_data & FINAL_Grad_ModB[Final Grad_ModB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
+
 
     subgraph Phase 13: Specialized Grad_H Reduction
         K13["<b>(13) reduce_grad_h_over_modules</b><br/>(Specialized Reduction)"]:::specialized_kernel
@@ -217,11 +223,14 @@ graph TD
         K15 --> PARTIAL_Grad_SB_i[PARTIAL Grad_SB 'i']:::partial_data
     end
 
-    subgraph Phase 16: Final Aggregation
-        K16["<b>(16) Aggregate Kernel</b>"]:::host_logic
-        PARTIAL_Grad_SW_i & PARTIAL_Grad_SB_i -- All Chunks --> K16
-        K16 --> FINAL_Grad_SW[Final Grad_SW]:::final_data & FINAL_Grad_SB[Final Grad_SB]:::final_data
+    subgraph "Phase 16: Recursive Shared Gradient Aggregation"
+        direction LR
+        style "Phase 16: Recursive Shared Gradient Aggregation" loop_box
+        K_Recursive_16["(agg) ...<br/>Iterative Reduction"]:::host_logic
     end
+    PARTIAL_Grad_SW_i & PARTIAL_Grad_SB_i -- All Chunks --> K_Recursive_16
+    K_Recursive_16 --> FINAL_Grad_SW[Final Grad_SW]:::final_data & FINAL_Grad_SB[Final Grad_SB]:::final_data
+
 
     subgraph "Phase 17-19: Finalization & Dispatch"
         direction LR
@@ -245,7 +254,6 @@ graph TD
     EV_Final --> Host_Wait_Final["Host Blocks for<br/>Full Batch"]:::host_logic
 ```
 
-
 ### **Final Kernel & Synchronization Contracts**
 
 - **(4) `forward_pass`**: Computes hidden activations for a chunk of the input batch.
@@ -263,11 +271,11 @@ graph TD
 ---
 
 - **(11) `transpose_chunk`**: **(Generic Utility).** A streamable kernel whose purpose is **latency hiding**. It is enqueued on a per-chunk basis to overlap memory-bound transpose operations with compute-bound gradient calculations.
-- **(12) `aggregate_*` kernels**: Generic, stateless kernel interface invoked to consolidate all partial results from the module/class chunking phase. For `Grad_H`, it produces an intermediate `Aggregated_Grad_H` buffer which requires further reduction.
+- **(12) `aggregate_*` kernels**: Generic, stateless kernel interface that serves as the engine for the **Recursive Halving Renderer**. It is invoked iteratively at each stage of the reduction tree to consolidate `K` partial results (`Level L`) into a single higher-level result (`Level L+1`). For `Grad_H`, this process produces an intermediate `Aggregated_Grad_H` buffer which requires its own separate reduction.
 - **(13) `reduce_grad_h_over_modules`**: A specialized reduction kernel that sums the module-major `Aggregated Grad_H` buffer. It is designed to be **robust to memory padding**, using physical strides to correctly navigate the buffer and sum contributions across the logical module dimension, producing the final `Final_Grad_H`.
 - **(14) `backprop_shared_weights_chunk`**: A streamable backpropagation kernel for shared layer weights, computing partial gradients for a batch chunk.
 - **(15) `backprop_shared_biases_chunk`**: A streamable backpropagation kernel for shared layer biases, computing partial gradients for a batch chunk.
-- **(16) `aggregate_*` kernels**: The same generic kernel interface, invoked to consolidate partial gradients from the shared layer.
+- **(16) `aggregate_*` kernels**: The same generic kernel interface, used by the **Recursive Halving Renderer** to consolidate partial gradients from the shared layer. It is invoked iteratively to reduce chunks from the streaming backpropagation phase (14, 15).
 - **(17) `D2H Async Copy`**: A non-blocking Device-to-Host transfer of the `Final Probs` buffer, whose completion signals the `inference_event`.
 - **(18) `adam_update`**: Generic optimizer kernel, invoked multiple times for different parameter groups. It accepts the global step `t` to guarantee numerical stability and relies on the host to provide **parameter, gradient, and momentum buffers with identical physical layouts** for correct operation.
 - **(19) `clamp_temperatures`**: Final utility kernel for parameter constraint.
@@ -279,7 +287,7 @@ graph TD
 
 - **Scenario: The Iris Case (Tiny Problem)**
 
-  - **Insight:** Demonstrates **universality**. For a model with a single, small `Classifier Head`, the "always stream" design gracefully degrades. With `num_*_chunks=1`, aggregation becomes a near-zero-cost identity copy, proving efficient function at any scale.
+  - **Insight:** Demonstrates **universality**. For a model with a single, small `Classifier Head`, the "always stream" design gracefully degrades. With `num_*_chunks=1`, the **Recursive Halving Renderer** simply executes a single reduction, becoming a near-zero-cost identity copy and proving efficient function at any scale.
 
 - **Scenario: The Marathon (Massive `epochs`)**
 
@@ -287,9 +295,7 @@ graph TD
 
 - **Scenario: The Hydra (Massive `num_heads`)**
 
-  - **Insight:** Validates **scalability of the core multi-head design**.
-    - **Problem (ML Lens):** A model is designed with a massive number of independent `Classifier Heads`.
-    - **Solution (System Lens):** The architecture treats each `Head` as a generic `Module`, chunking computation over the "module" dimension (`num_module_chunks > 1`) and streaming the work in parallel.
+  - **Insight:** Validates the **scalability and intelligence of the Recursive Halving Renderer**. For a massive number of heads, the Host Orchestrator acts as a **Reduction Planner**. It assesses VRAM, chooses a suitable **Reduction Batch Size (`K`)**, and renders an efficient, multi-stage `log_K(N)` reduction tree over the module dimension, ensuring the GPU remains saturated without exhausting memory.
 
 - **Scenario: The Behemoth (Massive `hidden_dim`)**
 
@@ -297,19 +303,15 @@ graph TD
 
 - **Scenario: The Lexicon (Massive `output_classes`)**
 
-  - **Insight:** Achieves **maximum hardware occupancy via interleaved compute and memory operations**.
-    - **Problem (ML Lens):** A `Classifier Head` must predict from millions of classes (a common `CCE Mode` scenario).
-    - **Solution (System Lens):** Within the `Classifier Module`'s execution path, the host orchestrates a fine-grained parallel workload. The compute-bound gradient kernels (8, 9, 10) for chunk _N+1_ are enqueued to run concurrently with the memory-bound `transpose_chunk` (11) of chunk _N_, hiding latency.
+  - **Insight:** Achieves **maximum hardware occupancy via the recursive renderer**. For a model with millions of classes, the Host Orchestrator acts as a **Reduction Planner**. It assesses VRAM, chooses a suitable **Reduction Batch Size (`K`)**, and renders an efficient, multi-stage `log_K(N)` reduction tree over the class dimension. The interleaved compute (8, 9, 10) and aggregation (`agg`) kernels ensure the GPU is fully occupied.
 
 - **Scenario: The Data Tsunami (Massive `batch_size`)**
 
-  - **Insight:** Validates the **two-phase streaming backpropagation strategy**. For large batches, backpropagation for the shared layer (14, 15) streams over the batch dimension, in contrast to earlier phases, showing a sophisticated dataflow tailored to memory patterns.
+  - **Insight:** Validates the **two-phase streaming backpropagation strategy**. For large batches, backpropagation for the shared layer (14, 15) streams over the batch dimension, with partial results being fed into their own **Recursive Halving Renderer** (16), showing a sophisticated dataflow tailored to memory patterns.
 
 - **Scenario: The Colossus (Holistic Stress Test)**
 
-  - **Insight:** Tests the **synergy of all scaling strategies under compound memory pressure**.
-    - **Problem (ML Lens):** The model is large across many dimensions (many `Heads`, large `hidden_dim`, many `classes`, large `batch_size`).
-    - **Solution (System Lens):** The host composes a multi-faceted plan. First, it constructs the base DAG according to each `Module`'s `Operating Mode`. Then, it applies chunking over `Modules`/classes (Phases 5-13) and over the batch (Phases 14-15) sequentially. It may also engage the `Recompute` strategy for activations, proving its ability to handle complex, symmetric workloads.
+  - **Insight:** Tests the **synergy of all scaling strategies under compound memory pressure**. The host demonstrates its full intelligence by composing a multi-faceted plan. It applies chunking over the batch dimension (Phases 14-15) while simultaneously invoking the **Recursive Halving Renderer** for the module/class dimensions (Phases 5-13). It may also engage the `Recompute` strategy for activations, proving its ability to construct and execute complex, dynamic, and deeply memory-aware computational graphs.
 
 - **Scenario: The Responsive Dashboard (Asynchronous Result Retrieval)**
   - **Insight:** Fulfills application-level needs by **decoupling forward-pass results from backward-pass latency**.

@@ -1,40 +1,40 @@
 # iris_dynamic_cl.py
 #
-# A Unified, Memory-Aware Streaming Classification Engine
-# =======================================================
+# A Unified, Memory-Aware Streaming Classification Engine (Host Implementation)
+# ===========================================================================
 #
-# This script is the complete host-side implementation of a sophisticated, event-driven
-# training and inference engine for a neural network architecture. It is designed around
-# four core principles:
+# This system implements the host-side contract defined in the Architectural
+# Hierarchy:
 #
-# 1. Primacy of Memory Strategy: All orchestration is geared towards maximizing GPU
-#    throughput by ensuring computations run in the fastest possible memory tier.
-# 2. Modular, "Dumb" Kernels: The engine uses a set of simple, single-purpose OpenCL
-#    kernels that are composed by the host to perform complex tasks.
-# 3. Trust the Driver: The host constructs a Directed Acyclic Graph (DAG) of operations
-#    and trusts the OpenCL driver to optimize scheduling, fusion, and execution.
-# 4. Unified Dataflow: A single, "always stream" pipeline handles problems of any
-#    scale, from tiny to massive, without separate, hard-coded logic paths.
+# 1. Design Document: The canonical specification (Layer 1 authority)
+# 2. kernels.cl.h: Device contract (Layer 2 authority)
+# 3. This Implementation: Host logic (Layer 3 authority)
 #
-# The host-side code is organized into a clean, four-layer architecture:
+# Core Architectural Compliance:
+# - Strict adherence to kernel interface contracts (no direct buffer access)
+# - Pure expression of Primacy of Memory Strategy through chunking/recomputation
+# - Event-driven DAG construction with driver-level optimization trust
+# - Unified streaming paradigm scaled via recursive halving renderer
+
+# Key Host Responsibilities
+# -------------------------
+# Orchestration:
+#   - Whole-training lifecycle management
+#   - Strategic VRAM budgeting and chunking
 #
-# Layer 4: Orchestration (TrainingOrchestrator)
-#   - The top-level owner of all components.
-#   - Manages the training loop and global state (e.g., epoch count).
+# Execution Planning:
+#   - Adaptive selection of cache/recompute strategies
+#   - Recursive reduction tree configuration (K param)
 #
-# Layer 3: Execution (BatchProcessor)
-#   - A stateful, single-use engine responsible for processing one batch.
-#   - Translates a strategic plan into a concrete, event-based DAG of kernel launches.
+# Kernel Contract Enforcement:
+#   - Physical buffer layout maintenance (SoA/AoS)
+#   - Implicit padding management for all kernel arguments
 #
-# Layer 2: Strategy (ExecutionStrategy)
-#   - A stateless component that assesses resource constraints (e.g., VRAM).
-#   - Creates a high-level `ExecutionPlan` for how a batch should be processed.
+# Memory Sovereignty:
+#   - Opaque handle-based memory management
+#   - Strict separation of transient vs. persistent allocations
 #
-# Layer 1: Action (BufferManager, KernelExecutor)
-#   - Stateless toolboxes that perform primitive actions.
-#   - `BufferManager`: Manages the lifecycle and memory layout of all GPU buffers.
-#   - `KernelExecutor`: Provides a direct, 1:1 mapping for launching each OpenCL kernel.
-#
+# Reference: See DESIGN.md §3 for architectural diagrams and host/device contracts.
 
 import os
 import pyopencl as cl
@@ -42,7 +42,7 @@ import numpy as np
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Tuple, List, Dict, Optional, Callable
+from typing import Tuple, List, Dict, Optional, Callable, Union
 import enum
 
 # --- Global Constants & Configuration ---
@@ -69,50 +69,51 @@ MIN_TEMP: float = 0.1
 MAX_TEMP: float = 10.0
 
 # --- COMPILE-TIME KERNEL CONSTANTS & ARCHITECTURAL TUNING ---
-MAX_REGISTER_AGGREGATE_ITEMS: int = 32  # Threshold to switch reduction strategy
-C_TILE_SIZE: int = 16  # Tile size for the matrix transpose kernel
-BACKPROP_STREAM_CHUNK_SIZE: int = 32  # Granularity for shared layer backprop
-## Max chunk constants for pre-allocating partial gradient buffers.
-# This single value now defines the max number of tiles
-MAX_TOTAL_TILES: int = 4096  # e.g., 64x64 grid
-MAX_BATCH_CHUNKS: int = 64  # Max number of chunks for batch dimension streaming
+MAX_REGISTER_AGGREGATE_ITEMS: int = 32
+C_TILE_SIZE: int = 16
+BACKPROP_STREAM_CHUNK_SIZE: int = 32
+REDUCTION_BATCH_SIZE_K: int = 16  # Defines the width of the recursive reduction front
+MAX_BATCH_CHUNKS: int = 64
 
 
 # --- Core Data Abstractions ---
 
 
-class LayoutType(enum.Enum):
-    """Defines the physical memory layout strategy for a buffer."""
+@dataclass(frozen=True, eq=True)
+class BufferHandle:
+    """An opaque handle to a memory buffer managed by the BufferManager."""
 
-    AoS = 1  # Array of Structs: Standard, logical row-major layout
-    SoA = 2  # Struct of Arrays: SIMD-optimized, transformed layout
+    id: int
+
+
+class LayoutType(enum.Enum):
+    AoS = 1
+    SoA = 2
 
 
 class BufferRole(enum.Enum):
-    """Defines the semantic purpose of a buffer, driving its memory padding strategy."""
-
-    INPUT = 1
-    HIDDEN_ACTIVATION = 2
-    SHARED_WEIGHTS = 3
-    SHARED_BIAS = 4
-    MODULE_WEIGHTS = 5
-    MODULE_BIAS = 6
-    TEMPERATURES = 7
-    PARTIAL_GRADIENT = 8
-    FINAL_GRADIENT = 9
-    ADAM_MOMENTUM = 10
-    INTERMEDIATE = 11  # For transient buffers like logits, softmax params
-    TARGETS = 12
-    MASK = 13
+    (
+        INPUT,
+        HIDDEN_ACTIVATION,
+        SHARED_WEIGHTS,
+        SHARED_BIAS,
+        MODULE_WEIGHTS,
+        MODULE_BIAS,
+        TEMPERATURES,
+        PARTIAL_GRADIENT,
+        FINAL_GRADIENT,
+        ADAM_MOMENTUM,
+        INTERMEDIATE,
+        TARGETS,
+        MASK,
+    ) = range(13)
 
 
 @dataclass(frozen=True)
 class Parameter:
-    """A semantic group for a trainable parameter and its related buffers."""
-
     name: str
     role: BufferRole
-    layout: LayoutType = LayoutType.AoS  # Default to standard layout
+    layout: LayoutType = LayoutType.AoS
 
     @property
     def grad(self) -> str:
@@ -128,32 +129,22 @@ class Parameter:
 
 
 class HostView:
-    """Manages a host-side numpy array for reading data back from a device buffer."""
-
     def __init__(self, spec: Tuple[Tuple, np.dtype], real_shape: Tuple):
         self.padded_shape, self.dtype = spec[0], spec[1]
         self.real_shape = real_shape
         self.host_data = np.empty(self.padded_shape, dtype=self.dtype)
 
     def enqueue_read(self, queue: cl.CommandQueue, cl_buffer: cl.Buffer, wait_for=None) -> cl.Event:
-        """Enqueues a non-blocking D2H copy into this view's host memory."""
         return cl.enqueue_copy(queue, self.host_data, cl_buffer, wait_for=wait_for or [])
 
     def get(self) -> np.ndarray:
-        """Returns the valid, un-padded slice of the data after the copy is complete."""
         slicing = tuple(slice(0, dim) for dim in self.real_shape)
-        if not slicing:
-            return self.host_data
-        return self.host_data[slicing]
+        return self.host_data[slicing] if slicing else self.host_data
 
 
-# --- 2D Tiling System ---
-
-
+# --- 2D Tiling & Strategic Planning ---
 @dataclass(frozen=True)
 class WorkTile:
-    """Represents a single, self-contained rectangle of the compute grid."""
-
     module_chunk_idx: int
     class_chunk_idx: int
     flat_tile_id: int
@@ -165,8 +156,6 @@ class WorkTile:
 
 @dataclass(frozen=True)
 class ExecutionGrid:
-    """Defines the M x N geometry of the module/class workload and acts as a tile factory."""
-
     num_module_chunks: int
     num_class_chunks: int
     total_modules: int
@@ -177,57 +166,40 @@ class ExecutionGrid:
         return self.num_module_chunks * self.num_class_chunks
 
     def __iter__(self):
-        """Makes the grid itself an iterable, yielding each WorkTile in order."""
         for m_idx in range(self.num_module_chunks):
             for c_idx in range(self.num_class_chunks):
                 yield self.get_tile(m_idx, c_idx)
 
-    def get_tile(self, module_chunk_idx: int, class_chunk_idx: int) -> "WorkTile":
-        """Creates a specific WorkTile, calculating its slice of the workload."""
-        module_chunk_size = (self.total_modules + self.num_module_chunks - 1) // self.num_module_chunks
-        module_offset = module_chunk_idx * module_chunk_size
-        num_modules_in_tile = min(module_chunk_size, self.total_modules - module_offset)
-
-        class_chunk_size = (self.total_classes + self.num_class_chunks - 1) // self.num_class_chunks
-        class_offset = class_chunk_idx * class_chunk_size
-        num_classes_in_tile = min(class_chunk_size, self.total_classes - class_offset)
-
-        flat_tile_id = module_chunk_idx * self.num_class_chunks + class_chunk_idx
-
-        return WorkTile(
-            module_chunk_idx=module_chunk_idx,
-            class_chunk_idx=class_chunk_idx,
-            flat_tile_id=flat_tile_id,
-            module_offset=module_offset,
-            num_modules_in_tile=num_modules_in_tile,
-            class_offset=class_offset,
-            num_classes_in_tile=num_classes_in_tile,
-        )
+    def get_tile(self, m_idx: int, c_idx: int) -> "WorkTile":
+        m_chunk_size = (self.total_modules + self.num_module_chunks - 1) // self.num_module_chunks
+        c_chunk_size = (self.total_classes + self.num_class_chunks - 1) // self.num_class_chunks
+        m_offset, num_m = m_idx * m_chunk_size, min(m_chunk_size, self.total_modules - (m_idx * m_chunk_size))
+        c_offset, num_c = c_idx * c_chunk_size, min(c_chunk_size, self.total_classes - (c_idx * c_chunk_size))
+        return WorkTile(m_idx, c_idx, m_idx * self.num_class_chunks + c_idx, m_offset, num_m, c_offset, num_c)
 
 
 @dataclass(frozen=True)
 class ChunkingConfig:
-    """Configuration for chunking a problem across one or more dimensions (e.g., batch)."""
-
     num_chunks: int = 1
     chunk_size: int = 0
     total_dim: int = 0
 
 
+@dataclass(frozen=True)
+class ReductionPlan:
+    k: int
+
+
 @dataclass
 class ExecutionPlan:
-    """Holds the strategic decisions for processing one batch."""
-
     grid: ExecutionGrid
     shared_layer_batch_chunking: ChunkingConfig
+    reduction_plan: ReductionPlan
     recompute_hidden: bool = False
 
 
 # --- Utility & Padding Functions ---
-
-
 def load_and_concatenate_kernels() -> str:
-    """Loads all kernel source files from disk and concatenates them."""
     kernel_files = [
         "kernels.cl.h",
         "chunk_kernels.cl.c",
@@ -235,22 +207,18 @@ def load_and_concatenate_kernels() -> str:
         "backprop_kernels.cl.c",
         "parameter_optim.cl.c",
     ]
-    source_parts = []
-    for filename in kernel_files:
-        if not os.path.exists(filename):
-            raise FileNotFoundError(f"Missing required kernel file: {filename}. Please create placeholder files.")
-        with open(filename, "r", encoding="utf-8") as f:
-            source_parts.append(f.read())
+    source_parts = [open(f, "r", encoding="utf-8").read() for f in kernel_files if os.path.exists(f)]
+    if len(source_parts) != len(kernel_files):
+        raise FileNotFoundError("Missing required kernel files.")
     print(f"Loaded {len(source_parts)} kernel source files.")
     return "\n".join(source_parts)
 
 
 def select_simd_width(device: cl.Device) -> int:
-    """Selects a reasonable SIMD width based on GPU vendor."""
     vendor = device.vendor.upper()
     if "NVIDIA" in vendor:
         return 32
-    if "AMD" in vendor or "ADVANCED MICRO DEVICES" in vendor:
+    if any(v in vendor for v in ["AMD", "ADVANCED MICRO DEVICES"]):
         return 64
     if "INTEL" in vendor:
         return 16
@@ -258,44 +226,37 @@ def select_simd_width(device: cl.Device) -> int:
 
 
 def pad_to_multiple(dim: int, multiple: int) -> int:
-    """Calculates the smallest multiple of `multiple` >= `dim`."""
-    if multiple == 0:
-        return dim
-    return (dim + multiple - 1) // multiple * multiple
+    return (dim + multiple - 1) // multiple * multiple if multiple != 0 else dim
 
 
-def _pad_none(shape: Tuple, *args) -> Tuple:
-    return shape
+_pad_none = lambda s, *a: s
 
 
-def _pad_last_dim(shape: Tuple, simd_width: int) -> Tuple:
-    padded = list(shape)
-    if len(padded) > 0 and padded[-1] > 1:
-        padded[-1] = pad_to_multiple(padded[-1], simd_width)
-    return tuple(padded)
+def _pad_last_dim(s, w):
+    p = list(s)
+    p[-1] = pad_to_multiple(p[-1], w) if len(p) > 0 and p[-1] > 1 else p[-1]
+    return tuple(p)
 
 
-def _pad_batch_dim(shape: Tuple, simd_width: int) -> Tuple:
-    padded = list(shape)
-    if len(padded) > 0:
-        padded[0] = pad_to_multiple(padded[0], simd_width)
-    return tuple(padded)
+def _pad_batch_dim(s, w):
+    p = list(s)
+    p[0] = pad_to_multiple(p[0], w) if len(p) > 0 else p[0]
+    return tuple(p)
 
 
-def _pad_batch_and_last_dim(shape: Tuple, simd_width: int) -> Tuple:
-    padded = list(shape)
-    if len(padded) > 1:
-        padded[0] = pad_to_multiple(padded[0], simd_width)
-        if padded[-1] > 1:
-            padded[-1] = pad_to_multiple(padded[-1], simd_width)
-    elif len(padded) == 1:
-        padded[0] = pad_to_multiple(padded[0], simd_width)
-    return tuple(padded)
+def _pad_batch_and_last_dim(s, w):
+    p = list(s)
+    if len(p) > 1:
+        p[0] = pad_to_multiple(p[0], w)
+        p[-1] = pad_to_multiple(p[-1], w) if p[-1] > 1 else p[-1]
+    elif len(p) == 1:
+        p[0] = pad_to_multiple(p[0], w)
+    return tuple(p)
 
 
 PADDING_RULES: Dict[BufferRole, Callable] = {
     BufferRole.INPUT: _pad_batch_and_last_dim,
-    BufferRole.HIDDEN_ACTIVATION: _pad_batch_and_last_dim,
+    B: _pad_batch_and_last_dim,
     BufferRole.SHARED_WEIGHTS: _pad_last_dim,
     BufferRole.MODULE_WEIGHTS: _pad_last_dim,
     BufferRole.FINAL_GRADIENT: _pad_last_dim,
@@ -304,19 +265,24 @@ PADDING_RULES: Dict[BufferRole, Callable] = {
     BufferRole.MASK: _pad_batch_dim,
 }
 
-
-# --- Layer 1: Action Layer (Stateless Tools) ---
+# --- Layer 1: Action Layer ---
 
 
 class BufferManager:
-    """Manages the lifecycle, creation, padding, and access of all OpenCL memory buffers."""
+    """Manages the lifecycle of ALL OpenCL buffers, issuing opaque handles."""
 
     def __init__(self, context: cl.Context, simd_width: int):
         self.context = context
         self.simd_width = simd_width
-        self.buffers: Dict[str, cl.Buffer] = {}
-        self.specs: Dict[str, Tuple[Tuple[int, ...], np.dtype]] = {}
-        self.byte_sizes: Dict[str, int] = {}
+        self._next_handle_id = 0
+        self._handle_to_buffer: Dict[BufferHandle, cl.Buffer] = {}
+        self._handle_to_spec: Dict[BufferHandle, Tuple[Tuple[int, ...], np.dtype]] = {}
+        self._name_to_handle: Dict[str, BufferHandle] = {}
+
+    def _get_new_handle(self) -> BufferHandle:
+        handle = BufferHandle(id=self._next_handle_id)
+        self._next_handle_id += 1
+        return handle
 
     def create_buffer(
         self,
@@ -326,23 +292,22 @@ class BufferManager:
         logical_shape: Tuple,
         dtype: np.dtype,
         init_data: Optional[np.ndarray] = None,
-    ):
-        """Creates a buffer, handling padding and layout transformation based on its declared role and layout type."""
+    ) -> None:
+        """Creates a named, long-lived buffer, managed internally."""
         physical_data, physical_shape = init_data, logical_shape
         if layout == LayoutType.SoA:
             if len(logical_shape) != 2:
                 raise ValueError(f"SoA layout only for 2D matrices, shape is {logical_shape}")
-            padded_i = pad_to_multiple(logical_shape[0], self.simd_width)
-            padded_h = pad_to_multiple(logical_shape[1], self.simd_width)
+            padded_i, padded_h = pad_to_multiple(logical_shape[0], self.simd_width), pad_to_multiple(
+                logical_shape[1], self.simd_width
+            )
             padded_aos = np.zeros((padded_i, padded_h), dtype=dtype)
-            if init_data is not None:
-                padded_aos[: logical_shape[0], : logical_shape[1]] = init_data
-            transformed_data = padded_aos.T.reshape(padded_h // self.simd_width, self.simd_width, padded_i).transpose(
+            padded_aos[: logical_shape[0], : logical_shape[1]] = init_data if init_data is not None else 0
+            transformed = padded_aos.T.reshape(padded_h // self.simd_width, self.simd_width, padded_i).transpose(
                 0, 2, 1
             )
-            physical_data, physical_shape = transformed_data, transformed_data.shape
-        padding_func = PADDING_RULES.get(role, _pad_none)
-        padded_shape = padding_func(physical_shape, self.simd_width)
+            physical_data, physical_shape = transformed, transformed.shape
+        padded_shape = PADDING_RULES.get(role, _pad_none)(physical_shape, self.simd_width)
         byte_size = max(4, int(np.prod(padded_shape) * dtype().itemsize) if padded_shape else 4)
         mem_flags, hostbuf = cl.mem_flags.READ_WRITE, None
         if physical_data is not None:
@@ -352,53 +317,72 @@ class BufferManager:
                 hostbuf[tuple(slice(0, d) for d in physical_data.shape)] = physical_data
             else:
                 hostbuf = physical_data
-        self.buffers[name] = cl.Buffer(self.context, mem_flags, size=byte_size, hostbuf=hostbuf)
-        self.specs[name] = (padded_shape, dtype)
-        self.byte_sizes[name] = byte_size
+        handle = self._get_new_handle()
+        self._name_to_handle[name] = handle
+        self._handle_to_buffer[handle] = cl.Buffer(self.context, mem_flags, size=byte_size, hostbuf=hostbuf)
+        self._handle_to_spec[handle] = (padded_shape, dtype)
 
-    def get(self, name: str) -> cl.Buffer:
-        return self.buffers[name]
+    def acquire_transient_buffer(self, size_bytes: int) -> BufferHandle:
+        """Leases an unnamed, temporary buffer from the manager."""
+        handle = self._get_new_handle()
+        self._handle_to_buffer[handle] = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, size=max(4, size_bytes))
+        return handle
 
-    def get_spec(self, name: str) -> Tuple[Tuple[int, ...], np.dtype]:
-        return self.specs[name]
+    def release_transient_buffer(self, handle: BufferHandle):
+        """Returns a transient buffer to the manager, allowing it to be recycled."""
+        if handle in self._handle_to_buffer:
+            del self._handle_to_buffer[handle]
 
-    def get_byte_size(self, name: str) -> int:
-        return self.byte_sizes[name]
+    def get_cl_buffer(self, ref: Union[str, BufferHandle]) -> cl.Buffer:
+        """The single gateway to resolve a reference (name or handle) to a cl.Buffer."""
+        handle = self._name_to_handle.get(ref) if isinstance(ref, str) else ref
+        if handle is None or handle not in self._handle_to_buffer:
+            raise KeyError(f"No buffer found for reference: {ref}")
+        return self._handle_to_buffer[handle]
+
+    def get_spec(self, ref: Union[str, BufferHandle]) -> Tuple[Tuple[int, ...], np.dtype]:
+        handle = self._name_to_handle.get(ref) if isinstance(ref, str) else ref
+        if handle is None or handle not in self._handle_to_spec:
+            raise KeyError(f"No spec found for reference: {ref}")
+        return self._handle_to_spec[handle]
 
 
 class KernelExecutor:
-    """A stateless toolbox for launching every specific kernel. Returns events."""
+    """A pure, stateless toolbox for launching every specific kernel. Accepts handles."""
 
     def __init__(self, program: cl.Program, buffer_mgr: BufferManager):
         self.p, self.b = program, buffer_mgr
         self.simd_width = self.b.simd_width
         self.padded_hidden_dim = self.b.get_spec("hidden_buf")[0][1]
         self.padded_input_dim = self.b.get_spec("input_buf")[0][1]
-        # Cache the physical class dimension for reuse, as it's the stride for many buffers.
         self.padded_output_classes = self.b.get_spec("full_logits_out")[0][2]
         self.scalar_size = SCALAR_NP_TYPE().itemsize
 
-    def enqueue_write_buffer(self, queue, name, data, wait_for) -> cl.Event:
-        buf, (shape, dtype) = self.b.get(name), self.b.get_spec(name)
+    def enqueue_write_buffer(self, queue, ref, data, wait_for) -> cl.Event:
+        buf, (shape, dtype) = self.b.get_cl_buffer(ref), self.b.get_spec(ref)
         padded_data = np.zeros(shape, dtype=dtype)
         padded_data[tuple(slice(0, d) for d in data.shape)] = data
         return cl.enqueue_copy(queue, buf, padded_data, wait_for=wait_for)
 
-    def enqueue_fill_buffer(self, queue, name, value, wait_for) -> cl.Event:
-        buf, spec = self.b.get(name), self.b.get_spec(name)
+    def enqueue_fill_buffer(self, queue, ref, value, wait_for) -> cl.Event:
+        buf, spec = self.b.get_cl_buffer(ref), self.b.get_spec(ref)
         return cl.enqueue_fill_buffer(queue, buf, spec[1](value), 0, buf.size, wait_for=wait_for)
 
-    def launch_forward_pass(self, queue, offset, num_samples, wait_for) -> cl.Event:
-        g = (pad_to_multiple(num_samples, self.simd_width), self.padded_hidden_dim // self.simd_width)
-        l = (self.simd_width, 1)
+    def launch_forward_pass(
+        self, queue, offset, num_samples, wait_for, in_ref, mask_ref, w_ref, b_ref, h_out_ref, h_mask_ref
+    ) -> cl.Event:
+        g, l = (pad_to_multiple(num_samples, self.simd_width), self.padded_hidden_dim // self.simd_width), (
+            self.simd_width,
+            1,
+        )
         args = (
             cl.LocalMemory(l[0] * (1 + l[0]) * self.scalar_size),
-            self.b.get("input_buf"),
-            self.b.get("sample_mask"),
-            self.b.get("weights"),
-            self.b.get("biases"),
-            self.b.get("hidden_buf"),
-            self.b.get("hidden_mask"),
+            self.b.get_cl_buffer(in_ref),
+            self.b.get_cl_buffer(mask_ref),
+            self.b.get_cl_buffer(w_ref),
+            self.b.get_cl_buffer(b_ref),
+            self.b.get_cl_buffer(h_out_ref),
+            self.b.get_cl_buffer(h_mask_ref),
             np.int32(offset),
             np.int32(num_samples),
             np.int32(self.padded_input_dim),
@@ -406,14 +390,16 @@ class KernelExecutor:
         )
         return self.p.forward_pass(queue, g, l, *args, wait_for=wait_for)
 
-    def launch_compute_logits_chunk(self, queue: cl.CommandQueue, tile: WorkTile, wait_for) -> cl.Event:
+    def launch_compute_logits_chunk(
+        self, queue: cl.CommandQueue, tile: WorkTile, wait_for, h_ref, h_mask_ref, w_ref, b_ref, logit_out_ref
+    ) -> cl.Event:
         g, l = (tile.num_modules_in_tile, BATCH_SIZE, tile.num_classes_in_tile), None
         args = (
-            self.b.get("hidden_buf"),
-            self.b.get("hidden_mask"),
-            self.b.get("module_weights"),
-            self.b.get("module_biases"),
-            self.b.get("full_logits_out"),
+            self.b.get_cl_buffer(h_ref),
+            self.b.get_cl_buffer(h_mask_ref),
+            self.b.get_cl_buffer(w_ref),
+            self.b.get_cl_buffer(b_ref),
+            self.b.get_cl_buffer(logit_out_ref),
             np.int32(tile.module_chunk_idx),
             np.int32(tile.module_offset),
             np.int32(tile.num_modules_in_tile),
@@ -427,12 +413,14 @@ class KernelExecutor:
         )
         return self.p.compute_logits_chunk(queue, g, l, *args, wait_for=wait_for)
 
-    def launch_reduce_for_softmax(self, queue, wait_for) -> cl.Event:
+    def launch_reduce_for_softmax(
+        self, queue: cl.CommandQueue, wait_for, logit_ref, temp_ref, sm_param_ref
+    ) -> cl.Event:
         g, l = (NUM_MODULES, BATCH_SIZE), None
         args = (
-            self.b.get("full_logits_out"),
-            self.b.get("temps"),
-            self.b.get("softmax_params_out"),
+            self.b.get_cl_buffer(logit_ref),
+            self.b.get_cl_buffer(temp_ref),
+            self.b.get_cl_buffer(sm_param_ref),
             np.int32(NUM_MODULES),
             np.int32(BATCH_SIZE),
             np.int32(OUTPUT_CLASSES),
@@ -440,16 +428,28 @@ class KernelExecutor:
         )
         return self.p.reduce_logits_for_softmax(queue, g, l, *args, wait_for=wait_for)
 
-    def launch_compute_probs_loss_cce_chunk(self, queue: cl.CommandQueue, tile: WorkTile, wait_for) -> cl.Event:
+    def launch_compute_probs_loss_cce_chunk(
+        self,
+        queue,
+        tile: WorkTile,
+        wait_for,
+        logit_ref,
+        sm_param_ref,
+        temp_ref,
+        target_ref,
+        mask_ref,
+        prob_out_ref,
+        loss_out_ref,
+    ) -> cl.Event:
         g, l = (tile.num_modules_in_tile, BATCH_SIZE, tile.num_classes_in_tile), None
         args = (
-            self.b.get("full_logits_out"),
-            self.b.get("softmax_params_out"),
-            self.b.get("temps"),
-            self.b.get("targets_buf"),
-            self.b.get("sample_mask"),
-            self.b.get("partial_probs_out"),
-            self.b.get("final_loss_out"),
+            self.b.get_cl_buffer(logit_ref),
+            self.b.get_cl_buffer(sm_param_ref),
+            self.b.get_cl_buffer(temp_ref),
+            self.b.get_cl_buffer(target_ref),
+            self.b.get_cl_buffer(mask_ref),
+            self.b.get_cl_buffer(prob_out_ref),
+            self.b.get_cl_buffer(loss_out_ref),
             np.int32(tile.module_chunk_idx),
             np.int32(tile.module_offset),
             np.int32(tile.num_modules_in_tile),
@@ -462,182 +462,158 @@ class KernelExecutor:
         return self.p.compute_probs_loss_cce_chunk(queue, g, l, *args, wait_for=wait_for)
 
     def launch_parallel_module_grads(
-        self, queue: cl.CommandQueue, tile: WorkTile, wait_for
+        self,
+        q: cl.CommandQueue,
+        tile: WorkTile,
+        wait_for,
+        h_ref,
+        prob_ref,
+        target_ref,
+        mask_ref,
+        w_ref,
+        gw_out_ref,
+        gb_out_ref,
+        gh_out_ref,
+        logit_ref,
+        temp_ref,
+        gt_out_ref,
     ) -> Tuple[cl.Event, cl.Event, cl.Event]:
-        lsize, problem_flag = 256, np.int32(0 if PROBLEM_TYPE == "CCE" else 1)
-        common_args = (
-            problem_flag,
-            np.int32(tile.module_chunk_idx),
-            np.int32(tile.module_offset),
-            np.int32(tile.num_modules_in_tile),
-            np.int32(tile.class_chunk_idx),
-            np.int32(tile.class_offset),
-            np.int32(tile.num_classes_in_tile),
-            np.int32(BATCH_SIZE),
-            np.int32(HIDDEN_DIM),
-            np.int32(self.padded_hidden_dim),
-            np.int32(OUTPUT_CLASSES),
-            np.int32(self.padded_output_classes),
-            np.int32(NUM_MODULES),
+        l, p, c = (
+            256,
+            np.int32(0 if PROBLEM_TYPE == "CCE" else 1),
+            (
+                problem_flag,
+                np.int32(tile.module_chunk_idx),
+                np.int32(tile.module_offset),
+                np.int32(tile.num_modules_in_tile),
+                np.int32(tile.class_chunk_idx),
+                np.int32(tile.class_offset),
+                np.int32(tile.num_classes_in_tile),
+                np.int32(BATCH_SIZE),
+                np.int32(HIDDEN_DIM),
+                np.int32(self.padded_hidden_dim),
+                np.int32(OUTPUT_CLASSES),
+                np.int32(self.padded_output_classes),
+                np.int32(NUM_MODULES),
+            ),
         )
-        grad_w_evt = self.p.calculate_module_param_grads_chunk(
-            queue,
+        gwe = self.p.calculate_module_param_grads_chunk(
+            q,
             (tile.num_modules_in_tile, HIDDEN_DIM, tile.num_classes_in_tile),
             None,
-            cl.LocalMemory(lsize * self.scalar_size),
-            self.b.get("hidden_buf"),
-            self.b.get("partial_probs_out"),
-            self.b.get("targets_buf"),
-            self.b.get("sample_mask"),
-            self.b.get("partial_grad_module_w_out"),
-            self.b.get("partial_grad_module_b_out"),
-            *common_args,
+            cl.LocalMemory(l * self.scalar_size),
+            self.b.get_cl_buffer(h_ref),
+            self.b.get_cl_buffer(prob_ref),
+            self.b.get_cl_buffer(target_ref),
+            self.b.get_cl_buffer(mask_ref),
+            self.b.get_cl_buffer(gw_out_ref),
+            self.b.get_cl_buffer(gb_out_ref),
+            *c,
             wait_for=wait_for,
         )
-        grad_h_evt = self.p.backprop_error_to_hidden_chunk(
-            queue,
+        ghe = self.p.backprop_error_to_hidden_chunk(
+            q,
             (tile.num_modules_in_tile, BATCH_SIZE, HIDDEN_DIM),
             None,
             cl.LocalMemory(0),
-            self.b.get("partial_probs_out"),
-            self.b.get("targets_buf"),
-            self.b.get("sample_mask"),
-            self.b.get("module_weights"),
-            self.b.get("partial_grad_h_aos_out"),
-            *common_args,
+            self.b.get_cl_buffer(prob_ref),
+            self.b.get_cl_buffer(target_ref),
+            self.b.get_cl_buffer(mask_ref),
+            self.b.get_cl_buffer(w_ref),
+            self.b.get_cl_buffer(gh_out_ref),
+            *c,
             wait_for=wait_for,
         )
-        grad_t_evt = self.p.calculate_chunk_temp_gradients(
-            queue,
-            (tile.num_modules_in_tile * lsize,),
-            (lsize,),
-            cl.LocalMemory(lsize * self.scalar_size),
-            self.b.get("full_logits_out"),
-            self.b.get("partial_probs_out"),
-            self.b.get("targets_buf"),
-            self.b.get("sample_mask"),
-            self.b.get("temps"),
-            self.b.get("partial_grad_temps_out"),
-            *common_args,
+        gte = self.p.calculate_chunk_temp_gradients(
+            q,
+            (tile.num_modules_in_tile * l,),
+            (l,),
+            cl.LocalMemory(l * self.scalar_size),
+            self.b.get_cl_buffer(logit_ref),
+            self.b.get_cl_buffer(prob_ref),
+            self.b.get_cl_buffer(target_ref),
+            self.b.get_cl_buffer(mask_ref),
+            self.b.get_cl_buffer(temp_ref),
+            self.b.get_cl_buffer(gt_out_ref),
+            *c,
             wait_for=wait_for,
         )
-        return grad_w_evt, grad_h_evt, grad_t_evt
-
-    def launch_grad_h_transpose_for_tile(self, queue: cl.CommandQueue, tile: WorkTile, wait_for) -> cl.Event:
-        """A specialized method to correctly launch transpose_chunk for a Grad_H tile."""
-        in_buf, out_buf = "partial_grad_h_aos_out", "partial_grad_h_soa_out"
-        in_spec, out_spec = self.b.get_spec(in_buf)[0], self.b.get_spec(out_buf)[0]
-        rows = tile.num_modules_in_tile
-        cols = BATCH_SIZE * HIDDEN_DIM
-        in_offset = tile.flat_tile_id * (in_spec[1] * in_spec[2] * in_spec[3])
-        out_offset = tile.flat_tile_id * (out_spec[1] * out_spec[2])
-        return self.launch_transpose_chunk(
-            queue, in_buf, out_buf, in_offset, out_offset, rows, cols, cols, out_spec[2], wait_for
-        )
+        return gwe, ghe, gte
 
     def launch_transpose_chunk(
-        self,
-        queue,
-        in_buf_name,
-        out_buf_name,
-        in_offset_elements,
-        out_offset_elements,
-        num_rows,
-        num_cols,
-        in_leading_dim,
-        out_leading_dim,
-        wait_for,
+        self, q, wait_for, in_ref, out_ref, in_offset_e, out_offset_e, num_rows, num_cols, in_ld, out_ld
     ) -> cl.Event:
-        g = (pad_to_multiple(num_cols, C_TILE_SIZE), pad_to_multiple(num_rows, C_TILE_SIZE))
-        l = (C_TILE_SIZE, C_TILE_SIZE)
+        g, l = (pad_to_multiple(num_cols, C_TILE_SIZE), pad_to_multiple(num_rows, C_TILE_SIZE)), (
+            C_TILE_SIZE,
+            C_TILE_SIZE,
+        )
         args = (
             cl.LocalMemory(l[0] * (l[0] + 1) * self.scalar_size),
-            self.b.get(in_buf_name),
-            self.b.get(out_buf_name),
-            np.int32(in_offset_elements),
-            np.int32(out_offset_elements),
+            self.b.get_cl_buffer(in_ref),
+            self.b.get_cl_buffer(out_ref),
+            np.int32(in_offset_e),
+            np.int32(out_offset_e),
             np.int32(num_rows),
             np.int32(num_cols),
-            np.int32(in_leading_dim),
-            np.int32(out_leading_dim),
+            np.int32(in_ld),
+            np.int32(out_ld),
         )
-        return self.p.transpose_chunk(queue, g, l, *args, wait_for=wait_for)
+        return self.p.transpose_chunk(q, g, l, *args, wait_for=wait_for)
 
-    def launch_aggregation(self, queue, in_buf, out_buf, num_partials, elements, is_avg, wait_for) -> cl.Event:
-        lsize, mode = 256, np.int32(1 if is_avg else 0)
-        elements = max(1, int(elements))
-        if num_partials <= 1:
-            return self.p.aggregate_identity(
-                queue,
-                (elements,),
-                None,
-                cl.LocalMemory(0),
-                self.b.get(in_buf),
-                self.b.get(out_buf),
-                np.int32(1),
-                np.int32(elements),
-                mode,
-                wait_for=wait_for,
-            )
-        elif num_partials <= MAX_REGISTER_AGGREGATE_ITEMS:
-            return self.p.aggregate_register_reduce(
-                queue,
-                (elements,),
-                None,
-                cl.LocalMemory(0),
-                self.b.get(in_buf),
-                self.b.get(out_buf),
-                np.int32(num_partials),
-                np.int32(elements),
-                mode,
-                wait_for=wait_for,
-            )
-        else:
-            gsize = pad_to_multiple(elements, lsize)
-            return self.p.aggregate_local_reduce(
-                queue,
-                (gsize,),
-                (lsize,),
-                cl.LocalMemory(lsize * self.scalar_size),
-                self.b.get(in_buf),
-                self.b.get(out_buf),
-                np.int32(num_partials),
-                np.int32(elements),
-                mode,
-                wait_for=wait_for,
-            )
+    def launch_aggregation(
+        self, q, wait_for, in_ref, out_ref, n_partials, elems, is_avg, in_offset_e=0, out_offset_e=0
+    ) -> cl.Event:
+        lsize, mode, elems = (256, np.int32(1 if is_avg else 0), max(1, int(elems)))
+        args = (
+            self.b.get_cl_buffer(in_ref),
+            self.b.get_cl_buffer(out_ref),
+            np.int32(n_partials),
+            np.int32(elems),
+            mode,
+        )
+        if n_partials <= 1:
+            return self.p.aggregate_identity(q, (elems,), None, cl.LocalMemory(0), *args, wait_for=wait_for)
+        if n_partials <= MAX_REGISTER_AGGREGATE_ITEMS:
+            return self.p.aggregate_register_reduce(q, (elems,), None, cl.LocalMemory(0), *args, wait_for=wait_for)
+        return self.p.aggregate_local_reduce(
+            q,
+            (pad_to_multiple(elems, lsize),),
+            (lsize,),
+            cl.LocalMemory(lsize * self.scalar_size),
+            *args,
+            wait_for=wait_for,
+        )
 
-    def launch_reduce_grad_h_over_modules(self, queue: cl.CommandQueue, wait_for) -> cl.Event:
-        """Launches the specialized kernel (13) to reduce Grad_H over the module dimension."""
+    def launch_reduce_grad_h_over_modules(self, q, wait_for, in_ref, out_ref) -> cl.Event:
         lsize = 256
-        in_buf_spec = self.b.get_spec("aggregated_grad_h_soa")
-        total_elements = in_buf_spec[0][0]
-        padded_total_modules = in_buf_spec[0][1]
-
-        gsize = pad_to_multiple(total_elements, lsize)
-
+        spec = self.b.get_spec(in_ref)[0]
+        total_elems, padded_m = spec[0], spec[1]
         args = (
             cl.LocalMemory(lsize * self.scalar_size),
-            self.b.get("aggregated_grad_h_soa"),
-            self.b.get("final_grad_h_buf"),
-            np.int32(total_elements),
+            self.b.get_cl_buffer(in_ref),
+            self.b.get_cl_buffer(out_ref),
+            np.int32(total_elems),
             np.int32(NUM_MODULES),
-            np.int32(padded_total_modules),
+            np.int32(padded_m),
         )
-        return self.p.reduce_grad_h_over_modules(queue, (gsize,), (lsize,), *args, wait_for=wait_for)
+        return self.p.reduce_grad_h_over_modules(
+            q, (pad_to_multiple(total_elems, lsize),), (lsize,), *args, wait_for=wait_for
+        )
 
-    def launch_backprop_shared_chunk(self, queue, chunk_id, offset, num_samples, wait_for) -> Tuple[cl.Event, cl.Event]:
-        lsize = 256
+    def launch_backprop_shared_chunk(
+        self, q, wait_for, chunk_id, offset, num_samples, in_ref, h_ref, gh_ref, mask_ref, gsw_out_ref, gsb_out_ref
+    ) -> Tuple[cl.Event, cl.Event]:
+        l = 256
         sw_evt = self.p.backprop_shared_weights_chunk(
-            queue,
-            (self.padded_input_dim, pad_to_multiple(self.padded_hidden_dim, lsize)),
-            (1, lsize),
-            cl.LocalMemory(lsize * self.scalar_size),
-            self.b.get("input_buf"),
-            self.b.get("hidden_buf"),
-            self.b.get("final_grad_h_buf"),
-            self.b.get("sample_mask"),
-            self.b.get("partial_grad_sw_out"),
+            q,
+            (self.padded_input_dim, pad_to_multiple(self.padded_hidden_dim, l)),
+            (1, l),
+            cl.LocalMemory(l * self.scalar_size),
+            self.b.get_cl_buffer(in_ref),
+            self.b.get_cl_buffer(h_ref),
+            self.b.get_cl_buffer(gh_ref),
+            self.b.get_cl_buffer(mask_ref),
+            self.b.get_cl_buffer(gsw_out_ref),
             np.int32(offset),
             np.int32(num_samples),
             np.int32(chunk_id),
@@ -646,14 +622,14 @@ class KernelExecutor:
             wait_for=wait_for,
         )
         sb_evt = self.p.backprop_shared_biases_chunk(
-            queue,
-            (pad_to_multiple(self.padded_hidden_dim, lsize),),
-            (lsize,),
-            cl.LocalMemory(lsize * self.scalar_size),
-            self.b.get("hidden_buf"),
-            self.b.get("final_grad_h_buf"),
-            self.b.get("sample_mask"),
-            self.b.get("partial_grad_sb_out"),
+            q,
+            (pad_to_multiple(self.padded_hidden_dim, l),),
+            (l,),
+            cl.LocalMemory(l * self.scalar_size),
+            self.b.get_cl_buffer(h_ref),
+            self.b.get_cl_buffer(gh_ref),
+            self.b.get_cl_buffer(mask_ref),
+            self.b.get_cl_buffer(gsb_out_ref),
             np.int32(offset),
             np.int32(num_samples),
             np.int32(chunk_id),
@@ -662,40 +638,68 @@ class KernelExecutor:
         )
         return sw_evt, sb_evt
 
-    def launch_adam_update_and_clamp(self, queue, p: Parameter, grad_ready_event, t: int) -> cl.Event:
-        num_params = int(np.prod(self.b.get_spec(p.name)[0]))
-        update_evt = self.p.adam_update(
-            queue,
-            (num_params,),
+    def launch_adam_update_and_clamp(self, q, wait_for, t: int, p: Parameter) -> cl.Event:
+        n_params = int(np.prod(self.b.get_spec(p.name)[0]))
+        up_evt = self.p.adam_update(
+            q,
+            (n_params,),
             None,
-            self.b.get(p.grad),
+            self.b.get_cl_buffer(p.grad),
             SCALAR_NP_TYPE(ADAM_BETA1),
             SCALAR_NP_TYPE(ADAM_BETA2),
             SCALAR_NP_TYPE(LEARNING_RATE),
             SCALAR_NP_TYPE(EPSILON),
             np.uint32(t),
-            self.b.get(p.name),
-            self.b.get(p.m1),
-            self.b.get(p.m2),
+            self.b.get_cl_buffer(p.name),
+            self.b.get_cl_buffer(p.m1),
+            self.b.get_cl_buffer(p.m2),
             np.int32(0),
-            np.int32(num_params),
-            wait_for=[grad_ready_event],
+            np.int32(n_params),
+            wait_for=wait_for,
         )
         if p.role == BufferRole.TEMPERATURES:
             return self.p.clamp_temperatures(
-                queue,
+                q,
                 (NUM_MODULES,),
                 None,
-                self.b.get("temps"),
+                self.b.get_cl_buffer("temps"),
                 SCALAR_NP_TYPE(MIN_TEMP),
                 SCALAR_NP_TYPE(MAX_TEMP),
                 np.int32(NUM_MODULES),
-                wait_for=[update_evt],
+                wait_for=[up_evt],
             )
-        return update_evt
+        return up_evt
 
 
-# --- Layer 2: Strategic Layer ---
+class PingPongManager:
+    """Manages a pair of recyclable 'ping-pong' buffers for a reduction tree."""
+
+    def __init__(self):
+        self.ping_handle: Optional[BufferHandle] = None
+        self.pong_handle: Optional[BufferHandle] = None
+        self._is_ping_input = True
+
+    def initialize(self, buffer_mgr: BufferManager, max_bytes: int):
+        self.ping_handle = buffer_mgr.acquire_transient_buffer(max_bytes)
+        self.pong_handle = buffer_mgr.acquire_transient_buffer(max_bytes)
+
+    def get_io_handles(self) -> Tuple[BufferHandle, BufferHandle]:
+        return (self.ping_handle, self.pong_handle) if self._is_ping_input else (self.pong_handle, self.ping_handle)
+
+    def swap(self):
+        self._is_ping_input = not self._is_ping_input
+
+    def get_final_buffer_handle(self) -> BufferHandle:
+        return self.get_io_handles()[1]
+
+    def release(self, buffer_mgr: BufferManager):
+        if self.ping_handle:
+            buffer_mgr.release_transient_buffer(self.ping_handle)
+        if self.pong_handle:
+            buffer_mgr.release_transient_buffer(self.pong_handle)
+
+
+# --- Layer 2 / Layer 3 ---
 
 
 class ExecutionStrategy:
@@ -706,47 +710,102 @@ class ExecutionStrategy:
         self.b = buffer_mgr
 
     def create_plan_for_batch(self, batch_size: int) -> ExecutionPlan:
-        """Determines the optimal 2D tiling grid based on memory constraints."""
-        hidden_size = self.b.get_byte_size("hidden_buf")
-        full_problem_mem = (
-            self.b.get_byte_size("full_logits_out")
-            + self.b.get_byte_size("partial_probs_out")
-            + self.b.get_byte_size("partial_grad_h_aos_out")
+        hidden_size = self.b.get_cl_buffer("hidden_buf").size
+        full_problem_mem = sum(
+            self.b.get_cl_buffer(n).size for n in ["full_logits_out", "partial_probs_out", "partial_grad_h_aos_out"]
         )
-        mem_per_module_slice = full_problem_mem / max(1, NUM_MODULES)
-        mem_per_class_slice = full_problem_mem / max(1, OUTPUT_CLASSES)
-        num_m_chunks, num_c_chunks = 1, 1
-
+        nm_chunks, nc_chunks = 1, 1
         while True:
-            mem_per_tile = full_problem_mem / (num_m_chunks * num_c_chunks)
+            mem_per_tile = full_problem_mem / (nm_chunks * nc_chunks)
             if mem_per_tile <= self.vram_budget:
                 break
-            cost_of_module_dim = mem_per_module_slice * (NUM_MODULES / num_m_chunks)
-            cost_of_class_dim = mem_per_class_slice * (OUTPUT_CLASSES / num_c_chunks)
-            if cost_of_module_dim >= cost_of_class_dim:
-                num_m_chunks += 1
+            cost_m, cost_c = full_problem_mem / nm_chunks, full_problem_mem / nc_chunks
+            if cost_m >= cost_c:
+                nm_chunks += 1
             else:
-                num_c_chunks += 1
-            if (num_m_chunks * num_c_chunks) > MAX_TOTAL_TILES:
-                raise MemoryError("Cannot create a tile small enough for device VRAM.")
-        grid = ExecutionGrid(num_m_chunks, num_c_chunks, NUM_MODULES, OUTPUT_CLASSES)
-
-        mem_per_tile_final = full_problem_mem / grid.total_tiles
-        recompute_hidden = (hidden_size + mem_per_tile_final) > self.vram_budget
-        num_batch_chunks = (batch_size + BACKPROP_STREAM_CHUNK_SIZE - 1) // BACKPROP_STREAM_CHUNK_SIZE
-        batch_cfg = ChunkingConfig(min(num_batch_chunks, MAX_BATCH_CHUNKS), BACKPROP_STREAM_CHUNK_SIZE, batch_size)
-
+                nc_chunks += 1
+            if (nm_chunks * nc_chunks) > (REDUCTION_BATCH_SIZE_K * 1024):
+                raise MemoryError("Cannot create a tile small enough for VRAM.")
+        grid = ExecutionGrid(nm_chunks, nc_chunks, NUM_MODULES, OUTPUT_CLASSES)
+        recompute_hidden, num_b_chunks = (hidden_size + mem_per_tile) > self.vram_budget, (
+            batch_size + BACKPROP_STREAM_CHUNK_SIZE - 1
+        ) // BACKPROP_STREAM_CHUNK_SIZE
+        batch_cfg, reduction_plan = ChunkingConfig(
+            min(num_b_chunks, MAX_BATCH_CHUNKS), BACKPROP_STREAM_CHUNK_SIZE, batch_size
+        ), ReductionPlan(k=REDUCTION_BATCH_SIZE_K)
         print(
-            f"INFO: Determined a {grid.num_module_chunks}x{grid.num_class_chunks} tiling grid ({grid.total_tiles} total tiles)."
+            f"INFO: Determined a {grid.num_module_chunks}x{grid.num_class_chunks} grid ({grid.total_tiles} tiles). Recompute Hidden: {recompute_hidden}."
         )
-        print("  - Strategy: Unified INTERLEAVED_STREAMING backprop for Grad_H.")
-        if recompute_hidden:
-            print("INFO: Extreme memory pressure. `hidden` buffer will be recomputed.")
-
-        return ExecutionPlan(grid, batch_cfg, recompute_hidden)
+        return ExecutionPlan(grid, batch_cfg, reduction_plan, recompute_hidden)
 
 
-# --- Layer 3: Execution Layer ---
+class RecursiveAggregator:
+    """Stateful engine executing a dynamic, multi-stage reduction tree."""
+
+    def __init__(self, queue: cl.CommandQueue, executor: KernelExecutor):
+        self.queue, self.executor, self.ppm = queue, executor, PingPongManager()
+
+    def execute(
+        self,
+        plan: ReductionPlan,
+        in_ref: str,
+        out_ref: str,
+        n_partials: int,
+        elems_per_partial: int,
+        is_avg: bool,
+        wait_for: List[cl.Event],
+    ) -> cl.Event:
+        if n_partials <= 1:
+            return self.executor.launch_aggregation(self.queue, wait_for, in_ref, out_ref, 1, elems_per_partial, is_avg)
+        k = plan.k
+        scalar_size = self.executor.scalar_size
+        l1_n_partials = (n_partials + k - 1) // k
+        max_bytes = int(l1_n_partials * elems_per_partial * scalar_size)
+        self.ppm.initialize(self.executor.b, max_bytes)
+        _, first_out_handle = self.ppm.get_io_handles()
+        stage_evts = []
+        for i in range(0, n_partials, k):
+            n_now = min(k, n_partials - i)
+            evt = self.executor.launch_aggregation(
+                self.queue,
+                wait_for,
+                in_ref,
+                first_out_handle,
+                n_now,
+                elems_per_partial,
+                False,
+                in_offset_e=i * elems_per_partial,
+                out_offset_e=(i // k) * elems_per_partial,
+            )
+            stage_evts.append(evt)
+        self.ppm.swap()
+        current_n_partials, dependencies = l1_n_partials, stage_evts
+        while current_n_partials > 1:
+            n_outs = (current_n_partials + k - 1) // k
+            in_handle, out_handle = self.ppm.get_io_handles()
+            stage_evts = []
+            for i in range(0, current_n_partials, k):
+                n_now = min(k, current_n_partials - i)
+                evt = self.executor.launch_aggregation(
+                    self.queue,
+                    dependencies,
+                    in_handle,
+                    out_handle,
+                    n_now,
+                    elems_per_partial,
+                    False,
+                    in_offset_e=i * elems_per_partial,
+                    out_offset_e=(i // k) * elems_per_partial,
+                )
+                stage_evts.append(evt)
+            self.ppm.swap()
+            current_n_partials, dependencies = n_outs, stage_evts
+        final_handle = self.ppm.get_final_buffer_handle()
+        final_evt = self.executor.launch_aggregation(
+            self.queue, dependencies, final_handle, out_ref, 1, elems_per_partial, is_avg
+        )
+        self.ppm.release(self.executor.b)
+        return final_evt
 
 
 class BatchProcessor:
@@ -754,162 +813,225 @@ class BatchProcessor:
 
     def __init__(self, orchestrator: "TrainingOrchestrator", X_batch: np.ndarray, y_batch: np.ndarray):
         self.orchestrator = orchestrator
-        self.ctx, self.queue, self.executor = orchestrator.ctx, orchestrator.queue, orchestrator.executor
-        self.events: Dict[str, cl.Event] = {}
-        self.event_lists: Dict[str, List[cl.Event]] = defaultdict(list)
-        self.final_grad_events: Dict[str, cl.Event] = {}
-        self.X_batch, self.y_batch = X_batch, y_batch
-        self.global_step = orchestrator.global_step
-        self.host_probs_view = HostView(
-            self.executor.b.get_spec("final_probs_buf"), (NUM_MODULES, X_batch.shape[0], OUTPUT_CLASSES)
+        self.ctx, self.q, self.ex = orchestrator.ctx, orchestrator.queue, orchestrator.executor
+        self.events, self.event_lists = ({}, defaultdict(list))
+        self.final_grad_events = {}
+        self.X_batch, self.y_batch, self.step = X_batch, y_batch, orchestrator.global_step
+        self.host_probs = HostView(
+            self.ex.b.get_spec("final_probs_buf"), (NUM_MODULES, X_batch.shape[0], OUTPUT_CLASSES)
         )
-        self.host_loss_view = HostView(self.executor.b.get_spec("final_loss_out"), (NUM_MODULES, X_batch.shape[0]))
+        self.host_loss = HostView(self.ex.b.get_spec("final_loss_out"), (NUM_MODULES, X_batch.shape[0]))
+        self.aggregator = RecursiveAggregator(self.q, self.ex)
 
-    def _get_deps(self, *resource_names: str) -> List[cl.Event]:
-        deps = [self.events[name] for name in resource_names if name in self.events]
-        for name in resource_names:
-            deps.extend(self.event_lists.get(name, []))
-        return list(set(deps))
+    def _deps(self, *names: str) -> List[cl.Event]:
+        return list(
+            set(
+                [self.events[n] for n in names if n in self.events]
+                + [e for n in names for e in self.event_lists.get(n, [])]
+            )
+        )
 
     def run(self, plan: ExecutionPlan):
-        print(f"  - Executing Plan: {plan.grid}")
         self._upload_data()
         self._zero_gradients()
-        self.events["hidden_ready"] = self.executor.launch_forward_pass(
-            self.queue, 0, self.X_batch.shape[0], self._get_deps("input_ready", "grads_zeroed")
+        self.events["hidden_ready"] = self.ex.launch_forward_pass(
+            self.q,
+            0,
+            self.X_batch.shape[0],
+            self._deps("input_ready", "grads_zeroed"),
+            "input_buf",
+            "sample_mask",
+            "weights",
+            "biases",
+            "hidden_buf",
+            "hidden_mask",
         )
         self._execute_module_path(plan)
-        self._aggregate_and_backprop_shared(plan)
+        self._aggregate_and_backprop(plan)
         self._finalize_and_update()
         return self.get_sync_points()
 
     def _upload_data(self):
-        write_X = self.executor.enqueue_write_buffer(self.queue, "input_buf", self.X_batch, None)
-        write_mask = self.executor.enqueue_write_buffer(
-            self.queue, "sample_mask", np.ones(self.X_batch.shape[0], dtype=SCALAR_NP_TYPE), None
+        wX, wM = self.ex.enqueue_write_buffer(self.q, "input_buf", self.X_batch, None), self.ex.enqueue_write_buffer(
+            self.q, "sample_mask", np.ones(self.X_batch.shape[0], SCALAR_NP_TYPE), None
         )
-        self.events["input_ready"] = cl.WaitForEvents([write_X, write_mask])
-        self.events["targets_ready"] = self.executor.enqueue_write_buffer(self.queue, "targets_buf", self.y_batch, None)
+        self.events["input_ready"] = cl.WaitForEvents([wX, wM])
+        self.events["targets_ready"] = self.ex.enqueue_write_buffer(self.q, "targets_buf", self.y_batch, None)
 
     def _zero_gradients(self):
-        grad_names = [name for name in self.executor.b.buffers if "grad_" in name]
-        zero_events = [self.executor.enqueue_fill_buffer(self.queue, name, 0, None) for name in grad_names]
-        self.events["grads_zeroed"] = cl.WaitForEvents(zero_events)
+        self.events["grads_zeroed"] = cl.WaitForEvents(
+            [self.ex.enqueue_fill_buffer(self.q, n, 0, None) for n in self.ex.b._name_to_handle if "grad_" in n]
+        )
 
     def _execute_module_path(self, plan: ExecutionPlan):
-        """Executes the module/class path using a two-pass approach to respect the CCE softmax synchronization point."""
         tiles = list(plan.grid)
-        logit_deps = self._get_deps("hidden_ready")
         for tile in tiles:
             if tile.num_modules_in_tile > 0 and tile.num_classes_in_tile > 0:
-                evt = self.executor.launch_compute_logits_chunk(self.queue, tile, logit_deps)
+                evt = self.ex.launch_compute_logits_chunk(
+                    self.q,
+                    tile,
+                    self._deps("hidden_ready"),
+                    "hidden_buf",
+                    "hidden_mask",
+                    "module_weights",
+                    "module_biases",
+                    "full_logits_out",
+                )
                 self.event_lists["logit_chunks_ready"].append(evt)
         self.events["all_logits_ready"] = cl.WaitForEvents(self.event_lists["logit_chunks_ready"])
-
         if PROBLEM_TYPE == "CCE":
-            self.events["softmax_params_ready"] = self.executor.launch_reduce_for_softmax(
-                self.queue, self._get_deps("all_logits_ready")
+            self.events["softmax_params_ready"] = self.ex.launch_reduce_for_softmax(
+                self.q, self._deps("all_logits_ready"), "full_logits_out", "temps", "softmax_params_out"
             )
-
         for tile in tiles:
             if tile.num_modules_in_tile > 0 and tile.num_classes_in_tile > 0:
-                self._launch_tile_downstream_work(tile, plan)
+                self._launch_tile_downstream_work(tile)
         self.events["all_prob_loss_chunks_ready"] = cl.WaitForEvents(self.event_lists["prob_loss_chunks_ready"])
 
-    def _launch_tile_downstream_work(self, tile: WorkTile, plan: ExecutionPlan):
-        """Launches all kernels for a tile that come AFTER the logit/softmax sync point."""
-        prob_loss_deps = self._get_deps("softmax_params_ready", "targets_ready", "all_logits_ready")
-        prob_loss_evt = self.executor.launch_compute_probs_loss_cce_chunk(self.queue, tile, prob_loss_deps)
-        self.event_lists["prob_loss_chunks_ready"].append(prob_loss_evt)
-        grad_base_deps = self._get_deps("hidden_ready", "all_logits_ready", "targets_ready")
-        grad_base_deps.append(prob_loss_evt)
-        w_grad, h_grad, t_grad = self.executor.launch_parallel_module_grads(self.queue, tile, grad_base_deps)
-        self.event_lists["partial_grad_w_ready"].append(w_grad)
-        self.event_lists["partial_grad_t_ready"].append(t_grad)
+    def _launch_tile_downstream_work(self, tile: WorkTile):
+        deps = self._deps("softmax_params_ready", "targets_ready", "all_logits_ready")
+        evt = self.ex.launch_compute_probs_loss_cce_chunk(
+            self.q,
+            tile,
+            deps,
+            "full_logits_out",
+            "softmax_params_out",
+            "temps",
+            "targets_buf",
+            "sample_mask",
+            "partial_probs_out",
+            "final_loss_out",
+        )
+        self.event_lists["prob_loss_chunks_ready"].append(evt)
+        grad_deps = self._deps("hidden_ready", "all_logits_ready", "targets_ready") + [evt]
+        w, h, t = self.ex.launch_parallel_module_grads(
+            self.q,
+            tile,
+            grad_deps,
+            "hidden_buf",
+            "partial_probs_out",
+            "targets_buf",
+            "sample_mask",
+            "module_weights",
+            "partial_grad_module_w_out",
+            "partial_grad_module_b_out",
+            "partial_grad_h_aos_out",
+            "full_logits_out",
+            "temps",
+            "partial_grad_temps_out",
+        )
+        self.event_lists["partial_grad_w_ready"].append(w)
+        self.event_lists["partial_grad_t_ready"].append(t)
+        in_sp, out_sp = self.ex.b.get_spec("partial_grad_h_aos_out")[0], self.ex.b.get_spec("partial_grad_h_soa_out")[0]
+        in_off, out_off = tile.flat_tile_id * (in_sp[1] * in_sp[2] * in_sp[3]), tile.flat_tile_id * (
+            out_sp[1] * out_sp[2]
+        )
+        rows, cols = tile.num_modules_in_tile, BATCH_SIZE * HIDDEN_DIM
+        tp_evt = self.ex.launch_transpose_chunk(
+            self.q,
+            [h],
+            "partial_grad_h_aos_out",
+            "partial_grad_h_soa_out",
+            in_off,
+            out_off,
+            rows,
+            cols,
+            cols,
+            out_sp[2],
+        )
+        self.event_lists["partial_grad_h_soa_ready"].append(tp_evt)
 
-        # ---- The Unified Path ----
-        # The interleaved transpose-as-you-go approach is always optimal and is required by the aggregation logic.
-        transpose_evt = self.executor.launch_grad_h_transpose_for_tile(self.queue, tile, wait_for=[h_grad])
-        self.event_lists["partial_grad_h_soa_ready"].append(transpose_evt)
-
-    def _aggregate_and_backprop_shared(self, plan: ExecutionPlan):
-        b = self.executor.b
-        get_elem = lambda name: int(np.prod(b.get_spec(name)[0]))
-
-        # --- Aggregate all partials from the module/class grid ---
-        self.events["final_probs_ready"] = self.executor.launch_aggregation(
-            self.queue,
+    def _aggregate_and_backprop(self, plan: ExecutionPlan):
+        b, rp, g = self.ex.b, plan.reduction_plan, plan.grid
+        get_spec, get_elem = b.get_spec, lambda r: int(np.prod(b.get_spec(r)[0]))
+        self.events["final_probs_ready"] = self.aggregator.execute(
+            rp,
             "partial_probs_out",
             "final_probs_buf",
-            plan.grid.total_tiles,
+            g.total_tiles,
             get_elem("final_probs_buf"),
             False,
-            self._get_deps("all_prob_loss_chunks_ready"),
+            self._deps("all_prob_loss_chunks_ready"),
         )
-        self.final_grad_events["grad_module_weights"] = self.executor.launch_aggregation(
-            self.queue,
+        self.final_grad_events["grad_module_weights"] = self.aggregator.execute(
+            rp,
             "partial_grad_module_w_out",
             "grad_module_weights",
-            plan.grid.total_tiles,
+            g.total_tiles,
             get_elem("grad_module_weights"),
             False,
             self.event_lists["partial_grad_w_ready"],
         )
-        self.final_grad_events["grad_module_biases"] = self.executor.launch_aggregation(
-            self.queue,
+        self.final_grad_events["grad_module_biases"] = self.aggregator.execute(
+            rp,
             "partial_grad_module_b_out",
             "grad_module_biases",
-            plan.grid.total_tiles,
+            g.total_tiles,
             get_elem("grad_module_biases"),
             False,
             self.event_lists["partial_grad_w_ready"],
         )
-        self.final_grad_events["grad_temps"] = self.executor.launch_aggregation(
-            self.queue,
+        self.final_grad_events["grad_temps"] = self.aggregator.execute(
+            rp,
             "partial_grad_temps_out",
             "grad_temps",
-            plan.grid.total_tiles,
+            g.total_tiles,
             get_elem("grad_temps"),
             False,
             self.event_lists["partial_grad_t_ready"],
         )
-
-        # --- Path for Grad_H ---
-        agg_grad_h_evt = self.executor.launch_aggregation(
-            self.queue,
+        agg_h_evt = self.aggregator.execute(
+            rp,
             "partial_grad_h_soa_out",
             "aggregated_grad_h_soa",
-            plan.grid.total_tiles,
+            g.total_tiles,
             get_elem("aggregated_grad_h_soa"),
             False,
-            self.event_lists["partial_grad_h_soa_ready"],  # Depends on the SoA partials
+            self.event_lists["partial_grad_h_soa_ready"],
         )
-
-        self.events["final_grad_h_ready"] = self.executor.launch_reduce_grad_h_over_modules(
-            self.queue, wait_for=[agg_grad_h_evt]
+        self.events["final_grad_h_ready"] = self.ex.launch_reduce_grad_h_over_modules(
+            self.q, [agg_h_evt], "aggregated_grad_h_soa", "final_grad_h_buf"
         )
-
-        # --- Streaming backprop for the shared layer ---
-        backprop_deps = self._get_deps("final_grad_h_ready")
-        if plan.recompute_hidden:
-            backprop_deps.append(
-                self.executor.launch_forward_pass(self.queue, 0, self.X_batch.shape[0], self._get_deps("input_ready"))
+        deps = self._deps("final_grad_h_ready")
+        (
+            deps.append(
+                self.ex.launch_forward_pass(
+                    self.q,
+                    0,
+                    self.X_batch.shape[0],
+                    self._deps("input_ready"),
+                    "input_buf",
+                    "sample_mask",
+                    "weights",
+                    "biases",
+                    "hidden_buf",
+                    "hidden_mask",
+                )
             )
-        else:
-            backprop_deps.extend(self._get_deps("hidden_ready"))
-
+            if plan.recompute_hidden
+            else deps.extend(self._deps("hidden_ready"))
+        )
         cfg = plan.shared_layer_batch_chunking
         for i in range(cfg.num_chunks):
-            offset, size = i * cfg.chunk_size, min(cfg.chunk_size, cfg.total_dim - offset)
-            if size <= 0:
-                continue
-            sw, sb = self.executor.launch_backprop_shared_chunk(self.queue, i, offset, size, backprop_deps)
-            self.event_lists["partial_grad_sw_ready"].append(sw)
-            self.event_lists["partial_grad_sb_ready"].append(sb)
-
-        # --- Final aggregation for shared layer gradients ---
-        self.final_grad_events["grad_weights"] = self.executor.launch_aggregation(
-            self.queue,
+            off, size = i * cfg.chunk_size, min(cfg.chunk_size, cfg.total_dim - off)
+            if size > 0:
+                sw, sb = self.ex.launch_backprop_shared_chunk(
+                    self.q,
+                    deps,
+                    i,
+                    off,
+                    size,
+                    "input_buf",
+                    "hidden_buf",
+                    "final_grad_h_buf",
+                    "sample_mask",
+                    "partial_grad_sw_out",
+                    "partial_grad_sb_out",
+                )
+                self.event_lists["partial_grad_sw_ready"].append(sw)
+                self.event_lists["partial_grad_sb_ready"].append(sb)
+        self.final_grad_events["grad_weights"] = self.aggregator.execute(
+            rp,
             "partial_grad_sw_out",
             "grad_weights",
             cfg.num_chunks,
@@ -917,8 +1039,8 @@ class BatchProcessor:
             True,
             self.event_lists["partial_grad_sw_ready"],
         )
-        self.final_grad_events["grad_biases"] = self.executor.launch_aggregation(
-            self.queue,
+        self.final_grad_events["grad_biases"] = self.aggregator.execute(
+            rp,
             "partial_grad_sb_out",
             "grad_biases",
             cfg.num_chunks,
@@ -928,35 +1050,22 @@ class BatchProcessor:
         )
 
     def _finalize_and_update(self):
-        self.events["d2h_probs_ready"] = self.host_probs_view.enqueue_read(
-            self.queue, self.executor.b.get("final_probs_buf"), self._get_deps("final_probs_ready")
-        )
+        d2h_deps = self._deps("final_probs_ready")
+        d2h_buf = self.ex.b.get_cl_buffer("final_probs_buf")
+        self.events["d2h_probs_ready"] = self.host_probs.enqueue_read(self.q, d2h_buf, d2h_deps)
         for p in self.orchestrator.params:
-            if p.grad not in self.final_grad_events:
-                continue
-            grad_ready = self.final_grad_events[p.grad]
-            self.event_lists["updates_done"].append(
-                self.executor.launch_adam_update_and_clamp(self.queue, p, grad_ready, self.global_step)
-            )
+            if p.grad in self.final_grad_events:
+                self.event_lists["updates_done"].append(
+                    self.ex.launch_adam_update_and_clamp(self.q, [self.final_grad_events[p.grad]], self.step, p)
+                )
         self.events["all_updates_done"] = cl.WaitForEvents(self.event_lists["updates_done"])
 
     def get_sync_points(self) -> Tuple[cl.UserEvent, cl.UserEvent]:
-        inf_evt, final_evt = cl.UserEvent(self.ctx), cl.UserEvent(self.ctx)
-        d2h_event = self.events.get("d2h_probs_ready")
-        final_done = self.events.get("all_updates_done")
-
-        def set_complete(status, user_event):
-            user_event.set_status(cl.command_execution_status.COMPLETE)
-
-        if d2h_event:
-            d2h_event.set_callback(cl.command_execution_status.COMPLETE, set_complete, inf_evt)
-        else:
-            inf_evt.set_status(cl.command_execution_status.COMPLETE)
-        if final_done:
-            final_done.set_callback(cl.command_execution_status.COMPLETE, set_complete, final_evt)
-        else:
-            final_evt.set_status(cl.command_execution_status.COMPLETE)
-        return inf_evt, final_evt
+        inf, final = cl.UserEvent(self.ctx), cl.UserEvent(self.ctx)
+        cb = lambda s, e: e.set_status(cl.command_execution_status.COMPLETE)
+        self.events.get("d2h_probs_ready", inf).set_callback(cl.command_execution_status.COMPLETE, cb, inf)
+        self.events.get("all_updates_done", final).set_callback(cl.command_execution_status.COMPLETE, cb, final)
+        return inf, final
 
 
 # --- Layer 4: Orchestration Layer ---
@@ -969,12 +1078,13 @@ class TrainingOrchestrator:
         self.ctx = cl.create_some_context(interactive=False)
         self.device = self.ctx.devices[0]
         self.queue = cl.CommandQueue(self.ctx, properties=cl.command_queue_properties.OUT_OF_ORDER_EXEC_MODE_ENABLE)
-        print(f"Using device: {self.device.name} ({self.device.vendor})")
-        print(f"VRAM: {self.device.global_mem_size / 1e9:.2f} GB")
+        print(
+            f"Using device: {self.device.name} ({self.device.vendor}) | VRAM: {self.device.global_mem_size/1e9:.2f} GB"
+        )
         self.simd_width = select_simd_width(self.device)
         self.program = self._compile_kernels()
         self.params: List[Parameter] = [
-            Parameter("weights", BufferRole.SHARED_WEIGHTS, layout=LayoutType.SoA),
+            Parameter("weights", BufferRole.SHARED_WEIGHTS, LayoutType.SoA),
             Parameter("biases", BufferRole.SHARED_BIAS),
             Parameter("module_weights", BufferRole.MODULE_WEIGHTS),
             Parameter("module_biases", BufferRole.MODULE_BIAS),
@@ -994,16 +1104,14 @@ class TrainingOrchestrator:
         self.global_step = 1
 
     def _compile_kernels(self) -> cl.Program:
-        kernel_src = load_and_concatenate_kernels()
         opts = [
             f"-cl-std=CL1.2",
             f"-D SCALAR_TYPE={CL_SCALAR_TYPE}",
             f"-D SIMD_WIDTH={self.simd_width}",
             f"-D C_TILE_SIZE={C_TILE_SIZE}",
+            "-D cl_khr_fp16" if SCALAR_TYPE == "half" else "",
         ]
-        if SCALAR_TYPE == "half":
-            opts.append("-D cl_khr_fp16")
-        return cl.Program(self.ctx, kernel_src).build(options=opts)
+        return cl.Program(self.ctx, load_and_concatenate_kernels()).build(options=opts)
 
     def _setup_buffers(self):
         for p in self.params:
@@ -1022,7 +1130,6 @@ class TrainingOrchestrator:
             self.buffer_mgr.create_buffer(p.grad, BufferRole.FINAL_GRADIENT, LayoutType.AoS, phys_shape, dtype)
             self.buffer_mgr.create_buffer(p.m1, BufferRole.ADAM_MOMENTUM, LayoutType.AoS, phys_shape, dtype)
             self.buffer_mgr.create_buffer(p.m2, BufferRole.ADAM_MOMENTUM, LayoutType.AoS, phys_shape, dtype)
-
         dtype_map = {"targets_buf": np.int32} if PROBLEM_TYPE == "CCE" else {}
         targets_shape = (BATCH_SIZE,) if PROBLEM_TYPE == "CCE" else (BATCH_SIZE, OUTPUT_CLASSES)
         int_buffers = {
@@ -1038,27 +1145,27 @@ class TrainingOrchestrator:
             "softmax_params_out": (BufferRole.INTERMEDIATE, (NUM_MODULES, BATCH_SIZE, 2)),
             "partial_grad_module_w_out": (
                 BufferRole.PARTIAL_GRADIENT,
-                (MAX_TOTAL_TILES, *self.param_shapes["module_weights"]),
+                (REDUCTION_BATCH_SIZE_K, *self.param_shapes["module_weights"]),
             ),
             "partial_grad_module_b_out": (
                 BufferRole.PARTIAL_GRADIENT,
-                (MAX_TOTAL_TILES, *self.param_shapes["module_biases"]),
+                (REDUCTION_BATCH_SIZE_K, *self.param_shapes["module_biases"]),
             ),
-            "partial_grad_temps_out": (BufferRole.PARTIAL_GRADIENT, (MAX_TOTAL_TILES, *self.param_shapes["temps"])),
+            "partial_grad_temps_out": (
+                BufferRole.PARTIAL_GRADIENT,
+                (REDUCTION_BATCH_SIZE_K, *self.param_shapes["temps"]),
+            ),
             "partial_grad_sw_out": (BufferRole.PARTIAL_GRADIENT, (MAX_BATCH_CHUNKS, *self.param_shapes["weights"])),
             "partial_grad_sb_out": (BufferRole.PARTIAL_GRADIENT, (MAX_BATCH_CHUNKS, *self.param_shapes["biases"])),
             "partial_grad_h_aos_out": (
                 BufferRole.PARTIAL_GRADIENT,
-                (MAX_TOTAL_TILES, NUM_MODULES, BATCH_SIZE, HIDDEN_DIM),
+                (REDUCTION_BATCH_SIZE_K, NUM_MODULES, BATCH_SIZE, HIDDEN_DIM),
             ),
             "partial_grad_h_soa_out": (
                 BufferRole.PARTIAL_GRADIENT,
-                (MAX_TOTAL_TILES, BATCH_SIZE * HIDDEN_DIM, NUM_MODULES),
+                (REDUCTION_BATCH_SIZE_K, BATCH_SIZE * HIDDEN_DIM, NUM_MODULES),
             ),
-            # This buffer now holds the result of aggregating the partial SoA chunks.
-            # Its layout is (B*H, M), making it ready for the specialized reduction kernel.
             "aggregated_grad_h_soa": (BufferRole.INTERMEDIATE, (BATCH_SIZE * HIDDEN_DIM, NUM_MODULES)),
-            # This is the final destination for the upstream gradient.
             "final_grad_h_buf": (BufferRole.FINAL_GRADIENT, (BATCH_SIZE, HIDDEN_DIM)),
         }
         for name, (role, shape) in int_buffers.items():
@@ -1074,23 +1181,19 @@ class TrainingOrchestrator:
         X = X[: y.shape[0]]
         X = StandardScaler().fit_transform(X).astype(SCALAR_NP_TYPE)
         y_bce = OneHotEncoder().fit_transform(y.reshape(-1, 1)).toarray().astype(SCALAR_NP_TYPE)
-
         print(f"\n--- Starting training for {EPOCHS} epochs ---")
         for epoch in range(EPOCHS):
             indices = np.arange((epoch * BATCH_SIZE), (epoch * BATCH_SIZE) + BATCH_SIZE) % X.shape[0]
             X_batch, y_batch_int = X[indices], y[indices]
             y_b = y_batch_int.astype(np.int32) if PROBLEM_TYPE == "CCE" else y_bce[indices]
-
             print(f"Epoch {(self.global_step):_} | Batch Size: {X_batch.shape[0]}")
             plan = self.strategy.create_plan_for_batch(X_batch.shape[0])
             processor = BatchProcessor(self, X_batch, y_b)
             inference_event, final_event = processor.run(plan)
-
             inference_event.wait()
-            valid_probs = processor.host_probs_view.get()
+            valid_probs = processor.host_probs.get()
             predicted_classes = np.argmax(valid_probs[0, :, :], axis=1)
             accuracy = np.mean(predicted_classes == y_batch_int) if y_batch_int.size > 0 else 0.0
-
             print(f"  - Inference Latency Path Complete. Accuracy: {accuracy:.2%}")
             final_event.wait()
             print(f"  - Full Training Step Complete.")
@@ -1100,7 +1203,6 @@ class TrainingOrchestrator:
 
 if __name__ == "__main__":
     try:
-        # Create dummy kernel files if they don't exist, to allow the script to run.
         for fname in [
             "kernels.cl.h",
             "chunk_kernels.cl.c",
@@ -1109,18 +1211,15 @@ if __name__ == "__main__":
             "parameter_optim.cl.c",
         ]:
             if not os.path.exists(fname):
-                with open(fname, "w") as f:
-                    f.write(f"// Placeholder for {fname}\n")
-        orchestrator = TrainingOrchestrator()
-        orchestrator.train()
-    except cl.LogicError as e:
-        print(f"A logic error occurred. This often means a kernel argument is wrong. Details: {e}")
-    except cl.MemoryError as e:
-        print(f"A memory error occurred. A buffer might be too large or accessed out of bounds. Details: {e}")
+                open(fname, "w").write(f"// Placeholder for {fname}\n")
+        TrainingOrchestrator().train()
+    except (cl.LogicError, cl.MemoryError) as e:
+        print(f"A CL error occurred: {e}")
     except cl.BuildError as e:
-        print("--- KERNEL BUILD FAILED ---")
-        for dev, log in e.device_logs:
-            print(f"Device: {dev.name}\n--- Build Log ---\n{log}")
+        print(
+            "--- KERNEL BUILD FAILED ---\n"
+            + "\n".join([f"Device: {d.name}\n--- Log ---\n{l}" for d, l in e.device_logs])
+        )
     except Exception as e:
         import traceback
 
