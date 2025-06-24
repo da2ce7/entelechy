@@ -610,7 +610,7 @@ class KernelExecutor:
     def launch_reduce_grad_h_over_modules(self, queue: cl.CommandQueue, wait_for) -> cl.Event:
         """Launches the specialized kernel (13) to reduce Grad_H over the module dimension."""
         lsize = 256
-        in_buf_spec = self.b.get_spec("agg_grad_h_module_major_buf")
+        in_buf_spec = self.b.get_spec("aggregated_grad_h_soa")
         total_elements = in_buf_spec[0][0]
         padded_total_modules = in_buf_spec[0][1]
 
@@ -618,7 +618,7 @@ class KernelExecutor:
 
         args = (
             cl.LocalMemory(lsize * self.scalar_size),
-            self.b.get("agg_grad_h_module_major_buf"),
+            self.b.get("aggregated_grad_h_soa"),
             self.b.get("final_grad_h_buf"),
             np.int32(total_elements),
             np.int32(NUM_MODULES),
@@ -878,9 +878,9 @@ class BatchProcessor:
         agg_grad_h_evt = self.executor.launch_aggregation(
             self.queue,
             "partial_grad_h_soa_out",
-            "agg_grad_h_module_major_buf",
+            "aggregated_grad_h_soa",
             plan.grid.total_tiles,
-            get_elem("agg_grad_h_module_major_buf"),
+            get_elem("aggregated_grad_h_soa"),
             False,
             self.event_lists["partial_grad_h_soa_ready"],  # Depends on the SoA partials
         )
@@ -1057,7 +1057,7 @@ class TrainingOrchestrator:
             ),
             # This buffer now holds the result of aggregating the partial SoA chunks.
             # Its layout is (B*H, M), making it ready for the specialized reduction kernel.
-            "agg_grad_h_module_major_buf": (BufferRole.INTERMEDIATE, (BATCH_SIZE * HIDDEN_DIM, NUM_MODULES)),
+            "aggregated_grad_h_soa": (BufferRole.INTERMEDIATE, (BATCH_SIZE * HIDDEN_DIM, NUM_MODULES)),
             # This is the final destination for the upstream gradient.
             "final_grad_h_buf": (BufferRole.FINAL_GRADIENT, (BATCH_SIZE, HIDDEN_DIM)),
         }
