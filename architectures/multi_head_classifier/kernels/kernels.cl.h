@@ -154,7 +154,7 @@ __kernel void compute_logits_chunk(
     __global const SCALAR_TYPE *__restrict module_weights_buf, // [IN]  Shape: (total_modules, hidden_dim, padded_total_output_classes)
     __global const SCALAR_TYPE *__restrict module_biases_buf,  // [IN]  Shape: (total_modules, padded_total_output_classes)
     __global SCALAR_TYPE *__restrict full_logits_out,          // [OUT] Shape: (total_modules, total_batch_size, padded_total_output_classes)
-    int module_chunk_id,                                       // [IN scalar: >= 0]
+    int module_batch_chunk_index,                              // [IN scalar: >= 0]
     int module_param_offset,                                   // [IN scalar: >= 0]
     int num_modules_in_chunk,                                  // [IN scalar: > 0]
     int class_offset,                                          // [IN scalar: >= 0]
@@ -196,7 +196,7 @@ __kernel void compute_probs_loss_cce_chunk(
     __global const SCALAR_TYPE *__restrict sample_mask,        // [IN]  Shape: (total_batch_size)
     __global SCALAR_TYPE *__restrict partial_probs_out,        // [OUT] Shape: (total_modules, total_batch_size, padded_total_output_classes)
     __global SCALAR_TYPE *__restrict final_loss_out,           // [OUT] Shape: (total_modules, total_batch_size)
-    int module_chunk_id,                                       // [IN scalar: >= 0]
+    int module_batch_chunk_index,                              // [IN scalar: >= 0]
     int module_param_offset,                                   // [IN scalar: >= 0]
     int num_modules_in_chunk,                                  // [IN scalar: > 0]
     int class_offset,                                          // [IN scalar: >= 0]
@@ -206,37 +206,43 @@ __kernel void compute_probs_loss_cce_chunk(
     int padded_total_output_classes);                          // [IN scalar: > 0, The physical stride for class dimension]
 
 /**
- * @brief (Node 7b - BCE Path) Computes probabilities and a PARTIAL BCE loss.
- * @contract Computes Sigmoid probabilities and a partial BCE loss. It is designed to be
- *           ROBUST TO MEMORY PADDING, using the physical stride `padded_total_output_classes`
- *           to correctly navigate all class-dimensioned buffers.
- * @usage (Host) BCE Path Only. The `partial_loss_out` buffer must be aggregated.
+ * @brief (Node 7b - BCE Path) Computes probabilities and a PARTIAL BCE loss for a tile.
+ * @contract Computes Sigmoid probabilities and a partial BCE loss. This kernel is a
+ *           Partial Renderer for BOTH of its outputs. It accepts a unique `flat_tile_index`
+ *           from the host to calculate the write offset into the `partial_probs_out` and
+ *           `partial_loss_out` collection buffers, preventing data races. The final
+ *           results must be consolidated by an aggregation kernel.
+ * @usage (Host) BCE Path Only. Called once per tile in the execution grid.
  */
 __kernel void compute_probs_loss_bce_chunk(
     __global const SCALAR_TYPE *__restrict full_logits_buf, // [IN]  Shape: (total_modules, total_batch_size, padded_total_output_classes)
     __global const SCALAR_TYPE *__restrict temps_buf,       // [IN]  Shape: (total_modules)
     __global const SCALAR_TYPE *__restrict targets_bce_buf, // [IN]  Shape: (total_batch_size, padded_total_output_classes)
     __global const SCALAR_TYPE *__restrict sample_mask,     // [IN]  Shape: (total_batch_size)
-    __global SCALAR_TYPE *__restrict partial_probs_out,     // [OUT] Shape: (total_modules, total_batch_size, padded_total_output_classes)
-    __global SCALAR_TYPE *__restrict partial_loss_out,      // [OUT] Shape: (num_class_chunks, total_modules, total_batch_size)
-    int module_chunk_id,                                    // [IN scalar: >= 0]
-    int module_param_offset,                                // [IN scalar: >= 0]
-    int num_modules_in_chunk,                               // [IN scalar: > 0]
-    int class_chunk_id,                                     // [IN scalar: >= 0]
-    int class_offset,                                       // [IN scalar: >= 0]
-    int num_classes_in_chunk,                               // [IN scalar: > 0]
+    __global SCALAR_TYPE *__restrict partial_probs_out,     // [OUT] Shape: (total_tiles, num_modules_in_chunk, total_batch_size, num_classes_in_chunk)
+    __global SCALAR_TYPE *__restrict partial_loss_out,      // [OUT] Shape: (total_tiles, num_modules_in_chunk, total_batch_size)
+    int module_batch_chunk_index,                           // [IN scalar: >= 0, Logical MODULE chunk index for parameter selection]
+    int module_param_offset,                                // [IN scalar: >= 0, Start module index for this chunk]
+    int num_modules_in_chunk,                               // [IN scalar: > 0, Number of modules in this chunk]
+    int class_batch_chunk_index,                            // [IN scalar: >= 0, Logical CLASS chunk index for parameter selection]
+    int flat_tile_index,                                    // [IN scalar: >= 0, The unique flat index for this tile's output placement]
+    int class_offset,                                       // [IN scalar: >= 0, Start class index for this chunk]
+    int num_classes_in_chunk,                               // [IN scalar: > 0, Number of classes in this chunk]
     int total_batch_size,                                   // [IN scalar: > 0]
     int total_output_classes,                               // [IN scalar: > 0, The logical number of classes]
     int padded_total_output_classes,                        // [IN scalar: > 0, The physical stride for class dimension]
     int total_modules);                                     // [IN scalar: > 0]
 
-// --- Phase 8-10: Parallel Gradient Computation ---
+// --- Phase 8-10: Parallel Gradient Computation (Corrected & Harmonized) ---
 
 /**
  * @brief (Node 8) Computes partial module param gradients (Weights, Biases) for a class chunk.
  * @contract Computes a partial gradient via reduction over the batch dimension. It is
  *           designed to be ROBUST TO MEMORY PADDING, using the physical stride
  *           `padded_total_output_classes` to correctly navigate all class-dimensioned buffers.
+ *           The kernel accepts a unique `flat_tile_index` from the host to
+ *           calculate the write offset into the output collection buffers,
+ *           ensuring that parallel invocations do not cause race conditions.
  *           If `problem_type_flag`=0 (CCE), `targets_buf` is `__global int*`.
  *           If `problem_type_flag`=1 (BCE), `targets_buf` is `__global SCALAR_TYPE*`.
  */
@@ -246,13 +252,14 @@ __kernel void calculate_module_param_grads_chunk(
     __global const SCALAR_TYPE *__restrict partial_probs_buf,   // [IN]  Shape: (total_modules, total_batch_size, padded_total_output_classes)
     __global const void *__restrict targets_buf,                // [IN]  Shape: Generic, cast based on problem_type_flag
     __global const SCALAR_TYPE *__restrict sample_mask,         // [IN]  Shape: (total_batch_size)
-    __global SCALAR_TYPE *__restrict partial_grad_module_w_out, // [OUT] Shape: (num_class_chunks, total_modules, h_dim, padded_total_output_classes)
-    __global SCALAR_TYPE *__restrict partial_grad_module_b_out, // [OUT] Shape: (num_class_chunks, total_modules, padded_total_output_classes)
+    __global SCALAR_TYPE *__restrict partial_grad_module_w_out, // [OUT] Shape: (total_tiles, total_modules, h_dim, padded_total_output_classes)
+    __global SCALAR_TYPE *__restrict partial_grad_module_b_out, // [OUT] Shape: (total_tiles, total_modules, padded_total_output_classes)
     int problem_type_flag,                                      // [IN scalar: 0|1, CCE or BCE]
-    int module_chunk_id,                                        // [IN scalar: >= 0]
+    int module_batch_chunk_index,                               // [IN scalar: >= 0]
     int module_param_offset,                                    // [IN scalar: >= 0]
     int num_modules_in_chunk,                                   // [IN scalar: > 0]
-    int class_chunk_id,                                         // [IN scalar: >= 0]
+    int class_batch_chunk_index,                                // [IN scalar: >= 0, Logical CLASS chunk index for parameter selection]
+    int flat_tile_index,                                        // [IN scalar: >= 0, The unique flat index for this tile's output placement]
     int class_offset,                                           // [IN scalar: >= 0]
     int num_classes_in_chunk,                                   // [IN scalar: > 0]
     int total_batch_size,                                       // [IN scalar: > 0]
@@ -267,6 +274,8 @@ __kernel void calculate_module_param_grads_chunk(
  * @contract Produces a partial upstream gradient via reduction over the class dimension.
  *           It is designed to be ROBUST TO MEMORY PADDING, using the physical stride
  *           `padded_total_output_classes` to correctly navigate all class-dimensioned buffers.
+ *           The kernel accepts a unique `flat_tile_index` from the host to
+ *           calculate the write offset into the `partial_grad_h_aos_out` collection buffer.
  *           If `problem_type_flag`=0 (CCE), `targets_buf` is `__global int*`.
  *           If `problem_type_flag`=1 (BCE), `targets_buf` is `__global SCALAR_TYPE*`.
  */
@@ -276,12 +285,13 @@ __kernel void backprop_error_to_hidden_chunk(
     __global const void *__restrict targets_buf,               // [IN]  Shape: Generic, cast based on problem_type_flag
     __global const SCALAR_TYPE *__restrict sample_mask,        // [IN]  Shape: (total_batch_size)
     __global const SCALAR_TYPE *__restrict module_weights_buf, // [IN]  Shape: (total_modules, hidden_dim, padded_total_output_classes)
-    __global SCALAR_TYPE *__restrict partial_grad_h_aos_out,   // [OUT] Shape: (num_class_chunks, total_modules, total_batch_size, hidden_dim)
+    __global SCALAR_TYPE *__restrict partial_grad_h_aos_out,   // [OUT] Shape: (total_tiles, total_modules, total_batch_size, hidden_dim)
     int problem_type_flag,                                     // [IN scalar: 0|1, CCE or BCE]
-    int module_chunk_id,                                       // [IN scalar: >= 0]
+    int module_batch_chunk_index,                              // [IN scalar: >= 0]
     int module_param_offset,                                   // [IN scalar: >= 0]
     int num_modules_in_chunk,                                  // [IN scalar: > 0]
-    int class_chunk_id,                                        // [IN scalar: >= 0]
+    int class_batch_chunk_index,                               // [IN scalar: >= 0, Logical CLASS chunk index for parameter selection]
+    int flat_tile_index,                                       // [IN scalar: >= 0, The unique flat index for this tile's output placement]
     int class_offset,                                          // [IN scalar: >= 0]
     int num_classes_in_chunk,                                  // [IN scalar: > 0]
     int total_batch_size,                                      // [IN scalar: > 0]
@@ -295,6 +305,8 @@ __kernel void backprop_error_to_hidden_chunk(
  * @contract Computes a partial gradient via reduction over batch and classes. It is
  *           designed to be ROBUST TO MEMORY PADDING, using the physical stride
  *           `padded_total_output_classes` to correctly navigate all class-dimensioned buffers.
+ *           The kernel accepts a unique `flat_tile_index` from the host to
+ *           calculate the write offset into the `partial_grad_temps_out` collection buffer.
  *           If `problem_type_flag`=0 (CCE), `targets_buf` is `__global int*`.
  *           If `problem_type_flag`=1 (BCE), `targets_buf` is `__global SCALAR_TYPE*`.
  */
@@ -305,12 +317,13 @@ __kernel void calculate_chunk_temp_gradients(
     __global const void *__restrict targets_buf,              // [IN]  Shape: Generic, cast based on problem_type_flag
     __global const SCALAR_TYPE *__restrict sample_mask,       // [IN]  Shape: (total_batch_size)
     __global const SCALAR_TYPE *__restrict temps_buf,         // [IN]  Shape: (total_modules)
-    __global SCALAR_TYPE *__restrict partial_grad_temps_out,  // [OUT] Shape: (num_class_chunks, total_modules)
+    __global SCALAR_TYPE *__restrict partial_grad_temps_out,  // [OUT] Shape: (total_tiles, total_modules)
     int problem_type_flag,                                    // [IN scalar: 0|1, CCE or BCE]
-    int module_chunk_id,                                      // [IN scalar: >= 0]
+    int module_batch_chunk_index,                             // [IN scalar: >= 0]
     int module_param_offset,                                  // [IN scalar: >= 0]
     int num_modules_in_chunk,                                 // [IN scalar: > 0]
-    int class_chunk_id,                                       // [IN scalar: >= 0]
+    int class_batch_chunk_index,                              // [IN scalar: >= 0, Logical CLASS chunk index for parameter selection]
+    int flat_tile_index,                                      // [IN scalar: >= 0, The unique flat index for this tile's output placement]
     int class_offset,                                         // [IN scalar: >= 0]
     int num_classes_in_chunk,                                 // [IN scalar: > 0]
     int total_batch_size,                                     // [IN scalar: > 0]
@@ -321,7 +334,7 @@ __kernel void calculate_chunk_temp_gradients(
 // --- Phase 11: Data Layout Transformation ---
 
 /**
- * @brief (Node 11) Transposes a rectangular slice (chunk) of a matrix.
+ * @brief (Node 11a) Transposes a rectangular slice (chunk) of a matrix.
  * @contract Reads a sub-matrix from `in_buf` and writes its transpose to a
  *           corresponding slice in `out_buf`. It uses element-based offsets
  *           and leading dimension arguments to correctly handle sub-regions
@@ -338,6 +351,28 @@ __kernel void transpose_chunk(
     int num_cols_in_chunk,                         // [IN scalar: > 0, The number of columns in the chunk to process]
     int in_leading_dim,                            // [IN scalar: > 0, The leading dimension (stride) of the IN buffer]
     int out_leading_dim);                          // [IN scalar: > 0, The leading dimension (stride) of the OUT buffer]
+
+/**
+ * @brief (Node 11b) Gathers and permutes scattered partial Grad_H chunks into a single, reduction-ready buffer.
+ * @contract This is a specialized permutation kernel. Each work-item is responsible for
+ *           a single hidden activation (b, h) across all modules. It reads (gathers)
+ *           the gradient contributions for this activation from multiple, non-contiguous
+ *           source partials and writes them into a single, contiguous row in the destination buffer.
+ * @usage (Host) Essential link between chunked backpropagation (Node 9) and specialized
+ *           reduction (Node 13). The host MUST provide correct strides and offsets that map
+ *           the scattered source layout to the dense destination layout.
+ */
+__kernel void gather_and_permute_grad_h(
+    __global const SCALAR_TYPE *__restrict partial_grad_h_aos_buf, // [IN]  Shape: The full collection of partials from (9)
+    __global SCALAR_TYPE *__restrict aggregated_grad_h_soa_out,  // [OUT] Shape: (total_batch_size * hidden_dim, padded_total_modules)
+    int total_batch_size,                                        // [IN scalar: > 0]
+    int hidden_dim,                                              // [IN scalar: > 0]
+    int total_modules,                                           // [IN scalar: > 0, The logical number of modules]
+    int padded_total_modules,                                    // [IN scalar: > 0, The physical stride of the OUT buffer]
+    int num_module_chunks,                                       // [IN scalar: > 0, The number of chunks the module dim was split into]
+    int modules_per_chunk,                                       // [IN scalar: > 0, The number of modules in each partial]
+    int num_class_chunks);                                       // [IN scalar: > 0, The number of chunks the class dim was split into]
+
 
 // --- Phase 12 & 16: Generic Tiered Aggregation Engine ---
 
@@ -427,7 +462,7 @@ __kernel void backprop_shared_weights_chunk(
     __global SCALAR_TYPE *__restrict partial_grad_sw_out,    // [OUT] Shape: (num_batch_chunks, padded_input_dim, padded_hidden_dim)
     int batch_offset,                                        // [IN scalar: >= 0, Start sample index]
     int num_batch_samples,                                   // [IN scalar: > 0, Number of samples in chunk]
-    int batch_chunk_id,                                      // [IN scalar: >= 0, Logical BATCH chunk index]
+    int batch_chunk_index,                                   // [IN scalar: >= 0, Logical BATCH chunk index]
     int padded_input_dim,                                    // [IN scalar: > 0]
     int padded_hidden_dim);                                  // [IN scalar: > 0]
 
@@ -445,7 +480,7 @@ __kernel void backprop_shared_biases_chunk(
     __global SCALAR_TYPE *__restrict partial_grad_sb_out,    // [OUT] Shape: (num_batch_chunks, padded_hidden_dim)
     int batch_offset,                                        // [IN scalar: >= 0, Start sample index]
     int num_batch_samples,                                   // [IN scalar: > 0, Number of samples in chunk]
-    int batch_chunk_id,                                      // [IN scalar: >= 0, Logical BATCH chunk index]
+    int batch_chunk_index,                                   // [IN scalar: >= 0, Logical BATCH chunk index]
     int padded_hidden_dim);                                  // [IN scalar: > 0]
 
 // --- Phase 17-19: Finalization & Dispatch ---

@@ -1,4 +1,3 @@
-
 ## **Architectural Concept: A Unified, Memory-Aware Streaming Classification Engine**
 
 ---
@@ -6,7 +5,7 @@
 ### **Guiding Principles**
 
 1.  **Primacy of Memory Strategy:** The singular goal of the host-side orchestration is to ensure the core computation executes in the fastest possible memory tier (Registers > Local > Global). This principle drives all design decisions, prioritizing memory efficiency over computational complexity.
-2.  **Modular, "Dumb" Kernels:** Kernels are simple, single-purpose modules. The architecture avoids complex branching ("smart" kernels) and monolithic designs in favor of composability, ensuring flexibility and ease of optimization.
+2.  **Modular, "Dumb" Kernels:** Kernels are simple, single-purpose modules. The architecture avoids complex branching ("smart" kernels) and monolithic designs in favor of composability, ensuring flexibility and ease of optimization. *While computationally simple, kernels can be context-aware, relying on the host to provide essential metadata such as a placement index for writing partial results into a larger collection buffer.*
 3.  **Trust the Driver:** Simple kernels are composed into a logical Directed Acyclic Graph (DAG). The architecture trusts the OpenCL driver to handle low-level optimizations like kernel fusion. The number of nodes in the DAG is a non-goal, emphasizing adaptability over rigid structure.
 4.  **Unified Execution Model:** All workflows follow Act (forward pass) then Learn (backpropagation) sequencing, manifesting as either **Sequential Execution Mode**—where Act-Learn phases execute contiguously for pre-labeled batches—or **Event-Triggered Execution Mode**—where Learn-phase execution awaits an external readiness signal post-Act. This split-phase approach ensures consistency across all use cases, enabling predictable behavior and optimized inter-phase pipelining.
 5.  **Architectural Hierarchy:** This system is developed under a strict hierarchy of artifacts to ensure conceptual integrity:
@@ -27,7 +26,7 @@ The architecture is built upon a foundation of modular, reusable kernels that op
 
 At the core of the architecture lies a powerful aggregation engine that implements a **recursive, multi-stage reduction tree**. Rather than generating all `N` partial results before aggregation, this model employs a divide-and-conquer strategy to keep the GPU saturated while minimizing VRAM usage. Governed by a host-configurable parameter, `K`—termed the **Reduction Batch Size**—this engine defines the width of the parallel kernel front at each reduction stage. The process unfolds as follows:
 
-1.  The Host Orchestrator renders the base `N` partial results in batches of `K`.
+1.  The Host Orchestrator dispatches `N` parallel kernel executions, each tasked with computing a single partial result and placing it into a unique slot within a **pre-allocated collection buffer**.
 2.  After each batch of `K` partials is computed, they are immediately reduced by an `aggregate_*` kernel into a single "Level 1" intermediate result.
 3.  This sequence repeats `N/K` times, transforming a large problem of `N` "Level 0" results into a smaller set of `N/K` "Level 1" results.
 4.  The host recursively applies this logic to the "Level 1" results, reducing them in batches of `K` into "Level 2" results, continuing until a single final tensor emerges.
@@ -60,12 +59,13 @@ The host logic serves as a sophisticated yet straightforward orchestrator, respo
 3.  **SIMD-Aware Weight Layout:** To exploit vector processing capabilities and ensure coalesced memory access, the orchestrator transforms shared layer weights into a SIMD-friendly "Struct of Arrays" (SoA) layout before enqueuing kernel (4). Weights shift from a logical `(hidden_dim, input_dim)` matrix to a physical `(hidden_dim/SIMD_WIDTH, input_dim, SIMD_WIDTH)` buffer, embodying the **Primacy of Memory Strategy** as a non-negotiable contract with the `forward_pass` kernel.
 4.  **DAG Construction & Parallel Dispatch:** The orchestrator constructs the multi-phase computational graph, enqueuing kernels according to the selected mode and chunking strategy. Logically independent tasks are enqueued back-to-back without synchronization, fostering parallel workloads.
 5.  **Reduction Planning & Rendering:** For tasks requiring aggregation over a large number of chunks (`N`), the orchestrator acts as a **Reduction Planner**, analyzing problem size and VRAM to set an optimal **Reduction Batch Size (`K`)**. It renders the full `log_K(N)` reduction tree, orchestrating iterative stages of computation and aggregation while managing intermediate buffer lifecycles.
-6.  **Phase Staging Policies:** The orchestrator governs phase intervals through:
+6.  **Partial Result Placement & Indexing:** When dispatching `N` parallel kernels to generate partial results, the orchestrator is responsible for providing each kernel invocation with a unique **Placement Index**. This index corresponds to a specific offset in a shared output buffer, guaranteeing that all `N` partials are written without data loss or race conditions before being passed to the aggregation engine.
+7.  **Phase Staging Policies:** The orchestrator governs phase intervals through:
     - **Temporal Sequencing:** Backward kernels are emitted only after `inference_event`, ensuring phase separation.
     - **Transition Policy Selection:**
       - **Sequential Execution Mode:** Learn kernels are enqueued immediately post-`inference_event` for pre-labeled data, maintaining contiguous execution while preserving the Act/Learn split.
       - **Event-Triggered Execution Mode:** Learn kernels await an external readiness signal for live data, accommodating real-world delays.
-    - **Buffer Lifetime Optimization:** The choice between Cache or Recompute strategies for intermediates (`hidden_i`, `Partial_Probs`) hinges on delay duration and VRAM pressure, balancing efficiency and resource availability.
+    - **Buffer Lifetime Optimization:** The choice between Cache or Recompute strategies for intermediates (`hidden_i`, `PARTIALS_Probs`) hinges on delay duration and VRAM pressure, balancing efficiency and resource availability.
     - **Task Interleaving:** Phases from distinct batches progress concurrently via priority queues, maximizing GPU utilization.
 
 Enforcing an Act/Learn split even for pre-labeled data guarantees consistency in event handling across all use cases, ensuring predictable behavior and enabling optimized inter-phase pipelining.
@@ -137,6 +137,8 @@ graph TD
     %% Phase 0-3: Setup
     subgraph "Phase 0-3: Host Setup & Global Params"
         HL_0[Start Batch]:::host_logic --> HL_1["1. VRAM Budgeting & Chunking"]:::host_logic --> HL_2["2. Read Mode, Manage Activations,<br/>& Plan Reductions"]:::host_logic
+        HL_2 --> HL_Placement["6. Partial Result Placement & Indexing"]:::host_logic
+
         P_Shared[Shared Params]:::param; P_ClassifierModule[Classifier Module Params]:::param; P_Temps[Temp Params]:::param;
         P_Step[Global Step 't']:::param
         Targets[Targets]:::param
@@ -183,7 +185,7 @@ graph TD
                 Softmax_Params & Full_Logits --> L7a_prob
                 SampleMask --> L7a_loss
                 L7a_loss --> FINAL_Loss_CCE[FINAL CCE Loss (no agg needed)]:::final_data
-                L7a_prob --> PARTIAL_Probs[PARTIAL Probabilities [C,R]]:::partial_data
+                L7a_prob --> PARTIALS_Probs["Collection of N<br/>PARTIAL Probabilities [C,R]"]:::partial_data
             end
 
             subgraph "Operating Mode: BCE (Sigmoid Path)"
@@ -193,8 +195,8 @@ graph TD
                 end
                 HL_3 & Full_Logits --> L7b_prob
                 SampleMask --> L7b_loss
-                L7b_loss --> PARTIAL_Loss_BCE[PARTIAL BCE Loss]:::partial_data
-                L7b_prob --> PARTIAL_Probs
+                L7b_loss --> PARTIALS_Loss_BCE["Collection of N<br/>PARTIAL BCE Loss"]:::partial_data
+                L7b_prob --> PARTIALS_Probs
             end
         end
 
@@ -214,6 +216,7 @@ graph TD
         subgraph "Phase 8-11: Per-Tile Streamable Gradient Computation"
             style "Phase 8-11: Per-Tile Streamable Gradient Computation" loop_box
             note_grad_loop["Note: Executes for each tile<br/>in the Execution Grid (N total tiles)"]:::host_logic
+            HL_Placement --> note_grad_loop
 
             subgraph "Parallel Gradient Path (Chunk-Based)"
                 style "Parallel Gradient Path (Chunk-Based)" parallel_group
@@ -224,26 +227,26 @@ graph TD
                         L8_w["Weight Grad Calc γ"]:::logical_step
                         L8_b["Bias Grad Calc γ"]:::logical_step
                     end
-                    PARTIAL_Probs & Targets & SampleMask --> L8_w; PARTIAL_Probs & Targets & SampleMask --> L8_b
+                    PARTIALS_Probs & Targets & SampleMask --> L8_w; PARTIALS_Probs & Targets & SampleMask --> L8_b
                     hidden_i --> L8_w
-                    L8_w --> PARTIAL_Grad_ModW[PARTIAL Grad_ModW]:::partial_data
-                    L8_b --> PARTIAL_Grad_ModB[PARTIAL Grad_ModB]:::partial_data
+                    L8_w --> PARTIALS_Grad_ModW["Collection of N<br/>PARTIAL Grad_ModW"]:::partial_data
+                    L8_b --> PARTIALS_Grad_ModB["Collection of N<br/>PARTIAL Grad_ModB"]:::partial_data
                 end
 
                 subgraph "Upstream Hidden Gradients & Transformation"
                     style "Upstream Hidden Gradients & Transformation" grad_path_b
                     K9["<b>(9) backprop_error_to_hidden_chunk</b>"]:::kernel
-                    PARTIAL_Probs & Targets & P_ClassifierModule & SampleMask --> K9
-                    K9 --> PARTIAL_Grad_H_AoS["PARTIAL Grad_H<br/>(AoS Layout)"]:::partial_data
-                    PARTIAL_Grad_H_AoS --> K11["<b>(11) transpose_chunk</b><br/>(on partial Grad_H)"]:::transpose_kernel
-                    K11 --> PARTIAL_Grad_H_SoA["PARTIAL Grad_H<br/>(SoA Layout)"]:::partial_data
+                    PARTIALS_Probs & Targets & P_ClassifierModule & SampleMask --> K9
+                    K9 --> PARTIALS_Grad_H_AoS["Collection of N<br/>PARTIAL Grad_H (AoS)"]:::partial_data
+                    PARTIALS_Grad_H_AoS --> K11["<b>(11) transpose_chunk</b><br/>(on partial Grad_H)"]:::transpose_kernel
+                    K11 --> PARTIALS_Grad_H_SoA["Collection of N<br/>PARTIAL Grad_H (SoA)"]:::partial_data
                 end
 
                 subgraph "Temperature Gradients"
                     style "Temperature Gradients" grad_path_c
                     K10["<b>(10) calculate_chunk_temp_gradients</b>"]:::kernel
-                    PARTIAL_Probs & Full_Logits & Targets & P_Temps & SampleMask --> K10
-                    K10 --> PARTIAL_Grad_Temps[PARTIAL Grad_Temps]:::partial_data
+                    PARTIALS_Probs & Full_Logits & Targets & P_Temps & SampleMask --> K10
+                    K10 --> PARTIALS_Grad_Temps["Collection of N<br/>PARTIAL Grad_Temps"]:::partial_data
                 end
             end
         end
@@ -253,7 +256,7 @@ graph TD
              K_Recursive_12["<b>(12) Recursive Reduction Engine</b><br/>(Processes N partials in batches of K)"]:::host_logic
         end
 
-        PARTIAL_Probs & PARTIAL_Loss_BCE & PARTIAL_Grad_ModW & PARTIAL_Grad_ModB & PARTIAL_Grad_Temps & PARTIAL_Grad_H_SoA -- "Streamed Partial Results" --> K_Recursive_12
+        PARTIALS_Probs & PARTIALS_Loss_BCE & PARTIALS_Grad_ModW & PARTIALS_Grad_ModB & PARTIALS_Grad_Temps & PARTIALS_Grad_H_SoA -- "Input: Buffers of N discrete partials" --> K_Recursive_12
 
         K_Recursive_12 --> FINAL_Probs[Final Probs]:::final_data & FINAL_BCE_Loss[Final BCE Loss]:::final_data & AGG_Grad_H_SoA["Aggregated Grad_H<br/>(B*H, M Layout)"]:::full_intermediate
         K_Recursive_12 --> FINAL_Grad_ModW[Final Grad_ModW]:::final_data & FINAL_Grad_ModB[Final Grad_ModB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
@@ -267,11 +270,11 @@ graph TD
         subgraph "Phase 14-15: Streaming Shared Layer Backprop"
             style "Phase 14-15: Streaming Shared Layer Backprop" parallel_group
             Input_i[Input Chunk 'i']:::data & SampleMask --> K14["<b>(14) backprop_shared_weights_chunk</b>"]:::kernel
-            K14 --> PARTIAL_Grad_SW_i[PARTIAL Grad_SW 'i']:::partial_data
+            K14 --> PARTIALS_Grad_SW_i["Collection of N<br/>PARTIAL Grad_SW 'i'"]:::partial_data
             hidden_i --> K14 & K15
             FINAL_Grad_H -- slice --> K14 & K15
             SampleMask --> K15["<b>(15) backprop_shared_biases_chunk</b>"]:::kernel
-            K15 --> PARTIAL_Grad_SB_i[PARTIAL Grad_SB 'i']:::partial_data
+            K15 --> PARTIALS_Grad_SB_i["Collection of N<br/>PARTIAL Grad_SB 'i'"]:::partial_data
         end
 
         subgraph "Phase 16: Recursive Shared Gradient Aggregation"
@@ -279,7 +282,7 @@ graph TD
             style "Phase 16: Recursive Shared Gradient Aggregation" loop_box
             K_Recursive_16["(agg) ...<br/>Iterative Reduction"]:::host_logic
         end
-        PARTIAL_Grad_SW_i & PARTIAL_Grad_SB_i -- All Chunks --> K_Recursive_16
+        PARTIALS_Grad_SW_i & PARTIALS_Grad_SB_i -- "Input: Buffers of N discrete partials" --> K_Recursive_16
         K_Recursive_16 --> FINAL_Grad_SW[Final Grad_SW]:::final_data & FINAL_Grad_SB[Final Grad_SB]:::final_data
 
         subgraph "Phase 18-19: Training Path (All Updates)"
@@ -300,6 +303,25 @@ graph TD
 ---
 
 ### Final Kernel & Synchronization Contracts
+
+#### **The Partial Renderer Kernel Contract**
+
+A significant number of kernels in this architecture follow a common pattern: they are **Partial Renderers**. These are streamable, chunk-based kernels that operate on a slice of a larger problem (e.g., a tile of classes, a chunk of the batch) and produce a *partial* result that is intended for later consolidation by the **Recursive, Tiered Aggregation Engine**.
+
+To ensure that `N` parallel invocations of these kernels can write their results into a single collection buffer without data loss or race conditions, all kernels designated as "Partial Renderers" must adhere to the following contractual obligation:
+
+> **The kernel must accept a unique `batch_chunk_index` or `flat_tile_index` (the zero-based index of a tile within a logically multi-dimensional execution grid that has been flattened into a 1D sequence) integer parameter from the host. This index is used to calculate the write offset within its designated output buffer, ensuring each partial result is placed in its correct, discrete slot.**
+
+The following kernels adhere to this contract for one or more of their outputs:
+*   **(7a) `compute_probs_loss_cce_chunk`** (for `partial_probs_out`)
+*   **(7b) `compute_probs_loss_bce_chunk`** (for `partial_loss_out` and `partial_probs_out`)
+*   **(8) `calculate_module_param_grads_chunk`**
+*   **(9) `backprop_error_to_hidden_chunk`**
+*   **(10) `calculate_chunk_temp_gradients`**
+*   **(14) `backprop_shared_weights_chunk`**
+*   **(15) `backprop_shared_biases_chunk`**
+
+> **Note:** *Kernel (7a) presents a special case of this contract for its `final_loss_out` buffer. While it contributes to the final buffer on a chunk-by-chunk basis like all partial renderers, the one-hot nature of CCE targets allows for a 'scatter-write' implementation. This avoids a separate aggregation step for the loss values, serving as a compliant optimization of the general consolidation principle.*
 
 #### **Phase 0-3: Host Setup & Global Params**
 
@@ -330,17 +352,17 @@ graph TD
 #### **Learn Phase Kernels**
 
 - **(8) `calculate_module_param_grads_chunk`**: A streamable kernel computing partial gradients for module weights and biases, robust to memory padding via physical strides. It computes the `(prob - target)` error signal on the fly.
-  - **Contract:** Utilizes `Partial_Probs` and `Targets` to generate gradient contributions, requiring ground truth presence.
+  - **Contract:** Utilizes `Partial_Probs` and `Targets` to generate gradient contributions, requiring ground truth presence. **This kernel adheres to the Partial Renderer Kernel Contract.**
 - **(9) `backprop_error_to_hidden_chunk`**: A streamable kernel computing the partial upstream gradient for the hidden layer (`Grad_H`), robust to memory padding via physical strides.
-  - **Contract:** Backpropagates errors using `Partial_Probs` and `Targets`, producing gradients for upstream layers.
+  - **Contract:** Backpropagates errors using `Partial_Probs` and `Targets`, producing gradients for upstream layers. **This kernel adheres to the Partial Renderer Kernel Contract.**
 - **(10) `calculate_chunk_temp_gradients`**: A streamable kernel computing partial gradients for temperature parameters, robust to memory padding via physical strides.
-  - **Contract:** Derives temperature gradients from `Partial_Probs`, `Full_Logits`, and `Targets`, integrating ground truth data.
+  - **Contract:** Derives temperature gradients from `Partial_Probs`, `Full_Logits`, and `Targets`, integrating ground truth data. **This kernel adheres to the Partial Renderer Kernel Contract.**
 - **(13) `reduce_grad_h_over_modules`**: A specialized reduction kernel summing the module-major `Aggregated Grad_H` buffer, robust to memory padding via physical strides.
   - **Contract:** Consolidates gradient contributions across modules, producing the final `Final_Grad_H`.
 - **(14) `backprop_shared_weights_chunk`**: A streamable backpropagation kernel for shared layer weights, computing partial gradients for a batch chunk.
-  - **Contract:** Processes `Final_Grad_H` and `hidden_i` to update shared weights, requiring Learn-phase data.
+  - **Contract:** Processes `Final_Grad_H` and `hidden_i` to update shared weights, requiring Learn-phase data. **This kernel adheres to the Partial Renderer Kernel Contract.**
 - **(15) `backprop_shared_biases_chunk`**: A streamable backpropagation kernel for shared layer biases, computing partial gradients for a batch chunk.
-  - **Contract:** Updates shared biases using `Final_Grad_H` and `hidden_i`, executed post-Act.
+  - **Contract:** Updates shared biases using `Final_Grad_H` and `hidden_i`, executed post-Act. **This kernel adheres to the Partial Renderer Kernel Contract.**
 - **(18) `adam_update`**: Generic optimizer kernel, invoked multiple times for different parameter groups. It accepts the global step `t` for numerical stability and relies on the host to provide parameter, gradient, and momentum buffers with identical physical layouts.
   - **Contract:** Applies Adam optimization to update parameters, integrating Learn-phase gradients.
 - **(19) `clamp_temperatures`**: Final utility kernel constraining temperature parameters.
@@ -349,10 +371,10 @@ graph TD
 #### **Phase-Dependant Utility Kernels**
 
 - **(7a) `compute_probs_loss_cce_chunk`**: Invoked when `Operating Mode` is `CCE`. A streamable kernel computing probabilities and final CCE loss, robust to memory padding via physical strides.
-  - **Contract:** Computes probabilities from `Full_Logits` and `Softmax Denominators`, with loss calculation deferred to the Learn phase if ground truth is unavailable during Act.
+  - **Contract:** Computes probabilities from `Full_Logits` and `Softmax Denominators`, with loss calculation deferred to the Learn phase if ground truth is unavailable during Act. **This kernel adheres to the Partial Renderer Kernel Contract for its `partial_probs_out` output.**
   - **Phase Compatibility Note:** Designed for Act Phase execution for probability calculation; Learn Phase for loss calculation if ground truth is provided.
 - **(7b) `compute_probs_loss_bce_chunk`**: Invoked when `Operating Mode` is `BCE`. A streamable kernel computing probabilities and partial BCE loss, robust to memory padding via physical strides.
-  - **Contract:** Generates probabilities from `Full_Logits`, with loss calculation deferred to the Learn phase pending ground truth availability.
+  - **Contract:** Generates probabilities from `Full_Logits`, with loss calculation deferred to the Learn phase pending ground truth availability. **This kernel adheres to the Partial Renderer Kernel Contract for its `partial_loss_out` and `partial_probs_out` outputs.**
   - **Phase Compatibility Note:** Designed for Act Phase execution for probability calculation; Learn Phase for loss calculation if ground truth is provided.
 
 #### **Phase-Agnostic Utility Kernels**
@@ -388,7 +410,7 @@ graph TD
 - **Scenario: The Real-Time Trader (Event-Triggered Execution Mode Validation)**
 
   - **Description:** A high-frequency trading system where market data streams in continuously. The system must make instant predictions (Act phase) to execute trades, while trade outcomes (labels) arrive after a delay (e.g., 500ms). The Learn phase is triggered only when labels become available.
-  - **Validation Focus:** Assesses the system's ability to release VRAM after the Act phase, freeing GPU resources during the delay. When the Learn phase starts, it recomputes intermediates (e.g., `hidden_i`, `Partial_Probs`) efficiently for backpropagation. Success is gauged by balancing recomputation costs against memory availability.
+  - **Validation Focus:** Assesses the system's ability to release VRAM after the Act phase, freeing GPU resources during the delay. When the Learn phase starts, it recomputes intermediates (e.g., `PARTIALS_Probs`) efficiently for backpropagation. Success is gauged by balancing recomputation costs against memory availability.
   - **Key Insight:** Demonstrates the architecture's strength in real-time, event-driven scenarios, efficiently managing resources and enabling delayed learning without sacrificing performance.
 
 - **Scenario: The Marathon (Massive `epochs`)**

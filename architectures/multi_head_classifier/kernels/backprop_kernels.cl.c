@@ -19,7 +19,7 @@ __kernel void backprop_shared_weights_chunk(
     __global SCALAR_TYPE *__restrict partial_grad_sw_out,
     int batch_offset,
     int num_batch_samples,
-    int batch_chunk_id,
+    int batch_chunk_index,
     int padded_input_dim,
     int padded_hidden_dim) {
     // Work-group (i_idx, j_idx) computes the gradient for shared weight SW[i_idx][j_idx].
@@ -69,8 +69,8 @@ __kernel void backprop_shared_weights_chunk(
     }
 
     if (lid == 0) {
-        // Use the renamed `batch_chunk_id` for clarity.
-        const uint grad_w_out_idx           = batch_chunk_id * padded_input_dim * padded_hidden_dim + i_idx * padded_hidden_dim + j_idx;
+        // Use the renamed `batch_chunk_index` for clarity.
+        const uint grad_w_out_idx           = batch_chunk_index * padded_input_dim * padded_hidden_dim + i_idx * padded_hidden_dim + j_idx;
         partial_grad_sw_out[grad_w_out_idx] = local_mem[0];
     }
 }
@@ -88,7 +88,7 @@ __kernel void backprop_shared_biases_chunk(
     __global SCALAR_TYPE *__restrict partial_grad_sb_out,
     int batch_offset,
     int num_batch_samples,
-    int batch_chunk_id,
+    int batch_chunk_index,
     int padded_hidden_dim) {
     // Work-group j_idx computes the gradient for shared bias SB[j_idx].
     const uint j_idx = get_group_id(0);
@@ -131,8 +131,8 @@ __kernel void backprop_shared_biases_chunk(
     }
 
     if (lid == 0) {
-        // Use the renamed `batch_chunk_id` for clarity.
-        const uint grad_b_out_idx           = batch_chunk_id * padded_hidden_dim + j_idx;
+        // Use the renamed `batch_chunk_index` for clarity.
+        const uint grad_b_out_idx           = batch_chunk_index * padded_hidden_dim + j_idx;
         partial_grad_sb_out[grad_b_out_idx] = local_mem[0];
     }
 }

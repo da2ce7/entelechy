@@ -103,7 +103,7 @@ __kernel void compute_logits_chunk(
     __global const SCALAR_TYPE *__restrict module_weights_buf,
     __global const SCALAR_TYPE *__restrict module_biases_buf,
     __global SCALAR_TYPE *__restrict full_logits_out,
-    int module_chunk_id,
+    int module_batch_chunk_index,
     int module_param_offset,
     int num_modules_in_chunk,
     int class_offset,
@@ -222,7 +222,7 @@ __kernel void compute_probs_loss_cce_chunk(
     __global const SCALAR_TYPE *__restrict sample_mask,
     __global SCALAR_TYPE *__restrict partial_probs_out,
     __global SCALAR_TYPE *__restrict final_loss_out,
-    int module_chunk_id,
+    int module_batch_chunk_index,
     int module_param_offset,
     int num_modules_in_chunk,
     int class_offset,
@@ -279,10 +279,12 @@ __kernel void compute_probs_loss_cce_chunk(
 }
 
 // --- Implementation: compute_probs_loss_bce_chunk (Node 7b - BCE Path) ---
-// Strategy: A 2D "map-reduce" kernel where each work-item processes one
-// (module, batch_sample) pair. It maps probability values for a class chunk
-// while reducing the corresponding BCE loss. The kernel is padding-aware, using
-// the physical class stride for all memory addressing.
+// Strategy: A tile-based kernel where each work-item processes one
+// (module, batch_sample) pair. It is a "Partial Renderer" for both outputs.
+// It uses the host-provided `flat_tile_index` to calculate the base write offset for
+// this tile's results, ensuring that parallel invocations write to unique,
+// non-overlapping regions of the `partial_probs_out` and `partial_loss_out`
+// collection buffers.
 __kernel void compute_probs_loss_bce_chunk(
     __global const SCALAR_TYPE *__restrict full_logits_buf,
     __global const SCALAR_TYPE *__restrict temps_buf,
@@ -290,10 +292,11 @@ __kernel void compute_probs_loss_bce_chunk(
     __global const SCALAR_TYPE *__restrict sample_mask,
     __global SCALAR_TYPE *__restrict partial_probs_out,
     __global SCALAR_TYPE *__restrict partial_loss_out,
-    int module_chunk_id,
+    int module_batch_chunk_index,
     int module_param_offset,
     int num_modules_in_chunk,
-    int class_chunk_id,
+    int class_batch_chunk_index,
+    int flat_tile_index,
     int class_offset,
     int num_classes_in_chunk,
     int total_batch_size,
@@ -311,14 +314,19 @@ __kernel void compute_probs_loss_bce_chunk(
     }
 
     const uint module_global_idx = module_param_offset + module_local_idx;
-    const uint loss_out_idx      = class_chunk_id * total_modules * total_batch_size + module_global_idx * total_batch_size + batch_idx;
+
+    // --- Calculate base write offsets for this tile using the flat_tile_index ---
+    const long loss_tile_base_offset = (long)flat_tile_index * num_modules_in_chunk * total_batch_size;
+    const long prob_tile_base_offset = (long)flat_tile_index * num_modules_in_chunk * total_batch_size * num_classes_in_chunk;
+
+    const long loss_out_idx = loss_tile_base_offset + (long)module_local_idx * total_batch_size + batch_idx;
 
     // Skip computation for masked samples.
     if (sample_mask[batch_idx] < 0.5f) {
         partial_loss_out[loss_out_idx] = SCALAR_ZERO;
         for (int c_local = 0; c_local < num_classes_in_chunk; ++c_local) {
-            const int  c_global             = class_offset + c_local;
-            const long prob_out_idx         = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes + c_global;
+            // Write zero to the correct slice of the partial probabilities collection buffer.
+            const long prob_out_idx         = prob_tile_base_offset + ((long)module_local_idx * total_batch_size + batch_idx) * num_classes_in_chunk + c_local;
             partial_probs_out[prob_out_idx] = SCALAR_ZERO;
         }
         return;
@@ -328,37 +336,42 @@ __kernel void compute_probs_loss_bce_chunk(
     const SCALAR_TYPE temp_inv           = 1.0f / temps_buf[module_global_idx];
 
     // Each work-item iterates through its assigned slice of classes, fusing two operations:
-    // 1. MAP: Computing and writing the Sigmoid probability for each class.
+    // 1. MAP: Computing and writing the Sigmoid probability for each class to its tile-local slot.
     // 2. REDUCE: Accumulating the BCE loss contributions from each class.
     for (int c_local = 0; c_local < num_classes_in_chunk; ++c_local) {
         const int c_global = class_offset + c_local;
-        // CRITICAL: All class-dimensioned buffers are indexed using the physical stride.
-        const long logit_prob_idx = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes + c_global;
-        const long target_idx     = (long)batch_idx * padded_total_output_classes + c_global;
 
-        const SCALAR_TYPE logit = full_logits_buf[logit_prob_idx];
+        // READ indices are unchanged; they read from full input buffers.
+        const long logit_read_idx  = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes + c_global;
+        const long target_read_idx = (long)batch_idx * padded_total_output_classes + c_global;
+
+        const SCALAR_TYPE logit = full_logits_buf[logit_read_idx];
 
         // 1. MAP: Compute and write the Sigmoid probability.
-        const SCALAR_TYPE prob            = 1.0f / (1.0f + MATH_FN exp(-logit * temp_inv));
-        partial_probs_out[logit_prob_idx] = prob;
+        const SCALAR_TYPE prob = 1.0f / (1.0f + MATH_FN exp(-logit * temp_inv));
+
+        // --- Write to the unique slot for this tile. ---
+        const long prob_out_idx         = prob_tile_base_offset + ((long)module_local_idx * total_batch_size + batch_idx) * num_classes_in_chunk + c_local;
+        partial_probs_out[prob_out_idx] = prob;
 
         // 2. REDUCE: Accumulate the BCE loss.
-        const SCALAR_TYPE target_val = targets_bce_buf[target_idx];
+        const SCALAR_TYPE target_val = targets_bce_buf[target_read_idx];
         const SCALAR_TYPE term1      = target_val * MATH_FN log(fmax(prob, 1e-9f));
         const SCALAR_TYPE term2      = (1.0f - target_val) * MATH_FN log(fmax(1.0f - prob, 1e-9f));
         partial_loss_accum += term1 + term2;
     }
 
-    // Write the final, negated partial loss sum for this chunk.
+    // Write the final, negated partial loss sum to the unique slot for this tile.
     partial_loss_out[loss_out_idx] = -partial_loss_accum;
 }
 
 // --- Implementation: calculate_module_param_grads_chunk (Node 8) ---
-// Strategy: A "work-group per gradient component" reduction. Each work-group
-// computes one scalar gradient value (e.g., dL/dW_ehc) by reducing over the
-// batch dimension. The kernel is padding-aware, using the physical class stride
-// for all indexing. A two-stage reduction over local memory ensures bias and
-// weight gradients are computed without race conditions.
+// Strategy: A "work-group per gradient component" kernel that computes the partial
+// gradients for a single tile. It accepts a unique `flat_tile_index` from the host,
+// which it uses to calculate a base offset into the large `partial_grad_*_out`
+// collection buffers. Each work-group computes one scalar gradient value for the
+// current tile (e.g., dL/dW_ehc) by reducing over the batch dimension. This ensures
+// each tile's complete gradient result is written to a unique, non-overlapping block.
 __kernel void calculate_module_param_grads_chunk(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict hidden_buf,
@@ -368,10 +381,11 @@ __kernel void calculate_module_param_grads_chunk(
     __global SCALAR_TYPE *__restrict partial_grad_module_w_out,
     __global SCALAR_TYPE *__restrict partial_grad_module_b_out,
     int problem_type_flag,
-    int module_chunk_id,
+    int module_batch_chunk_index,
     int module_param_offset,
     int num_modules_in_chunk,
-    int class_chunk_id,
+    int class_batch_chunk_index,
+    int flat_tile_index,
     int class_offset,
     int num_classes_in_chunk,
     int total_batch_size,
@@ -419,12 +433,16 @@ __kernel void calculate_module_param_grads_chunk(
         const SCALAR_TYPE h_val = hidden_buf[GET_PHYSICAL_HIDDEN_IDX(b, h_idx, padded_hidden_dim)];
         p_grad_w += d_loss_d_logit * h_val;
 
-        // Bias gradient only needs to be computed once per (module, class).
-        // It's arbitrarily but deterministically handled by threads with h_idx=0.
         if (h_idx == 0) {
             p_grad_b += d_loss_d_logit;
         }
     }
+
+    // --- Calculate base offsets for this tile's results ---
+    const long bias_tile_size     = (long)num_modules_in_chunk * num_classes_in_chunk;
+    const long weight_tile_size   = (long)num_modules_in_chunk * hidden_dim * num_classes_in_chunk;
+    const long bias_base_offset   = (long)flat_tile_index * bias_tile_size;
+    const long weight_base_offset = (long)flat_tile_index * weight_tile_size;
 
     // --- Two-Stage Local Memory Reduction ---
 
@@ -438,14 +456,12 @@ __kernel void calculate_module_param_grads_chunk(
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         if (lid == 0) {
-            const long out_idx                 = (long)class_chunk_id * (total_modules * padded_total_output_classes) + (long)module_global_idx * (padded_total_output_classes) + class_global_idx;
+            // --- Use flat_tile_index to find the correct output slot. ----
+            const long out_idx                 = bias_base_offset + (long)module_local_idx * num_classes_in_chunk + class_local_idx;
             partial_grad_module_b_out[out_idx] = local_mem[0];
         }
     }
 
-    // SYNCHRONIZATION POINT: All threads must wait here. This ensures Stage 1 is complete
-    // before Stage 2 begins, preventing the weight gradient calculation from corrupting
-    // the bias gradient reduction which reuses the same local memory.
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // STAGE 2: Reduce weight gradient (all threads participate).
@@ -457,17 +473,18 @@ __kernel void calculate_module_param_grads_chunk(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     if (lid == 0) {
-        const long out_idx = (long)class_chunk_id * (total_modules * hidden_dim * padded_total_output_classes) + (long)module_global_idx * (hidden_dim * padded_total_output_classes)
-                             + (long)h_idx * (padded_total_output_classes) + class_global_idx;
+        // --- Use flat_tile_index to find the correct output slot. ----
+        const long out_idx                 = weight_base_offset + (long)module_local_idx * (hidden_dim * num_classes_in_chunk) + (long)h_idx * num_classes_in_chunk + class_local_idx;
         partial_grad_module_w_out[out_idx] = local_mem[0];
     }
 }
 
 // --- Implementation: backprop_error_to_hidden_chunk (Node 9) ---
-// Strategy: A 3D "map" kernel where each work-item computes one scalar value
-// in the partial Grad_H tensor. It performs an independent reduction over its
-// assigned class chunk and is padding-aware, using the physical class stride
-// for correct memory addressing.
+// Strategy: A 3D "map" kernel that computes the partial Grad_H tensor for
+// a single tile. It receives a unique `flat_tile_index` from the host, which it
+// uses to compute a base write offset into the `partial_grad_h_aos_out`
+// collection buffer. Each work-item computes one scalar value in this tile's
+// Grad_H by reducing over its assigned class chunk.
 __kernel void backprop_error_to_hidden_chunk(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict partial_probs_buf,
@@ -476,10 +493,11 @@ __kernel void backprop_error_to_hidden_chunk(
     __global const SCALAR_TYPE *__restrict module_weights_buf,
     __global SCALAR_TYPE *__restrict partial_grad_h_aos_out,
     int problem_type_flag,
-    int module_chunk_id,
+    int module_batch_chunk_index,
     int module_param_offset,
     int num_modules_in_chunk,
-    int class_chunk_id,
+    int class_batch_chunk_index,
+    int flat_tile_index,
     int class_offset,
     int num_classes_in_chunk,
     int total_batch_size,
@@ -488,7 +506,7 @@ __kernel void backprop_error_to_hidden_chunk(
     int padded_total_output_classes,
     int total_modules) {
 
-    // Map the 3D work-item grid to the logical (module, batch, hidden) space.
+    // Map the 3D work-item grid to the logical (module, batch, hidden) space for this tile.
     const uint module_local_idx = get_global_id(0);
     const uint batch_idx        = get_global_id(1);
     const uint h_idx            = get_global_id(2);
@@ -498,15 +516,19 @@ __kernel void backprop_error_to_hidden_chunk(
         return;
     }
 
-    const uint module_global_idx = module_param_offset + module_local_idx;
-    // Output buffer is not dimensioned by class, so its index is safe from class padding.
-    const uint out_idx = class_chunk_id * (total_modules * total_batch_size * hidden_dim) + module_global_idx * (total_batch_size * hidden_dim) + batch_idx * hidden_dim + h_idx;
+    // --- Use flat_tile_index to find the correct output block. ---
+    const long tile_size        = (long)num_modules_in_chunk * total_batch_size * hidden_dim;
+    const long tile_base_offset = (long)flat_tile_index * tile_size;
+    const long local_offset     = (long)module_local_idx * (total_batch_size * hidden_dim) + (long)batch_idx * hidden_dim + h_idx;
+    const long out_idx          = tile_base_offset + local_offset;
 
     // Skip computation for masked-out samples.
     if (sample_mask[batch_idx] < 0.5f) {
         partial_grad_h_aos_out[out_idx] = SCALAR_ZERO;
         return;
     }
+
+    const uint module_global_idx = module_param_offset + module_local_idx;
 
     // --- Core Logic: Reduction over the Class Chunk ---
     SCALAR_TYPE grad_h_accum = SCALAR_ZERO;
@@ -534,10 +556,11 @@ __kernel void backprop_error_to_hidden_chunk(
 }
 
 // --- Implementation: calculate_chunk_temp_gradients (Node 10) ---
-// Strategy: A "work-group per module" reduction. Each work-group computes a
-// partial temperature gradient for one module by reducing over the batch and
-// class chunk dimensions. The kernel is padding-aware, using the physical class
-// stride for all memory addressing.
+// Strategy: A tile-based reduction kernel where each work-group computes a
+// partial temperature gradient for one module within its assigned tile. It uses the
+// host-provided `flat_tile_index` to calculate a base write offset, ensuring each
+// tile's results are placed in a unique block within the `partial_grad_temps_out`
+// collection buffer.
 __kernel void calculate_chunk_temp_gradients(
     __local SCALAR_TYPE *local_mem,
     __global const SCALAR_TYPE *__restrict full_logits_buf,
@@ -547,10 +570,11 @@ __kernel void calculate_chunk_temp_gradients(
     __global const SCALAR_TYPE *__restrict temps_buf,
     __global SCALAR_TYPE *__restrict partial_grad_temps_out,
     int problem_type_flag,
-    int module_chunk_id,
+    int module_batch_chunk_index,
     int module_param_offset,
     int num_modules_in_chunk,
-    int class_chunk_id,
+    int class_batch_chunk_index,
+    int flat_tile_index,
     int class_offset,
     int num_classes_in_chunk,
     int total_batch_size,
@@ -570,20 +594,19 @@ __kernel void calculate_chunk_temp_gradients(
     SCALAR_TYPE p_grad_sum        = SCALAR_ZERO;
 
     // Threads in the work-group sum contributions over the batch dimension.
+    // This core computational logic is correct and remains unchanged.
     for (int b = lid; b < total_batch_size; b += lsize) {
         if (sample_mask[b] < 0.5f) {
             continue;
         }
 
         // For each sample, sum the gradient contribution across the class chunk.
-        // This value represents SUM_c( (p_c - y_c) * z_c ) for one sample.
         SCALAR_TYPE grad_contribution_for_sample = SCALAR_ZERO;
         for (int c_local = 0; c_local < num_classes_in_chunk; c_local++) {
-            const int c_global = class_offset + c_local;
-            // CRITICAL: Use physical stride for all class-dimensioned buffer access.
+            const int         c_global = class_offset + c_local;
             const long        base_idx = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)b * padded_total_output_classes + c_global;
             const SCALAR_TYPE prob     = partial_probs_buf[base_idx];
-            SCALAR_TYPE       d_loss_d_logit; // This is (p_c - y_c)
+            SCALAR_TYPE       d_loss_d_logit;
 
             if (problem_type_flag == PROBLEM_TYPE_CCE) {
                 const __global int *targets_cce = (__global int *)targets_buf;
@@ -593,7 +616,7 @@ __kernel void calculate_chunk_temp_gradients(
                 d_loss_d_logit                          = prob - targets_bce[(long)b * padded_total_output_classes + c_global];
             }
 
-            const SCALAR_TYPE unscaled_logit = full_logits_buf[base_idx]; // This is z_c
+            const SCALAR_TYPE unscaled_logit = full_logits_buf[base_idx];
             grad_contribution_for_sample += d_loss_d_logit * unscaled_logit;
         }
         p_grad_sum += grad_contribution_for_sample;
@@ -611,12 +634,13 @@ __kernel void calculate_chunk_temp_gradients(
 
     // First thread writes the final result for the work-group.
     if (lid == 0) {
-        // The derivative of loss w.r.t temperature T is:
-        // dL/dT = dL/d(logits) * d(logits)/dT = SUM_c( (p_c - y_c) * z_c ) * (-1/T^2)
-        const SCALAR_TYPE total_sum_for_chunk = local_mem[0]; // Represents SUM_b( SUM_c( (p_c - y_c) * z_c ) )
+        const SCALAR_TYPE total_sum_for_chunk = local_mem[0];
         const SCALAR_TYPE temp                = temps_buf[module_global_idx];
         const SCALAR_TYPE final_partial_grad  = total_sum_for_chunk * (-1.0f / (temp * temp));
-        const uint        out_idx             = class_chunk_id * total_modules + module_global_idx;
-        partial_grad_temps_out[out_idx]       = final_partial_grad;
+
+        // --- Use flat_tile_index to find the correct output slot. ---
+        // Each tile produces `num_modules_in_chunk` partial gradient values.
+        const uint out_idx              = (uint)flat_tile_index * num_modules_in_chunk + module_local_idx;
+        partial_grad_temps_out[out_idx] = final_partial_grad;
     }
 }

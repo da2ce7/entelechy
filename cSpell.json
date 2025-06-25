@@ -4,6 +4,7 @@
         "CDNA",
         "itemsize",
         "keepdims",
+        "logit",
         "logits",
         "ndarray",
         "padder",

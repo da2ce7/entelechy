@@ -145,8 +145,8 @@ class HostView:
 # --- 2D Tiling & Strategic Planning ---
 @dataclass(frozen=True)
 class WorkTile:
-    module_chunk_idx: int
-    class_chunk_idx: int
+    module_batch_chunk_index: int
+    class_batch_chunk_index: int
     flat_tile_id: int
     module_offset: int
     num_modules_in_tile: int
@@ -400,7 +400,7 @@ class KernelExecutor:
             self.b.get_cl_buffer(w_ref),
             self.b.get_cl_buffer(b_ref),
             self.b.get_cl_buffer(logit_out_ref),
-            np.int32(tile.module_chunk_idx),
+            np.int32(tile.module_batch_chunk_index),
             np.int32(tile.module_offset),
             np.int32(tile.num_modules_in_tile),
             np.int32(tile.class_offset),
@@ -450,7 +450,7 @@ class KernelExecutor:
             self.b.get_cl_buffer(mask_ref),
             self.b.get_cl_buffer(prob_out_ref),
             self.b.get_cl_buffer(loss_out_ref),
-            np.int32(tile.module_chunk_idx),
+            np.int32(tile.module_batch_chunk_index),
             np.int32(tile.module_offset),
             np.int32(tile.num_modules_in_tile),
             np.int32(tile.class_offset),
@@ -483,10 +483,10 @@ class KernelExecutor:
             np.int32(0 if PROBLEM_TYPE == "CCE" else 1),
             (
                 p,
-                np.int32(tile.module_chunk_idx),
+                np.int32(tile.module_batch_chunk_index),
                 np.int32(tile.module_offset),
                 np.int32(tile.num_modules_in_tile),
-                np.int32(tile.class_chunk_idx),
+                np.int32(tile.class_batch_chunk_index),
                 np.int32(tile.class_offset),
                 np.int32(tile.num_classes_in_tile),
                 np.int32(BATCH_SIZE),
@@ -601,7 +601,18 @@ class KernelExecutor:
         )
 
     def launch_backprop_shared_chunk(
-        self, q, wait_for, chunk_id, offset, num_samples, in_ref, h_ref, gh_ref, mask_ref, gsw_out_ref, gsb_out_ref
+        self,
+        q,
+        wait_for,
+        batch_chunk_index,
+        offset,
+        num_samples,
+        in_ref,
+        h_ref,
+        gh_ref,
+        mask_ref,
+        gsw_out_ref,
+        gsb_out_ref,
     ) -> Tuple[cl.Event, cl.Event]:
         l = 256
         sw_evt = self.p.backprop_shared_weights_chunk(
@@ -616,7 +627,7 @@ class KernelExecutor:
             self.b.get_cl_buffer(gsw_out_ref),
             np.int32(offset),
             np.int32(num_samples),
-            np.int32(chunk_id),
+            np.int32(batch_chunk_index),
             np.int32(self.padded_input_dim),
             np.int32(self.padded_hidden_dim),
             wait_for=wait_for,
@@ -632,7 +643,7 @@ class KernelExecutor:
             self.b.get_cl_buffer(gsb_out_ref),
             np.int32(offset),
             np.int32(num_samples),
-            np.int32(chunk_id),
+            np.int32(batch_chunk_index),
             np.int32(self.padded_hidden_dim),
             wait_for=wait_for,
         )
