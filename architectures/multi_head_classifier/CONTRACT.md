@@ -1,4 +1,4 @@
-### **System Contract: Host-Device Kernel Interface (Revision 1)**
+### **System Contract: Host-Device Kernel Interface (Revision 2)**
 
 #### **Preamble**
 
@@ -22,8 +22,15 @@ A buffer identifier shall be constructed as:
 `[Flow] :: "buffer" :: [MemoryScope] :: [ContextAndUsage]`
 
 - **`[Flow]`**: `src_` | `dest_` | `update_` | `sync_`
-- **`[MemoryScope]`**: `GLOBAL_` | `LOCAL_` | `CONST_`
+- \*\*`[MemoryScope]`: `GLOBAL_` | `LOCAL_` | `GLOBAL_CONST_` | `DEVICE_CONST_`
 - **`[ContextAndUsage]`**: A canonical identifier defined exclusively in **Appendix B: Canonical Lexicon**.
+
+**2.1.1. Memory Scope Token Definitions**
+
+- **`GLOBAL_`**: Standard read/write `__global` device memory.
+- **`LOCAL_`**: Work-group exclusive `__local` memory.
+- **`GLOBAL_CONST_`**: Read-only `__global` device memory (qualified as `__global const`).
+- **`DEVICE_CONST_`**: The hardware-specific, read-only `__constant` address space.
 
 **2.2. Scalar Name Grammar**
 A scalar identifier shall be constructed as:
@@ -66,8 +73,9 @@ The following formal notation illustrates the sole valid method for specifying a
  *        - Calculability Proof: [src_scalar_NATURAL_total_item_count]
  *        - Validation Preconditions: [src_scalar_NATURAL_item_offset + src_scalar_NATURAL_item_count <= src_scalar_NATURAL_total_item_count]
  *
- * @param src_buffer_CONST_lookup_table A read-only, constant-memory data resource.
+ * @param src_buffer_DEVICE_CONST_lookup_table A read-only, device-constant memory resource.
  *        - Tensor Shape: (LUT_CAPACITY)
+          - Memory Mapping: Maps to OpenCL `__constant` address space.
  *        - Padding Contract: None.
  *        - Calculability Proof: [Compile-time constant: LUT_CAPACITY]
  *        - Validation Preconditions: None.
@@ -99,7 +107,7 @@ The following formal notation illustrates the sole valid method for specifying a
  */
 __kernel void illustrative_kernel_name(
     __global const SCALAR_TYPE* src_buffer_GLOBAL_input_stream,
-    __constant const SCALAR_TYPE* src_buffer_CONST_lookup_table,
+    __constant const SCALAR_TYPE* src_buffer_DEVICE_CONST_lookup_table,
     __global SCALAR_TYPE* dest_buffer_GLOBAL_partial_results,
     __local SCALAR_TYPE* update_buffer_LOCAL_reduction_tile,
     __global atomic_uint* sync_buffer_GLOBAL_atomic_counter,
