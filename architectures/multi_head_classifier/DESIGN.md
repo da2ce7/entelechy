@@ -1,4 +1,4 @@
-## **Architectural Concept: A Unified, Memory-Aware Streaming Classification Engine (Revision 2)**
+## **Architectural Concept: A Unified, Memory-Aware Streaming Classification Engine (Revision 3)**
 
 ### **Guiding Principles**
 
@@ -36,9 +36,15 @@ The lifetime of an input batch spans two event-delimited phases:
 The host logic serves as a sophisticated orchestrator, responsible for resource management and DAG construction. For each batch, it performs strategic assessments to optimize execution:
 
 1.  **Memory Assessment & Chunk Definition:** The orchestrator determines an optimal chunking strategy, defining `num_module_chunks`, `num_batch_chunks`, and `num_class_chunks` to balance compute and memory demands.
-2.  **Activation Lifecycle & Streaming:** The orchestrator manages the lifecycle of intermediate hidden activations (`hidden_i`), which are always processed in **batch chunks**. It selects between:
-    - **Cache Strategy (Space > Time):** Retains `hidden_i` chunks in VRAM for reuse during the Learn phase.
-    - **Recompute Strategy (Time > Space):** Discards `hidden_i` chunks post-Act to free VRAM, regenerating them on-demand during the Learn phase. This enables true streaming backpropagation.
+2.  **Activation Lifecycle & Streaming:** ... It selects between a Cache or Recompute strategy and manages **two distinct backpropagation streaming models** based on data path requirements:
+
+- **Model A: Accumulate via Recompute (For `Grad_H` and `Grad_Mod*`):** Used when a downstream kernel requires a global synchronization point (e.g., Node 12 permutation). The host allocates a monolithic partials buffer and populates it iteratively by:
+  1. Recomputing a single `hidden_i` chunk.
+  2. Calling the gradient kernel to process that chunk and write its result.
+  3. Discarding the `hidden_i` chunk.
+     This maintains a minimal memory footprint at the cost of a host-side loop.
+- **Model B: True Streaming (For `Grad_SW` & `Grad_SB`):** Used for data paths without global dependencies. The host recomputes a `hidden_i` chunk and passes it, along with the corresponding slice of `Final_Grad_H`, to a gradient kernel whose partial result is immediately fed into the reduction engine.
+
 3.  **SIMD-Aware Weight Layout:** The orchestrator transforms shared layer weights into a SIMD-friendly "Struct of Arrays" (SoA) layout before enqueuing kernel (4).
 4.  **DAG Construction & Parallel Dispatch:** The orchestrator constructs the multi-phase computational graph, enqueuing kernels according to the selected mode and chunking strategy.
 5.  **Reduction Planning & Rendering:** The orchestrator acts as a **Reduction Planner**, analyzing problem size and VRAM to set an optimal **Reduction Batch Size (`K`)**. It renders the full `log_K(N)` reduction tree, managing intermediate buffer lifecycles.
@@ -47,7 +53,7 @@ The host logic serves as a sophisticated orchestrator, responsible for resource 
 
 ---
 
-### **Architectural Blueprint & Data Contracts for a Multi-Head Classifier (Revision 2)**
+### **Architectural Blueprint & Data Contracts for a Multi-Head Classifier**
 
 ```mermaid
 graph TD
@@ -77,13 +83,9 @@ graph TD
       TermNote["Note: 'Module' refers to the system<br/>implementation of an ML 'Head'."]
       subgraph "Fused Operation Key"
           direction LR
-          LS_Alpha["α"]:::logical_step; LS_Beta["β"]:::logical_step
-          LS_Gamma["γ"]:::logical_step; LS_Delta["δ"]:::logical_step; LS_Epsilon["ε"]:::logical_step
+          LS_Alpha["α"]:::logical_step; LS_Epsilon["ε"]:::logical_step
           Desc_Alpha["Mat-Mul + Bias"]
-          Desc_Beta["Prob Calc + Loss Calc"]
-          Desc_Gamma["Weight Grad + Bias Grad"]
-          Desc_Delta["Mat-Mul + Bias + ReLU"]
-          Desc_Epsilon["Stable Softmax + Prob Calc + Loss Calc"]
+          Desc_Epsilon["<b>Stable Softmax + Prob Calc + Loss Calc</b>"]
       end
       subgraph "Temporal Execution Keys & Buffer Lifetime"
           direction LR
@@ -101,69 +103,60 @@ graph TD
         Targets[Targets]:::param; SampleMask[Sample Mask]:::param
     end
 
-    %% Phase 4-18: Act Phase
+    %% Phase 4-7: Act Phase
     subgraph "PHASE 1: ACT"
-        subgraph "Phase 4: Shared Layer Forward Pass (Batch-Chunked)"
-            style "Phase 4: Shared Layer Forward Pass (Batch-Chunked)" loop_box
+        subgraph "Phase 4: Shared Layer Forward Pass (Batch-Chunked Optional)"
+            style "Phase 4: Shared Layer Forward Pass (Batch-Chunked Optional)" loop_box
             note_hidden["Note: hidden_i lifecycle<br/>always chunked by batch,<br/>[C] or [R] policy by Host"]
             HL_2 --> note_hidden
 
             subgraph K4["(4) forward_pass"]:::fused_kernel_box
                 direction LR
-                L4["Mat-Mul + Bias + ReLU δ"]:::logical_step
+                L4["Mat-Mul + Bias + ReLU"]:::logical_step
             end
             HL_1 --> L4; SampleMask --> L4
             L4 --> hidden_i[Hidden Activations<br/>Chunk 'i' [C,R]]:::data
             L4 --> hidden_mask[Hidden Mask<br/>Chunk 'i' [C,R]]:::data
         end
 
-        subgraph "Phase 5-7: Forward Pass for Classifier Head (as a Module)"
+        subgraph "Phase 5-7: Module Layer Forward & Loss Pass (Tiled)"
             subgraph K5["(5) compute_logits_chunk"]:::fused_kernel_box
-                direction LR
-                L5["Mat-Mul + Bias α"]:::logical_step
+                 direction LR
+                 L5["Mat-Mul + Bias α"]:::logical_step
             end
             hidden_i & hidden_mask --> L5
             L5 --> Full_Logits[Full Logits Buffer [C,R]]:::full_intermediate
 
-            HL_3["(7) Host Selects Path<br/>based on Operating Mode (CCE/BCE)"]:::host_logic
-            Full_Logits --> HL_3
+            HL_PathSelect["Host Selects Path<br/>based on Operating Mode (CCE/BCE)"]:::host_logic
+            Full_Logits --> HL_PathSelect
 
             subgraph "Operating Mode: CCE (Softmax Path) [Fused]"
               style "Operating Mode: CCE (Softmax Path) [Fused]" path_cce
-              K6_cce["<b>(6) compute_probs_loss_cce_chunk</b><br/>[Fused Kernel]"]:::fused_kernel_box
-              HL_3 & Full_Logits & P_Temps & SampleMask & Targets --> K6_cce
+              K6_cce["<b>(6) compute_probs_loss_cce_chunk</b><br/>[Fused Kernel ε]"]:::fused_kernel_box
+              HL_PathSelect & Full_Logits & P_Temps & SampleMask & Targets --> K6_cce
               K6_cce --> FINAL_Loss_CCE[FINAL CCE Loss (no agg needed)]:::final_data
               K6_cce --> PARTIALS_Probs["Collection of N<br/>PARTIAL Probabilities [C,R]"]:::partial_data
             end
 
             subgraph "Operating Mode: BCE (Sigmoid Path)"
                 style "Operating Mode: BCE (Sigmoid Path)" path_bce
-                subgraph K7_bce["(7) compute_probs_loss_bce_chunk"]:::fused_kernel_box
-                    direction LR
-                    L7_prob["Prob Calc β"]:::logical_step --> L7_loss["Loss Calc β"]:::logical_step
-                end
-                HL_3 & Full_Logits --> L7_prob
-                SampleMask --> L7_loss
-                L7_loss --> PARTIALS_Loss_BCE["Collection of N<br/>PARTIAL BCE Loss"]:::partial_data
-                L7_prob --> PARTIALS_Probs
+                K7_bce["(7) compute_probs_loss_bce_chunk"]:::kernel
+                HL_PathSelect & Full_Logits & P_Temps & SampleMask & Targets --> K7_bce
+                K7_bce --> PARTIALS_Loss_BCE["Collection of N<br/>PARTIAL BCE Loss"]:::partial_data
+                K7_bce --> PARTIALS_Probs
             end
         end
-
-        subgraph "Phase 18: Asynchronous Result Retrieval"
-            direction LR
-            K18["<b>(18) D2H Async Copy</b><br/>(Final Probs)"]:::data --> EV_Inference["<b>inference_event</b>"]:::sync_event
-        end
     end
-
-    FINAL_Probs --> K18
-    EV_Inference --> Host_Act["Host Acts on<br/>Full Forward Result"]:::host_logic
 
     %% Phase 8-20: Learn Phase
     subgraph "PHASE 2: LEARN"
         Host_Act -.->|Host trigger| K8_Start["K8 Start Trigger"]:::host_logic
 
-        subgraph "Phase 8-10: Per-Tile Streamable Gradient Computation"
-            style "Phase 8-10: Per-Tile Streamable Gradient Computation" loop_box
+        note_accumulate_model["<b>Host Strategy 1: Accumulate via Recompute</b><br/>For paths requiring a monolithic input (e.g., Grad_H),<br/>the host iteratively recomputes hidden_i chunks to populate<br/>the partials buffer, keeping VRAM usage constant."]:::host_logic
+        K8_Start --> note_accumulate_model
+
+        subgraph "Phase 8-10: Per-Tile Gradient Computation"
+            style "Phase 8-10: Per-Tile Gradient Computation" loop_box
             note_grad_loop["Note: Executes for each tile<br/>in the Execution Grid (N total tiles)"]:::host_logic
             HL_Placement --> note_grad_loop
 
@@ -172,13 +165,10 @@ graph TD
 
                 subgraph "Gradients for Classifier Module"
                     style "Gradients for Classifier Module" grad_path_a
-                    subgraph K8["<b>(8) calculate_module_param_grads_chunk</b>"]:::fused_kernel_box
-                        L8_w["Weight Grad Calc γ"]:::logical_step; L8_b["Bias Grad Calc γ"]:::logical_step
-                    end
-                    PARTIALS_Probs & Targets & SampleMask & hidden_i --> L8_w
-                    L8_w --> PARTIALS_Grad_ModW["Collection of N<br/>PARTIAL Grad_ModW"]:::partial_data
-                    PARTIALS_Probs & Targets & SampleMask --> L8_b
-                    L8_b --> PARTIALS_Grad_ModB["Collection of N<br/>PARTIAL Grad_ModB"]:::partial_data
+                    K8["<b>(8) calculate_module_param_grads_chunk</b>"]:::kernel
+                    PARTIALS_Probs & Targets & SampleMask & hidden_i --> K8
+                    K8 --> PARTIALS_Grad_ModW["Collection of N<br/>PARTIAL Grad_ModW"]:::partial_data
+                    K8 --> PARTIALS_Grad_ModB["Collection of N<br/>PARTIAL Grad_ModB"]:::partial_data
                 end
 
                 subgraph "Upstream Hidden Gradients"
@@ -197,31 +187,33 @@ graph TD
             end
         end
 
-        subgraph "Phase 11-12: Grad_H Permutation"
-             K12["<b>(12) gather_and_permute_grad_h</b><br/>(Specialized Permutation)"]:::permute_kernel
+        subgraph "Phase 11-12: Grad_H Permutation (Solution to 'Transpose Illusion')"
+             K12["<b>(12) gather_and_permute_grad_h</b><br/>[Specialized Permutation]<br/><b>[Architectural Synchronization Point]</b>"]:::permute_kernel
              PARTIALS_Grad_H_AoS --> K12
              K12 --> Permuted_Grad_H_SoA["Permuted Grad_H<br/>(B*H, M Layout)"]:::full_intermediate
-             K11["(11) transpose_chunk<br/>(General Utility, not on critical path)"]:::transpose_kernel
+             K11["(11) transpose_chunk<br/>(General Utility, not on critical path)"]:::kernel
         end
 
-        subgraph "Phase 13: Recursive Reduction Engine"
-             style "Phase 13: Recursive Reduction Engine" loop_box
+        subgraph "Phase 13: Recursive Reduction (Module Grads & Act Phase Results)"
+             style "Phase 13: Recursive Reduction (Module Grads & Act Phase Results)" loop_box
              K_Recursive_13["<b>(13) Recursive Reduction Engine</b><br/>(Processes N partials in batches of K)"]:::host_logic
         end
 
         PARTIALS_Probs & PARTIALS_Loss_BCE & PARTIALS_Grad_ModW & PARTIALS_Grad_ModB & PARTIALS_Grad_Temps -- "Input: Buffers of N discrete partials" --> K_Recursive_13
-
         K_Recursive_13 --> FINAL_Probs[Final Probs]:::final_data & FINAL_BCE_Loss[Final BCE Loss]:::final_data
         K_Recursive_13 --> FINAL_Grad_ModW[Final Grad_ModW]:::final_data & FINAL_Grad_ModB[Final Grad_ModB]:::final_data & FINAL_Grad_Temps[Final Grad_Temps]:::final_data
 
         subgraph "Phase 14: Specialized Grad_H Reduction"
-            K14["<b>(14) reduce_grad_h_over_modules</b><br/>(Specialized Reduction)"]:::specialized_kernel
+            K14["<b>(14) reduce_grad_h_over_modules</b><br/>[Specialized Reduction]"]:::specialized_kernel
             Permuted_Grad_H_SoA --> K14
             K14 --> FINAL_Grad_H[Final Grad_H]:::final_data
         end
 
-        subgraph "Phase 15-16: Streaming Shared Layer Backprop"
-            style "Phase 15-16: Streaming Shared Layer Backprop" parallel_group
+        note_streaming_model["<b>Host Strategy 2: True Streaming</b><br/>For paths without monolithic dependencies (e.g., Grad_SW),<br>the host streams recomputed hidden_i chunks with slices<br>of upstream gradients directly into the reduction engine."]:::host_logic
+        FINAL_Grad_H --> note_streaming_model
+
+        subgraph "Phase 15-16: True Streaming Shared Layer Backprop"
+            style "Phase 15-16: True Streaming Shared Layer Backprop" parallel_group
             Input_i[Input Chunk 'i']:::data & SampleMask --> K15["<b>(15) backprop_shared_weights_chunk</b>"]:::kernel
             K15 --> PARTIALS_Grad_SW_i["Collection of N<br/>PARTIAL Grad_SW 'i'"]:::partial_data
             hidden_i --> K15 & K16
@@ -230,13 +222,20 @@ graph TD
             K16 --> PARTIALS_Grad_SB_i["Collection of N<br/>PARTIAL Grad_SB 'i'"]:::partial_data
         end
 
-        subgraph "Phase 17: Recursive Shared Gradient Aggregation"
+        subgraph "Phase 17: Recursive Reduction (Shared Grads)"
             direction LR
-            style "Phase 17: Recursive Shared Gradient Aggregation" loop_box
+            style "Phase 17: Recursive Reduction (Shared Grads)" loop_box
             K_Recursive_17["(agg) ...<br/>Iterative Reduction"]:::host_logic
         end
         PARTIALS_Grad_SW_i & PARTIALS_Grad_SB_i -- "Input: Buffers of N discrete partials" --> K_Recursive_17
         K_Recursive_17 --> FINAL_Grad_SW[Final Grad_SW]:::final_data & FINAL_Grad_SB[Final Grad_SB]:::final_data
+
+        subgraph "Phase 18: Asynchronous Result Retrieval"
+            direction LR
+            K18["<b>(18) D2H Async Copy</b><br/>(Final Probs)"]:::data --> EV_Inference["<b>inference_event</b>"]:::sync_event
+        end
+        FINAL_Probs --> K18
+        EV_Inference --> Host_Act["Host Acts on<br/>Full Forward Result"]:::host_logic
 
         subgraph "Phase 19-20: Training Path (All Updates)"
             direction LR
@@ -253,7 +252,7 @@ graph TD
 
 ---
 
-### Final Kernel & Synchronization Contracts (Revision 2)
+### Final Kernel & Synchronization Contracts
 
 #### **The Partial Renderer Kernel Contract**
 
@@ -303,13 +302,40 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
 
 ---
 
-#### **Validation Scenarios (Revised & Validated)**
+#### **Validation Scenarios**
 
-- **Scenario: The Iris Case** - **Insight:** Unchanged. The unified model remains efficient for small, sequential tasks.
-- **Scenario: The Real-Time Trader** - **Insight:** Unchanged. The system excels at event-driven workflows with delayed learning.
-- **Scenario: The Marathon (Massive `epochs`)** - **Insight:** **[Corrected]** Guarantees **long-term stability** by offloading the `beta**t` calculation to the host, which can use high-precision arithmetic (`double`) to compute the bias correction terms before passing them to the kernel. This prevents on-device floating-point underflow and ensures the optimizer remains mathematically correct indefinitely.
-- **Scenario: The Hydra (Massive `num_heads`)** - **Insight:** Unchanged. The recursive renderer efficiently handles aggregation over the module dimension.
-- **Scenario: The Behemoth (Massive `hidden_dim`)** - **Insight:** Unchanged. The host can trade compute for memory by recomputing `hidden_i` chunks as needed.
-- **Scenario: The Lexicon (Massive `output_classes`)** - **Insight:** Unchanged. The recursive renderer efficiently handles aggregation over the class dimension.
-- **Scenario: The Data Tsunami (Massive `batch_size`)** - **Insight:** **[Corrected & Validated]** Validates the **two-phase streaming backpropagation strategy**. Gradient kernels (**8, 15, 16**) now operate on **chunks** of the `hidden_i` buffer, not the monolithic whole. This enables true streaming over the batch dimension, allowing the system to process arbitrarily large batches with a fixed VRAM footprint by caching or recomputing `hidden_i` chunks on demand.
-- **Scenario: The Colossus (Holistic Stress Test)** - **Insight:** **[Validated]** Tests the synergy of all scaling strategies. The host composes a dynamic plan, **streaming over the batch dimension** (producing `hidden_i` chunks), invoking the **Recursive Halving Renderer** for module/class dimensions, and using the Recompute strategy. The system is now proven to be robust under compound memory pressure.
+- **Scenario: The Iris Case (Sequential Execution Mode Validation)**
+
+  - **Description:** A classic supervised learning task using the Iris dataset, where a batch of pre-labeled flower measurements is processed in a single training step. The system executes the Act phase (forward pass) and immediately triggers the Learn phase (backpropagation) with no delay.
+  - **Validation Focus:** Measures the end-to-end latency of processing the batch, ensuring the split-phase model's overhead is minimal (e.g., less than 1% additional runtime compared to a monolithic baseline). This confirms efficiency for small, high-throughput problems.
+  - **Key Insight:** Proves the success of the **unified execution model**. By demonstrating negligible overhead (<1%), it confirms that the Act/Learn split is not a costly abstraction but a foundational primitive that gracefully and efficiently handles both fully-labeled sequential batches and event-triggered asynchronous workflows under a single, consistent paradigm.
+
+- **Scenario: The Real-Time Trader (Event-Triggered Execution Mode Validation)**
+
+  - **Description:** A high-frequency trading system where market data streams in continuously. The system must make instant predictions (Act phase) to execute trades, while trade outcomes (labels) arrive after a delay (e.g., 500ms). The Learn phase is triggered only when labels become available.
+  - **Validation Focus:** Assesses the system's ability to release VRAM after the Act phase, freeing GPU resources during the delay. When the Learn phase starts, it recomputes intermediates (e.g., `PARTIALS_Probs`) efficiently for backpropagation. Success is gauged by balancing recomputation costs against memory availability.
+  - **Key Insight:** Demonstrates the architecture's strength in real-time, event-driven scenarios, efficiently managing resources and enabling delayed learning without sacrificing performance.
+
+- **Scenario: The Marathon (Massive `epochs`)**
+
+  - **Insight:** Guarantees **long-term stability** by delegating the sensitive `beta**t` calculation to the `(18) adam_update` kernel, avoiding host-side precision loss and ensuring the optimizer remains mathematically correct indefinitely.
+
+- **Scenario: The Hydra (Massive `num_heads`)**
+
+  - **Insight:** Validates the **scalability and intelligence of the Recursive Halving Renderer**. For a massive number of heads, the Host Orchestrator acts as a **Reduction Planner**, assessing VRAM, choosing a suitable **Reduction Batch Size (`K`)**, and rendering an efficient `log_K(N)` reduction tree over the module dimension.
+
+- **Scenario: The Behemoth (Massive `hidden_dim`)**
+
+  - **Insight:** Proves **scalability through strategic compute/memory trade-offs**. When the `hidden_i` buffer is a bottleneck, the host opts to **Cache** or **Recompute** it, ensuring any network size can train.
+
+- **Scenario: The Lexicon (Massive `output_classes`)**
+
+  - **Insight:** Achieves **maximum hardware occupancy** via the recursive renderer. For millions of classes, the Host Orchestrator plans a `log_K(N)` reduction tree over the class dimension, interleaving compute and aggregation kernels for full GPU utilization.
+
+- **Scenario: The Data Tsunami (Massive `batch_size`)**
+
+  - **Insight:** Validates the system's **dual-model streaming backpropagation**. The architecture correctly identifies the global permutation (Node 12) as a hard synchronization point for `Grad_H`. It handles this by employing an **Accumulate via Recompute** strategy for dependent kernels (8, 9, 10), keeping memory usage constant by regenerating `hidden_i` inputs on-demand. For subsequent paths without this dependency (15, 16), it uses a **True Streaming** model. This demonstrates a sophisticated, adaptive memory management strategy, not a naive universal one.
+
+- **Scenario: The Colossus (Holistic Stress Test)**
+
+  - **Insight:** Tests the synergy of all scaling strategies. The host composes a dynamic plan, expertly managing the **dual streaming models**: it uses **Accumulate via Recompute** for the `Grad_H` path to satisfy the monolithic permutation dependency and **True Streaming** for the shared layer backprop. This is combined with the **Recursive Halving Renderer** for other dimensions, proving the orchestrator is robust under complex, compound memory pressure.

@@ -400,34 +400,6 @@ __kernel void compute_probs_loss_bce_chunk(
     uint src_scalar_NATURAL_total_modules,
     uint src_scalar_NATURAL_num_total_tiles);
 
-/**
- * @brief (Node 7b - BCE Path) Computes probabilities and a PARTIAL BCE loss for a tile.
- * @contract Computes Sigmoid probabilities and a partial BCE loss. This kernel is a
- *           Partial Renderer for BOTH of its outputs. It accepts a unique `flat_tile_index`
- *           from the host to calculate the write offset into the `partial_probs_out` and
- *           `partial_loss_out` collection buffers, preventing data races. The final
- *           results must be consolidated by an aggregation kernel.
- * @usage (Host) BCE Path Only. Called once per tile in the execution grid.
- */
-__kernel void compute_probs_loss_bce_chunk(
-    __global const SCALAR_TYPE *__restrict full_logits_buf, // [IN]  Shape: (total_modules, total_batch_size, padded_total_output_classes)
-    __global const SCALAR_TYPE *__restrict temps_buf,       // [IN]  Shape: (total_modules)
-    __global const SCALAR_TYPE *__restrict targets_bce_buf, // [IN]  Shape: (total_batch_size, padded_total_output_classes)
-    __global const SCALAR_TYPE *__restrict sample_mask,     // [IN]  Shape: (total_batch_size)
-    __global SCALAR_TYPE *__restrict partial_probs_out,     // [OUT] Shape: (total_tiles, num_modules_in_chunk, total_batch_size, num_classes_in_chunk)
-    __global SCALAR_TYPE *__restrict partial_loss_out,      // [OUT] Shape: (total_tiles, num_modules_in_chunk, total_batch_size)
-    int module_batch_chunk_index,                           // [IN scalar: >= 0, Logical MODULE chunk index for parameter selection]
-    int module_param_offset,                                // [IN scalar: >= 0, Start module index for this chunk]
-    int num_modules_in_chunk,                               // [IN scalar: > 0, Number of modules in this chunk]
-    int class_batch_chunk_index,                            // [IN scalar: >= 0, Logical CLASS chunk index for parameter selection]
-    int flat_tile_index,                                    // [IN scalar: >= 0, The unique flat index for this tile's output placement]
-    int class_offset,                                       // [IN scalar: >= 0, Start class index for this chunk]
-    int num_classes_in_chunk,                               // [IN scalar: > 0, Number of classes in this chunk]
-    int total_batch_size,                                   // [IN scalar: > 0]
-    int total_output_classes,                               // [IN scalar: > 0, The logical number of classes]
-    int padded_total_output_classes,                        // [IN scalar: > 0, The physical stride for class dimension]
-    int total_modules);                                     // [IN scalar: > 0]
-
 // --- Phase 8-10: Parallel Gradient Computation ---
 
 /**
@@ -514,6 +486,9 @@ __kernel void calculate_module_param_grads_chunk(
 
 /**
  * @brief (Node 9) Computes the partial upstream gradient for the hidden layer (Grad_H) for a tile.
+ * @contract ARCHITECTURAL NOTE: This kernel produces a full-batch partial result because its
+ *           consumer (Node 12) is a global permutation that requires the entire batch.
+ *           Batch streaming IS NOT applied at this stage of the pipeline.
  */
 __kernel void backprop_error_to_hidden_chunk(
     /**
@@ -554,17 +529,15 @@ __kernel void backprop_error_to_hidden_chunk(
 
     /**
      * @param dest_buffer_GLOBAL_partial_grad_h_aos The collection buffer for this tile's computed upstream gradients.
-     *        - Tensor Shape: (src_scalar_NATURAL_num_total_tiles, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_batch_chunk_count, src_scalar_NATURAL_hidden_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_num_total_tiles, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_size, src_scalar_NATURAL_hidden_count)
      *        - Padding Contract: None.
      *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
-     *        - Validation Preconditions: Host shall ensure sufficient VRAM is allocated. This buffer is consumed by Node 12.
+     *        - Validation Preconditions: Host shall ensure sufficient VRAM for this monolithic buffer. This is consumed by Node 12.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_grad_h_aos,
 
     uint src_scalar_FLAG_problem_type,
     uint src_scalar_NATURAL_flat_tile_index,
-    uint src_scalar_NATURAL_batch_chunk_offset,
-    uint src_scalar_NATURAL_batch_chunk_count,
     uint src_scalar_NATURAL_num_class_chunks,
     uint src_scalar_NATURAL_classes_per_chunk,
     uint src_scalar_NATURAL_modules_per_chunk,
@@ -730,151 +703,332 @@ __kernel void gather_and_permute_grad_h(
     uint src_scalar_NATURAL_num_class_chunks,
     uint src_scalar_NATURAL_num_total_tiles);
 
-// --- Phase 12 & 16: Generic Tiered Aggregation Engine ---
+// --- Phase 13 & 17: Recursive, Tiered Aggregation Engine ---
 
 /**
- * @brief (Node 12, 16) Tier 0 (N=1): Identity pass-through copy.
- * @contract Copies `elements_per_partial` elements from input to output.
- *           `num_partials_to_reduce` must be 1.
- * @usage (Host) A pass-through copy kernel. Used when only one partial input needs to be
- *           moved to the final output buffer, representing the terminal base case
- *           for any reduction operation.
+ * @brief (Node 13, 17) Tier 0 (N=1): Identity pass-through copy. Base case for reduction.
+ * @contract Copies `elements_per_partial` elements from input to output. This kernel is
+ *           only invoked by the host when the number of partials to reduce is exactly 1.
  */
 __kernel void aggregate_identity(
-    __local SCALAR_TYPE *local_mem,                           // [MEMORY size: (unused)]
-    __global const SCALAR_TYPE *__restrict partial_input_buf, // [IN]  Shape: (elements_per_partial)
-    __global SCALAR_TYPE *__restrict final_output_buf,        // [OUT] Shape: (elements_per_partial)
-    int num_partials_to_reduce,                               // [IN scalar: unused]
-    int elements_per_partial,                                 // [IN scalar: > 0, Number of elements to copy]
-    int reduction_mode_flag);                                 // [IN scalar: unused]
+    /**
+     * @param src_buffer_GLOBAL_partial_input The single source partial buffer to be copied.
+     *        - Tensor Shape: (src_scalar_NATURAL_elements_per_partial)
+     *        - Padding Contract: Assumed to be handled by the producer of this buffer; this kernel is layout-agnostic.
+     *        - Calculability Proof: [src_scalar_NATURAL_elements_per_partial]
+     *        - Validation Preconditions: Buffer must be non-NULL and readable.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_input,
+
+    /**
+     * @param dest_buffer_GLOBAL_final_output The destination buffer for the copied data.
+     *        - Tensor Shape: (src_scalar_NATURAL_elements_per_partial)
+     *        - Padding Contract: N/A.
+     *        - Calculability Proof: [src_scalar_NATURAL_elements_per_partial]
+     *        - Validation Preconditions: Buffer must be non-NULL, writable, and sufficiently large.
+     */
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_final_output,
+
+    uint src_scalar_NATURAL_elements_per_partial);
 
 /**
- * @brief (Node 12, 16) Tier 1 (N is small): Reduces partial results using registers.
- * @contract Reduces `num_partials_to_reduce` segments from the input buffer.
- *           Each work-item handles one element across all partials.
- * @usage (Host) A generic reduction kernel for consolidating a small number of partial
- *           results. It is optimized to perform the reduction summation primarily
- *           within registers, making it efficient for small `num_partials_to_reduce`.
+ * @brief (Node 13, 17) Tier 1 (N is small): Reduces partial results using registers.
+ * @contract Reduces `num_partials_to_reduce` segments from the input buffer. Each work-item
+ *           is responsible for one element across all partials, performing the reduction
+ *           summation primarily within its own private registers for maximum efficiency.
+ *           Applies SUM or AVERAGE policy based on `aggregation_mode` flag.
  */
 __kernel void aggregate_register_reduce(
-    __local SCALAR_TYPE *local_mem,                           // [MEMORY size: (unused)]
-    __global const SCALAR_TYPE *__restrict partial_input_buf, // [IN]  Shape: (num_partials_to_reduce, elements_per_partial)
-    __global SCALAR_TYPE *__restrict final_output_buf,        // [OUT] Shape: (elements_per_partial)
-    int num_partials_to_reduce,                               // [IN scalar: > 0, Number of partials to reduce]
-    int elements_per_partial,                                 // [IN scalar: > 0, Elements in one partial tensor]
-    int reduction_mode_flag);                                 // [IN scalar: 0|1, SUM or AVERAGE]
+    /**
+     * @param src_buffer_GLOBAL_partial_input The collection of source partial buffers to be reduced.
+     *        - Tensor Shape: (src_scalar_NATURAL_num_partials_to_reduce, src_scalar_NATURAL_elements_per_partial)
+     *        - Padding Contract: Assumed to be handled by the producer; this kernel is layout-agnostic beyond the 2D shape.
+     *        - Calculability Proof: [src_scalar_NATURAL_num_partials_to_reduce, src_scalar_NATURAL_elements_per_partial]
+     *        - Validation Preconditions: Buffer must be non-NULL and readable.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_input,
+
+    /**
+     * @param dest_buffer_GLOBAL_final_output The destination buffer for the single, reduced partial result.
+     *        - Tensor Shape: (src_scalar_NATURAL_elements_per_partial)
+     *        - Padding Contract: N/A.
+     *        - Calculability Proof: [src_scalar_NATURAL_elements_per_partial]
+     *        - Validation Preconditions: Buffer must be non-NULL, writable, and sufficiently large.
+     */
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_final_output,
+
+    uint src_scalar_NATURAL_num_partials_to_reduce,
+    uint src_scalar_NATURAL_elements_per_partial,
+    uint src_scalar_FLAG_aggregation_mode);
 
 /**
- * @brief (Node 12, 16) Tier 2 (N is large): Reduces partial results using local memory.
- * @contract Reduces `num_partials_to_reduce` segments from the input buffer.
- *           Each work-group handles one element across all partials using local memory.
- * @usage (Host) A generic, scalable reduction kernel for consolidating a large number
- *           of partial results. It uses local memory to perform an efficient
- *           parallel reduction within each work-group, making it the workhorse
- *           for any large-scale aggregation task.
+ * @brief (Node 13, 17) Tier 2 (N is large): Reduces partial results using local memory.
+ * @contract Reduces `num_partials_to_reduce` segments from the input buffer. Each work-group
+ *           is responsible for one element across all partials. The work-group performs an
+ *           efficient parallel reduction using its own dedicated local memory tile.
+ *           Applies SUM or AVERAGE policy based on `aggregation_mode` flag.
  */
 __kernel void aggregate_local_reduce(
-    __local SCALAR_TYPE *local_mem,                           // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
-    __global const SCALAR_TYPE *__restrict partial_input_buf, // [IN]  Shape: (num_partials_to_reduce, elements_per_partial)
-    __global SCALAR_TYPE *__restrict final_output_buf,        // [OUT] Shape: (elements_per_partial)
-    int num_partials_to_reduce,                               // [IN scalar: > 0, Number of partials to reduce]
-    int elements_per_partial,                                 // [IN scalar: > 0, Elements in one partial tensor]
-    int reduction_mode_flag);                                 // [IN scalar: 0|1, SUM or AVERAGE]
+    /**
+     * @param update_buffer_LOCAL_reduction_tile Local memory for performing the intra-work-group reduction.
+     *        - Local Memory Requirement: [get_local_size(0) * sizeof(SCALAR_TYPE)] bytes.
+     *        - Validation Preconditions: Host must allocate this amount via clSetKernelArg. get_local_size(0) must be a power of 2 for optimal performance.
+     */
+    __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
 
-// --- Phase 13: Specialized Grad_H Reduction ---
+    /**
+     * @param src_buffer_GLOBAL_partial_input The collection of source partial buffers to be reduced.
+     *        - Tensor Shape: (src_scalar_NATURAL_num_partials_to_reduce, src_scalar_NATURAL_elements_per_partial)
+     *        - Padding Contract: Assumed to be handled by the producer; this kernel is layout-agnostic beyond the 2D shape.
+     *        - Calculability Proof: [src_scalar_NATURAL_num_partials_to_reduce, src_scalar_NATURAL_elements_per_partial]
+     *        - Validation Preconditions: Buffer must be non-NULL and readable.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_input,
+
+    /**
+     * @param dest_buffer_GLOBAL_final_output The destination buffer for the single, reduced partial result.
+     *        - Tensor Shape: (src_scalar_NATURAL_elements_per_partial)
+     *        - Padding Contract: N/A.
+     *        - Calculability Proof: [src_scalar_NATURAL_elements_per_partial]
+     *        - Validation Preconditions: Buffer must be non-NULL, writable, and sufficiently large.
+     */
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_final_output,
+
+    uint src_scalar_NATURAL_num_partials_to_reduce,
+    uint src_scalar_NATURAL_elements_per_partial,
+    uint src_scalar_FLAG_aggregation_mode);
+
+// --- Phase 14: Specialized Grad_H Reduction ---
 
 /**
- * @brief (Node 13) Reduces the aggregated, module-major Grad_H buffer to the final upstream gradient.
- * @contract Designed to be ROBUST TO MEMORY PADDING. It sums the contributions from all logical modules
- *           for each hidden activation by using the physical stride (`padded_total_modules`) to correctly
- *           navigate the potentially padded input buffer.
- *           Performs the reduction: (total_elements, padded_total_modules) -> (total_elements).
- * @usage (Host) Specialized "join" operation for the parallel multi-head fork. Replaces a
- *           less efficient transpose-and-aggregate sequence with a single purpose-built kernel. The host
- *           MUST provide the physical leading dimension of the input buffer.
+ * @brief (Node 14) Specialized Kernel: Reduces the permuted Grad_H buffer over the module dimension.
+ * @contract Consumes the SoA-layout buffer from Node 12. Each work-group is responsible for
+ *           reducing the gradient contributions for a single hidden activation across all modules.
  */
 __kernel void reduce_grad_h_over_modules(
-    __local SCALAR_TYPE *local_mem,                               // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
-    __global const SCALAR_TYPE *__restrict aggregated_grad_h_soa, // [IN]  Shape: (total_elements, padded_total_modules)
-    __global SCALAR_TYPE *__restrict final_grad_h_buf,            // [OUT] Shape: (total_elements) -> Logically (batch, hidden)
-    int total_elements,                                           // [IN scalar: > 0, The number of elements to reduce (B * H)]
-    int total_modules,                                            // [IN scalar: > 0, The logical number of modules to sum over]
-    int padded_total_modules);                                    // [IN scalar: > 0, The physical leading dimension (stride) of the input buffer]
+    /**
+     * @param update_buffer_LOCAL_reduction_tile Local memory for performing the intra-work-group reduction.
+     *        - Local Memory Requirement: [get_local_size(0) * sizeof(SCALAR_TYPE)] bytes.
+     *        - Validation Preconditions: Host must allocate this amount via clSetKernelArg. get_local_size(0) must be a power of 2.
+     */
+    __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
 
-// --- Phase 14-15: Streaming Shared Layer Backpropagation ---
+    /**
+     * @param src_buffer_GLOBAL_grad_h_permuted_soa The permuted, SoA-layout buffer from Node 12.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_elements, src_scalar_NATURAL_padded_total_modules)
+     *        - Padding Contract: {Type: ROW, Formula: `total_modules` padded to alignment for the trailing dimension}
+     *        - Calculability Proof: From Node 12 output contract.
+     *        - Validation Preconditions: Must be the valid output of Node 12.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_grad_h_permuted_soa,
+
+    /**
+     * @param dest_buffer_GLOBAL_final_grad_h The final, consolidated upstream gradient for the shared layer.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_elements)
+     *        - Padding Contract: None.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_elements]
+     *        - Validation Preconditions: Buffer must be non-NULL, writable, and sufficiently large.
+     */
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_final_grad_h,
+
+    uint src_scalar_NATURAL_total_elements,
+    uint src_scalar_NATURAL_total_modules,
+    uint src_scalar_NATURAL_padded_total_modules);
+
+// --- Phase 15-16: Streaming Shared Layer Backpropagation ---
 
 /**
- * @brief (Node 14) Computes partial gradients for shared layer weights from a batch chunk.
- * @contract Produces a *partial* weight gradient by reducing over a chunk of the batch.
- *           Implicitly filters gradients using the ReLU derivative (`hidden_buf` > 0).
- * @usage (Host) Called in a loop over batch chunks. Can be launched in parallel with (15).
+ * @brief (Node 15) Computes partial gradients for shared layer weights from a batch chunk.
+ * @contract Produces a partial weight gradient by reducing over a chunk of the batch dimension.
+ *           Is a "Partial Renderer," using `batch_chunk_index` for output placement.
  */
 __kernel void backprop_shared_weights_chunk(
-    __local SCALAR_TYPE *local_mem,                          // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
-    __global const SCALAR_TYPE *__restrict input_buf,        // [IN]  Shape: (total_batch_size, padded_input_dim)
-    __global const SCALAR_TYPE *__restrict hidden_buf,       // [IN]  Shape: (total_batch_size, padded_hidden_dim)
-    __global const SCALAR_TYPE *__restrict final_grad_h_buf, // [IN]  Shape: (total_batch_size, padded_hidden_dim)
-    __global const SCALAR_TYPE *__restrict sample_mask,      // [IN]  Shape: (total_batch_size)
-    __global SCALAR_TYPE *__restrict partial_grad_sw_out,    // [OUT] Shape: (num_batch_chunks, padded_input_dim, padded_hidden_dim)
-    int batch_offset,                                        // [IN scalar: >= 0, Start sample index]
-    int num_batch_samples,                                   // [IN scalar: > 0, Number of samples in chunk]
-    int batch_chunk_index,                                   // [IN scalar: >= 0, Logical BATCH chunk index]
-    int padded_input_dim,                                    // [IN scalar: > 0]
-    int padded_hidden_dim);                                  // [IN scalar: > 0]
+    /**
+     * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reductions.
+     *        - Local Memory Requirement: [get_local_size(0) * sizeof(SCALAR_TYPE)] bytes
+     *        - Validation Preconditions: Host must allocate this amount via clSetKernelArg.
+     */
+    __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
+
+    /**
+     * @param src_buffer_GLOBAL_input The initial, untransformed input data for the batch.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_size, src_scalar_NATURAL_padded_input_count)
+     *        - Padding Contract: {Type: ROW, Formula: Padded to alignment}
+     *        - Calculability Proof: From initial problem definition.
+     *        - Validation Preconditions: Must be non-NULL.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_input,
+
+    /**
+     * @param src_buffer_GLOBAL_hidden_activations The intermediate activations from the shared layer (Node 4).
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_size, src_scalar_NATURAL_padded_hidden_count)
+     *        - Padding Contract: {Type: ROW, Formula: Padded to alignment}
+     *        - Calculability Proof: From Node 4 output contract.
+     *        - Validation Preconditions: Must be the valid output of Node 4.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_activations,
+
+    /**
+     * @param src_buffer_GLOBAL_final_grad_h The final, consolidated upstream gradient from Node 14.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_size * src_scalar_NATURAL_hidden_count)
+     *        - Padding Contract: None.
+     *        - Calculability Proof: From Node 14 output contract.
+     *        - Validation Preconditions: Must be the valid output of Node 14.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_final_grad_h,
+
+    /**
+     * @param src_buffer_GLOBAL_sample_mask A tensor defining the validity (1) or padding (0) status of samples.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_size)
+     *        - Padding Contract: None.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_size]
+     *        - Validation Preconditions: Buffer must be non-NULL.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_sample_mask,
+
+    /**
+     * @param dest_buffer_GLOBAL_partial_grad_weights_shared The collection buffer for this chunk's computed weight gradients.
+     *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_input_count, src_scalar_NATURAL_padded_hidden_count)
+     *        - Padding Contract: Host-defined. This kernel writes a dense chunk.
+     *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
+     *        - Validation Preconditions: Host shall ensure sufficient VRAM is allocated.
+     */
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_grad_weights_shared,
+
+    uint src_scalar_NATURAL_batch_chunk_offset,
+    uint src_scalar_NATURAL_batch_chunk_count,
+    uint src_scalar_NATURAL_batch_chunk_index,
+    uint src_scalar_NATURAL_total_batch_size,
+    uint src_scalar_NATURAL_num_batch_chunks,
+    uint src_scalar_NATURAL_padded_input_count,
+    uint src_scalar_NATURAL_padded_hidden_count);
 
 /**
- * @brief (Node 15) Computes partial gradients for shared layer biases from a batch chunk.
- * @contract Produces a *partial* bias gradient by reducing over a chunk of the batch.
- *           Implicitly filters gradients using the ReLU derivative (`hidden_buf` > 0).
- * @usage (Host) Called in a loop over batch chunks. Can be launched in parallel with (14).
+ * @brief (Node 16) Computes partial gradients for shared layer biases from a batch chunk.
+ * @contract Produces a partial bias gradient by reducing over a chunk of the batch dimension.
+ *           Is a "Partial Renderer," using `batch_chunk_index` for output placement.
  */
 __kernel void backprop_shared_biases_chunk(
-    __local SCALAR_TYPE *local_mem,                          // [MEMORY size: get_local_size(0) * sizeof(SCALAR_TYPE)]
-    __global const SCALAR_TYPE *__restrict hidden_buf,       // [IN]  Shape: (total_batch_size, padded_hidden_dim)
-    __global const SCALAR_TYPE *__restrict final_grad_h_buf, // [IN]  Shape: (total_batch_size, padded_hidden_dim)
-    __global const SCALAR_TYPE *__restrict sample_mask,      // [IN]  Shape: (total_batch_size)
-    __global SCALAR_TYPE *__restrict partial_grad_sb_out,    // [OUT] Shape: (num_batch_chunks, padded_hidden_dim)
-    int batch_offset,                                        // [IN scalar: >= 0, Start sample index]
-    int num_batch_samples,                                   // [IN scalar: > 0, Number of samples in chunk]
-    int batch_chunk_index,                                   // [IN scalar: >= 0, Logical BATCH chunk index]
-    int padded_hidden_dim);                                  // [IN scalar: > 0]
+    /**
+     * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reductions.
+     *        - Local Memory Requirement: [get_local_size(0) * sizeof(SCALAR_TYPE)] bytes
+     *        - Validation Preconditions: Host must allocate this amount via clSetKernelArg.
+     */
+    __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
 
-// --- Phase 17-19: Finalization & Dispatch ---
+    /**
+     * @param src_buffer_GLOBAL_hidden_activations The intermediate activations from the shared layer (Node 4).
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_size, src_scalar_NATURAL_padded_hidden_count)
+     *        - Padding Contract: {Type: ROW, Formula: Padded to alignment}
+     *        - Calculability Proof: From Node 4 output contract.
+     *        - Validation Preconditions: Must be the valid output of Node 4.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_activations,
+
+    /**
+     * @param src_buffer_GLOBAL_final_grad_h The final, consolidated upstream gradient from Node 14.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_size * src_scalar_NATURAL_hidden_count)
+     *        - Padding Contract: None.
+     *        - Calculability Proof: From Node 14 output contract.
+     *        - Validation Preconditions: Must be the valid output of Node 14.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_final_grad_h,
+
+    /**
+     * @param src_buffer_GLOBAL_sample_mask A tensor defining the validity (1) or padding (0) status of samples.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_size)
+     *        - Padding Contract: None.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_size]
+     *        - Validation Preconditions: Buffer must be non-NULL.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_sample_mask,
+
+    /**
+     * @param dest_buffer_GLOBAL_partial_grad_biases_shared The collection buffer for this chunk's computed bias gradients.
+     *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_hidden_count)
+     *        - Padding Contract: Host-defined. This kernel writes a dense chunk.
+     *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
+     *        - Validation Preconditions: Host shall ensure sufficient VRAM is allocated.
+     */
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_grad_biases_shared,
+
+    uint src_scalar_NATURAL_batch_chunk_offset,
+    uint src_scalar_NATURAL_batch_chunk_count,
+    uint src_scalar_NATURAL_batch_chunk_index,
+    uint src_scalar_NATURAL_total_batch_size,
+    uint src_scalar_NATURAL_num_batch_chunks,
+    uint src_scalar_NATURAL_padded_hidden_count);
+
+// --- Phase 19-20: Finalization & Updates ---
 
 /**
- * @brief (Node 18) Applies Adam optimizer update to a slice of a parameter buffer.
- * @contract Performs the complete Adam update, including the bias correction term
- *           which is calculated INTERNALLY from the global step `t`.
- *           NOTE: The contract requires that the `param`, `grad`, `m1`, and `m2`
- *           buffers have IDENTICAL physical memory layouts and sizes.
- * @usage (Host) Generic optimizer called once per parameter group. The host is responsible
- *           for enforcing layout consistency, typically via harmonized padding rules
- *           during buffer creation. `num_params_to_update` MUST match the full
- *           physical size of these buffers.
+ * @brief (Node 19) Applies Adam optimizer update to an entire parameter group. Single dispatch.
+ * @contract Host MUST pre-compute `beta1**t` and `beta2**t` in high-precision (e.g., double)
+ *           and pass the final numerical values to this kernel to avoid on-device underflow
+ *           during long training runs. This kernel does NOT perform `pown`.
  */
 __kernel void adam_update(
-    __global const SCALAR_TYPE *__restrict grad, // [IN]     Shape: (num_params_to_update)
-    SCALAR_TYPE beta1,                           // [IN scalar: (0,1), Decay rate for 1st moment]
-    SCALAR_TYPE beta2,                           // [IN scalar: (0,1), Decay rate for 2nd moment]
-    SCALAR_TYPE learning_rate,                   // [IN scalar: > 0]
-    SCALAR_TYPE epsilon,                         // [IN scalar: > 0]
-    uint        t,                               // [IN scalar: > 0, The current global training step]
-    __global SCALAR_TYPE *__restrict param,      // [IN/OUT] Shape: (num_params_to_update)
-    __global SCALAR_TYPE *__restrict m1,         // [IN/OUT] Shape: (num_params_to_update), 1st moment vector
-    __global SCALAR_TYPE *__restrict m2,         // [IN/OUT] Shape: (num_params_to_update), 2nd moment vector
-    int param_offset,                            // [IN scalar: >= 0, Start index for this parameter slice]
-    int num_params_to_update                     // [IN scalar: > 0, Number of params in this slice]
-);
+    /**
+     * @param src_buffer_GLOBAL_grad The buffer containing the final, aggregated gradients.
+     *        - Tensor Shape: (src_scalar_NATURAL_param_count)
+     *        - Padding Contract: Must be identical to `param`, `m1`, and `m2`.
+     *        - Calculability Proof: [src_scalar_NATURAL_param_count]
+     *        - Validation Preconditions: Must be non-NULL.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_grad,
+
+    /**
+     * @param update_buffer_GLOBAL_param The parameter buffer to be updated in-place.
+     *        - Tensor Shape: (src_scalar_NATURAL_param_count)
+     *        - Padding Contract: Must be identical to `grad`, `m1`, and `m2`.
+     *        - Calculability Proof: [src_scalar_NATURAL_param_count]
+     *        - Validation Preconditions: Must be non-NULL. Physical layout must match other buffers.
+     */
+    __global SCALAR_TYPE *update_buffer_GLOBAL_param,
+
+    /**
+     * @param update_buffer_GLOBAL_m1 The first moment vector buffer to be updated in-place.
+     *        - Tensor Shape: (src_scalar_NATURAL_param_count)
+     *        - Padding Contract: Must be identical to `grad`, `param`, and `m2`.
+     *        - Calculability Proof: [src_scalar_NATURAL_param_count]
+     *        - Validation Preconditions: Must be non-NULL. Physical layout must match other buffers.
+     */
+    __global SCALAR_TYPE *update_buffer_GLOBAL_m1,
+
+    /**
+     * @param update_buffer_GLOBAL_m2 The second moment vector buffer to be updated in-place.
+     *        - Tensor Shape: (src_scalar_NATURAL_param_count)
+     *        - Padding Contract: Must be identical to `grad`, `param`, and `m1`.
+     *        - Calculability Proof: [src_scalar_NATURAL_param_count]
+     *        - Validation Preconditions: Must be non-NULL. Physical layout must match other buffers.
+     */
+    __global SCALAR_TYPE *update_buffer_GLOBAL_m2,
+
+    SCALAR_TYPE src_scalar_REAL_learning_rate,
+    SCALAR_TYPE src_scalar_REAL_beta1_pow_t,
+    SCALAR_TYPE src_scalar_REAL_beta2_pow_t,
+    SCALAR_TYPE src_scalar_REAL_beta1,
+    SCALAR_TYPE src_scalar_REAL_beta2,
+    SCALAR_TYPE src_scalar_REAL_epsilon,
+    uint        src_scalar_NATURAL_param_count);
 
 /**
- * @brief (Node 19) Clamps temperature parameters within a [min, max] range.
- * @contract Enforces `param = clamp(param, min_temp, max_temp)`.
- * @usage (Host) Called only on the temperature buffer, immediately after its Adam update.
+ * @brief (Node 20) Clamps temperature parameters within a [min, max] range.
+ * @contract Enforces `param = clamp(param, min_value, max_value)` for each element.
+ *           This is the final operation in the Learn phase for temperature parameters.
  */
 __kernel void clamp_temperatures(
-    __global SCALAR_TYPE *__restrict temps_buf, // [IN/OUT] Shape: (total_modules)
-    SCALAR_TYPE min_temp,                       // [IN scalar: Minimum allowed temperature value]
-    SCALAR_TYPE max_temp,                       // [IN scalar: Maximum allowed temperature value]
-    int         total_modules);                         // [IN scalar: > 0, The number of temperatures to clamp]
+    /**
+     * @param update_buffer_GLOBAL_temps The temperature parameter buffer to be clamped in-place.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_modules)
+     *        - Padding Contract: None.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_modules]
+     *        - Validation Preconditions: Buffer must be the valid, updated output of Node 19's Adam optimizer.
+     */
+    __global SCALAR_TYPE *update_buffer_GLOBAL_temps,
+
+    SCALAR_TYPE src_scalar_REAL_min_value,
+    SCALAR_TYPE src_scalar_REAL_max_value,
+    uint        src_scalar_NATURAL_total_modules);
 
 #endif // KERNELS_CL_H
