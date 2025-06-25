@@ -1,4 +1,4 @@
-### **System Contract: Host-Device Kernel Interface (Revision 3)**
+### **System Contract: Host-Device Kernel Interface (Revision 4)**
 
 #### **Preamble**
 
@@ -8,10 +8,11 @@ This document constitutes the definitive and inviolable contract governing all i
 
 ### **Article 1: Foundational Axioms**
 
-The architecture is immutably founded upon two axioms, which are the basis for all subsequent articles.
+The architecture is immutably founded upon the following axioms.
 
 - **1.1. Axiom of Jurisdictional Separation.** A parameter's syntactic structure (**Name**) defines its machine-enforced contract. A parameter's semantic block (**Commentary**) defines its human-verifiable and logical contract. These two jurisdictions are distinct and exhaustive.
 - **1.2. Axiom of Semantic Uniqueness.** Information encoded within the syntactic jurisdiction (Name) is prohibited from being duplicated within the semantic jurisdiction (Commentary), and vice versa. There shall exist no redundancy between the two.
+- **1.3. Axiom of Memory Layout.** All multi-dimensional buffers are contractually obligated to be stored in a **row-major memory layout**. The physical address of an element is calculated accordingly. Any deviation from this layout must be explicitly signaled by a canonical layout suffix (e.g., `_soa`).
 
 ### **Article 2: Parameter Lexical Mandate**
 
@@ -22,8 +23,8 @@ A buffer identifier shall be constructed as:
 `[Flow] :: "buffer" :: [MemoryScope] :: [ContextAndUsage]`
 
 - **`[Flow]`**: `src_` | `dest_` | `update_` | `sync_`
-- \*\*`[MemoryScope]`: `GLOBAL_` | `LOCAL_` | `GLOBAL_CONST_` | `DEVICE_CONST_`
-- **`[ContextAndUsage]`**: A canonical identifier defined exclusively in **Appendix B: Canonical Lexicon**.
+- **`[MemoryScope]`**: `GLOBAL_` | `LOCAL_` | `GLOBAL_CONST_` | `DEVICE_CONST_`
+- **`[ContextAndUsage]`**: A canonical identifier defined exclusively in **Article 8: Canonical Lexicon**.
 
 **2.1.1. Memory Scope Token Definitions**
 
@@ -38,10 +39,10 @@ A scalar identifier shall be constructed as:
 
 - **`[Flow]`**: `src_` | `dest_`
 - **`[NumberType]`**: A mandatory prefix defining the parameter's abstract numerical domain.
-- **`[ContextAndUsage]`**: A canonical identifier defined exclusively in **Appendix B: Canonical Lexicon**.
+- **`[ContextAndUsage]`**: A canonical identifier defined exclusively in **Article 8: Canonical Lexicon**.
 
 **2.3. Scalar `[NumberType]` Taxonomy**
-The `[NumberType]` component defines the set of valid values for a scalar. Any value outside the specified domain constitutes a contract violation.
+The `[NumberType]` component defines the set of valid values for a scalar.
 
 | Token      | Abstract Numerical Domain            | Core Constraint                                                      |
 | :--------- | :----------------------------------- | :------------------------------------------------------------------- |
@@ -52,42 +53,70 @@ The `[NumberType]` component defines the set of valid values for a scalar. Any v
 
 ### **Article 3: Parameter Commentary Contract**
 
-The `@param` block constitutes the complete logical specification for a parameter.
+The `@param` block constitutes the complete logical specification for a parameter. It shall contain the following keys as required:
 
-- **3.1. Buffer Commentary.** For any parameter of type Buffer, the commentary block **shall** fully specify the Tensor Contract, including its Shape, Padding Contract, Calculability Proof, and Validation Preconditions. No other location may define these properties. For any `update_buffer_LOCAL_*` parameter whose physical layout is multi-dimensional or accessed via non-contiguous strides (e.g., tiled transpose, parallel reduction), the **Padding Contract is mandatory** and must specify the strategy for mitigating memory bank conflicts.
+- **`Tensor Shape`**: The logical dimensions of the tensor.
+- **`Padding Contract`**: A key-value object literal specifying padding strategy.
+- **`Calculability Proof`**: The source of truth for buffer dimensions.
+- **`Validation Preconditions`**: Mandatory conditions the host must meet.
+- **`Performance Notes`**: Optional, non-binding performance optimization hints.
 
-  **3.1.1. Padding Contract Specification**
-  The `Padding Contract` field **shall** be a string formatted as a key-value object literal. It must contain the following keys:
+**3.1. Padding Contract Specification**
+The `Padding Contract` field `Type` key accepts the following string literals:
 
-  - **`Type`**: A string literal specifying the logical reason for padding.
-  - **`Formula`**: A human-readable string describing how the padding is calculated.
+| Type Token                | Definition                                                               |
+| :------------------------ | :----------------------------------------------------------------------- |
+| `CACHE`                   | Padding to align data to a hardware cache line boundary.                 |
+| `BANK_CONFLICT_AVOIDANCE` | Padding to the stride of a local memory array to prevent bank conflicts. |
+| `SIMD`                    | Padding to align a dimension to the natural SIMD vector width.           |
+| `NONE`                    | No padding is required or applied.                                       |
 
-  Valid `Type` string literals are:
+**3.2. Partial Renderer Contract**
+Kernels designated as "Partial Renderers" accept a `src_scalar_NATURAL_flat_tile_index`. The decomposition of this index into logical coordinates **shall** use the formula: `module_chunk_idx = flat_tile_index / num_class_chunks; class_chunk_idx = flat_tile_index % num_class_chunks;`
 
-  | Type Token                | Definition                                                                                                                                        |
-  | :------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------ |
-  | `CACHE`                   | Padding is applied to align data structures to a hardware cache line boundary (e.g., 128-bytes) to optimize global memory throughput.             |
-  | `BANK_CONFLICT_AVOIDANCE` | Padding is applied to the stride of a multi-dimensional local memory array to prevent simultaneous accesses from landing in the same memory bank. |
-  | `SIMD`                    | Padding is applied to align a dimension to the natural SIMD vector width of the hardware, ensuring full utilization of vector processing units.   |
-  | `NONE`                    | No padding is required or applied.                                                                                                                |
+### **Article 4: The Kernel Contract Block**
 
-- **3.2. Scalar Commentary.** For any parameter of type Scalar, the commentary **shall** provide a single, declarative statement of its logical purpose.
+**4.1. Mandate of Inclusion.** Every kernel interface specification **shall** begin with a `@kernel_contract` block. This block is mandatory and must precede the parameter list. Its purpose is to declare holistic constraints that apply to the kernel as a single unit.
 
----
+**4.2. Formal Structure.** The block shall be a key-value list. The following keys are recognized:
 
-### **Appendix A: Canonical Interface Instantiation**
+| Key                         | Definition                                                                                                                                                                                     | Status        |
+| :-------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------ |
+| **`Holistic Constraints`**  | This key is a tool of last resort, to be used only when a constraint truly has no logical owner in the parameter list. If none exist, this key **shall** contain the exact string: _"All constraints are defined by the parameter commentary blocks."_ | **Mandatory** |
+| **`Idempotency`** | Declares the kernel's precise deterministic and state-modifying behavior. It **shall** be one of the following string literals: `Strictly Idempotent`, `Associatively Non-Idempotent`, or `Fundamentally Non-Idempotent (Stateful)`. | **Mandatory** |
+| **`Synchronization Model`** | Describes the kernel's role within the global DAG (e.g., "Streamable," "Global Barrier").                                                                                                      | Optional      |
+| **`Behavioral Invariants`** | Defines strict rules governing the kernel's internal implementation (e.g., "Forbidden from using `pown`").                                                                                     | Optional      |
 
-The following formal notation illustrates the sole valid method for specifying a kernel interface in adherence to this contract. This is a prescriptive template, not an illustrative example.
 
-```c
+### **Article 5: Architectural Constants**
+
+This article defines fixed, system-wide constants that are contractually binding on both host and device implementations. The device implementation shall enforce these values at compile-time.
+
+- `LOCAL_MEM_BANK_PADDING`: Defined with a mandatory value of **`1`**.
+
+### **Article 6: Mandatory Build-Time Symbols**
+
+This article defines symbols that must be provided by the host build environment at compile time (e.g., via `-D` flags). Their values constitute the "hardware target profile" for a given compilation.
+
+- `SCALAR_TYPE`: Defines the primary floating-point type (e.g., `float`, `half`).
+- `SIMD_WIDTH`: Defines the target SIMD vector width (e.g., `8`, `16`).
+- `C_TILE_SIZE`: Defines the block/tile dimension for tiled algorithms.
+
+### **Article 7: Canonical Interface Instantiation**
+
+The following formal notation illustrates the sole valid method for specifying a kernel interface in adherence to this contract.
+
 /**
- * @brief Performs [function_name] operation.
+ * @brief Performs a tiled matrix transpose, demonstrating full contract compliance.
+ * @kernel_contract
+ *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
+ *        - Idempotency: "Fundamentally Non-Idempotent (Stateful)"
  */
 __kernel void illustrative_kernel_name(
     /**
      * @param src_buffer_GLOBAL_input_stream The primary data source for the computational unit.
      *        - Tensor Shape: (src_scalar_NATURAL_total_item_count)
-     *        - Padding Contract: {Type: CACHE, Formula: Post-pad to 128-byte alignment}
+     *        - Padding Contract: {Type: CACHE, Formula: "Post-pad to 128-byte alignment"}
      *        - Calculability Proof: [src_scalar_NATURAL_total_item_count]
      *        - Validation Preconditions: [src_scalar_NATURAL_item_offset + src_scalar_NATURAL_item_count <= src_scalar_NATURAL_total_item_count]
      */
@@ -96,8 +125,7 @@ __kernel void illustrative_kernel_name(
     /**
      * @param src_buffer_DEVICE_CONST_lookup_table A read-only, device-constant memory resource.
      *        - Tensor Shape: (LUT_CAPACITY)
-     *        - Memory Mapping: Maps to OpenCL `__constant` address space.
-     *        - Padding Contract: None.
+     *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [Compile-time constant: LUT_CAPACITY]
      *        - Validation Preconditions: None.
      */
@@ -106,7 +134,7 @@ __kernel void illustrative_kernel_name(
     /**
      * @param dest_buffer_GLOBAL_partial_results The sole collection resource for this unit's partial output.
      *        - Tensor Shape: (dest_scalar_NATURAL_total_chunks, RESULT_ELEMENTS_PER_CHUNK)
-     *        - Padding Contract: None.
+     *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [dest_scalar_NATURAL_total_chunks, Compile-time constant: RESULT_ELEMENTS_PER_CHUNK]
      *        - Validation Preconditions: Host shall zero-initialize this buffer prior to dispatch.
      */
@@ -116,15 +144,14 @@ __kernel void illustrative_kernel_name(
      * @param update_buffer_LOCAL_transpose_tile A work-group exclusive memory resource for a tiled matrix transpose.
      *        - Tensor Shape: (TILE_DIM, TILE_DIM + LOCAL_MEM_BANK_PADDING)
      *        - Padding Contract: {Type: BANK_CONFLICT_AVOIDANCE, Formula: "Pad row stride to (TILE_DIM + LOCAL_MEM_BANK_PADDING) elements"}
-     *        - Calculability Proof: [Compile-time constant: TILE_DIM, Compile-time constant: LOCAL_MEM_BANK_PADDING]
-     *        - Validation Preconditions: Host interaction is prohibited. Host shall allocate [TILE_DIM * (TILE_DIM + LOCAL_MEM_BANK_PADDING) * sizeof(SCALAR_TYPE)] bytes.
+     *        - Validation Preconditions: Host shall allocate size according to the formula derived from this contract, using the value of `LOCAL_MEM_BANK_PADDING` defined in System Contract Article 5.
      */
     __local SCALAR_TYPE* update_buffer_LOCAL_transpose_tile,
 
     /**
-     * @param sync_buffer_GLOBAL_atomic_counter A global resource for cross-group atomic synchronization.
+     * @param sync_buffer_GLOBAL_atomic_counter A global resource for cross-group atomic synchronization. This buffer makes the kernel stateful.
      *        - Tensor Shape: (1)
-     *        - Padding Contract: None.
+     *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [Implicit size: atomic_uint]
      *        - Validation Preconditions: Host shall initialize this resource to 0.
      */
@@ -137,57 +164,81 @@ __kernel void illustrative_kernel_name(
     uint dest_scalar_NATURAL_output_chunk_index,
     uint dest_scalar_NATURAL_total_chunks
 );
-```
 
-### **Appendix B: Canonical Lexicon for `[ContextAndUsage]`**
+
+### **Article 8: Canonical Lexicon for `[ContextAndUsage]`**
 
 #### **1.0 Mandate**
 
-This Lexicon establishes the sole and binding semantic definitions for the `[ContextAndUsage]` component of any parameter name. Usage of any term not explicitly defined herein is a violation of the contract. The semantics of these terms are fixed. Amendments to this Lexicon require formal review and ratification by the Architecture Governance Committee.
+This Lexicon establishes the sole binding definitions for the `[ContextAndUsage]` component. Usage of any term not defined herein is a violation.
 
 #### **2.0 Core Data Role Primitives**
 
-| Term                 | Definition                                                                            |
-| :------------------- | :------------------------------------------------------------------------------------ |
-| `input`              | The initial, untransformed data set for a complete computation.                       |
-| `weights`            | The set of learnable weight parameters for a model layer.                             |
-| `biases`             | The set of learnable bias parameters for a model layer.                               |
-| `hidden_activations` | The post-activation output tensor of an intermediate system layer.                    |
-| `logits`             | The pre-activation, real-valued output tensor of the final system layer.              |
-| `probs`              | The post-activation, normalized probability tensor of the final system layer.         |
-| `grad`               | The gradient tensor derived from a specified parameter.                               |
-| `sample_mask`        | A tensor whose elements define the validity (`1`) or padding (`0`) status of samples. |
-| `temps`              | The set of learnable temperature parameters for logit scaling.                        |
+| Term                 | Definition                                                                    |
+| :------------------- | :---------------------------------------------------------------------------- |
+| `input`              | The initial, untransformed data set for a complete computation.               |
+| `weights`            | The set of learnable weight parameters for a model layer.                     |
+| `biases`             | The set of learnable bias parameters for a model layer.                       |
+| `parameters`         | A generic learnable parameter buffer (e.g., for optimizers).                  |
+| `hidden_activations` | The post-activation output tensor of an intermediate system layer.            |
+| `logits`             | The pre-activation, real-valued output tensor of the final system layer.      |
+| `loss`               | The final computed loss value or tensor.                                      |
+| `probs`              | The post-activation, normalized probability tensor of the final system layer. |
+| `grad`               | The gradient tensor derived from a specified parameter.                       |
+| `sample_mask`        | A tensor defining the validity (`1`) or padding (`0`) status of samples.      |
+| `shared`             | A parameter that is shared across multiple modules or layers.                 |
+| `module`             | A parameter specific to a single classifier module (head).                    |
+| `output_class`       | A dimension or count related to the output classes of a classifier.           |
+| `targets`            | The ground truth labels for a supervised learning task.                       |
+| `temps`              | The set of learnable temperature parameters for logit scaling.                |
+| `generic`            | A type-punned buffer whose interpretation is context-dependent.               |
 
 #### **3.0 Decomposition Strategy Primitives**
 
-| Term          | Definition                                                                                             |
-| :------------ | :----------------------------------------------------------------------------------------------------- |
-| `flat_tile`   | A unit of work derived from the flattening of a logical multi-dimensional grid to a 1D dispatch index. |
-| `batch_chunk` | A contiguous 1D partition of the primary batch dimension.                                              |
+| Term          | Definition                                                          |
+| :------------ | :------------------------------------------------------------------ |
+| `flat_tile`   | A unit of work from the flattening of a logical grid to a 1D index. |
+| `batch_chunk` | A contiguous 1D partition of the primary batch dimension.           |
 
-#### **4.0 Scalar Context Modifiers**
+#### **4.0 Context Modifiers**
 
-| Type   | Term      | Function                                                                                                                                                     |
-| :----- | :-------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Prefix | `total_`  | Denotes the total logical cardinality of a dimension for the complete problem space.                                                                         |
-| Prefix | `padded_` | Denotes the physical, in-memory cardinality of a dimension, inclusive of any padding.                                                                        |
-| Prefix | `num_`    | Denotes the number of discrete partitions into which a dimension has been decomposed.                                                                        |
-| Suffix | `_index`  | Denotes a **logical**, ordinal position within a conceptual sequence or grid, independent of physical memory representation. Defines a work unit's identity. |
-| Suffix | `_offset` | Denotes a **physical** displacement, in elements, specifying a read/write start position. Used for direct memory address calculation.                        |
-| Suffix | `_count`  | The number of elements to process, typically relative to a corresponding `_offset`.                                                                          |
+| Type   | Term       | Function                                                                      |
+| :----- | :--------- | :---------------------------------------------------------------------------- |
+| Prefix | `total_`   | Denotes the total logical cardinality of a dimension.                         |
+| Prefix | `padded_`  | Denotes the physical, in-memory cardinality of a dimension.                   |
+| Prefix | `num_`     | Denotes the number of partitions a dimension has been decomposed into.        |
+| Prefix | `partial_` | Denotes an intermediate, un-aggregated result requiring further reduction.    |
+| Prefix | `final_`   | Denotes a fully reduced, final result.                                        |
+| Prefix | `in_`      | Pertaining to a source buffer.                                                |
+| Prefix | `out_`     | Pertaining to a destination buffer.                                           |
+| Suffix | `_index`   | A logical, ordinal position within a sequence or grid.                        |
+| Suffix | `_offset`  | A physical displacement for direct memory address calculation.                |
+| Suffix | `_count`   | The number of elements to process, relative to a corresponding `_offset`.     |
+| Suffix | `_pow_t`   | A value representing a base raised to the power of the current time-step `t`. |
 
 #### **5.0 Domain and Utility Primitives**
 
-| Domain             | Term            | Type            | Definition                                                                       |
-| :----------------- | :-------------- | :-------------- | :------------------------------------------------------------------------------- |
-| Specialized Layout | `_simd_major`   | Suffix          | Specifies a Struct-of-Arrays (SoA) memory layout aligned to SIMD vector width.   |
-| Optimizer State    | `m1`            | Data Role       | The first moment vector.                                                         |
-| Optimizer State    | `m2`            | Data Role       | The second moment vector.                                                        |
-| Optimizer State    | `learning_rate` | Hyperparameter  | The optimizer step size.                                                         |
-| Optimizer State    | `beta1`         | Hyperparameter  | The exponential decay rate for `m1`.                                             |
-| Optimizer State    | `beta2`         | Hyperparameter  | The exponential decay rate for `m2`.                                             |
-| Optimizer State    | `epsilon`       | Hyperparameter  | The term for preventing division by zero.                                        |
-| Matrix Navigation  | `_leading_dim`  | Suffix (Scalar) | The physical stride, in elements, between the start of consecutive rows/columns. |
-| Constraint Value   | `min_value`     | Scalar Context  | The inclusive minimum boundary for a value.                                      |
-| Constraint Value   | `max_value`     | Scalar Context  | The inclusive maximum boundary for a value.                                      |
+| Domain               | Term                                         | Type            | Definition                                                                       |
+| :------------------- | :------------------------------------------- | :-------------- | :------------------------------------------------------------------------------- |
+| Specialized Layout   | `_simd_major`                                | Suffix          | A Struct-of-Arrays (SoA) layout aligned to SIMD vector width.                    |
+| Specialized Layout   | `_aos`                                       | Suffix          | An Array-of-Structs layout.                                                      |
+| Specialized Layout   | `_soa`                                       | Suffix          | A Struct-of-Arrays layout.                                                       |
+| Specialized Layout   | `_permuted`                                  | Suffix          | A buffer whose elements have undergone a non-trivial permutation.                |
+| Local Memory Pattern | `simd_tile`                                  | Data Role       | A local memory tile used for SIMD optimization.                                  |
+| Local Memory Pattern | `reduction_tile`                             | Data Role       | A local memory tile used for parallel reduction.                                 |
+| Local Memory Pattern | `transpose_tile`                             | Data Role       | A local memory tile used for matrix transpose.                                   |
+| Optimizer State      | `m1`, `m2`                                   | Data Role       | The first and second moment vectors.                                             |
+| Optimizer State      | `learning_rate`, `beta1`, `beta2`, `epsilon` | Hyperparameter  | Optimizer hyperparameters.                                                       |
+| Matrix Navigation    | `_leading_dim`                               | Suffix (Scalar) | The physical stride, in elements, between the start of consecutive rows/columns. |
+| Constraint Value     | `min_value`                                  | Scalar Context  | The inclusive minimum boundary for a value.                                      |
+| Constraint Value     | `max_value`                                  | Scalar Context  | The inclusive maximum boundary for a value.                                      |
+
+#### **6.0 Forbidden & Deprecated Terms**
+
+The following terms are contractually forbidden and must be refactored if found in existing code.
+| Term | Reason | Replacement |
+| :--- | :--- | :--- |
+| `param` | Too generic. | Use `parameters`, or a specific learnable (`weights`, `biases`).|
+| `h` | Ambiguous abbreviation. | Use the full canonical term `hidden_activations`. |
+| `elements` | Redundant with `_count`. | Standardize on the canonical `_count` suffix. |
+| `cce`/`bce` | Problem-specific type in name. | Use generic terms (`loss`, `targets`); type is handled by a `FLAG` param. |
