@@ -45,16 +45,32 @@
 // Define standard kernel attributes for OpenCL environment
 #define KERNEL_ATTR __attribute__((work_group_size_hint(SIMD_WIDTH, 1, 1)))
 
-// In OpenCL mode, require SCALAR_TYPE, SIMD_WIDTH and C_TILE_SIZE to be defined
+// =========================================================================
+// == Contract Enforcement: Mandatory Build-Time Symbols & Constants
+// =========================================================================
+// The System Contract mandates that the following symbols are provided by the
+// host build system at compile time. Failure to do so is a contract violation.
+
+// --- Mandatory Build-Time Symbols ---
+
 #ifndef SCALAR_TYPE
-#error "SCALAR_TYPE must be defined in OpenCL mode"
+#error "System Contract Violation: SCALAR_TYPE must be defined by the host build system."
 #endif
 #ifndef SIMD_WIDTH
-#error "SIMD_WIDTH must be defined in OpenCL mode"
+#error "System Contract Violation: SIMD_WIDTH must be defined by the host build system."
 #endif
 #ifndef C_TILE_SIZE
-#error "C_TILE_SIZE must be defined in OpenCL mode"
+#error "System Contract Violation: C_TILE_SIZE must be defined by the host build system."
 #endif
+
+// --- Mandatory Architectural Constants ---
+
+// The System Contract (Article 5) defines LOCAL_MEM_BANK_PADDING as a fixed
+// architectural constant. The build system MUST provide this exact value.
+#if !defined(LOCAL_MEM_BANK_PADDING) || (LOCAL_MEM_BANK_PADDING != 1)
+#error "System Contract Violation: LOCAL_MEM_BANK_PADDING must be defined and have a value of exactly 1."
+#endif
+
 
 #else
 // Host/C++ mode stub definitions
@@ -85,6 +101,9 @@
 #ifndef C_TILE_SIZE
 #define C_TILE_SIZE 1
 #endif
+#ifndef LOCAL_MEM_BANK_PADDING
+#define LOCAL_MEM_BANK_PADDING 1
+#endif
 #define CLK_LOCAL_MEM_FENCE 0x01
 #define CLK_GLOBAL_MEM_FENCE 0x02
 #define min(a, b) (((a) < (b)) ? (a) : (b))
@@ -99,6 +118,10 @@ inline SCALAR_TYPE clamp(SCALAR_TYPE val, SCALAR_TYPE min_val, SCALAR_TYPE max_v
 inline SCALAR_TYPE select(SCALAR_TYPE a, SCALAR_TYPE b, int c) { return (c) ? b : a; }
 inline SCALAR_TYPE pown(SCALAR_TYPE base, int exp) { return pow(base, (SCALAR_TYPE)exp); }
 #endif // __OPENCL_VERSION__
+
+// Defines the number of extra SCALAR_TYPE elements to pad local memory array strides
+// to mitigate bank conflicts during parallel, strided access patterns.
+#define LOCAL_MEM_BANK_PADDING 1
 
 // Computes the flattened 1D index for a hidden unit, assuming a row-major memory layout.
 #define GET_PHYSICAL_HIDDEN_IDX(b, h, padded_h_dim) ((b) * (padded_h_dim) + (h))

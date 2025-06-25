@@ -1,4 +1,4 @@
-### **System Contract: Host-Device Kernel Interface (Revision 2)**
+### **System Contract: Host-Device Kernel Interface (Revision 3)**
 
 #### **Preamble**
 
@@ -54,7 +54,23 @@ The `[NumberType]` component defines the set of valid values for a scalar. Any v
 
 The `@param` block constitutes the complete logical specification for a parameter.
 
-- **3.1. Buffer Commentary.** For any parameter of type Buffer, the commentary block **shall** fully specify the Tensor Contract, including its Shape, Padding, Calculability Proof, and Validation Preconditions. No other location may define these properties.
+- **3.1. Buffer Commentary.** For any parameter of type Buffer, the commentary block **shall** fully specify the Tensor Contract, including its Shape, Padding Contract, Calculability Proof, and Validation Preconditions. No other location may define these properties. For any `update_buffer_LOCAL_*` parameter whose physical layout is multi-dimensional or accessed via non-contiguous strides (e.g., tiled transpose, parallel reduction), the **Padding Contract is mandatory** and must specify the strategy for mitigating memory bank conflicts.
+
+  **3.1.1. Padding Contract Specification**
+  The `Padding Contract` field **shall** be a string formatted as a key-value object literal. It must contain the following keys:
+
+  - **`Type`**: A string literal specifying the logical reason for padding.
+  - **`Formula`**: A human-readable string describing how the padding is calculated.
+
+  Valid `Type` string literals are:
+
+  | Type Token                | Definition                                                                                                                                        |
+  | :------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------ |
+  | `CACHE`                   | Padding is applied to align data structures to a hardware cache line boundary (e.g., 128-bytes) to optimize global memory throughput.             |
+  | `BANK_CONFLICT_AVOIDANCE` | Padding is applied to the stride of a multi-dimensional local memory array to prevent simultaneous accesses from landing in the same memory bank. |
+  | `SIMD`                    | Padding is applied to align a dimension to the natural SIMD vector width of the hardware, ensuring full utilization of vector processing units.   |
+  | `NONE`                    | No padding is required or applied.                                                                                                                |
+
 - **3.2. Scalar Commentary.** For any parameter of type Scalar, the commentary **shall** provide a single, declarative statement of its logical purpose.
 
 ---
@@ -66,50 +82,52 @@ The following formal notation illustrates the sole valid method for specifying a
 ```c
 /**
  * @brief Performs [function_name] operation.
- *
- * @param src_buffer_GLOBAL_input_stream The primary data source for the computational unit.
- *        - Tensor Shape: (src_scalar_NATURAL_total_item_count)
- *        - Padding Contract: {Type: CACHE, Formula: Post-pad to 128-byte alignment}
- *        - Calculability Proof: [src_scalar_NATURAL_total_item_count]
- *        - Validation Preconditions: [src_scalar_NATURAL_item_offset + src_scalar_NATURAL_item_count <= src_scalar_NATURAL_total_item_count]
- *
- * @param src_buffer_DEVICE_CONST_lookup_table A read-only, device-constant memory resource.
- *        - Tensor Shape: (LUT_CAPACITY)
-          - Memory Mapping: Maps to OpenCL `__constant` address space.
- *        - Padding Contract: None.
- *        - Calculability Proof: [Compile-time constant: LUT_CAPACITY]
- *        - Validation Preconditions: None.
- *
- * @param dest_buffer_GLOBAL_partial_results The sole collection resource for this unit's partial output.
- *        - Tensor Shape: (dest_scalar_NATURAL_total_chunks, RESULT_ELEMENTS_PER_CHUNK)
- *        - Padding Contract: None.
- *        - Calculability Proof: [dest_scalar_NATURAL_total_chunks, Compile-time constant: RESULT_ELEMENTS_PER_CHUNK]
- *        - Validation Preconditions: Host shall zero-initialize this buffer prior to dispatch.
- *
- * @param update_buffer_LOCAL_reduction_tile A work-group exclusive memory resource for intra-group reductions.
- *        - Tensor Shape: (WORK_GROUP_SIZE + BANK_PADDING)
- *        - Padding Contract: {Type: BANK, Formula: + BANK_PADDING}
- *        - Calculability Proof: [Launch-time parameter: get_local_size(0), Compile-time constant: BANK_PADDING]
- *        - Validation Preconditions: Host interaction is prohibited.
- *
- * @param sync_buffer_GLOBAL_atomic_counter A global resource for cross-group atomic synchronization.
- *        - Tensor Shape: (1)
- *        - Padding Contract: None.
- *        - Calculability Proof: [Implicit size: atomic_uint]
- *        - Validation Preconditions: Host shall initialize this resource to 0.
- *
- * @param src_scalar_NATURAL_item_offset Specifies the physical element offset for the read window.
- * @param src_scalar_NATURAL_item_count Specifies the logical element count for the read window.
- * @param src_scalar_NATURAL_total_item_count Specifies the total logical element count of the source stream.
- * @param src_scalar_REAL_processing_threshold Defines the real-valued threshold for the filtering operation.
- * @param dest_scalar_NATURAL_output_chunk_index Defines the logical index for placement of the output chunk.
- * @param dest_scalar_NATURAL_total_chunks Defines the total number of chunks in the decomposition of the output space.
  */
 __kernel void illustrative_kernel_name(
+    /**
+     * @param src_buffer_GLOBAL_input_stream The primary data source for the computational unit.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_item_count)
+     *        - Padding Contract: {Type: CACHE, Formula: Post-pad to 128-byte alignment}
+     *        - Calculability Proof: [src_scalar_NATURAL_total_item_count]
+     *        - Validation Preconditions: [src_scalar_NATURAL_item_offset + src_scalar_NATURAL_item_count <= src_scalar_NATURAL_total_item_count]
+     */
     __global const SCALAR_TYPE* src_buffer_GLOBAL_input_stream,
+
+    /**
+     * @param src_buffer_DEVICE_CONST_lookup_table A read-only, device-constant memory resource.
+     *        - Tensor Shape: (LUT_CAPACITY)
+     *        - Memory Mapping: Maps to OpenCL `__constant` address space.
+     *        - Padding Contract: None.
+     *        - Calculability Proof: [Compile-time constant: LUT_CAPACITY]
+     *        - Validation Preconditions: None.
+     */
     __constant const SCALAR_TYPE* src_buffer_DEVICE_CONST_lookup_table,
+
+    /**
+     * @param dest_buffer_GLOBAL_partial_results The sole collection resource for this unit's partial output.
+     *        - Tensor Shape: (dest_scalar_NATURAL_total_chunks, RESULT_ELEMENTS_PER_CHUNK)
+     *        - Padding Contract: None.
+     *        - Calculability Proof: [dest_scalar_NATURAL_total_chunks, Compile-time constant: RESULT_ELEMENTS_PER_CHUNK]
+     *        - Validation Preconditions: Host shall zero-initialize this buffer prior to dispatch.
+     */
     __global SCALAR_TYPE* dest_buffer_GLOBAL_partial_results,
-    __local SCALAR_TYPE* update_buffer_LOCAL_reduction_tile,
+
+    /**
+     * @param update_buffer_LOCAL_transpose_tile A work-group exclusive memory resource for a tiled matrix transpose.
+     *        - Tensor Shape: (TILE_DIM, TILE_DIM + LOCAL_MEM_BANK_PADDING)
+     *        - Padding Contract: {Type: BANK_CONFLICT_AVOIDANCE, Formula: "Pad row stride to (TILE_DIM + LOCAL_MEM_BANK_PADDING) elements"}
+     *        - Calculability Proof: [Compile-time constant: TILE_DIM, Compile-time constant: LOCAL_MEM_BANK_PADDING]
+     *        - Validation Preconditions: Host interaction is prohibited. Host shall allocate [TILE_DIM * (TILE_DIM + LOCAL_MEM_BANK_PADDING) * sizeof(SCALAR_TYPE)] bytes.
+     */
+    __local SCALAR_TYPE* update_buffer_LOCAL_transpose_tile,
+
+    /**
+     * @param sync_buffer_GLOBAL_atomic_counter A global resource for cross-group atomic synchronization.
+     *        - Tensor Shape: (1)
+     *        - Padding Contract: None.
+     *        - Calculability Proof: [Implicit size: atomic_uint]
+     *        - Validation Preconditions: Host shall initialize this resource to 0.
+     */
     __global atomic_uint* sync_buffer_GLOBAL_atomic_counter,
 
     uint src_scalar_NATURAL_item_offset,

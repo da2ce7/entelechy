@@ -3,13 +3,26 @@
 ### **Guiding Principles**
 
 1.  **Primacy of Memory Strategy:** The singular goal of the host-side orchestration is to ensure the core computation executes in the fastest possible memory tier (Registers > Local > Global). This principle drives all design decisions, prioritizing memory efficiency over computational complexity.
+
+    > **Data organization is inherently informed by the target hardware’s memory hierarchy and access patterns.** The system prioritizes layouts that harmonize with fundamental theoretical constraints of the hardware class (e.g., alignment principles, memory bank theory, access granularity axioms) to optimize computational pathways for throughput and scalable efficiency. This principle elevates hardware-class-aware design as a first-class concern, ensuring implementations achieve maximal bandwidth utilization and latency hiding through generalized hardware paradigms, not ad-hoc device-specific optimizations.
+
 2.  **Modular, "Dumb" Kernels:** Kernels are simple, single-purpose modules. The architecture avoids complex branching ("smart" kernels) and monolithic designs in favor of composability. Where a complex data transformation is a critical-path bottleneck unsolved by generic tools, a **specialized, single-purpose kernel** will be employed. This specialist kernel remains "dumb"—stateless and reliant on the host for all contextual parameters.
+
+    > **Branching is orthogonal to modularity.** When a kernel's core operation diverges fundamentally between use cases (e.g., CCE vs. BCE loss gradients), this document permits two valid strategies:
+
+    > - **(A) Single Kernel with Host-Injected Flag:** \_A unified kernel uses a `FLAG\__` scalar to toggle paths, provided the divergence is manageable.\*
+    > - **(B) Separate Kernels:** _Distinct kernels are expected when divergence is complex or imposes conflicting memory patterns._
+
 3.  **Trust the Driver:** Simple kernels are composed into a logical Directed Acyclic Graph (DAG). The architecture trusts the OpenCL driver to handle low-level optimizations like kernel fusion. The number of nodes in the DAG is a non-goal, emphasizing adaptability over rigid structure.
 4.  **Unified Execution Model:** All workflows follow Act (forward pass) then Learn (backpropagation) sequencing, manifesting as either **Sequential Execution Mode**—where Act-Learn phases execute contiguously for pre-labeled batches—or **Event-Triggered Execution Mode**—where Learn-phase execution awaits an external readiness signal post-Act. This split-phase approach ensures consistency across all use cases.
 5.  **Architectural Hierarchy:** This system is developed under a strict hierarchy of artifacts to ensure conceptual integrity:
+
     - **1. Design Document (This Document):** The highest authority and source of truth for conceptual correctness.
     - **2. Kernel Header Contract:** The binding technical contract between host and device, resonating deeply with the design document.
     - **3. Host Code Implementation:** The lowest authority, rigorously conforming to the kernel header's contract. The header is never modified to suit the host code; the host code always yields to the contract.
+
+    > **Numerical stability in iterative processes (e.g., optimizer state updates) is the sole responsibility of the Host (Level 3).** Terms requiring long-term numerical fidelity—such as exponential decay factors (`beta1**t`, `beta2**t` in Adam)—must be computed by the Host in high-precision arithmetic (e.g., double) and passed as finalized scalar arguments to the device. Device kernels (Level 2) are strictly forbidden from recalculating these terms, ensuring catastrophic underflow or precision erosion cannot occur during extended training sequences.
+
 6.  **No Silent Monoliths:** All executions manifest externally as an Act/Learn split, even if phases are contiguous, ensuring consistency and enabling inter-phase optimization. This eliminates silent assumptions of single-pass execution, reinforcing the architecture’s phased nature.
 
 ---
