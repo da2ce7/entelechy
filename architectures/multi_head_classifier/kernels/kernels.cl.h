@@ -140,8 +140,10 @@ inline SCALAR_TYPE pown(SCALAR_TYPE base, int exp) { return pow(base, (SCALAR_TY
 __kernel void forward_pass(
     /**
      * @param update_buffer_LOCAL_simd_tile A local memory resource for tiling to optimize SIMD operations.
+     *        - Tensor Shape: (SIMD_WIDTH, SIMD_WIDTH + LOCAL_MEM_BANK_PADDING)
      *        - Padding Contract: {Type: BANK_CONFLICT_AVOIDANCE, Formula: "Pad row stride by LOCAL_MEM_BANK_PADDING"}
-     *        - Validation Preconditions: Host shall allocate exactly [SIMD_WIDTH * (SIMD_WIDTH + LOCAL_MEM_BANK_PADDING) * sizeof(SCALAR_TYPE)] bytes of local memory for this argument.
+     *        - Calculability Proof: [Compile-time constant: SIMD_WIDTH, System Contract constant: LOCAL_MEM_BANK_PADDING]
+     *        - Validation Preconditions: Host shall allocate size according to the formula derived from this contract.
      */
     __local SCALAR_TYPE *update_buffer_LOCAL_simd_tile,
 
@@ -150,7 +152,8 @@ __kernel void forward_pass(
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_input_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Pad row stride to 128-byte alignment"}
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_input_count]
-     *        - Validation Preconditions: Buffer must be non-NULL.
+     *        - Validation Preconditions: The access slice defined by chunk parameters must be within the buffer's bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset +
+     * src_scalar_NATURAL_batch_chunk_count) <= src_scalar_NATURAL_total_batch_count.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_input,
 
@@ -186,7 +189,7 @@ __kernel void forward_pass(
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
-     *        - Validation Preconditions: Host shall ensure sufficient VRAM is allocated.
+     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count * sizeof(SCALAR_TYPE)] bytes.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_hidden_activations,
 
@@ -195,7 +198,7 @@ __kernel void forward_pass(
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
-     *        - Validation Preconditions: Host shall ensure sufficient VRAM is allocated.
+     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count * sizeof(SCALAR_TYPE)] bytes.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_hidden_mask,
 
@@ -218,8 +221,9 @@ __kernel void compute_logits_chunk(
      * @param src_buffer_GLOBAL_hidden_activations The intermediate activations from the shared layer.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
-     *        - Calculability Proof: From Node 4 output contract.
-     *        - Validation Preconditions: Must be the valid output of Node 4.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: The batch slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
+     * src_scalar_NATURAL_total_batch_count.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_activations,
 
@@ -227,17 +231,19 @@ __kernel void compute_logits_chunk(
      * @param src_buffer_GLOBAL_hidden_mask The ReLU mask corresponding to the hidden activations.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
-     *        - Calculability Proof: From Node 4 output contract.
-     *        - Validation Preconditions: Must be the valid output of Node 4.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: The batch slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
+     * src_scalar_NATURAL_total_batch_count.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_mask,
 
     /**
      * @param src_buffer_GLOBAL_CONST_weights_module The learnable weights for all classifier modules.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {Type: SIMD, Formula: "output_class_count padded for SIMD/Cache alignment"}
-     *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
-     *        - Validation Preconditions: Buffer must be non-NULL.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
+     *        - Validation Preconditions: The module and class slices must be within bounds, as proven by: [(src_scalar_NATURAL_module_chunk_offset + src_scalar_NATURAL_module_chunk_count) <=
+     * src_scalar_NATURAL_total_modules_count] AND [(src_scalar_NATURAL_class_chunk_offset + src_scalar_NATURAL_class_chunk_count) <= src_scalar_NATURAL_total_output_class_count].
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_CONST_weights_module,
 
@@ -246,7 +252,8 @@ __kernel void compute_logits_chunk(
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {Type: SIMD, Formula: "output_class_count padded for SIMD alignment"}
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_total_output_class_count]
-     *        - Validation Preconditions: Buffer must be non-NULL.
+     *        - Validation Preconditions: The module and class slices must be within bounds, as proven by: [(src_scalar_NATURAL_module_chunk_offset + src_scalar_NATURAL_module_chunk_count) <=
+     * src_scalar_NATURAL_total_modules_count] AND [(src_scalar_NATURAL_class_chunk_offset + src_scalar_NATURAL_class_chunk_count) <= src_scalar_NATURAL_total_output_class_count].
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_CONST_biases_module,
 
@@ -255,7 +262,8 @@ __kernel void compute_logits_chunk(
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {Type: CACHE, Formula: "output_class_count padded for alignment"}
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_total_output_class_count]
-     *        - Validation Preconditions: Host shall ensure sufficient VRAM is allocated.
+     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_total_modules_count * src_scalar_NATURAL_total_batch_count *
+     * src_scalar_NATURAL_padded_total_output_class_count * sizeof(SCALAR_TYPE)] bytes.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_logits,
 
@@ -275,7 +283,8 @@ __kernel void compute_logits_chunk(
 /**
  * @brief (Node 6) Fused kernel to compute probabilities and final CCE loss for a tile.
  * @kernel_contract
- *        - Holistic Constraints: "This kernel is a fused, indivisible unit for numerically stable Softmax calculation."
+ *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
+ *        - Behavioral Invariants: "The implementation is a fused, indivisible unit for numerically stable Softmax calculation."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Partial Renderer for probabilities output."
  */
@@ -284,8 +293,8 @@ __kernel void compute_probs_loss_cce_chunk(
      * @param src_buffer_GLOBAL_logits The raw, pre-activation output from Node 5.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {Type: CACHE, Formula: "output_class_count padded for alignment"}
-     *        - Calculability Proof: From Node 5 output contract.
-     *        - Validation Preconditions: Must be the valid output of Node 5.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_total_output_class_count]
+     *        - Validation Preconditions: The requested tile must be within the total number of tiles, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_logits,
 
@@ -320,8 +329,9 @@ __kernel void compute_probs_loss_cce_chunk(
      * @param dest_buffer_GLOBAL_partial_probs The collection buffer for this tile's computed probabilities.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
-     *        - Validation Preconditions: Adheres to the Partial Renderer contract using `flat_tile_index`.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk]
+     *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
+     *        - Validation Preconditions: Host must provide a valid flat_tile_index and other necessary scalars for the grid_mod_cls placement strategy.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_probs,
 
@@ -357,8 +367,8 @@ __kernel void compute_probs_loss_bce_chunk(
      * @param src_buffer_GLOBAL_logits The raw, pre-activation output from Node 5.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {Type: CACHE, Formula: "output_class_count padded for alignment"}
-     *        - Calculability Proof: From Node 5 output contract.
-     *        - Validation Preconditions: Must be the valid output of Node 5.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_total_output_class_count]
+     *        - Validation Preconditions: The requested tile must be within the total number of tiles, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_logits,
 
@@ -393,8 +403,9 @@ __kernel void compute_probs_loss_bce_chunk(
      * @param dest_buffer_GLOBAL_partial_probs The collection buffer for this tile's computed probabilities.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
-     *        - Validation Preconditions: Adheres to the Partial Renderer contract using `flat_tile_index`.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk]
+     *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
+     *        - Validation Preconditions: Host must provide a valid flat_tile_index and other necessary scalars for the grid_mod_cls placement strategy.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_probs,
 
@@ -402,8 +413,9 @@ __kernel void compute_probs_loss_bce_chunk(
      * @param dest_buffer_GLOBAL_partial_loss The collection buffer for this tile's computed partial loss.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
-     *        - Validation Preconditions: Adheres to the Partial Renderer contract using `flat_tile_index`.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count]
+     *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
+     *        - Validation Preconditions: Host must provide a valid flat_tile_index and other necessary scalars for the grid_mod_cls placement strategy.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_loss,
 
@@ -429,7 +441,9 @@ __kernel void compute_probs_loss_bce_chunk(
 __kernel void calculate_module_param_grads_chunk(
     /**
      * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reductions.
+     *        - Tensor Shape: (get_local_size(0))
      *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [Implicit from work-group dispatch]
      *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(SCALAR_TYPE)`.
      */
     __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
@@ -438,8 +452,9 @@ __kernel void calculate_module_param_grads_chunk(
      * @param src_buffer_GLOBAL_hidden_activations The intermediate activations from the shared layer.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
-     *        - Calculability Proof: From Node 4 output contract.
-     *        - Validation Preconditions: Must be the valid output of Node 4.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: The batch access slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
+     * src_scalar_NATURAL_total_batch_count.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_activations,
 
@@ -447,8 +462,8 @@ __kernel void calculate_module_param_grads_chunk(
      * @param src_buffer_GLOBAL_partial_probs The collection of partial probabilities from Node 6 or 7.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: From Node 6/7 output contracts.
-     *        - Validation Preconditions: Buffer must be valid output of Node 6/7.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk]
+     *        - Validation Preconditions: The requested tile must be within the total number of tiles, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_probs,
 
@@ -467,16 +482,18 @@ __kernel void calculate_module_param_grads_chunk(
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
-     *        - Validation Preconditions: Buffer must be non-NULL.
+     *        - Validation Preconditions: The batch access slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
+     * src_scalar_NATURAL_total_batch_count.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_sample_mask,
 
     /**
      * @param dest_buffer_GLOBAL_partial_grad_weights_module The collection buffer for this tile's computed weight gradients.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_hidden_count, src_scalar_NATURAL_classes_per_chunk)
+     *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_classes_per_chunk)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
-     *        - Validation Preconditions: Adheres to the Partial Renderer contract using `flat_tile_index`.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_classes_per_chunk]
+     *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
+     *        - Validation Preconditions: The write tile index must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_grad_weights_module,
 
@@ -484,8 +501,9 @@ __kernel void calculate_module_param_grads_chunk(
      * @param dest_buffer_GLOBAL_partial_grad_biases_module The collection buffer for this tile's computed bias gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_classes_per_chunk)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
-     *        - Validation Preconditions: Adheres to the Partial Renderer contract using `flat_tile_index`.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_classes_per_chunk]
+     *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
+     *        - Validation Preconditions: The write tile index must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_grad_biases_module,
 
@@ -516,8 +534,8 @@ __kernel void backprop_error_to_hidden_chunk(
      * @param src_buffer_GLOBAL_partial_probs The collection of partial probabilities from Node 6 or 7.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: From Node 6/7 output contracts.
-     *        - Validation Preconditions: Buffer must be valid output of Node 6/7.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk]
+     *        - Validation Preconditions: The requested tile must be within the total number of tiles, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_probs,
 
@@ -542,20 +560,23 @@ __kernel void backprop_error_to_hidden_chunk(
 
     /**
      * @param src_buffer_GLOBAL_CONST_weights_module The learnable weights for all classifier modules.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {Type: CACHE, Formula: "output_class_count padded to alignment"}
-     *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
-     *        - Validation Preconditions: Buffer must be non-NULL.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
+     *        - Validation Preconditions: The module targeted by the tile index must be within bounds. The logic for deriving the module index from flat_tile_index is complex, but the overarching tile
+     * index itself must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_CONST_weights_module,
 
     /**
      * @param dest_buffer_GLOBAL_partial_grad_hidden_activations_aos The collection buffer for this tile's computed upstream gradients.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_hidden_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
-     *        - Validation Preconditions: [ARCHITECTURAL SYNCHRONIZATION POINT] The consumer of this buffer (Node 12) is a global permutation requiring a monolithic input. Therefore, the Host
-     * Orchestrator MUST NOT stream the batch dimension when populating this buffer. It must be computed in full via the 'Accumulate via Recompute' strategy.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
+     *        - Validation Preconditions: [1] The write tile index must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] [ARCHITECTURAL
+     * SYNCHRONIZATION POINT] The consumer of this buffer (Node 12) is a global permutation requiring a monolithic input. Therefore, the Host Orchestrator MUST NOT stream the batch dimension when
+     * populating this buffer. It must be computed in full via the 'Accumulate via Recompute' strategy.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_grad_hidden_activations_aos,
 
@@ -566,6 +587,7 @@ __kernel void backprop_error_to_hidden_chunk(
     uint src_scalar_NATURAL_modules_per_chunk,
     uint src_scalar_NATURAL_total_batch_count,
     uint src_scalar_NATURAL_hidden_count,
+    uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_total_output_class_count,
     uint src_scalar_NATURAL_padded_total_output_class_count,
     uint src_scalar_NATURAL_total_modules_count,
@@ -581,7 +603,9 @@ __kernel void backprop_error_to_hidden_chunk(
 __kernel void calculate_chunk_temp_gradients(
     /**
      * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reductions.
+     *        - Tensor Shape: (get_local_size(0))
      *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [Implicit from work-group dispatch]
      *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(SCALAR_TYPE)`.
      */
     __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
@@ -590,7 +614,7 @@ __kernel void calculate_chunk_temp_gradients(
      * @param src_buffer_GLOBAL_logits The raw, pre-activation output from Node 5.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {Type: CACHE, Formula: "output_class_count padded for alignment"}
-     *        - Calculability Proof: From Node 5 output contract.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_total_output_class_count]
      *        - Validation Preconditions: Must be the valid output of Node 5.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_logits,
@@ -599,7 +623,7 @@ __kernel void calculate_chunk_temp_gradients(
      * @param src_buffer_GLOBAL_partial_probs The collection of partial probabilities from Node 6 or 7.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: From Node 6/7 output contracts.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk]
      *        - Validation Preconditions: Buffer must be valid output of Node 6/7.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_probs,
@@ -636,8 +660,9 @@ __kernel void calculate_chunk_temp_gradients(
      * @param dest_buffer_GLOBAL_partial_grad_temps The collection buffer for this tile's computed temperature gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
-     *        - Validation Preconditions: Adheres to the Partial Renderer contract using `flat_tile_index`.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk]
+     *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
+     *        - Validation Preconditions: Host must provide valid `src_scalar_NATURAL_flat_tile_index` and `src_scalar_NATURAL_num_class_chunks` scalars.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_grad_temps,
 
@@ -664,36 +689,44 @@ __kernel void calculate_chunk_temp_gradients(
 __kernel void transpose_chunk(
     /**
      * @param update_buffer_LOCAL_transpose_tile Local memory for optimizing the transpose via tiling.
+     *        - Tensor Shape: (C_TILE_SIZE, C_TILE_SIZE + LOCAL_MEM_BANK_PADDING)
      *        - Padding Contract: {Type: BANK_CONFLICT_AVOIDANCE, Formula: "Pad row stride by LOCAL_MEM_BANK_PADDING"}
-     *        - Validation Preconditions: [1] Host shall allocate exactly [C_TILE_SIZE * (C_TILE_SIZE + LOCAL_MEM_BANK_PADDING) * sizeof(SCALAR_TYPE)] bytes of local memory, using the value of
-     * LOCAL_MEM_BANK_PADDING defined in System Contract Article 5. [2] Host must dispatch this kernel with a 2D local work-group size of (C_TILE_SIZE, C_TILE_SIZE).
+     *        - Calculability Proof: [Compile-time constant: C_TILE_SIZE, System Contract constant: LOCAL_MEM_BANK_PADDING]
+     *        - Validation Preconditions: [1] Host shall allocate size according to the formula derived from this contract. [2] Host must dispatch this kernel with a 2D local work-group size of
+     * (C_TILE_SIZE, C_TILE_SIZE).
      */
     __local SCALAR_TYPE *update_buffer_LOCAL_transpose_tile,
 
     /**
      * @param src_buffer_GLOBAL_input The source buffer containing the slice to transpose.
-     *        - Tensor Shape: Host-defined.
-     *        - Padding Contract: Host-defined. The kernel navigates this buffer using the provided leading dimension and offset scalars.
-     *        - Calculability Proof: Provided by host at runtime.
-     *        - Validation Preconditions: The sub-region defined by kernel arguments must be within buffer bounds.
+     *        - Tensor Shape: (src_scalar_NATURAL_in_total_element_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_in_total_element_count]
+     *        - Validation Preconditions: [1] The sub-region defined by kernel arguments must be within the buffer's physical bounds, as proven by: (src_scalar_NATURAL_in_offset +
+     * ((src_scalar_NATURAL_sub_region_dim1_count - 1) * src_scalar_NATURAL_in_leading_dim) + (src_scalar_NATURAL_sub_region_dim2_count - 1)) < src_scalar_NATURAL_in_total_element_count. [2] The
+     * kernel is agnostic to this buffer's padding strategy; correct navigation is guaranteed by the `in_offset` and `in_leading_dim` scalars.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_input,
 
     /**
      * @param dest_buffer_GLOBAL_output The destination buffer for the transposed slice.
-     *        - Tensor Shape: Host-defined.
-     *        - Padding Contract: Host-defined. The kernel navigates this buffer using the provided leading dimension and offset scalars.
-     *        - Calculability Proof: Provided by host at runtime.
-     *        - Validation Preconditions: The sub-region defined by kernel arguments must be within buffer bounds.
+     *        - Tensor Shape: (src_scalar_NATURAL_out_total_element_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_out_total_element_count]
+     *        - Validation Preconditions: [1] The sub-region defined by kernel arguments must be within the buffer's physical bounds, as proven by: (src_scalar_NATURAL_out_offset +
+     * ((src_scalar_NATURAL_sub_region_dim2_count - 1) * src_scalar_NATURAL_out_leading_dim) + (src_scalar_NATURAL_sub_region_dim1_count - 1)) < src_scalar_NATURAL_out_total_element_count. [2] The
+     * kernel is agnostic to this buffer's padding strategy; correct navigation is guaranteed by the `out_offset` and `out_leading_dim` scalars.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_output,
 
     uint src_scalar_NATURAL_in_offset,
     uint src_scalar_NATURAL_out_offset,
-    uint src_scalar_NATURAL_rows_count,
-    uint src_scalar_NATURAL_cols_count,
+    uint src_scalar_NATURAL_sub_region_dim1_count,
+    uint src_scalar_NATURAL_sub_region_dim2_count,
     uint src_scalar_NATURAL_in_leading_dim,
-    uint src_scalar_NATURAL_out_leading_dim);
+    uint src_scalar_NATURAL_out_leading_dim,
+    uint src_scalar_NATURAL_in_total_element_count,
+    uint src_scalar_NATURAL_out_total_element_count);
 
 /**
  * @brief (Node 12) Specialized Kernel: Gathers scattered partial gradients into a single, reduction-ready buffer.
@@ -707,9 +740,9 @@ __kernel void transpose_chunk(
 __kernel void gather_and_permute_grad_hidden_activations(
     /**
      * @param src_buffer_GLOBAL_partial_grad_hidden_activations_aos The full collection of partial upstream gradients from Node 9.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_hidden_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: From Node 9 output contract.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
      *        - Validation Preconditions: [ARCHITECTURAL SYNCHRONIZATION POINT] The consumer of this buffer (this kernel, Node 12) is a global permutation requiring a monolithic input. Therefore, the
      * Host Orchestrator MUST NOT stream the batch dimension when dispatching the producer of this buffer (Node 9). The 'Accumulate via Recompute' strategy is mandatory for the upstream data path.
      */
@@ -717,15 +750,16 @@ __kernel void gather_and_permute_grad_hidden_activations(
 
     /**
      * @param dest_buffer_GLOBAL_grad_hidden_activations_permuted_soa The final, contiguous, SoA-layout buffer ready for reduction by Node 14.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_hidden_count, src_scalar_NATURAL_padded_total_modules_count)
-     *        - Padding Contract: {Type: CACHE, Formula: "`total_modules_count` padded to alignment for the trailing dimension"}
-     *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count)
+     *        - Padding Contract: {Type: CACHE, Formula: "Trailing dimension (`total_modules_count`) is Host-padded to `padded_total_modules_count` for alignment."}
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count]
      *        - Validation Preconditions: Host shall ensure sufficient VRAM is allocated.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_grad_hidden_activations_permuted_soa,
 
     uint src_scalar_NATURAL_total_batch_count,
     uint src_scalar_NATURAL_hidden_count,
+    uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_total_modules_count,
     uint src_scalar_NATURAL_padded_total_modules_count,
     uint src_scalar_NATURAL_num_module_chunks_count,
@@ -740,73 +774,75 @@ __kernel void gather_and_permute_grad_hidden_activations(
  * @kernel_contract
  *        - Holistic Constraints: "This kernel forms the base case of the reduction engine. The Host Orchestrator is contractually obligated to invoke this kernel if and only if the number of partials
  * to be reduced is exactly 1."
- *        - Idempotency: "Associatively Idempotent"
+ *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Utility / Base Case"
  */
 __kernel void aggregate_identity(
     /**
      * @param src_buffer_GLOBAL_partial_input The single source partial buffer to be copied.
-     *        - Tensor Shape: (src_scalar_NATURAL_element_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_total_element_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_element_count]
+     *        - Calculability Proof: [src_scalar_NATURAL_total_element_count]
      *        - Validation Preconditions: Buffer must be non-NULL and readable.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_input,
 
     /**
-     * @param dest_buffer_GLOBAL_final_result The destination buffer for the copied data.
-     *        - Tensor Shape: (src_scalar_NATURAL_element_count)
+     * @param dest_buffer_GLOBAL_final_output The destination buffer for the copied data.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_element_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_element_count]
-     *        - Validation Preconditions: Buffer must be non-NULL, writable, and sufficiently large.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_element_count]
+     *        - Validation Preconditions: Buffer must be non-NULL and host must allocate at least [src_scalar_NATURAL_total_element_count * sizeof(SCALAR_TYPE)] bytes.
      */
-    __global SCALAR_TYPE *dest_buffer_GLOBAL_final_result,
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_final_output,
 
-    uint src_scalar_NATURAL_element_count);
+    uint src_scalar_NATURAL_total_element_count);
 
 /**
  * @brief (Node 13, 17) Tier 1 (N is small): Reduces partial results using registers.
  * @kernel_contract
  *        - Holistic Constraints: "The Host Orchestrator invokes this tier of the reduction engine for a small number of partials (N > 1)."
- *        - Behavioral Invariants: "The reduction policy (e.g., SUM or AVERAGE) is controlled by the `aggregation_mode` flag."
+ *        - Behavioral Invariants: "The reduction policy (e.g., SUM or AVERAGE) is controlled by the `operation_type` flag."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Reduction Engine Tier 1"
  */
 __kernel void aggregate_register_reduce(
     /**
      * @param src_buffer_GLOBAL_partial_input The collection of source partial buffers to be reduced.
-     *        - Tensor Shape: (src_scalar_NATURAL_in_partials_count, src_scalar_NATURAL_elements_per_partial_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_in_partials_count, src_scalar_NATURAL_partial_element_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_in_partials_count, src_scalar_NATURAL_elements_per_partial_count]
+     *        - Calculability Proof: [src_scalar_NATURAL_in_partials_count, src_scalar_NATURAL_partial_element_count]
      *        - Validation Preconditions: Buffer must be non-NULL and readable.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_input,
 
     /**
-     * @param dest_buffer_GLOBAL_reduced_result The destination buffer for the single, reduced partial result.
-     *        - Tensor Shape: (src_scalar_NATURAL_elements_per_partial_count)
+     * @param dest_buffer_GLOBAL_partial_output The destination buffer for the single, reduced partial result.
+     *        - Tensor Shape: (src_scalar_NATURAL_partial_element_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_elements_per_partial_count]
-     *        - Validation Preconditions: Buffer must be non-NULL, writable, and sufficiently large.
+     *        - Calculability Proof: [src_scalar_NATURAL_partial_element_count]
+     *        - Validation Preconditions: Host must allocate at least [src_scalar_NATURAL_partial_element_count * sizeof(SCALAR_TYPE)] bytes.
      */
-    __global SCALAR_TYPE *dest_buffer_GLOBAL_reduced_result,
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_output,
 
     uint src_scalar_NATURAL_in_partials_count,
-    uint src_scalar_NATURAL_elements_per_partial_count,
-    uint src_scalar_FLAG_aggregation_mode);
+    uint src_scalar_NATURAL_partial_element_count,
+    uint src_scalar_FLAG_operation_type);
 
 /**
  * @brief (Node 13, 17) Tier 2 (N is large): Reduces partial results using local memory.
  * @kernel_contract
  *        - Holistic Constraints: "The Host Orchestrator invokes this tier of the reduction engine for a large number of partials."
- *        - Behavioral Invariants: "The reduction policy (e.g., SUM or AVERAGE) is controlled by the `aggregation_mode` flag."
+ *        - Behavioral Invariants: "The reduction policy (e.g., SUM or AVERAGE) is controlled by the `operation_type` flag."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Reduction Engine Tier 2 / Work-group Parallel"
  */
 __kernel void aggregate_local_reduce(
     /**
      * @param update_buffer_LOCAL_reduction_tile Local memory for performing the intra-work-group reduction.
+     *        - Tensor Shape: (get_local_size(0))
      *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [Implicit from work-group dispatch]
      *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(SCALAR_TYPE)`.
      *        - Performance Notes: For optimal performance, the work-group size for dimension 0 should be a power of 2 to ensure conflict-free parallel reduction.
      */
@@ -814,68 +850,28 @@ __kernel void aggregate_local_reduce(
 
     /**
      * @param src_buffer_GLOBAL_partial_input The collection of source partial buffers to be reduced.
-     *        - Tensor Shape: (src_scalar_NATURAL_in_partials_count, src_scalar_NATURAL_elements_per_partial_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_in_partials_count, src_scalar_NATURAL_partial_element_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_in_partials_count, src_scalar_NATURAL_elements_per_partial_count]
+     *        - Calculability Proof: [src_scalar_NATURAL_in_partials_count, src_scalar_NATURAL_partial_element_count]
      *        - Validation Preconditions: Buffer must be non-NULL and readable.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_input,
 
     /**
-     * @param dest_buffer_GLOBAL_reduced_result The destination buffer for the single, reduced partial result.
-     *        - Tensor Shape: (src_scalar_NATURAL_elements_per_partial_count)
+     * @param dest_buffer_GLOBAL_partial_output The destination buffer for the single, reduced partial result.
+     *        - Tensor Shape: (src_scalar_NATURAL_partial_element_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_elements_per_partial_count]
-     *        - Validation Preconditions: Buffer must be non-NULL, writable, and sufficiently large.
+     *        - Calculability Proof: [src_scalar_NATURAL_partial_element_count]
+     *        - Validation Preconditions: Host must allocate at least [src_scalar_NATURAL_partial_element_count * sizeof(SCALAR_TYPE)] bytes.
      */
-    __global SCALAR_TYPE *dest_buffer_GLOBAL_reduced_result,
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_output,
 
     uint src_scalar_NATURAL_in_partials_count,
-    uint src_scalar_NATURAL_elements_per_partial_count,
-    uint src_scalar_FLAG_aggregation_mode);
-
-// --- Phase 14: Specialized Grad_H Reduction ---
-
-/**
- * @brief (Node 14) Specialized Kernel: Reduces the permuted Grad_H buffer over the module dimension.
- * @kernel_contract
- *        - Holistic Constraints: "Specialized reduction kernel for consuming the SoA-layout buffer produced by Node 12."
- *        - Idempotency: "Associatively Non-Idempotent"
- *        - Synchronization Model: "Work-group Parallel Reduction"
- *        - Behavioral Invariant: "Each work-group is responsible for reducing the gradient contributions for a single hidden activation across all modules."
- */
-__kernel void reduce_grad_hidden_activations_over_modules(
-    /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for performing the intra-work-group reduction.
-     *        - Padding Contract: {Type: NONE}
-     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(SCALAR_TYPE)`.
-     *        - Performance Notes: For optimal performance, the work-group size for dimension 0 should be a power of 2 to ensure conflict-free parallel reduction.
-     */
-    __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
-
-    /**
-     * @param src_buffer_GLOBAL_grad_hidden_activations_permuted_soa The permuted, SoA-layout buffer from Node 12.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_element_count, src_scalar_NATURAL_padded_total_modules_count)
-     *        - Padding Contract: {Type: CACHE, Formula: "`total_modules_count` padded to alignment for the trailing dimension"}
-     *        - Calculability Proof: From Node 12 output contract.
-     *        - Validation Preconditions: Must be the valid output of Node 12.
-     */
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_grad_hidden_activations_permuted_soa,
-
-    /**
-     * @param dest_buffer_GLOBAL_final_grad_hidden_activations The final, consolidated upstream gradient for the shared layer.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_element_count)
-     *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_total_element_count]
-     *        - Validation Preconditions: Buffer must be non-NULL, writable, and sufficiently large.
-     */
-    __global SCALAR_TYPE *dest_buffer_GLOBAL_final_grad_hidden_activations,
-
-    uint src_scalar_NATURAL_total_element_count,
-    uint src_scalar_NATURAL_total_modules_count,
-    uint src_scalar_NATURAL_padded_total_modules_count);
+    uint src_scalar_NATURAL_partial_element_count,
+    uint src_scalar_FLAG_operation_type);
 
 // --- Phase 15-16: Streaming Shared Layer Backpropagation ---
+
 /**
  * @brief (Node 15) Computes partial gradients for shared layer weights from a batch chunk.
  * @kernel_contract
@@ -886,7 +882,9 @@ __kernel void reduce_grad_hidden_activations_over_modules(
 __kernel void backprop_shared_weights_chunk(
     /**
      * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reductions.
+     *        - Tensor Shape: (get_local_size(0))
      *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [Implicit from work-group dispatch]
      *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(SCALAR_TYPE)`.
      */
     __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
@@ -895,8 +893,8 @@ __kernel void backprop_shared_weights_chunk(
      * @param src_buffer_GLOBAL_input The initial, untransformed input data for the batch.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_input_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
-     *        - Calculability Proof: From initial problem definition.
-     *        - Validation Preconditions: Must be non-NULL.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_input_count]
+     *        - Validation Preconditions: Buffer must be non-NULL.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_input,
 
@@ -904,17 +902,18 @@ __kernel void backprop_shared_weights_chunk(
      * @param src_buffer_GLOBAL_hidden_activations The intermediate activations from the shared layer (Node 4).
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
-     *        - Calculability Proof: From Node 4 output contract.
-     *        - Validation Preconditions: Must be the valid output of Node 4.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: Buffer must be non-NULL.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_activations,
 
     /**
      * @param src_buffer_GLOBAL_final_grad_hidden_activations The final, consolidated upstream gradient from Node 14.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_hidden_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_total_element_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: From Node 14 output contract.
-     *        - Validation Preconditions: Must be the valid output of Node 14.
+     *        - Calculability Proof: [src_scalar_NATURAL_final_grad_hidden_total_element_count]
+     *        - Validation Preconditions: [1] The logical shape assumed by this kernel must match the physical size of the provided buffer, as proven by: (src_scalar_NATURAL_total_batch_count *
+     * src_scalar_NATURAL_padded_hidden_count) == src_scalar_NATURAL_final_grad_hidden_total_element_count. [2] Buffer must be the valid output of Node 14.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_final_grad_hidden_activations,
 
@@ -931,8 +930,9 @@ __kernel void backprop_shared_weights_chunk(
      * @param dest_buffer_GLOBAL_partial_grad_weights_shared The collection buffer for this chunk's computed weight gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks_count, src_scalar_NATURAL_padded_input_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
-     *        - Validation Preconditions: Adheres to the Partial Renderer contract using `src_scalar_NATURAL_batch_chunk_index` for output placement.
+     *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks_count, src_scalar_NATURAL_padded_input_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Placement Contract: linear_batch(src_scalar_NATURAL_batch_chunk_index)
+     *        - Validation Preconditions: Host must provide a valid `src_scalar_NATURAL_batch_chunk_index`.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_grad_weights_shared,
 
@@ -942,7 +942,8 @@ __kernel void backprop_shared_weights_chunk(
     uint src_scalar_NATURAL_total_batch_count,
     uint src_scalar_NATURAL_num_batch_chunks_count,
     uint src_scalar_NATURAL_padded_input_count,
-    uint src_scalar_NATURAL_padded_hidden_count);
+    uint src_scalar_NATURAL_padded_hidden_count,
+    uint src_scalar_NATURAL_final_grad_hidden_total_element_count);
 
 /**
  * @brief (Node 16) Computes partial gradients for shared layer biases from a batch chunk.
@@ -954,7 +955,9 @@ __kernel void backprop_shared_weights_chunk(
 __kernel void backprop_shared_biases_chunk(
     /**
      * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reductions.
+     *        - Tensor Shape: (get_local_size(0))
      *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [Implicit from work-group dispatch]
      *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(SCALAR_TYPE)`.
      */
     __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
@@ -963,17 +966,18 @@ __kernel void backprop_shared_biases_chunk(
      * @param src_buffer_GLOBAL_hidden_activations The intermediate activations from the shared layer (Node 4).
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
-     *        - Calculability Proof: From Node 4 output contract.
-     *        - Validation Preconditions: Must be the valid output of Node 4.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: Buffer must be non-NULL.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_activations,
 
     /**
      * @param src_buffer_GLOBAL_final_grad_hidden_activations The final, consolidated upstream gradient from Node 14.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_hidden_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_total_element_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: From Node 14 output contract.
-     *        - Validation Preconditions: Must be the valid output of Node 14.
+     *        - Calculability Proof: [src_scalar_NATURAL_final_grad_hidden_total_element_count]
+     *        - Validation Preconditions: [1] The logical shape assumed by this kernel must match the physical size of the provided buffer, as proven by: (src_scalar_NATURAL_total_batch_count *
+     * src_scalar_NATURAL_padded_hidden_count) == src_scalar_NATURAL_final_grad_hidden_total_element_count. [2] Buffer must be the valid output of Node 14.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_final_grad_hidden_activations,
 
@@ -990,8 +994,9 @@ __kernel void backprop_shared_biases_chunk(
      * @param dest_buffer_GLOBAL_partial_grad_biases_shared The collection buffer for this chunk's computed bias gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: All dimensions are scalars provided by the Host Orchestrator.
-     *        - Validation Preconditions: Adheres to the Partial Renderer contract using `src_scalar_NATURAL_batch_chunk_index` for output placement.
+     *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Placement Contract: linear_batch(src_scalar_NATURAL_batch_chunk_index)
+     *        - Validation Preconditions: Host must provide a valid `src_scalar_NATURAL_batch_chunk_index`.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_grad_biases_shared,
 
@@ -1000,9 +1005,11 @@ __kernel void backprop_shared_biases_chunk(
     uint src_scalar_NATURAL_batch_chunk_index,
     uint src_scalar_NATURAL_total_batch_count,
     uint src_scalar_NATURAL_num_batch_chunks_count,
-    uint src_scalar_NATURAL_padded_hidden_count);
+    uint src_scalar_NATURAL_padded_hidden_count,
+    uint src_scalar_NATURAL_final_grad_hidden_total_element_count);
 
 // --- Phase 19-20: Finalization & Updates ---
+
 /**
  * @brief (Node 19) Applies Adam optimizer update to an entire parameter group. Single dispatch.
  * @kernel_contract

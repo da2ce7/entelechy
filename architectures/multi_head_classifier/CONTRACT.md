@@ -13,6 +13,7 @@ The architecture is immutably founded upon the following axioms.
 - **1.1. Axiom of Jurisdictional Separation.** A parameter's syntactic structure (**Name**) defines its machine-enforced contract. A parameter's semantic block (**Commentary**) defines its human-verifiable and logical contract. These two jurisdictions are distinct and exhaustive.
 - **1.2. Axiom of Semantic Uniqueness.** Information encoded within the syntactic jurisdiction (Name) is prohibited from being duplicated within the semantic jurisdiction (Commentary), and vice versa. There shall exist no redundancy between the two.
 - **1.3. Axiom of Memory Layout.** All multi-dimensional buffers are contractually obligated to be stored in a **row-major memory layout**. The physical address of an element is calculated accordingly. Any deviation from this layout must be explicitly signaled by a canonical layout suffix (e.g., `_soa`).
+- **1.4: Axiom of Interface Verifiability.** A kernel's public interface, defined by its full parameter list, shall constitute a **closed logical system**. The information required to validate any parameter's `Calculability Proof` or `Validation Preconditions` must be present within the parameter list itself. The interface is forbidden from depending on implicit, host-only knowledge for its contextual validation. A kernel must possess sufficient information to verify its own contract.
 
 ### **Article 2: Parameter Lexical Mandate**
 
@@ -57,7 +58,7 @@ The `@param` block constitutes the complete logical specification for a paramete
 
 - **`Tensor Shape`**: The logical dimensions of the tensor.
 - **`Padding Contract`**: A key-value object literal specifying padding strategy.
-- **`Calculability Proof`**: The source of truth for buffer dimensions.
+- **`Calculability Proof`**: Defines the derivation of buffer dimensions or scalar values through a constructive arithmetic expression composed solely of parameters present within the kernel’s interface. All terms in this expression shall correspond to kernel arguments, satisfying the Axiom of Interface Verifiability (1.4).
 - **`Validation Preconditions`**: Mandatory conditions the host must meet.
 - **`Performance Notes`**: Optional, non-binding performance optimization hints.
 
@@ -71,8 +72,32 @@ The `Padding Contract` field `Type` key accepts the following string literals:
 | `SIMD`                    | Padding to align a dimension to the natural SIMD vector width.           |
 | `NONE`                    | No padding is required or applied.                                       |
 
+
 **3.2. Partial Renderer Contract**
-Kernels designated as "Partial Renderers" accept a `src_scalar_NATURAL_flat_tile_index`. The decomposition of this index into logical coordinates **shall** use the formula: `module_chunk_idx = flat_tile_index / num_class_chunks; class_chunk_idx = flat_tile_index % num_class_chunks;`
+
+**3.2.1. Principle**
+
+A kernel designated a "Partial Renderer" writes its output to a discrete, non-overlapping slice of a larger collection buffer. This is governed by a **`Placement Contract`**, which defines the precise strategy for calculating a write offset from a host-provided key.
+
+**3.2.2. Specification**
+
+The contract is specified within a parameter's commentary block using the `Placement Contract` key. The value of this key **shall** be a string literal adhering to a function-like grammar:
+
+`strategy_name(key_parameter)`
+
+-   `strategy_name`: A canonical, lowercase identifier for the placement strategy, as defined in Article 3.2.3.
+-   `key_parameter`: The full, canonical name of the scalar parameter that serves as the unique placement key for the kernel invocation.
+
+**3.2.3. Canonical Placement Strategies**
+
+The following strategy names are exhaustive. Their use contractually binds the implementation to the specified calculation logic.
+
+| `strategy_name`  | Definition                                                                        | Mandatory Key Parameter                     | Required Context Parameters               |
+| :--------------- | :-------------------------------------------------------------------------------- | :------------------------------------------ | :---------------------------------------- |
+| `grid_mod_cls`   | Decomposes a 2D logical grid of (Module, Class) chunks from a flattened 1D index. | `src_scalar_NATURAL_flat_tile_index`        | `src_scalar_NATURAL_num_class_chunks`     |
+| `linear_batch`   | Decomposes by linear chunking of the batch dimension.                             | `src_scalar_NATURAL_batch_chunk_index`      | None, beyond buffer/stride dimensions.    |
+| `linear_generic` | Decomposes by linear chunking of an arbitrary dimension.                          | An appropriate `..._chunk_index` scalar.    | None, beyond buffer/stride dimensions.    |
+
 
 ### **Article 4: The Kernel Contract Block**
 
@@ -80,13 +105,12 @@ Kernels designated as "Partial Renderers" accept a `src_scalar_NATURAL_flat_tile
 
 **4.2. Formal Structure.** The block shall be a key-value list. The following keys are recognized:
 
-| Key                         | Definition                                                                                                                                                                                     | Status        |
-| :-------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------ |
+| Key                         | Definition                                                                                                                                                                                                                                             | Status        |
+| :-------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------ |
 | **`Holistic Constraints`**  | This key is a tool of last resort, to be used only when a constraint truly has no logical owner in the parameter list. If none exist, this key **shall** contain the exact string: _"All constraints are defined by the parameter commentary blocks."_ | **Mandatory** |
-| **`Idempotency`** | Declares the kernel's precise deterministic and state-modifying behavior. It **shall** be one of the following string literals: `Strictly Idempotent`, `Associatively Non-Idempotent`, or `Fundamentally Non-Idempotent (Stateful)`. | **Mandatory** |
-| **`Synchronization Model`** | Describes the kernel's role within the global DAG (e.g., "Streamable," "Global Barrier").                                                                                                      | Optional      |
-| **`Behavioral Invariants`** | Defines strict rules governing the kernel's internal implementation (e.g., "Forbidden from using `pown`").                                                                                     | Optional      |
-
+| **`Idempotency`**           | Declares the kernel's precise deterministic and state-modifying behavior. It **shall** be one of the following string literals: `Strictly Idempotent`, `Associatively Non-Idempotent`, or `Fundamentally Non-Idempotent (Stateful)`.                   | **Mandatory** |
+| **`Synchronization Model`** | Describes the kernel's role within the global DAG (e.g., "Streamable," "Global Barrier").                                                                                                                                                              | Optional      |
+| **`Behavioral Invariants`** | Defines strict rules governing the kernel's internal implementation (e.g., "Forbidden from using `pown`").                                                                                                                                             | Optional      |
 
 ### **Article 5: Architectural Constants**
 
@@ -106,6 +130,7 @@ This article defines symbols that must be provided by the host build environment
 
 The following formal notation illustrates the sole valid method for specifying a kernel interface in adherence to this contract.
 
+```
 /**
  * @brief Performs a tiled matrix transpose, demonstrating full contract compliance.
  * @kernel_contract
@@ -164,7 +189,7 @@ __kernel void illustrative_kernel_name(
     uint dest_scalar_NATURAL_output_chunk_index,
     uint dest_scalar_NATURAL_total_chunks
 );
-
+```
 
 ### **Article 8: Canonical Lexicon for `[ContextAndUsage]`**
 
@@ -174,24 +199,25 @@ This Lexicon establishes the sole binding definitions for the `[ContextAndUsage]
 
 #### **2.0 Core Data Role Primitives**
 
-| Term                 | Definition                                                                    |
-| :------------------- | :---------------------------------------------------------------------------- |
-| `input`              | The initial, untransformed data set for a complete computation.               |
-| `weights`            | The set of learnable weight parameters for a model layer.                     |
-| `biases`             | The set of learnable bias parameters for a model layer.                       |
-| `parameters`         | A generic learnable parameter buffer (e.g., for optimizers).                  |
-| `hidden_activations` | The post-activation output tensor of an intermediate system layer.            |
-| `logits`             | The pre-activation, real-valued output tensor of the final system layer.      |
-| `loss`               | The final computed loss value or tensor.                                      |
-| `probs`              | The post-activation, normalized probability tensor of the final system layer. |
-| `grad`               | The gradient tensor derived from a specified parameter.                       |
-| `sample_mask`        | A tensor defining the validity (`1`) or padding (`0`) status of samples.      |
-| `shared`             | A parameter that is shared across multiple modules or layers.                 |
-| `module`             | A parameter specific to a single classifier module (head).                    |
-| `output_class`       | A dimension or count related to the output classes of a classifier.           |
-| `targets`            | The ground truth labels for a supervised learning task.                       |
-| `temps`              | The set of learnable temperature parameters for logit scaling.                |
-| `generic`            | A type-punned buffer whose interpretation is context-dependent.               |
+| Term                 | Definition                                                                                      |
+| :------------------- | :---------------------------------------------------------------------------------------------- |
+| `input`              | The initial, untransformed data set for a complete computation.                                 |
+| `weights`            | The set of learnable weight parameters for a model layer.                                       |
+| `biases`             | The set of learnable bias parameters for a model layer.                                         |
+| `parameters`         | A generic learnable parameter buffer (e.g., for optimizers).                                    |
+| `hidden_activations` | The post-activation output tensor of an intermediate system layer.                              |
+| `logits`             | The pre-activation, real-valued output tensor of the final system layer.                        |
+| `loss`               | The final computed loss value or tensor.                                                        |
+| `probs`              | The post-activation, normalized probability tensor of the final system layer.                   |
+| `grad`               | The gradient tensor derived from a specified parameter.                                         |
+| `sample_mask`        | A tensor defining the validity (`1.0`) or invalidity/padding (`0.0`) of each sample in a batch. |
+| `hidden_mask`        | A derivative mask, typically from a ReLU operation, combined with an upstream `sample_mask`.    |
+| `shared`             | A parameter that is shared across multiple modules or layers.                                   |
+| `module`             | A parameter specific to a single classifier module (head).                                      |
+| `output_class`       | A dimension or count related to the output classes of a classifier.                             |
+| `targets`            | The ground truth labels for a supervised learning task.                                         |
+| `temps`              | The set of learnable temperature parameters for logit scaling.                                  |
+| `generic`            | A type-punned buffer whose interpretation is context-dependent.                                 |
 
 #### **3.0 Decomposition Strategy Primitives**
 
