@@ -1029,7 +1029,7 @@ __kernel void reduce_grad_h_over_modules(
     __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
 
     /**
-     * @param src_buffer_GLOBAL_grad_hidden_activations_permuted_soa The contiguous, SoA-layout buffer from Node 12.
+     * @param src_buffer_GLOBAL_grad_hidden_activations_permuted_soa The contiguous, SoA-layout buffer from Node 13.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count]
@@ -1094,7 +1094,7 @@ __kernel void backprop_shared_weights_chunk(
     __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_activations,
 
     /**
-     * @param src_buffer_GLOBAL_final_grad_hidden_activations The final, consolidated upstream gradient from Node 14.
+     * @param src_buffer_GLOBAL_final_grad_hidden_activations The final, consolidated upstream gradient from Node 16.
      *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_total_element_count)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_final_grad_hidden_total_element_count]
@@ -1162,7 +1162,7 @@ __kernel void backprop_shared_biases_chunk(
     __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_activations,
 
     /**
-     * @param src_buffer_GLOBAL_final_grad_hidden_activations The final, consolidated upstream gradient from Node 14.
+     * @param src_buffer_GLOBAL_final_grad_hidden_activations The final, consolidated upstream gradient from Node 16.
      *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_total_element_count)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_final_grad_hidden_total_element_count]
