@@ -390,7 +390,7 @@ class KernelExecutor:
         )
         return self.p.forward_pass(queue, g, l, *args, wait_for=wait_for)
 
-    def launch_compute_logits_chunk(
+    def launch_render_logits_chunk(
         self, queue: cl.CommandQueue, tile: WorkTile, wait_for, h_ref, h_mask_ref, w_ref, b_ref, logit_out_ref
     ) -> cl.Event:
         g, l = (tile.num_modules_in_tile, BATCH_SIZE, tile.num_classes_in_tile), None
@@ -411,7 +411,7 @@ class KernelExecutor:
             np.int32(OUTPUT_CLASSES),
             np.int32(self.padded_output_classes),
         )
-        return self.p.compute_logits_chunk(queue, g, l, *args, wait_for=wait_for)
+        return self.p.render_logits_chunk(queue, g, l, *args, wait_for=wait_for)
 
     def launch_reduce_for_softmax(
         self, queue: cl.CommandQueue, wait_for, logit_ref, temp_ref, sm_param_ref
@@ -878,7 +878,7 @@ class BatchProcessor:
         tiles = list(plan.grid)
         for tile in tiles:
             if tile.num_modules_in_tile > 0 and tile.num_classes_in_tile > 0:
-                evt = self.ex.launch_compute_logits_chunk(
+                evt = self.ex.launch_render_logits_chunk(
                     self.q,
                     tile,
                     self._deps("hidden_ready"),

@@ -92,12 +92,12 @@ __kernel void forward_pass(
     hidden_out_buf[hidden_idx] = fmax(accum, SCALAR_ZERO);
 }
 
-// --- Implementation: compute_logits_chunk (Node 5) ---
+// --- Implementation: render_logits_chunk (Node 5) ---
 // Strategy: A pure 3D "map" kernel where each work-item computes one logit. It
 // is designed to be padding-aware, using the physical stride of the class
 // dimension (`padded_total_output_classes`) for all memory index calculations.
 // This ensures correct addressing into buffers that are padded for performance.
-__kernel void compute_logits_chunk(
+__kernel void render_logits_chunk(
     __global const SCALAR_TYPE *__restrict hidden_buf,
     __global const SCALAR_TYPE *__restrict hidden_mask,
     __global const SCALAR_TYPE *__restrict module_weights_buf,

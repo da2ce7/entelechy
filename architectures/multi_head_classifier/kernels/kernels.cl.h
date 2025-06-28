@@ -215,13 +215,13 @@ __kernel void forward_pass(
 // --- Phase 5-7: Module Layer Forward Pass & Loss ---
 
 /**
- * @brief (Node 5) Computes a chunk of raw logits for a slice of modules, classes, and batch samples.
+ * @brief (Node 5) Renders a contiguous slice of the monolithic logits buffer.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Idempotency: "Strictly Idempotent"
- *        - Synchronization Model: "Streamable. Consumes chunked inputs to produce slice of monolithic output."
+ *        - Synchronization Model: "Monolithic Slice Renderer. Consumes chunked inputs to render a final slice of a monolithic output buffer."
  */
-__kernel void compute_logits_chunk(
+__kernel void render_logits_chunk(
     /**
      * @param src_buffer_GLOBAL_hidden_activations The intermediate activations from the shared layer.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
@@ -392,7 +392,8 @@ __kernel void compute_probs_loss_bce_chunk(
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count]
-     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_total_modules_count * sizeof(SCALAR_TYPE)] bytes for this buffer.
+     *        - Validation Preconditions: [1] The tile access must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] Host shall allocate exactly
+     * [src_scalar_NATURAL_total_modules_count * sizeof(SCALAR_TYPE)] bytes for this buffer.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_CONST_temps,
 
@@ -639,7 +640,9 @@ __kernel void calculate_chunk_temp_gradients(
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {Type: CACHE, Formula: "output_class_count padded for alignment"}
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_total_output_class_count]
-     *        - Validation Preconditions: The requested tile must be within the total number of tiles, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count.
+     *        - Validation Preconditions: [1] The requested tile must be within the total number of tiles, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2]
+     * Host must ensure this buffer was allocated to exactly [src_scalar_NATURAL_total_modules_count * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_total_output_class_count *
+     * sizeof(SCALAR_TYPE)] bytes.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_logits,
 
@@ -648,7 +651,9 @@ __kernel void calculate_chunk_temp_gradients(
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk]
-     *        - Validation Preconditions: The requested tile must be within the total number of tiles, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count.
+     *        - Validation Preconditions: [1] The requested tile must be within the total number of tiles, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2]
+     * Host shall allocate exactly [src_scalar_NATURAL_total_tile_count * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk *
+     * sizeof(SCALAR_TYPE)] bytes.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_probs,
 
@@ -728,9 +733,8 @@ __kernel void transpose_chunk(
      *        - Tensor Shape: (src_scalar_NATURAL_in_total_element_count)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_in_total_element_count]
-     *        - Validation Preconditions: [1] The sub-region defined by kernel arguments must be within the buffer's physical bounds, as proven by: (src_scalar_NATURAL_in_offset +
-     * ((src_scalar_NATURAL_sub_region_dim1_count - 1) * src_scalar_NATURAL_in_leading_dim) + (src_scalar_NATURAL_sub_region_dim2_count - 1)) < src_scalar_NATURAL_in_total_element_count. [2] The
-     * kernel is agnostic to this buffer's padding strategy; correct navigation is guaranteed by the `in_offset` and `in_leading_dim` scalars.
+     *        - Validation Preconditions: The sub-region defined by kernel arguments must be within the buffer's physical bounds, as proven by: (src_scalar_NATURAL_in_offset +
+     * ((src_scalar_NATURAL_height - 1) * src_scalar_NATURAL_in_stride) + (src_scalar_NATURAL_width - 1)) < src_scalar_NATURAL_in_total_element_count.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_input,
 
@@ -739,18 +743,17 @@ __kernel void transpose_chunk(
      *        - Tensor Shape: (src_scalar_NATURAL_out_total_element_count)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_out_total_element_count]
-     *        - Validation Preconditions: [1] The sub-region defined by kernel arguments must be within the buffer's physical bounds, as proven by: (src_scalar_NATURAL_out_offset +
-     * ((src_scalar_NATURAL_sub_region_dim2_count - 1) * src_scalar_NATURAL_out_leading_dim) + (src_scalar_NATURAL_sub_region_dim1_count - 1)) < src_scalar_NATURAL_out_total_element_count. [2] The
-     * kernel is agnostic to this buffer's padding strategy; correct navigation is guaranteed by the `out_offset` and `out_leading_dim` scalars.
+     *        - Validation Preconditions: The sub-region defined by kernel arguments must be within the buffer's physical bounds, as proven by: (src_scalar_NATURAL_out_offset +
+     * ((src_scalar_NATURAL_width - 1) * src_scalar_NATURAL_out_stride) + (src_scalar_NATURAL_height - 1)) < src_scalar_NATURAL_out_total_element_count.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_output,
 
     uint src_scalar_NATURAL_in_offset,
     uint src_scalar_NATURAL_out_offset,
-    uint src_scalar_NATURAL_sub_region_dim1_count,
-    uint src_scalar_NATURAL_sub_region_dim2_count,
-    uint src_scalar_NATURAL_in_leading_dim,
-    uint src_scalar_NATURAL_out_leading_dim,
+    uint src_scalar_NATURAL_height,
+    uint src_scalar_NATURAL_width,
+    uint src_scalar_NATURAL_in_stride,
+    uint src_scalar_NATURAL_out_stride,
     uint src_scalar_NATURAL_in_total_element_count,
     uint src_scalar_NATURAL_out_total_element_count);
 
@@ -811,7 +814,7 @@ __kernel void aggregate_identity(
      *        - Tensor Shape: (src_scalar_NATURAL_total_element_count)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_total_element_count]
-     *        - Validation Preconditions: Host shall ensure at least [src_scalar_NATURAL_total_element_count * sizeof(SCALAR_TYPE)] bytes are readable at this address.
+     *        - Validation Preconditions: Host shall ensure this buffer was allocated to exactly [src_scalar_NATURAL_total_element_count * sizeof(SCALAR_TYPE)] bytes.
      */
     __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_input,
 
@@ -897,6 +900,51 @@ __kernel void aggregate_local_reduce(
     uint src_scalar_NATURAL_in_partials_count,
     uint src_scalar_NATURAL_partial_element_count,
     uint src_scalar_FLAG_operation_type);
+
+// --- Phase 14: Specialized Grad_H Reduction ---
+
+/**
+ * @brief (Node 14) Specialized Kernel: Reduces the permuted Grad_H buffer across the module dimension.
+ * @kernel_contract
+ *        - Holistic Constraints: "This kernel is a specialized architectural primitive. Its sole purpose is to perform a row-wise reduction on the monolithic SoA buffer produced by Node 12."
+ *        - Behavioral Invariants: "The implementation shall perform a parallel sum-reduction over the `total_modules_count` dimension for each row."
+ *        - Synchronization Model: "Specialized Reduction Kernel / Global Barrier. Cannot execute until its sole input buffer is fully rendered by Node 12."
+ *        - Idempotency: "Associatively Non-Idempotent"
+ */
+__kernel void reduce_grad_h_over_modules(
+    /**
+     * @param update_buffer_LOCAL_reduction_tile Local memory for performing the intra-work-group reduction.
+     *        - Tensor Shape: (get_local_size(0))
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [Implicit from work-group dispatch]
+     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(SCALAR_TYPE)`.
+     */
+    __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
+
+    /**
+     * @param src_buffer_GLOBAL_grad_hidden_activations_permuted_soa The contiguous, SoA-layout buffer from Node 12.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count)
+     *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count]
+     *        - Validation Preconditions: [1] Host must ensure this buffer was fully populated by a preceding, synchronized call to `gather_and_permute_grad_hidden_activations`. [2] Host shall
+     * allocate exactly [(src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count) * src_scalar_NATURAL_padded_total_modules_count * sizeof(SCALAR_TYPE)] bytes.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_grad_hidden_activations_permuted_soa,
+
+    /**
+     * @param dest_buffer_GLOBAL_final_grad_hidden_activations The final, consolidated upstream gradient, ready for shared layer backprop.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: [1] Host shall zero-initialize this buffer prior to dispatch. [2] Host shall allocate exactly [(src_scalar_NATURAL_total_batch_count *
+     * src_scalar_NATURAL_padded_hidden_count) * sizeof(SCALAR_TYPE)] bytes.
+     */
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_final_grad_hidden_activations,
+
+    uint src_scalar_NATURAL_total_batch_count,
+    uint src_scalar_NATURAL_padded_hidden_count,
+    uint src_scalar_NATURAL_total_modules_count,
+    uint src_scalar_NATURAL_padded_total_modules_count);
 
 // --- Phase 15-16: Streaming Shared Layer Backpropagation ---
 
@@ -1071,7 +1119,8 @@ __kernel void adam_update(
      *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]
-     *        - Validation Preconditions: [1] Must be non-NULL. [2] The physical memory layout must be identical to `grad`, `m1`, and `m2` buffers.
+     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_parameter_count * sizeof(SCALAR_TYPE)] bytes. [2] The physical memory layout must be identical to `grad`,
+     * `m1`, and `m2` buffers.
      */
     __global SCALAR_TYPE *update_buffer_GLOBAL_parameters,
 
@@ -1080,7 +1129,8 @@ __kernel void adam_update(
      *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]
-     *        - Validation Preconditions: [1] Must be non-NULL. [2] The physical memory layout must be identical to other state buffers.
+     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_parameter_count * sizeof(SCALAR_TYPE)] bytes. [2] The physical memory layout must be identical to other
+     * state buffers.
      */
     __global SCALAR_TYPE *update_buffer_GLOBAL_m1,
 
@@ -1089,7 +1139,8 @@ __kernel void adam_update(
      *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]
-     *        - Validation Preconditions: [1] Must be non-NULL. [2] The physical memory layout must be identical to other state buffers.
+     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_parameter_count * sizeof(SCALAR_TYPE)] bytes. [2] The physical memory layout must be identical to other
+     * state buffers.
      */
     __global SCALAR_TYPE *update_buffer_GLOBAL_m2,
 

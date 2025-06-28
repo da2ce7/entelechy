@@ -1,9 +1,12 @@
 {
     "words": [
+        "backprop",
+        "Backpropagates",
         "Backpropagation",
         "CDNA",
         "itemsize",
         "keepdims",
+        "lifecycles",
         "logit",
         "logits",
         "ndarray",
@@ -12,6 +15,8 @@
         "pyopencl",
         "RDNA",
         "reqs",
+        "Softmax",
+        "streamable",
         "xfer"
     ],
     "enableFiletypes": [
