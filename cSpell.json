@@ -4,6 +4,7 @@
         "Backpropagates",
         "Backpropagation",
         "CDNA",
+        "hyperparameters",
         "itemsize",
         "keepdims",
         "lifecycles",
