@@ -148,107 +148,72 @@ class ClipPartialGradientsPerItemNormSignature(_ClipPartialGradientsBase):
         ]
 
 
-# === Node 12: Transpose Chunk (Utility) ===
-
-
-@dataclass(frozen=True)
-class TransposeChunkSignature(KernelSignature):
-    """(Node 12) Signature for the general-purpose `transpose_chunk` kernel."""
-
-    c_tile_size: int
-    local_mem_bank_padding: int
-    scalar_size_bytes: int
-    in_ref: BufferHandle
-    out_ref: BufferHandle
-    in_offset: np.uint32
-    out_offset: np.uint32
-    height: np.uint32
-    width: np.uint32
-    in_stride: np.uint32
-    out_stride: np.uint32
-    in_total_element_count: np.uint32 = field(init=False)
-    out_total_element_count: np.uint32 = field(init=False)
-
-    def __post_init__(self):
-        in_shape, _ = self._buffer_mgr.get_spec(self.in_ref)
-        out_shape, _ = self._buffer_mgr.get_spec(self.out_ref)
-        object.__setattr__(self, "in_total_element_count", np.uint32(np.prod(in_shape)))
-        object.__setattr__(self, "out_total_element_count", np.uint32(np.prod(out_shape)))
-
-    @property
-    def kernel_name(self) -> str:
-        return "transpose_chunk"
-
-    def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        global_size = (_pad_to_multiple(self.width, self.c_tile_size), _pad_to_multiple(self.height, self.c_tile_size))
-        local_size = (self.c_tile_size, self.c_tile_size)
-        return global_size, local_size
-
-    def get_args(self) -> List:
-        """Returns all 11 arguments in exact contractual order."""
-        local_mem_size = self.c_tile_size * (self.c_tile_size + self.local_mem_bank_padding) * self.scalar_size_bytes
-        return [
-            cl.LocalMemory(local_mem_size),
-            self._buffer_mgr.get_cl_buffer(self.in_ref),
-            self._buffer_mgr.get_cl_buffer(self.out_ref),
-            self.in_offset,
-            self.out_offset,
-            self.height,
-            self.width,
-            self.in_stride,
-            self.out_stride,
-            self.in_total_element_count,
-            self.out_total_element_count,
-        ]
-
-
 # === Node 13: Gather & Permute Grad_H (Item Synchronization Point) ===
 
 
 @dataclass(frozen=True)
 class GatherAndPermuteGradHSignature(KernelSignature):
-    """(Node 13) Signature for the `gather_and_permute_grad_hidden_activations` kernel."""
+    """
+    (REV 2) Signature for the `gather_and_permute_grad_hidden_activations` kernel.
 
+    This version is architecturally rectified. It no longer attempts to derive
+    the host's tiling plan. Instead, it accepts all dimensional parameters
+    explicitly, fulfilling its sole contract of being a 1:1 representation of the
+    C-level kernel interface. Its validation logic now serves as the final
+    assurance check against the host's provided plan.
+    """
+
+    # --- Buffer Handles (from kernel contract) ---
     clipped_partials_aos_ref: BufferHandle
     permuted_soa_out_ref: BufferHandle
+
+    # --- High-Level Dimensional Parameters (Now explicitly passed in) ---
     total_modules_count: np.uint32
     hidden_count: np.uint32
-    total_batch_count: np.uint32 = field(init=False)
+    total_batch_count: np.uint32
+    num_module_chunks_count: np.uint32
+    modules_per_chunk_count: np.uint32
+    num_class_chunks_count: np.uint32
+
+    # --- Derived *Padded* Dimensions & Total Counts ---
+    # These are the only values derived, as they are properties of the memory, not the plan.
     padded_hidden_count: np.uint32 = field(init=False)
     padded_total_modules_count: np.uint32 = field(init=False)
-    num_module_chunks_count: np.uint32 = field(init=False)
-    modules_per_chunk_count: np.uint32 = field(init=False)
-    num_class_chunks_count: np.uint32 = field(init=False)
     total_tile_count: np.uint32 = field(init=False)
 
     def __post_init__(self):
+        """
+        Derives physical (padded) dimensions from buffer specs and performs
+        host-side validation of the provided plan against memory allocations.
+        """
         aos_shape, _ = self._buffer_mgr.get_spec(self.clipped_partials_aos_ref)
         soa_shape, _ = self._buffer_mgr.get_spec(self.permuted_soa_out_ref)
 
+        # Derive physical memory properties
         object.__setattr__(self, "total_tile_count", np.uint32(aos_shape[0]))
-        object.__setattr__(self, "modules_per_chunk_count", np.uint32(aos_shape[1]))
-        object.__setattr__(self, "total_batch_count", np.uint32(aos_shape[2]))
         object.__setattr__(self, "padded_hidden_count", np.uint32(aos_shape[3]))
         object.__setattr__(self, "padded_total_modules_count", np.uint32(soa_shape[1]))
 
-        if self.modules_per_chunk_count > 0:
-            num_mod_chunks = (
-                self.total_modules_count + self.modules_per_chunk_count - 1
-            ) // self.modules_per_chunk_count
-            object.__setattr__(self, "num_module_chunks_count", np.uint32(num_mod_chunks))
-            if self.total_tile_count > 0 and num_mod_chunks > 0:
-                object.__setattr__(self, "num_class_chunks_count", np.uint32(self.total_tile_count // num_mod_chunks))
-            else:
-                object.__setattr__(self, "num_class_chunks_count", np.uint32(0))
-        else:
-            object.__setattr__(self, "num_module_chunks_count", np.uint32(0))
-            object.__setattr__(self, "num_class_chunks_count", np.uint32(0))
+        # --- VALIDATION LOGIC (The Signature's True Responsibility) ---
+        # 1. Validate the host's plan against itself for internal consistency.
+        assert self.total_tile_count == self.num_module_chunks_count * self.num_class_chunks_count, (
+            f"Host plan inconsistency: total_tiles ({self.total_tile_count}) does not match "
+            f"num_module_chunks ({self.num_module_chunks_count}) * num_class_chunks ({self.num_class_chunks_count})."
+        )
 
-        # Derivation-as-verification: Enforce dimensional consistency
-        assert self.total_batch_count * self.padded_hidden_count == soa_shape[0], "SoA output dimension 0 mismatch!"
-        assert (
-            self.total_tile_count == self.num_module_chunks_count * self.num_class_chunks_count
-        ), "Tile count mismatch!"
+        # 2. Validate the host's plan against the physical buffer allocations.
+        assert aos_shape[1] == self.modules_per_chunk_count, (
+            f"Buffer spec mismatch: Clipped partials buffer expects {aos_shape[1]} modules per chunk, "
+            f"but plan requires {self.modules_per_chunk_count}."
+        )
+        assert aos_shape[2] == self.total_batch_count, (
+            f"Buffer spec mismatch: Clipped partials buffer expects batch size {aos_shape[2]}, "
+            f"but plan requires {self.total_batch_count}."
+        )
+        assert soa_shape[0] == self.total_batch_count * self.padded_hidden_count, (
+            f"Buffer spec mismatch: Permuted SoA output expects {soa_shape[0]} rows, "
+            f"but plan requires {self.total_batch_count * self.padded_hidden_count}."
+        )
 
     @property
     def kernel_name(self) -> str:
@@ -260,7 +225,10 @@ class GatherAndPermuteGradHSignature(KernelSignature):
         return global_size, None
 
     def get_args(self) -> List:
-        """Returns all 11 arguments in exact contractual order."""
+        """
+        Returns all 11 arguments in exact contractual order. The arguments are
+        now guaranteed to be consistent by the __post_init__ validation.
+        """
         return [
             self._buffer_mgr.get_cl_buffer(self.clipped_partials_aos_ref),
             self._buffer_mgr.get_cl_buffer(self.permuted_soa_out_ref),

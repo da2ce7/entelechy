@@ -3,19 +3,23 @@
 """
 A Module of High-Level, Reusable Parallel Computing Patterns.
 
-This module provides high-level, reusable classes that implement common, complex
-parallel computing patterns like workload partitioning (tiling) and hierarchical
-reduction (aggregation).
+(REV 5) This module provides the definitive, architecturally pure implementations
+for common parallel computing patterns. This version formalizes the concept of
+"gathering" partial results into a first-class declarative abstraction: the
+`GatherPrimitive`.
 
-(REV 4): This version formalizes the `log_K(N)` reduction process into a
-first-class architectural primitive: the `ReductionTreeExecutor`. This new
-class encapsulates the entire stateful process of executing a reduction tree,
-leaving the `AggregationManager` as a stateless, tactical tool that only
-executes single reduction stages. This rectifies a previous design flaw and
-restores architectural elegance by moving complex loop and state management out
-of the high-level orchestrator.
+This core change resolves all prior architectural discrepancies:
+- The `ReductionTreeExecutor` is now fully decoupled from the host's high-level
+  workload partitioning logic, consuming the `GatherPrimitive` as its sole source
+  of truth for memory layout.
+- The `N=1` reduction base case is now handled with a direct, efficient driver
+  call, upholding the "Primacy of Memory Strategy".
+- All stateful loop management, buffer sizing, and indirection list generation
+  is now flawlessly encapsulated within the `ReductionTreeExecutor`, presenting
+  a clean and declarative interface to the high-level orchestrator.
 """
 
+import abc
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -31,7 +35,7 @@ from .kernel_signatures import (
 )
 
 
-# === Workload Partitioning (Tiling) Pattern ===
+# === Section 1: Workload Partitioning (Tiling) Pattern ===
 
 
 @dataclass(frozen=True)
@@ -77,7 +81,88 @@ class ExecutionGrid:
         return WorkTile(m_idx, c_idx, flat_idx, self.num_class_chunks, mod_offset, num_mods, cls_offset, num_cls)
 
 
-# === Hierarchical Aggregation (Reduction) Pattern ===
+# === Section 2: The Gather Abstraction ===
+
+
+class GatherPrimitive(abc.ABC):
+    """
+    An abstract contract representing a collection of partials to be gathered.
+
+    This is a declarative primitive that tells the ReductionTreeExecutor *how* a
+    set of partials is laid out, allowing the executor to derive the necessary
+    indirection list without the orchestrator needing to manage low-level details.
+    """
+
+    @property
+    @abc.abstractmethod
+    def num_partials(self) -> int:
+        """The total number of partials in the collection."""
+        pass
+
+    @property
+    @abc.abstractmethod
+    def elements_per_partial(self) -> int:
+        """The number of scalar elements in a single partial."""
+        pass
+
+    @abc.abstractmethod
+    def get_offsets(self) -> np.ndarray:
+        """
+        Returns a host-side numpy array of uints, where each element is the
+        starting OFFSET (in elements, not bytes) of a partial relative to the
+        start of its collection buffer.
+        """
+        pass
+
+
+@dataclass(frozen=True)
+class TiledGather(GatherPrimitive):
+    """
+    Represents partials scattered across a collection buffer according to a
+    tiled placement strategy (e.g., `grid_mod_cls`).
+    """
+
+    grid: ExecutionGrid
+    _elements_per_partial: int
+
+    @property
+    def num_partials(self) -> int:
+        return self.grid.total_tiles
+
+    @property
+    def elements_per_partial(self) -> int:
+        return self._elements_per_partial
+
+    def get_offsets(self) -> np.ndarray:
+        """The offset is simply the tile index multiplied by the element stride."""
+        return np.arange(self.num_partials, dtype=SCALAR_UINT_TYPE) * self.elements_per_partial
+
+
+@dataclass(frozen=True)
+class ContiguousGather(GatherPrimitive):
+    """
+
+    Represents partials that are laid out contiguously in memory, such as the
+    output of a previous reduction stage in a ping-pong buffer.
+    """
+
+    _num_partials: int
+    _elements_per_partial: int
+
+    @property
+    def num_partials(self) -> int:
+        return self._num_partials
+
+    @property
+    def elements_per_partial(self) -> int:
+        return self._elements_per_partial
+
+    def get_offsets(self) -> np.ndarray:
+        """The offsets are a simple linear progression from the start of the buffer."""
+        return np.arange(self.num_partials, dtype=SCALAR_UINT_TYPE) * self.elements_per_partial
+
+
+# === Section 3: Hierarchical Aggregation (Reduction) Pattern ===
 
 
 @dataclass(frozen=True)
@@ -114,9 +199,7 @@ class AggregationManager:
         destination_ref: BufferHandle,
         wait_for: List[cl.Event],
     ) -> cl.Event:
-        """
-        Executes a single reduction stage, honoring the Indirection Contract.
-        """
+        """Executes a single reduction stage, honoring the Indirection Contract."""
         if num_partials_to_reduce <= 1:
             raise ValueError("AggregationManager.execute_stage should only be called for N > 1 partials.")
 
@@ -145,7 +228,6 @@ class AggregationManager:
                 partial_width=np.uint32(elements_per_partial),
                 operation_type=np.uint32(0),  # AGG_MODE_SUM
             )
-
         return self.ex.launch(queue, sig, wait_for=wait_for)
 
 
@@ -156,8 +238,8 @@ class ReductionTreeExecutor:
     This class is the embodiment of the hierarchical aggregation primitive. It
     encapsulates the entire complex process of looping, managing transient
     ping-pong buffers, and generating the necessary indirection tables
-    for each stage of the reduction. It uses an `AggregationManager`
-    as its tactical tool to execute each individual stage.
+    for each stage of the reduction, which it consumes via the declarative
+    `GatherPrimitive` abstraction.
     """
 
     def __init__(
@@ -174,59 +256,64 @@ class ReductionTreeExecutor:
         self.agg_mgr = agg_mgr
         self.plan = plan
 
-    def _create_offset_list(
-        self, num_offsets: int, element_stride: int, wait_for: List[cl.Event]
-    ) -> Tuple[BufferHandle, cl.Event]:
-        """Creates and uploads an indirection table (offset list) to the device."""
-        offsets_host = np.arange(num_offsets, dtype=SCALAR_UINT_TYPE) * element_stride
+    def _create_offset_list(self, offsets_host: np.ndarray, wait_for: List[cl.Event]) -> Tuple[BufferHandle, cl.Event]:
+        """Creates and uploads an indirection table (offset list) from a host array."""
         offset_list_ref = self.bm.acquire_transient_buffer(offsets_host.nbytes)
         evt = cl.enqueue_copy(self.q, self.bm.get_cl_buffer(offset_list_ref), offsets_host, wait_for=wait_for)
         return offset_list_ref, evt
 
     def execute(
         self,
+        gather_primitive: GatherPrimitive,
         partial_collection_ref: BufferHandle,
         final_dest_handle: BufferHandle,
-        num_initial_partials: int,
         wait_for: Optional[List[cl.Event]] = None,
     ) -> cl.Event:
-        """Executes the full reduction tree from scattered partials to a final dense buffer."""
+        """Executes the full reduction tree from a collection of partials to a final dense buffer."""
         wait_for = wait_for or []
-        if num_initial_partials <= 0:
-            return cl.UserEvent(self.q.context)  # Return a completed event if no work
+        n = gather_primitive.num_partials
 
-        spec, dtype = self.bm.get_spec(final_dest_handle)
-        elements_per_partial = int(np.prod(spec)) if spec else 1
-        scalar_byte_size = dtype().itemsize
+        if n <= 0:
+            user_event = cl.UserEvent(self.q.context)
+            user_event.set_status(cl.command_execution_status.COMPLETE)
+            return user_event
 
-        if num_initial_partials == 1:
-            # Base case: A simple identity copy is sufficient. Assumes the
-            # single partial is at offset 0 of the collection buffer.
-            sig = AggregateIdentitySignature(
-                self.bm,
-                in_ref=partial_collection_ref,
-                out_ref=final_dest_handle,
-                total_element_count=np.uint32(elements_per_partial),
+        elements_per_partial = gather_primitive.elements_per_partial
+        scalar_byte_size = self.bm.get_spec(final_dest_handle)[1]().itemsize
+        partial_byte_size = elements_per_partial * scalar_byte_size
+
+        initial_offsets_host = gather_primitive.get_offsets()
+
+        if n == 1:
+            # Optimal N=1 case: A direct driver copy with the correct offset.
+            src_offset_bytes = int(initial_offsets_host[0] * scalar_byte_size)
+            return cl.enqueue_copy_buffer(
+                self.q,
+                src=self.bm.get_cl_buffer(partial_collection_ref),
+                dst=self.bm.get_cl_buffer(final_dest_handle),
+                byte_count=partial_byte_size,
+                src_offset=src_offset_bytes,
+                dst_offset=0,
+                wait_for=wait_for,
             )
-            return self.ex.launch(self.q, sig, wait_for=wait_for)
 
-        # --- Setup the Process Resources ---
+        # --- Setup Resources for N > 1 Reduction Tree ---
         ppm = PingPongManager()
+        stage_output_partials = (n + self.plan.k - 1) // self.plan.k
+        ppm_buffer_size_bytes = stage_output_partials * partial_byte_size
+        ppm.initialize(self.bm, max_bytes=ppm_buffer_size_bytes)
         transient_handles = []
         try:
-            ppm.initialize(self.bm, max_bytes=(num_initial_partials * elements_per_partial * scalar_byte_size))
-
-            # --- Stage 1: The Initial Gather from SCATTERED Partials ---
-            offset_list_ref, upload_evt = self._create_offset_list(num_initial_partials, elements_per_partial, wait_for)
+            # Stage 1: The Initial Gather from the source collection.
+            offset_list_ref, upload_evt = self._create_offset_list(initial_offsets_host, wait_for)
             transient_handles.append(offset_list_ref)
 
-            current_n = num_initial_partials
-            # The first stage reads from the original, scattered collection.
+            current_n = n
             current_collection_ref = partial_collection_ref
-            loop_deps = [upload_evt]
+            current_deps = [upload_evt]
 
             # --- Main Reduction Loop ---
-            while current_n > 1:
+            while current_n > self.plan.k:
                 stage_dest_ref, _ = ppm.get_io()
                 stage_event = self.agg_mgr.execute_stage(
                     self.q,
@@ -235,38 +322,36 @@ class ReductionTreeExecutor:
                     current_n,
                     elements_per_partial,
                     stage_dest_ref,
-                    loop_deps,
+                    current_deps,
                 )
-                loop_deps = [stage_event]
+                current_deps = [stage_event]
 
                 # Prepare for the NEXT Iteration
                 next_n = (current_n + self.plan.k - 1) // self.plan.k
-                if next_n <= 1:
-                    break  # Last stage has produced the final transient result
 
                 # The output of the last stage is the now-contiguous input for the next.
                 current_collection_ref = stage_dest_ref
-                current_n = next_n
-
-                # Subsequent offset lists are trivial, as the partials are now dense.
-                offset_list_ref, upload_evt = self._create_offset_list(current_n, elements_per_partial, loop_deps)
+                next_gather_primitive = ContiguousGather(next_n, elements_per_partial)
+                next_offsets_host = next_gather_primitive.get_offsets()
+                offset_list_ref, upload_evt = self._create_offset_list(next_offsets_host, current_deps)
                 transient_handles.append(offset_list_ref)
-                loop_deps = [upload_evt]
+                current_deps = [upload_evt]
+                current_n = next_n
                 ppm.swap()
 
-            # --- Finalization: Copy the final result to its persistent destination ---
-            final_transient_handle, _ = ppm.get_io()
-            final_event = cl.enqueue_copy_buffer(
+            # --- Final Reduction Stage (writes to the persistent destination) ---
+            final_stage_event = self.agg_mgr.execute_stage(
                 self.q,
-                src=self.bm.get_cl_buffer(final_transient_handle),
-                dst=self.bm.get_cl_buffer(final_dest_handle),
-                byte_count=(elements_per_partial * scalar_byte_size),
-                wait_for=loop_deps,
+                current_collection_ref,
+                offset_list_ref,
+                current_n,
+                elements_per_partial,
+                final_dest_handle,
+                current_deps,
             )
-            return final_event
+            return final_stage_event
 
         finally:
-            # Safely release all transient resources used during the process.
             ppm.release()
             for handle in transient_handles:
                 self.bm.release_transient_buffer(handle)

@@ -28,31 +28,6 @@ from ..memory_layout import _pad_to_multiple, SCALAR_NP_TYPE
 
 
 @dataclass(frozen=True)
-class AggregateIdentitySignature(KernelSignature):
-    """(Node 14) Signature for `identity_copy`, the N=1 reduction base case."""
-
-    in_ref: BufferHandle
-    out_ref: BufferHandle
-    total_element_count: np.uint32
-
-    @property
-    def kernel_name(self) -> str:
-        # This can point to a generic copy kernel.
-        return "identity_copy"
-
-    def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        return (int(self.total_element_count),), None
-
-    def get_args(self) -> List:
-        """Returns all 3 arguments in exact contractual order."""
-        return [
-            self._buffer_mgr.get_cl_buffer(self.in_ref),
-            self._buffer_mgr.get_cl_buffer(self.out_ref),
-            self.total_element_count,
-        ]
-
-
-@dataclass(frozen=True)
 class AggregateRegisterReduceSignature(KernelSignature):
     """(Node 15) Signature for `aggregate_register_reduce` using an indirection table."""
 
