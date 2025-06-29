@@ -111,7 +111,14 @@ class BackpropSharedWeightsChunkSignature(KernelSignature):
 
 @dataclass(frozen=True)
 class BackpropSharedBiasesChunkSignature(KernelSignature):
-    """(Node 18) Signature for `backprop_shared_biases_chunk` kernel."""
+    """
+    (Node 18) Signature for `backprop_shared_biases_chunk` kernel.
+
+    (REV 2 - Rectified) This version corrects the previous implementation, which
+    was missing two arguments and had incorrect argument ordering. This signature
+    is now in full compliance with the kernel's 12-argument contract defined
+    in `kernels.cl.h`.
+    """
 
     # --- Injected Architectural Constants ---
     work_group_size_0: int
@@ -126,47 +133,60 @@ class BackpropSharedBiasesChunkSignature(KernelSignature):
     # --- Control & Dimensional Scalars ---
     batch_chunk_offset: np.uint32
     batch_chunk_count: np.uint32
-    num_batch_chunks: np.uint32
+    batch_chunk_index: np.uint32
+    num_batch_chunks_count: np.uint32
 
     # --- Derived Scalar Fields ---
     total_batch_count: np.uint32 = field(init=False)
     padded_hidden_count: np.uint32 = field(init=False)
+    final_grad_hidden_total_element_count: np.uint32 = field(init=False)
 
     def __post_init__(self):
-        """Derives dimensions from the hidden activation buffer spec."""
+        """Derives dimensions from the hidden activation and gradient buffer specs."""
+        super().__post_init__()
         h_shape, _ = self._buffer_mgr.get_spec(self.h_ref)
+        grad_h_shape, _ = self._buffer_mgr.get_spec(self.grad_h_ref)
+
         object.__setattr__(self, "total_batch_count", np.uint32(h_shape[0]))
         object.__setattr__(self, "padded_hidden_count", np.uint32(h_shape[1]))
+        object.__setattr__(self, "final_grad_hidden_total_element_count", np.uint32(np.prod(grad_h_shape)))
 
     @property
     def kernel_name(self) -> str:
         return "backprop_shared_biases_chunk"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        """Calculates 1D grid for reduction over hidden dimension.
+        """
+        Calculates 1D grid for reduction over hidden dimension.
 
         The execution model is one work-group per output element of the bias
         gradient vector. The total number of work-groups is therefore equal
         to the number of hidden dimensions.
         """
-
         num_work_groups = self.padded_hidden_count
         global_size = (int(num_work_groups) * self.work_group_size_0,)
         local_size = (self.work_group_size_0,)
         return global_size, local_size
 
     def get_args(self) -> List:
-        """Returns all 10 arguments in exact contractual order."""
+        """
+        Returns all 12 arguments in the exact order mandated by `kernels.cl.h`.
+        """
         local_mem_size = self.work_group_size_0 * self.scalar_size_bytes
         return [
+            # Arg 1: Local Memory
             cl.LocalMemory(local_mem_size),
+            # Arg 2-5: Buffers
             self._buffer_mgr.get_cl_buffer(self.h_ref),
             self._buffer_mgr.get_cl_buffer(self.grad_h_ref),
             self._buffer_mgr.get_cl_buffer(self.mask_ref),
             self._buffer_mgr.get_cl_buffer(self.partial_gsb_out_ref),
+            # Arg 6-12: Scalars in strict contractual order
             self.batch_chunk_offset,
             self.batch_chunk_count,
-            self.num_batch_chunks,
+            self.batch_chunk_index,
             self.total_batch_count,
+            self.num_batch_chunks_count,
             self.padded_hidden_count,
+            self.final_grad_hidden_total_element_count,
         ]

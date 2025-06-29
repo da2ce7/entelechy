@@ -26,16 +26,30 @@ from ..launcher_infra import BufferHandle, KernelSignature, SCALAR_NP_TYPE
 # === Pre-Update Normalization (Node 20) ===
 
 
+# In file: kernel_signatures/phase_3_update.py
+
+
 @dataclass(frozen=True)
 class NormalizeGradientsSignature(KernelSignature):
-    """(Node 20) Signature for the `normalize_gradients` kernel."""
+    """
+    (Node 20) Signature for the `normalize_gradients` kernel.
+
+    (REV 2 - Rectified) This version corrects the previous implementation,
+    which was missing the mandatory 'epsilon' argument. This signature is
+    now in full compliance with the kernel's 5-argument contract.
+    """
 
     summed_grad_ref: BufferHandle
     final_grad_out_ref: BufferHandle
     effective_batch_size: SCALAR_NP_TYPE
+    epsilon: SCALAR_NP_TYPE
+
+    # --- Derived Scalar Fields ---
     element_count: np.uint32 = field(init=False)
 
     def __post_init__(self):
+        """Derives the element count from the destination buffer spec."""
+        super().__post_init__()
         shape, _ = self._buffer_mgr.get_spec(self.final_grad_out_ref)
         object.__setattr__(self, "element_count", np.uint32(np.prod(shape)))
 
@@ -47,11 +61,12 @@ class NormalizeGradientsSignature(KernelSignature):
         return (int(self.element_count),), None
 
     def get_args(self) -> List:
-        """Returns all 4 arguments in exact contractual order."""
+        """Returns all 5 arguments in the exact order mandated by `kernels.cl.h`."""
         return [
             self._buffer_mgr.get_cl_buffer(self.summed_grad_ref),
             self._buffer_mgr.get_cl_buffer(self.final_grad_out_ref),
             self.effective_batch_size,
+            self.epsilon,
             self.element_count,
         ]
 
