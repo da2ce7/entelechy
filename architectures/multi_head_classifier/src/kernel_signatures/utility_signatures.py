@@ -25,55 +25,6 @@ from ..memory_layout import _pad_to_multiple
 
 
 @dataclass(frozen=True)
-class IdentityCopySignature(KernelSignature):
-    """
-    Signature for the `identity_copy` kernel, a generic element-wise copy utility.
-
-    This serves as the N=1 base case for the reduction engine, preventing the
-    unnecessary launch of more complex aggregation kernels when a simple copy
-    will suffice.
-    """
-
-    in_ref: BufferHandle
-    out_ref: BufferHandle
-
-    # --- Derived Scalar Fields ---
-    width: np.uint32 = field(init=False)
-
-    def __post_init__(self):
-        """Derives element count and validates buffer consistency."""
-        super().__post_init__()
-        in_shape, _ = self._buffer_mgr.get_spec(self.in_ref)
-        out_shape, _ = self._buffer_mgr.get_spec(self.out_ref)
-
-        in_count = np.uint32(np.prod(in_shape))
-        out_count = np.uint32(np.prod(out_shape))
-
-        assert in_count == out_count, (
-            f"Buffer spec mismatch for IdentityCopy: Input buffer has {in_count} elements, "
-            f"but output buffer has {out_count} elements."
-        )
-
-        object.__setattr__(self, "width", out_count)
-
-    @property
-    def kernel_name(self) -> str:
-        return "identity_copy"
-
-    def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        """Dispatches one work-item per element to be copied."""
-        return (int(self.width),), None
-
-    def get_args(self) -> List:
-        """Returns all 3 arguments in exact contractual order."""
-        return [
-            self._buffer_mgr.get_cl_buffer(self.in_ref),
-            self._buffer_mgr.get_cl_buffer(self.out_ref),
-            self.width,
-        ]
-
-
-@dataclass(frozen=True)
 class TransposeChunkSignature(KernelSignature):
     """(Node 12) Signature for the general-purpose, tiled `transpose_chunk` kernel."""
 

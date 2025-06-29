@@ -58,6 +58,8 @@ from .phase_2_learn_C_reduction import (
 from .phase_2_learn_D_backprop import (
     BackpropSharedWeightsChunkSignature,
     BackpropSharedBiasesChunkSignature,
+    SharedGradientHandles,
+    ClipSharedGradientsChunkSignature,
 )
 
 # --- Phase 3: Update (Normalization & Finalization) ---
@@ -70,7 +72,6 @@ from .phase_3_update import (
 
 # --- General Purpose Utility Signature Imports ---
 from .utility_signatures import (
-    IdentityCopySignature,
     TransposeChunkSignature,
 )
 
@@ -103,12 +104,13 @@ __all__ = [
     # Phase 2D: Shared Backprop
     "BackpropSharedWeightsChunkSignature",
     "BackpropSharedBiasesChunkSignature",
+    "SharedGradientHandles",
+    "ClipSharedGradientsChunkSignature",
     # Phase 3: Update
     "NormalizeGradientsSignature",
     "AdamUpdateSignature",
     "AdamParameterGroup",
     "ClampTemperaturesSignature",
     # Utility Kernels
-    "IdentityCopySignature",
     "TransposeChunkSignature",
 ]

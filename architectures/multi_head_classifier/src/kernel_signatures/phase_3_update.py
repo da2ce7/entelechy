@@ -23,7 +23,7 @@ import pyopencl as cl
 from ..launcher_infra import BufferHandle, KernelSignature, SCALAR_NP_TYPE
 
 
-# === Pre-Update Normalization (Node 20) ===
+# === Pre-Update Normalization (Node 21) ===
 
 
 # In file: kernel_signatures/phase_3_update.py
@@ -32,7 +32,7 @@ from ..launcher_infra import BufferHandle, KernelSignature, SCALAR_NP_TYPE
 @dataclass(frozen=True)
 class NormalizeGradientsSignature(KernelSignature):
     """
-    (Node 20) Signature for the `normalize_gradients` kernel.
+    (Node 21) Signature for the `normalize_gradients` kernel.
 
     (REV 2 - Rectified) This version corrects the previous implementation,
     which was missing the mandatory 'epsilon' argument. This signature is
@@ -71,7 +71,7 @@ class NormalizeGradientsSignature(KernelSignature):
         ]
 
 
-# === Optimizer Update & Constraint Enforcement (Nodes 23, 24) ===
+# === Optimizer Update & Constraint Enforcement (Nodes 24, 25) ===
 
 
 @dataclass(frozen=True)
@@ -86,7 +86,7 @@ class AdamParameterGroup:
 
 @dataclass(frozen=True)
 class AdamUpdateSignature(KernelSignature):
-    """(Node 23) Signature for the `adam_update` kernel."""
+    """(Node 24) Signature for the `adam_update` kernel."""
 
     # --- Buffer Handles (grouped for clarity) ---
     param_group: AdamParameterGroup
@@ -137,7 +137,7 @@ class AdamUpdateSignature(KernelSignature):
 
 @dataclass(frozen=True)
 class ClampTemperaturesSignature(KernelSignature):
-    """(Node 24) Signature for the `clamp_temperatures` domain constraint kernel."""
+    """(Node 25) Signature for the `clamp_temperatures` domain constraint kernel."""
 
     temps_ref: BufferHandle  # Operates in-place
     min_val: SCALAR_NP_TYPE

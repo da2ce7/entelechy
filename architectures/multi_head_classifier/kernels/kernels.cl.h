@@ -1191,22 +1191,22 @@ __kernel void backprop_shared_biases_chunk(
     uint src_scalar_NATURAL_num_batch_chunks_count,
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_final_grad_hidden_total_element_count);
+
 /**
  * @brief (Node 19) [Utility Kernel] Computes the L2 Norm for a single SHARED GRADIENT
- * chunk and conditionally scales it.
+ * chunk and conditionally scales it, writing the result to a host-specified offset.
  * @kernel_contract
- *        - Holistic Constraints: "The kernel processes the gradients for shared weights and
- *          biases for a single, contiguous data chunk. It has no knowledge of the
- *          tiled module geometry or any other work item."
+ *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Behavioral Invariants: "[1] Implements a two-pass algorithm: Norm calculation followed
  *          by conditional scaling. [2] An epsilon term shall be used to prevent division by
  *          zero when calculating the scaling factor. [3] The L2 norm is computed over the
  *          concatenated vector of both weight and bias gradients for the chunk."
  *        - Idempotency: "Strictly Idempotent"
- *        - Synchronization Model: "Streamable Utility / Stability Primitive. Designed to be
- *          invoked inside a host-side streaming loop, acting as a mandatory stability
- *          gate before partial results are fed to the reduction engine."
+ *        - Synchronization Model: "Streamable Utility / Stability Primitive. Fulfills the Placement
+ *          Contract by writing its output to a host-provided linear offset, acting as a mandatory
+ *          stability gate before partial results are fed to the reduction engine."
  */
+
 __kernel void clip_shared_gradients_chunk(
     /**
      * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reduction of the sum-of-squares.
@@ -1241,50 +1241,36 @@ __kernel void clip_shared_gradients_chunk(
     __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_grad_biases_shared,
 
     /**
-     * @param dest_buffer_GLOBAL_clipped_partial_grad_weights_shared The destination for the clipped
+     * @param dest_buffer_GLOBAL_clipped_partial_grad_weights_shared The COLLECTION buffer for clipped
      *        weight gradients of this chunk, ready for consumption by Node (20).
-     *        - Tensor Shape: (src_scalar_NATURAL_weights_parameter_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_weights_parameter_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_weights_parameter_count]
-     *        - Validation Preconditions: Host must allocate a buffer with a size and layout identical
-     *          to its `src_` counterpart.
+     *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_weights_parameter_count]
+     *        - Placement Contract: linear_generic(src_scalar_NATURAL_dest_weights_write_offset_elements)
+     *        - Validation Preconditions: The Host is responsible for providing a valid offset that ensures
+     *          the write operation is within the bounds of the collection buffer.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_weights_shared,
 
     /**
-     * @param dest_buffer_GLOBAL_clipped_partial_grad_biases_shared The destination for the clipped
+     * @param dest_buffer_GLOBAL_clipped_partial_grad_biases_shared The COLLECTION buffer for clipped
      *        bias gradients of this chunk, ready for consumption by Node (20).
-     *        - Tensor Shape: (src_scalar_NATURAL_biases_parameter_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_biases_parameter_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_biases_parameter_count]
-     *        - Validation Preconditions: Host must allocate a buffer with a size and layout identical
-     *          to its `src_` counterpart.
+     *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_biases_parameter_count]
+     *        - Placement Contract: linear_generic(src_scalar_NATURAL_dest_biases_write_offset_elements)
+     *        - Validation Preconditions: The Host is responsible for providing a valid offset that ensures
+     *          the write operation is within the bounds of the collection buffer.
      */
     __global SCALAR_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_biases_shared,
 
-    /**
-     * @param src_scalar_REAL_max_norm_global The maximum permissible L2 norm for this chunk.
-     *        - Validation Preconditions: Must be a positive real number.
-     */
     SCALAR_TYPE src_scalar_REAL_max_norm_global,
-
-    /**
-     * @param src_scalar_REAL_epsilon A small constant to prevent division by zero.
-     *        - Validation Preconditions: Must be a small, positive real number (e.g., 1e-6).
-     */
     SCALAR_TYPE src_scalar_REAL_epsilon,
-
-    /**
-     * @param src_scalar_NATURAL_weights_parameter_count The total number of elements in the
-     *        weight gradient buffer for this chunk.
-     */
-    uint src_scalar_NATURAL_weights_parameter_count,
-
-    /**
-     * @param src_scalar_NATURAL_biases_parameter_count The total number of elements in the
-     *        bias gradient buffer for this chunk.
-     */
-    uint src_scalar_NATURAL_biases_parameter_count);
+    uint        src_scalar_NATURAL_weights_parameter_count,
+    uint        src_scalar_NATURAL_biases_parameter_count,
+    uint        src_scalar_NATURAL_dest_weights_write_offset_elements,
+    uint        src_scalar_NATURAL_dest_biases_write_offset_elements,
+    uint        src_scalar_NATURAL_num_batch_chunks);
 
 // --- Phase 21-25: Finalization & Updates ---
 

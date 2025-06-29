@@ -191,58 +191,116 @@ class TrainingOrchestrator:
 
     def _create_execution_plan(self, batch_size: int) -> ExecutionPlan:
         """Authors the plan, now cleanly driven by the ParameterSpace."""
-        svs, spec = self.services, self.model_spec
+        svs, spec, h = self.services, self.model_spec, self.hyperparams
         policy_providers = {}
+
+        # 1. --- Define the Work Partitioning and Reduction Strategies ---
         grid = ExecutionGrid(
-            num_module_chunks=(spec.num_modules + 15) // 16,
-            num_class_chunks=(spec.output_classes + 15) // 16,
+            num_module_chunks=(spec.num_modules + 15) // 16,  # Example chunking
+            num_class_chunks=(spec.output_classes + 15) // 16,  # Example chunking
             total_modules=spec.num_modules,
             total_classes=spec.output_classes,
         )
-        reduction_plan = ReductionPlan(k=self.compute_env.arch_consts.optimal_tile_size)
+        reduction_plan = ReductionPlan(k=self.compute_env.arch_consts.get("optimal_tile_size", 16))
 
+        # 2. --- Define the DATA LIFECYCLE strategy for hidden_activations ---
+        print(f"  [Orchestrator] Authoring plan with '{self.adaptation_strategy}' strategy for hidden activations.")
         if self.adaptation_strategy == "CACHE":
+            # Pre-compute the full hidden activations and pass a provider that just returns the handle.
             fwd_exec = ForwardPassExecutor(svs)
             h_ref, h_ready_evt = fwd_exec.run(batch_size, deps=[])
             policy_providers["hidden_activations"] = CacheProvider(handle=h_ref, ready_event=h_ready_evt)
         else:  # "RECOMPUTE"
-            recompute_sig = ForwardPassSignature(...)
-            policy_providers["hidden_activations"] = RecomputeProvider(signature=recompute_sig, output_handle=...)
+            # Create a provider that will launch the forward_pass kernel on demand.
+            # It needs a transient buffer to write its output to.
+            h_shape, h_dtype = svs.bm.get_spec("hidden_activations")
+            recompute_out_ref = svs.bm.acquire_transient_buffer(int(np.prod(h_shape) * h_dtype().itemsize))
+            # Note: The recompute signature would need to be configured for a specific chunk if
+            # the recompute model was per-chunk. Here we assume a full recompute.
+            recompute_sig = ForwardPassSignature(
+                svs.bm,
+                simd_width=spec.simd_width,
+                local_mem_bank_padding=1,
+                scalar_size_bytes=spec.scalar_dtype().itemsize,
+                in_ref=svs.bm.get_handle_by_name("input"),
+                mask_ref=svs.bm.get_handle_by_name("sample_mask"),
+                w_ref=svs.bm.get_handle_by_name("shared_weights"),
+                b_ref=svs.bm.get_handle_by_name("shared_biases"),
+                h_out_ref=recompute_out_ref,
+                h_mask_out_ref=svs.bm.get_handle_by_name("hidden_mask"),  # Mask also needs recomputing
+                batch_chunk_offset=np.uint32(0),
+                batch_chunk_count=np.uint32(batch_size),
+            )
+            policy_providers["hidden_activations"] = RecomputeProvider(
+                signature=recompute_sig, output_handle=recompute_out_ref
+            )
 
-        # Create reduction providers for all parameters defined in the manifest
+        # 3. --- Define the REDUCTION strategy for every gradient flow ---
         for flow in self.param_space:
-
+            # The closure pattern is essential here to correctly capture the `current_flow`.
             def make_reduction_fn(current_flow=flow):
                 def fn(q, ex, deps):
-                    print(f"      [Provider] Executing reduction for {current_flow.name}...")
+                    print(f"      [Provider] Executing reduction for '{current_flow.name}'...")
                     if current_flow.specialized_reduction:
-                        # Specialized Grad_H Path
-                        permute_sig = GatherAndPermuteGradHSignature(svs.bm, ...)
+                        # --- Path for Specialized Grad_H Reduction ---
+                        clipped_ref = svs.bm.get_handle_by_name("clipped_partial_grad_hidden_activations")
+                        permuted_ref = svs.bm.get_handle_by_name("permuted_grad_h")
+                        summed_ref = svs.bm.get_handle_by_name(current_flow.summed_grad_buffer_name)
+
+                        permute_sig = GatherAndPermuteGradHSignature(
+                            svs.bm,
+                            clipped_partials_aos_ref=clipped_ref,
+                            permuted_soa_out_ref=permuted_ref,
+                            total_modules_count=np.uint32(spec.num_modules),
+                            # ... other dimensional scalars from spec and grid ...
+                        )
                         permute_evt = ex.launch(q, permute_sig, wait_for=deps)
-                        reduce_sig = ReduceGradHOverModulesSignature(svs.bm, ...)
+
+                        reduce_sig = ReduceGradHOverModulesSignature(
+                            svs.bm,
+                            # ... arch consts ...
+                            permuted_soa_in_ref=permuted_ref,
+                            final_grad_h_out_ref=summed_ref,
+                            total_modules_count=np.uint32(spec.num_modules),
+                            # ... other dimensional scalars ...
+                        )
                         reduce_evt = ex.launch(q, reduce_sig, wait_for=[permute_evt])
-                        return svs.bm.get_handle_by_name(current_flow.summed_grad_buffer_name), reduce_evt
+                        return summed_ref, reduce_evt
                     else:
-                        # Generic Reduction Path using the ReductionTreeExecutor
+                        # --- Path for Generic Reduction via ReductionTreeExecutor ---
                         clipped_ref = svs.bm.get_handle_by_name(current_flow.clipped_partial_grad_buffer_name)
                         shape, _ = svs.bm.get_spec(clipped_ref)
-                        elements_per_partial = np.prod(shape[1:]) if len(shape) > 1 else 1
-                        gather_prim = TiledGather(grid=grid, elements_per_partial=int(elements_per_partial))
+
+                        if "shared" in current_flow.name:
+                            # Shared gradients are linearly chunked by the streaming loop.
+                            num_chunks = SHARED_BACKPROP_STREAM_CHUNKS
+                            elements_per_chunk = int(np.prod(shape[1:]))
+                            gather_prim = LinearlyChunkedGather(num_chunks, elements_per_chunk)
+                        else:
+                            # Module gradients are tiled according to the main ExecutionGrid.
+                            elements_per_partial = int(np.prod(shape[1:]))
+                            gather_prim = TiledGather(grid=grid, elements_per_partial=elements_per_partial)
+
                         reduction_exec = ReductionTreeExecutor(q, ex, svs.bm, svs.agg_mgr, reduction_plan)
                         dest_h = svs.bm.get_handle_by_name(current_flow.summed_grad_buffer_name)
-                        return reduction_exec.execute(gather_prim, clipped_ref, dest_h, deps)
+                        evt = reduction_exec.execute(gather_prim, clipped_ref, dest_h, deps)
+                        return dest_h, evt
 
                 return fn
 
-            # e.g., key becomes "summed_shared_weights"
-            provider_key = current_flow.summed_grad_buffer_name.replace("summed_grad_", "summed_")
+            provider_key = f"summed_{flow.name}"
             policy_providers[provider_key] = StagedComputationProvider(computation_fn=make_reduction_fn())
 
+        # 4. --- Assemble the Final, Immutable ExecutionPlan ---
         return ExecutionPlan(
             grid=grid,
             reduction_plan=reduction_plan,
             lifecycle_policy=DataLifecyclePolicy(providers=policy_providers),
             effective_batch_size=batch_size,
+            # Pass through the strategic policies for the tactical executors to use.
+            problem_type="CCE",  # This would be configured based on the experiment
+            clipping_strategy="GLOBAL",  # This would be configured
+            hyperparams=self.hyperparams,
         )
 
     def train(self, X_train: np.ndarray, y_train: np.ndarray):

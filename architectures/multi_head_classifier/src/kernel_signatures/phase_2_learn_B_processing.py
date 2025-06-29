@@ -32,7 +32,7 @@ from ..memory_layout import _pad_to_multiple
 
 @dataclass
 class GradientHandles:
-    """A helper dataclass for the main "module path" clipping operation."""
+    """A helper dataclass for the main "module path" clipping operation (Node 11)."""
 
     grad_weights_module: BufferHandle
     grad_biases_module: BufferHandle
@@ -44,55 +44,40 @@ class GradientHandles:
     clipped_grad_hidden_activations_aos: BufferHandle
 
 
-@dataclass
-class SharedGradientHandles:
-    """A helper dataclass for clipping partials from the shared backprop stream."""
-
-    grad_weights_shared: BufferHandle
-    grad_biases_shared: BufferHandle
-    clipped_grad_weights_shared: BufferHandle
-    clipped_grad_biases_shared: BufferHandle
-
-
 # =========================================================================
 # === Node 11: Clip Partial Gradients (Stability Primitive)             ===
 # =========================================================================
 
-# --- Tier 1: The Apex of the Hierarchy ---
-
 
 @dataclass(frozen=True)
-class _ClipGradientsBaseBase(KernelSignature):
-    """The apex of the clipping hierarchy. Knows only the kernel name and common scalars."""
+class _ClipTiledModuleGradsBase(KernelSignature):
+    """(Internal) The unified base for all Node 11 clipping operations."""
 
+    # --- Merged attributes from the former BaseBase ---
     work_group_size_0: int
     scalar_size_bytes: int
-    epsilon: SCALAR_NP_TYPE  # Epsilon is common to all clipping operations
+    epsilon: SCALAR_NP_TYPE
 
-    @property
-    def kernel_name(self) -> str:
-        # Both clipping paths reuse the same generic, numerically robust kernel.
-        return "clip_partial_gradients"
-
-
-# --- Tier 2: Specialization for the Tiled Module Path ---
-
-
-@dataclass(frozen=True)
-class _ClipTiledModuleGradsBase(_ClipGradientsBaseBase):
-    """(Internal) Base for clipping the main per-tile module gradients."""
-
+    # --- Attributes specific to the tiled module path ---
     handles: GradientHandles
     tile: WorkTile
+
+    # --- Derived fields ---
     padded_hidden_count: np.uint32 = field(init=False)
     total_batch_count: np.uint32 = field(init=False)
     total_tile_count: np.uint32 = field(init=False)
 
     def __post_init__(self):
+        super().__post_init__()
         grad_h_shape, _ = self._buffer_mgr.get_spec(self.handles.grad_hidden_activations_aos)
         object.__setattr__(self, "total_tile_count", np.uint32(grad_h_shape[0]))
         object.__setattr__(self, "total_batch_count", np.uint32(grad_h_shape[2]))
         object.__setattr__(self, "padded_hidden_count", np.uint32(grad_h_shape[3]))
+
+    @property
+    def kernel_name(self) -> str:
+        """This signature class family is exclusively for the complex Node 11 kernel."""
+        return "clip_partial_gradients"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
         """Calculates grid size based on the total elements within a single logical tile."""
@@ -172,83 +157,6 @@ class ClipPartialGradientsPerItemNormSignature(_ClipTiledModuleGradsBase):
             self.total_batch_count,
             self.padded_hidden_count,
             self.total_tile_count,
-        ]
-
-
-# --- Tier 2: Specialization for the Streamed Shared Path ---
-
-
-@dataclass(frozen=True)
-class _ClipStreamedSharedGradsBase(_ClipGradientsBaseBase):
-    """(Internal) Base for clipping partials from the shared backprop stream."""
-
-    handles: SharedGradientHandles
-    num_elements_weights: np.uint32 = field(init=False)
-    num_elements_biases: np.uint32 = field(init=False)
-
-    def __post_init__(self):
-        w_shape, _ = self._buffer_mgr.get_spec(self.handles.grad_weights_shared)
-        b_shape, _ = self._buffer_mgr.get_spec(self.handles.grad_biases_shared)
-        object.__setattr__(self, "num_elements_weights", np.uint32(np.prod(w_shape)))
-        object.__setattr__(self, "num_elements_biases", np.uint32(np.prod(b_shape)))
-
-    def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        """Calculates grid size based on the total elements in the shared grad chunk."""
-        total_elements = self.num_elements_weights + self.num_elements_biases
-        global_size = (_pad_to_multiple(int(total_elements), self.work_group_size_0),)
-        local_size = (self.work_group_size_0,)
-        return global_size, local_size
-
-
-@dataclass(frozen=True)
-class ClipStreamedSharedGradsSignature(_ClipStreamedSharedGradsBase):
-    """The signature for clipping shared parameter gradients from a single stream chunk."""
-
-    max_norm_global: SCALAR_NP_TYPE
-
-    def get_args(self) -> List:
-        """
-        Assembles arguments for the generic clipping kernel, populating only the relevant slots.
-
-        ARCHITECTURAL NOTE: This signature makes a critical assumption about the
-        implementation of the `clip_partial_gradients` C kernel. It assumes the kernel
-        is generic enough to:
-        1. Accept NULL pointers for the unused buffer slots (all module/temp/hidden grads).
-        2. Distribute its workload based on `get_global_id()` rather than using the
-           tile-based geometry scalars (`flat_tile_index`, `num_class_chunks`, etc.),
-           which are passed as zero and are irrelevant for this use case.
-
-        If the C kernel is hardcoded to the module path geometry, a new, simplified
-        kernel (`clip_shared_gradients_chunk`) would be required. This implementation
-        proceeds under the assumption of a generic, reusable C kernel.
-        """
-        local_mem_size = self.work_group_size_0 * self.scalar_size_bytes
-        h = self.handles
-        return [
-            cl.LocalMemory(local_mem_size),
-            # src buffers: Populate first two, null out the rest
-            self._buffer_mgr.get_cl_buffer(h.grad_weights_shared),
-            self._buffer_mgr.get_cl_buffer(h.grad_biases_shared),
-            None,
-            None,
-            None,
-            # dest buffers: Populate first two, null out the rest
-            self._buffer_mgr.get_cl_buffer(h.clipped_grad_weights_shared),
-            self._buffer_mgr.get_cl_buffer(h.clipped_grad_biases_shared),
-            None,
-            None,
-            # Control flags and scalars
-            np.uint32(0),  # use_per_item_norm = FALSE
-            self.max_norm_global,
-            self.epsilon,
-            # Unused tile-based geometry scalars (passed as zero)
-            np.uint32(0),
-            np.uint32(0),
-            np.uint32(0),
-            np.uint32(0),
-            np.uint32(0),
-            np.uint32(0),
-            np.uint32(0),
         ]
 
 

@@ -29,7 +29,6 @@ import pyopencl as cl
 # --- Architectural Imports ---
 from .launcher_infra import BufferHandle, BufferManager, KernelExecutor, PingPongManager, SCALAR_UINT_TYPE
 from .kernel_signatures import (
-    AggregateIdentitySignature,
     AggregateRegisterReduceSignature,
     AggregateLocalReduceSignature,
 )
@@ -113,6 +112,29 @@ class GatherPrimitive(abc.ABC):
         start of its collection buffer.
         """
         pass
+
+
+@dataclass(frozen=True)
+class LinearlyChunkedGather(GatherPrimitive):
+    """
+    Represents partials scattered into a collection buffer according to a
+    linear chunking of a primary dimension (e.g., batch).
+    """
+
+    num_chunks: int
+    elements_per_chunk: int
+
+    @property
+    def num_partials(self) -> int:
+        return self.num_chunks
+
+    @property
+    def elements_per_partial(self) -> int:
+        return self.elements_per_chunk
+
+    def get_offsets(self) -> np.ndarray:
+        """The offset is the chunk index multiplied by the element stride."""
+        return np.arange(self.num_partials, dtype=SCALAR_UINT_TYPE) * self.elements_per_partial
 
 
 @dataclass(frozen=True)
