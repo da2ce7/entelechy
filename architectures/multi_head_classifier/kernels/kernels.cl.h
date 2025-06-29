@@ -905,43 +905,10 @@ __kernel void gather_and_permute_grad_hidden_activations(
     uint src_scalar_NATURAL_num_class_chunks_count,
     uint src_scalar_NATURAL_total_tile_count);
 
-// --- Phase 14, 15 & 19: Aggregation Engine ---
+// --- Phase 14, 15 & 20: Aggregation Engine ---
 
 /**
- * @brief [Utility Kernel] Performs an element-wise identity copy from a source to a destination buffer.
- * @kernel_contract
- *        - Holistic Constraints: "This is a generic copy utility. The Host Orchestrator may invoke it to handle the N=1 base case of a reduction, or for any other direct memory copy task."
- *        - Idempotency: "Strictly Idempotent"
- *        - Synchronization Model: "Utility"
- */
-__kernel void identity_copy(
-    /**
-     * @param src_buffer_GLOBAL_generic The source buffer for the copy operation.
-     *        - Tensor Shape: (src_scalar_NATURAL_width)
-     *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_width]
-     *        - Validation Preconditions: Host shall ensure this buffer was allocated to exactly [src_scalar_NATURAL_width * sizeof(SCALAR_TYPE)] bytes.
-     */
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_generic,
-
-    /**
-     * @param dest_buffer_GLOBAL_generic The destination buffer for the copy operation.
-     *        - Tensor Shape: (src_scalar_NATURAL_width)
-     *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_width]
-     *        - Validation Preconditions: Host shall ensure this buffer was allocated to exactly [src_scalar_NATURAL_width * sizeof(SCALAR_TYPE)] bytes.
-     */
-    __global SCALAR_TYPE *dest_buffer_GLOBAL_generic,
-
-    /**
-     * @param src_scalar_NATURAL_width The number of elements to copy.
-     *        - Calculability Proof: N/A.
-     *        - Validation Preconditions: This value must not exceed the allocated size of the source or destination buffers.
-     */
-    uint src_scalar_NATURAL_width);
-
-/**
- * @brief (Node 14, 15 & 19) Tier 1 (N is small): Reduces scattered partial results using registers and an indirection list.
+ * @brief (Node 14, 15 & 20) Tier 1 (N is small): Reduces scattered partial results using registers and an indirection list.
  * @kernel_contract
  *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a collection buffer, located via an explicit offset list. This avoids host-side staging
  * copies."
@@ -983,7 +950,7 @@ __kernel void aggregate_register_reduce(
     uint src_scalar_FLAG_operation_type);
 
 /**
- * @brief (Node 14, 15 & 19) Tier 2 (N is large): Reduces scattered partial results using local memory and an indirection list.
+ * @brief (Node 14, 15 & 20) Tier 2 (N is large): Reduces scattered partial results using local memory and an indirection list.
  * @kernel_contract
  *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a collection buffer, located via an explicit offset list. This avoids host-side staging
  * copies."
@@ -1224,11 +1191,105 @@ __kernel void backprop_shared_biases_chunk(
     uint src_scalar_NATURAL_num_batch_chunks_count,
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_final_grad_hidden_total_element_count);
+/**
+ * @brief (Node 19) [Utility Kernel] Computes the L2 Norm for a single SHARED GRADIENT
+ * chunk and conditionally scales it.
+ * @kernel_contract
+ *        - Holistic Constraints: "The kernel processes the gradients for shared weights and
+ *          biases for a single, contiguous data chunk. It has no knowledge of the
+ *          tiled module geometry or any other work item."
+ *        - Behavioral Invariants: "[1] Implements a two-pass algorithm: Norm calculation followed
+ *          by conditional scaling. [2] An epsilon term shall be used to prevent division by
+ *          zero when calculating the scaling factor. [3] The L2 norm is computed over the
+ *          concatenated vector of both weight and bias gradients for the chunk."
+ *        - Idempotency: "Strictly Idempotent"
+ *        - Synchronization Model: "Streamable Utility / Stability Primitive. Designed to be
+ *          invoked inside a host-side streaming loop, acting as a mandatory stability
+ *          gate before partial results are fed to the reduction engine."
+ */
+__kernel void clip_shared_gradients_chunk(
+    /**
+     * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reduction of the sum-of-squares.
+     *        - Tensor Shape: (get_local_size(0))
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [Implicit from work-group dispatch]
+     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group
+     *          size in dimension 0 multiplied by `sizeof(SCALAR_TYPE)`.
+     */
+    __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
 
-// --- Phase 20: Gradient Normalization ---
+    /**
+     * @param src_buffer_GLOBAL_partial_grad_weights_shared The partial weight gradients for a single
+     *        data chunk, produced by Node 17.
+     *        - Tensor Shape: (src_scalar_NATURAL_weights_parameter_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_weights_parameter_count]
+     *        - Validation Preconditions: Host shall ensure this buffer is a contiguous memory
+     *          region containing the complete partial weight gradient for the chunk being processed.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_grad_weights_shared,
+
+    /**
+     * @param src_buffer_GLOBAL_partial_grad_biases_shared The partial bias gradients for a single
+     *        data chunk, produced by Node 18.
+     *        - Tensor Shape: (src_scalar_NATURAL_biases_parameter_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_biases_parameter_count]
+     *        - Validation Preconditions: Host shall ensure this buffer is a contiguous memory
+     *          region containing the complete partial bias gradient for the chunk being processed.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_grad_biases_shared,
+
+    /**
+     * @param dest_buffer_GLOBAL_clipped_partial_grad_weights_shared The destination for the clipped
+     *        weight gradients of this chunk, ready for consumption by Node (20).
+     *        - Tensor Shape: (src_scalar_NATURAL_weights_parameter_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_weights_parameter_count]
+     *        - Validation Preconditions: Host must allocate a buffer with a size and layout identical
+     *          to its `src_` counterpart.
+     */
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_weights_shared,
+
+    /**
+     * @param dest_buffer_GLOBAL_clipped_partial_grad_biases_shared The destination for the clipped
+     *        bias gradients of this chunk, ready for consumption by Node (20).
+     *        - Tensor Shape: (src_scalar_NATURAL_biases_parameter_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_biases_parameter_count]
+     *        - Validation Preconditions: Host must allocate a buffer with a size and layout identical
+     *          to its `src_` counterpart.
+     */
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_biases_shared,
+
+    /**
+     * @param src_scalar_REAL_max_norm_global The maximum permissible L2 norm for this chunk.
+     *        - Validation Preconditions: Must be a positive real number.
+     */
+    SCALAR_TYPE src_scalar_REAL_max_norm_global,
+
+    /**
+     * @param src_scalar_REAL_epsilon A small constant to prevent division by zero.
+     *        - Validation Preconditions: Must be a small, positive real number (e.g., 1e-6).
+     */
+    SCALAR_TYPE src_scalar_REAL_epsilon,
+
+    /**
+     * @param src_scalar_NATURAL_weights_parameter_count The total number of elements in the
+     *        weight gradient buffer for this chunk.
+     */
+    uint src_scalar_NATURAL_weights_parameter_count,
+
+    /**
+     * @param src_scalar_NATURAL_biases_parameter_count The total number of elements in the
+     *        bias gradient buffer for this chunk.
+     */
+    uint src_scalar_NATURAL_biases_parameter_count);
+
+// --- Phase 21-25: Finalization & Updates ---
 
 /**
- * @brief (Node 20) [Utility Kernel] Normalizes a buffer of summed gradients by dividing each element by the effective batch size.
+ * @brief (Node 21) [Utility Kernel] Normalizes a buffer of summed gradients by dividing each element by the effective batch size.
  * @kernel_contract
  *        - Holistic Constraints: "This kernel is a generic, element-wise scaling utility designed to operate on any parameter group's summed gradient buffer."
  *        - Behavioral Invariants: "Performs element-wise division: `output[i] = input[i] / (effective_batch_size + epsilon)`. An epsilon term MUST be used to prevent division by zero if the
@@ -1276,10 +1337,8 @@ __kernel void normalize_gradients(
      */
     uint src_scalar_NATURAL_parameter_count);
 
-// --- Phase 23-24: Finalization & Updates ---
-
 /**
- * @brief (Node 23) Applies Adam optimizer update to an entire parameter group. Single dispatch.
+ * @brief (Node 24) Applies Adam optimizer update to an entire parameter group. Single dispatch.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction
@@ -1336,7 +1395,7 @@ __kernel void adam_update(
     uint        src_scalar_NATURAL_parameter_count);
 
 /**
- * @brief (Node 24) Clamps temperature parameters within a [min, max] range.
+ * @brief (Node 25) Clamps temperature parameters within a [min, max] range.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Behavioral Invariants: "Enforces `temps = clamp(temps, min_value, max_value)` for each element."
