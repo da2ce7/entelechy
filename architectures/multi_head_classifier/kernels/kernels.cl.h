@@ -905,75 +905,91 @@ __kernel void gather_and_permute_grad_hidden_activations(
     uint src_scalar_NATURAL_num_class_chunks_count,
     uint src_scalar_NATURAL_total_tile_count);
 
-// --- Phase 14, 15 & 19: Recursive, Tiered Aggregation Engine ---
+// --- Phase 14, 15 & 19: Aggregation Engine ---
 
 /**
- * @brief (Node 14, 15 & 19) Tier 0 (N=1): Identity pass-through copy. Base case for reduction.
+ * @brief [Utility Kernel] Performs an element-wise identity copy from a source to a destination buffer.
  * @kernel_contract
- *        - Holistic Constraints: "This kernel forms the base case of the reduction engine. The Host Orchestrator is contractually obligated to invoke this kernel if and only if the number of partials
- * to be reduced is exactly 1."
+ *        - Holistic Constraints: "This is a generic copy utility. The Host Orchestrator may invoke it to handle the N=1 base case of a reduction, or for any other direct memory copy task."
  *        - Idempotency: "Strictly Idempotent"
- *        - Synchronization Model: "Utility / Base Case"
+ *        - Synchronization Model: "Utility"
  */
-__kernel void aggregate_identity(
+__kernel void identity_copy(
     /**
-     * @param src_buffer_GLOBAL_partial_input The single source partial buffer to be copied.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_element_count)
+     * @param src_buffer_GLOBAL_generic The source buffer for the copy operation.
+     *        - Tensor Shape: (src_scalar_NATURAL_width)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_total_element_count]
-     *        - Validation Preconditions: Host shall ensure this buffer was allocated to exactly [src_scalar_NATURAL_total_element_count * sizeof(SCALAR_TYPE)] bytes.
+     *        - Calculability Proof: [src_scalar_NATURAL_width]
+     *        - Validation Preconditions: Host shall ensure this buffer was allocated to exactly [src_scalar_NATURAL_width * sizeof(SCALAR_TYPE)] bytes.
      */
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_input,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_generic,
 
     /**
-     * @param dest_buffer_GLOBAL_final_output The destination buffer for the copied data.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_element_count)
+     * @param dest_buffer_GLOBAL_generic The destination buffer for the copy operation.
+     *        - Tensor Shape: (src_scalar_NATURAL_width)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_total_element_count]
-     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_total_element_count * sizeof(SCALAR_TYPE)] bytes.
+     *        - Calculability Proof: [src_scalar_NATURAL_width]
+     *        - Validation Preconditions: Host shall ensure this buffer was allocated to exactly [src_scalar_NATURAL_width * sizeof(SCALAR_TYPE)] bytes.
      */
-    __global SCALAR_TYPE *dest_buffer_GLOBAL_final_output,
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_generic,
 
-    uint src_scalar_NATURAL_total_element_count);
+    /**
+     * @param src_scalar_NATURAL_width The number of elements to copy.
+     *        - Calculability Proof: N/A.
+     *        - Validation Preconditions: This value must not exceed the allocated size of the source or destination buffers.
+     */
+    uint src_scalar_NATURAL_width);
 
 /**
- * @brief (Node 14, 15 & 19) Tier 1 (N is small): Reduces partial results using registers.
+ * @brief (Node 14, 15 & 19) Tier 1 (N is small): Reduces scattered partial results using registers and an indirection list.
  * @kernel_contract
- *        - Holistic Constraints: "The Host Orchestrator invokes this tier of the reduction engine for a small number of partials (N > 1)."
- *        - Behavioral Invariants: "The reduction policy (e.g., SUM or AVERAGE) is controlled by the `operation_type` flag."
+ *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a collection buffer, located via an explicit offset list. This avoids host-side staging
+ * copies."
+ *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag."
  *        - Idempotency: "Associatively Non-Idempotent"
- *        - Synchronization Model: "Reduction Engine Tier 1"
+ *        - Synchronization Model: "Reduction Engine Stage"
  */
 __kernel void aggregate_register_reduce(
     /**
-     * @param src_buffer_GLOBAL_partial_input The collection of source partial buffers to be reduced.
-     *        - Tensor Shape: (src_scalar_NATURAL_in_partials_count, src_scalar_NATURAL_partial_element_count)
+     * @param src_buffer_GLOBAL_partial_collection The memory pool containing all partial results for this stage.
+     *        - Tensor Shape: Undefined.
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_in_partials_count, src_scalar_NATURAL_partial_element_count]
-     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_in_partials_count * src_scalar_NATURAL_partial_element_count * sizeof(SCALAR_TYPE)] bytes for this buffer.
+     *        - Calculability Proof: N/A.
+     *        - Validation Preconditions: Host must provide a valid buffer that encompasses all memory regions referenced by the combination of `src_buffer_GLOBAL_CONST_partial_offset_list` and
+     * `src_scalar_NATURAL_partial_width`.
      */
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_input,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_collection,
 
     /**
-     * @param dest_buffer_GLOBAL_partial_output The destination buffer for the single, reduced partial result.
-     *        - Tensor Shape: (src_scalar_NATURAL_partial_element_count)
+     * @param src_buffer_GLOBAL_CONST_partial_offset_list The indirection table. Each element is an offset into `src_buffer_GLOBAL_partial_collection`.
+     *        - Tensor Shape: (src_scalar_NATURAL_partial_offset_list_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_partial_element_count]
-     *        - Validation Preconditions: Host must allocate exactly [src_scalar_NATURAL_partial_element_count * sizeof(SCALAR_TYPE)] bytes.
+     *        - Calculability Proof: [src_scalar_NATURAL_partial_offset_list_count]
+     *        - Validation Preconditions: Host must provide a buffer containing exactly `src_scalar_NATURAL_partial_offset_list_count` uints.
      */
-    __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_output,
+    __global const uint *src_buffer_GLOBAL_CONST_partial_offset_list,
 
-    uint src_scalar_NATURAL_in_partials_count,
-    uint src_scalar_NATURAL_partial_element_count,
+    /**
+     * @param dest_buffer_GLOBAL_partial The destination buffer for the single, reduced partial result.
+     *        - Tensor Shape: (src_scalar_NATURAL_partial_width)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_partial_width]
+     *        - Validation Preconditions: Host must allocate exactly [src_scalar_NATURAL_partial_width * sizeof(SCALAR_TYPE)] bytes.
+     */
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_partial,
+
+    uint src_scalar_NATURAL_partial_offset_list_count,
+    uint src_scalar_NATURAL_partial_width,
     uint src_scalar_FLAG_operation_type);
 
 /**
- * @brief (Node 14, 15 & 19) Tier 2 (N is large): Reduces partial results using local memory.
+ * @brief (Node 14, 15 & 19) Tier 2 (N is large): Reduces scattered partial results using local memory and an indirection list.
  * @kernel_contract
- *        - Holistic Constraints: "The Host Orchestrator invokes this tier of the reduction engine for a large number of partials."
- *        - Behavioral Invariants: "The reduction policy (e.g., SUM or AVERAGE) is controlled by the `operation_type` flag."
+ *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a collection buffer, located via an explicit offset list. This avoids host-side staging
+ * copies."
+ *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag."
  *        - Idempotency: "Associatively Non-Idempotent"
- *        - Synchronization Model: "Reduction Engine Tier 2 / Work-group Parallel"
+ *        - Synchronization Model: "Reduction Engine Stage / Work-group Parallel"
  */
 __kernel void aggregate_local_reduce(
     /**
@@ -982,30 +998,39 @@ __kernel void aggregate_local_reduce(
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [Implicit from work-group dispatch]
      *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(SCALAR_TYPE)`.
-     *        - Performance Notes: For optimal performance, the work-group size for dimension 0 should be a power of 2 to ensure conflict-free parallel reduction.
      */
     __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
 
     /**
-     * @param src_buffer_GLOBAL_partial_input The collection of source partial buffers to be reduced.
-     *        - Tensor Shape: (src_scalar_NATURAL_in_partials_count, src_scalar_NATURAL_partial_element_count)
+     * @param src_buffer_GLOBAL_partial_collection The memory pool containing all partial results for this stage.
+     *        - Tensor Shape: Undefined.
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_in_partials_count, src_scalar_NATURAL_partial_element_count]
-     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_in_partials_count * src_scalar_NATURAL_partial_element_count * sizeof(SCALAR_TYPE)] bytes for this buffer.
+     *        - Calculability Proof: N/A.
+     *        - Validation Preconditions: Host must provide a valid buffer that encompasses all memory regions referenced by the combination of `src_buffer_GLOBAL_CONST_partial_offset_list` and
+     * `src_scalar_NATURAL_partial_width`.
      */
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_input,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_collection,
 
     /**
-     * @param dest_buffer_GLOBAL_partial_output The destination buffer for the single, reduced partial result.
-     *        - Tensor Shape: (src_scalar_NATURAL_partial_element_count)
+     * @param src_buffer_GLOBAL_CONST_partial_offset_list The indirection table. Each element is an offset into `src_buffer_GLOBAL_partial_collection`.
+     *        - Tensor Shape: (src_scalar_NATURAL_partial_offset_list_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_partial_element_count]
-     *        - Validation Preconditions: Host must allocate exactly [src_scalar_NATURAL_partial_element_count * sizeof(SCALAR_TYPE)] bytes.
+     *        - Calculability Proof: [src_scalar_NATURAL_partial_offset_list_count]
+     *        - Validation Preconditions: Host must provide a buffer containing exactly `src_scalar_NATURAL_partial_offset_list_count` uints.
      */
-    __global SCALAR_TYPE *dest_buffer_GLOBAL_partial_output,
+    __global const uint *src_buffer_GLOBAL_CONST_partial_offset_list,
 
-    uint src_scalar_NATURAL_in_partials_count,
-    uint src_scalar_NATURAL_partial_element_count,
+    /**
+     * @param dest_buffer_GLOBAL_partial The destination buffer for the single, reduced partial result.
+     *        - Tensor Shape: (src_scalar_NATURAL_partial_width)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_partial_width]
+     *        - Validation Preconditions: Host must allocate exactly [src_scalar_NATURAL_partial_width * sizeof(SCALAR_TYPE)] bytes.
+     */
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_partial,
+
+    uint src_scalar_NATURAL_partial_offset_list_count,
+    uint src_scalar_NATURAL_partial_width,
     uint src_scalar_FLAG_operation_type);
 
 // --- Phase 16: Specialized Grad_H Reduction ---

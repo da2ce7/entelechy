@@ -4,21 +4,13 @@
 Concrete KernelSignature Implementations for Reduction & Aggregation (Nodes 14-16, 19).
 
 This file contains the final, canonical implementations for the kernel launch
-signatures related to the third stage of the 'Learn' phase. These kernels are
-responsible for collapsing many partial gradient buffers into single,
-summed/averaged results.
+signatures related to the third stage of the 'Learn' phase.
 
-This implementation follows a rectified design where each kernel in the tiered
-aggregation engine has its own simple, 'dumb' signature class. This removes
-strategic logic from the signature layer and places it correctly in the
-orchestration layer (within a dedicated `AggregationManager`).
-
-This module provides:
-- AggregateIdentitySignature (Node 14): The N=1 base case.
-- AggregateRegisterReduceSignature (Node 15): The small-N, register-based case.
-- AggregateLocalReduceSignature (Node 19): The large-N, local memory-based case.
-- ReduceGradHOverModulesSignature (Node 16): A highly specialized signature for the
-  final reduction of the unique `Grad_H` SoA buffer.
+(REV 3): The generic aggregation signatures have been completely refactored to
+support the superior "Device-Side Gather" model. They now accept an indirection
+table (offset list) on the device, allowing the kernel to perform the gather
+operation implicitly. This avoids a massive, host-orchestrated memory copy and
+is a key performance optimization.
 """
 
 from dataclasses import dataclass, field
@@ -29,7 +21,7 @@ import pyopencl as cl
 
 # --- Local Infrastructure Imports ---
 from ..launcher_infra import BufferHandle, KernelSignature
-from ..memory_layout import _pad_to_multiple
+from ..memory_layout import _pad_to_multiple, SCALAR_NP_TYPE
 
 
 # === Generic, Tiered Aggregation Engine Signatures (Nodes 14, 15, 19) ===
@@ -37,19 +29,16 @@ from ..memory_layout import _pad_to_multiple
 
 @dataclass(frozen=True)
 class AggregateIdentitySignature(KernelSignature):
-    """(Node 14) Signature for `aggregate_identity`, the N=1 reduction base case."""
+    """(Node 14) Signature for `identity_copy`, the N=1 reduction base case."""
 
     in_ref: BufferHandle
     out_ref: BufferHandle
-    total_element_count: np.uint32 = field(init=False)
-
-    def __post_init__(self):
-        shape, _ = self._buffer_mgr.get_spec(self.out_ref)
-        object.__setattr__(self, "total_element_count", np.uint32(np.prod(shape)))
+    total_element_count: np.uint32
 
     @property
     def kernel_name(self) -> str:
-        return "aggregate_identity"
+        # This can point to a generic copy kernel.
+        return "identity_copy"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
         return (int(self.total_element_count),), None
@@ -65,70 +54,73 @@ class AggregateIdentitySignature(KernelSignature):
 
 @dataclass(frozen=True)
 class AggregateRegisterReduceSignature(KernelSignature):
-    """(Node 15) Signature for `aggregate_register_reduce`, for small N."""
+    """(Node 15) Signature for `aggregate_register_reduce` using an indirection table."""
 
-    partials_collection_ref: BufferHandle
-    out_ref: BufferHandle
-    in_partials_count: np.uint32
-    operation_type: np.uint32
-    partial_element_count: np.uint32 = field(init=False)
+    partial_collection_ref: BufferHandle
+    partial_offset_list_ref: BufferHandle  # The indirection table
+    dest_ref: BufferHandle
+    partial_offset_list_count: np.uint32  # Number of partials to reduce
+    partial_width: np.uint32  # Number of elements per partial
+    operation_type: np.uint32  # 0=SUM, 1=AVERAGE
 
     def __post_init__(self):
-        shape, _ = self._buffer_mgr.get_spec(self.out_ref)
-        object.__setattr__(self, "partial_element_count", np.uint32(np.prod(shape)))
+        super().__post_init__()
 
     @property
     def kernel_name(self) -> str:
         return "aggregate_register_reduce"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        return (int(self.partial_element_count),), None
+        # One work-item per element of the final reduced partial
+        return (int(self.partial_width),), None
 
     def get_args(self) -> List:
-        """Returns all 5 arguments in exact contractual order."""
+        """Returns all 6 arguments in exact contractual order."""
         return [
-            self._buffer_mgr.get_cl_buffer(self.partials_collection_ref),
-            self._buffer_mgr.get_cl_buffer(self.out_ref),
-            self.in_partials_count,
-            self.partial_element_count,
+            self._buffer_mgr.get_cl_buffer(self.partial_collection_ref),
+            self._buffer_mgr.get_cl_buffer(self.partial_offset_list_ref),
+            self._buffer_mgr.get_cl_buffer(self.dest_ref),
+            self.partial_offset_list_count,
+            self.partial_width,
             self.operation_type,
         ]
 
 
 @dataclass(frozen=True)
 class AggregateLocalReduceSignature(KernelSignature):
-    """(Node 19) Signature for `aggregate_local_reduce`, for large N."""
+    """(Node 19) Signature for `aggregate_local_reduce` using an indirection table."""
 
     work_group_size_0: int
     scalar_size_bytes: int
-    partials_collection_ref: BufferHandle
-    out_ref: BufferHandle
-    in_partials_count: np.uint32
-    operation_type: np.uint32
-    partial_element_count: np.uint32 = field(init=False)
+    partial_collection_ref: BufferHandle
+    partial_offset_list_ref: BufferHandle  # The indirection table
+    dest_ref: BufferHandle
+    partial_offset_list_count: np.uint32  # Number of partials to reduce
+    partial_width: np.uint32  # Number of elements per partial
+    operation_type: np.uint32  # 0=SUM, 1=AVERAGE
 
     def __post_init__(self):
-        shape, _ = self._buffer_mgr.get_spec(self.out_ref)
-        object.__setattr__(self, "partial_element_count", np.uint32(np.prod(shape)))
+        super().__post_init__()
 
     @property
     def kernel_name(self) -> str:
         return "aggregate_local_reduce"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        global_size = (_pad_to_multiple(int(self.partial_element_count), self.work_group_size_0),)
+        global_size = (_pad_to_multiple(int(self.partial_width), self.work_group_size_0),)
         local_size = (self.work_group_size_0,)
         return global_size, local_size
 
     def get_args(self) -> List:
-        """Returns all 6 arguments, prepending the local memory buffer."""
+        """Returns all 7 arguments, prepending local memory."""
         local_mem_size = self.work_group_size_0 * self.scalar_size_bytes
         return [
             cl.LocalMemory(local_mem_size),
-            self._buffer_mgr.get_cl_buffer(self.partials_collection_ref),
-            self._buffer_mgr.get_cl_buffer(self.out_ref),
-            self.in_partials_count,
-            self.partial_element_count,
+            self._buffer_mgr.get_cl_buffer(self.partial_collection_ref),
+            self._buffer_mgr.get_cl_buffer(self.partial_offset_list_ref),
+            self._buffer_mgr.get_cl_buffer(self.dest_ref),
+            self.partial_offset_list_count,
+            self.partial_width,
             self.operation_type,
         ]
 

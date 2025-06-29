@@ -14,11 +14,12 @@ and instead relying on explicit instructions from the orchestrator.
 
 Core Components:
 - BufferHandle & Enums: The canonical, type-safe lexicon for the host.
-- MemoryLayout Abstractions: Imported tools for explicit memory planning.
+- Workload Primitives (WorkTile, ExecutionGrid): Utilities to define work.
+- HostView: A utility for safe, padding-aware data reads from device to host.
 - BufferManager: The sole authority on device memory allocation and lifecycle.
+- PingPongManager: A stateful helper managing transient buffers for reductions.
 - KernelSignature (ABC): The abstract contract for all kernel launch objects.
 - KernelExecutor: The pure, stateless dispatcher that executes KernelSignatures.
-- PingPongManager: A stateful helper managing transient buffers for reductions.
 """
 
 import abc
@@ -31,12 +32,10 @@ import pyopencl as cl
 
 # --- Local Imports ---
 # This module relies on the MemoryLayout abstraction being in a separate, co-located file.
-from memory_layout import MemoryLayout, PaddingType, PaddingStrategy
+from memory_layout import MemoryLayout
 
 
 # --- Global Type Definitions ---
-# This establishes the abstract numerical type used throughout the system.
-# Changing this one line is sufficient to re-target the system's precision.
 SCALAR_NP_TYPE = np.float32
 
 
@@ -61,7 +60,6 @@ class BufferRole(enum.Enum):
     LOSS = enum.auto()
     TARGETS = enum.auto()
     SAMPLE_MASK = enum.auto()
-    HIDDEN_MASK = enum.auto()
     # Learnable Parameters
     SHARED_WEIGHTS = enum.auto()
     SHARED_BIAS = enum.auto()
@@ -77,33 +75,34 @@ class BufferRole(enum.Enum):
     ADAM_M2 = enum.auto()
     # Specialized Intermediates
     PERMUTED_GRAD_H = enum.auto()
+    SOFTMAX_PARAMS = enum.auto()
 
 
-@dataclass(frozen=True)
-class WorkTile:
-    """Defines a single, independent unit of work for tiled kernels.
-    This object encapsulates the scalar parameters that define a chunk.
-    """
+class HostView:
+    """A helper class for safe, padding-aware reads from device to host."""
 
-    flat_tile_index: int
-    module_chunk_index: int
-    class_chunk_index: int
-    num_class_chunks: int
-    modules_per_chunk: int
-    classes_per_chunk: int
+    def __init__(self, padded_shape: Tuple, dtype: np.dtype, real_shape: Tuple):
+        self.padded_shape = padded_shape
+        self.dtype = dtype
+        self.real_shape = real_shape
+        # Allocate a host-side buffer with the full padded shape
+        self.host_data = np.empty(self.padded_shape, dtype=self.dtype)
+
+    def enqueue_read(self, queue: cl.CommandQueue, cl_buffer: cl.Buffer, wait_for=None) -> cl.Event:
+        """Enqueues a non-blocking copy from the device buffer to this host view."""
+        return cl.enqueue_copy(queue, self.host_data, cl_buffer, wait_for=wait_for or [])
+
+    def get(self) -> np.ndarray:
+        """Returns a numpy array sliced to the real shape, effectively removing padding."""
+        slicing = tuple(slice(0, dim) for dim in self.real_shape)
+        return self.host_data[slicing] if slicing else self.host_data
 
 
 # --- Memory Management Layer ---
 
 
 class BufferManager:
-    """Manages the lifecycle of ALL OpenCL buffers, enforcing memory contracts.
-
-    This class is the sole authority for creating, accessing, and releasing
-    device memory. Its design has been refactored to be a "dumb worker" that
-    executes explicit `MemoryLayout` plans provided by the orchestrator,
-    abolishing all internal, implicit padding logic.
-    """
+    """Manages the lifecycle of ALL OpenCL buffers, enforcing memory contracts."""
 
     def __init__(self, context: cl.Context):
         self._context = context
@@ -118,16 +117,10 @@ class BufferManager:
         return handle
 
     def create_named_buffer(self, name: str, layout: MemoryLayout, dtype: np.dtype) -> BufferHandle:
-        """Creates a named, long-lived buffer based on an EXPLICIT layout plan."""
         if name in self._name_to_handle:
             raise ValueError(f"Buffer with name '{name}' already exists.")
-        if not isinstance(layout, MemoryLayout):
-            raise TypeError("`layout` argument must be an instance of MemoryLayout.")
-
-        # The BufferManager is now a simple worker. It executes the plan it is given.
         padded_shape = layout.get_padded_shape(dtype)
         byte_size = int(np.prod(padded_shape) * dtype().itemsize) if padded_shape else 4
-
         handle = self._get_new_handle()
         self._name_to_handle[name] = handle
         self._handle_to_buffer[handle] = cl.Buffer(self._context, cl.mem_flags.READ_WRITE, size=max(4, byte_size))
@@ -135,71 +128,73 @@ class BufferManager:
         return handle
 
     def acquire_transient_buffer(self, size_bytes: int) -> BufferHandle:
-        """Acquires an unnamed, temporary buffer. Used for intermediates like reduction trees."""
         handle = self._get_new_handle()
         self._handle_to_buffer[handle] = cl.Buffer(self._context, cl.mem_flags.READ_WRITE, size=max(4, size_bytes))
         return handle
 
     def release_transient_buffer(self, handle: BufferHandle):
-        """Returns a transient buffer, allowing its memory to be reclaimed by the driver."""
         if handle in self._handle_to_buffer:
             self._handle_to_buffer[handle].release()
             del self._handle_to_buffer[handle]
-        if handle in self._handle_to_spec:
-            del self._handle_to_spec[handle]
 
     def get_cl_buffer(self, ref: Union[str, BufferHandle]) -> cl.Buffer:
-        """The single gateway to resolve a reference to a cl.Buffer object."""
         handle = self._name_to_handle.get(ref) if isinstance(ref, str) else ref
         if handle is None or handle not in self._handle_to_buffer:
             raise KeyError(f"No buffer found for reference: {ref}")
         return self._handle_to_buffer[handle]
 
+    def get_handle_by_name(self, name: str) -> BufferHandle:
+        """Resolves a string name to its unique, opaque BufferHandle."""
+        if name not in self._name_to_handle:
+            raise KeyError(f"No buffer found with name: {name}")
+        return self._name_to_handle[name]
+
     def get_spec(self, ref: Union[str, BufferHandle]) -> Tuple[Tuple[int, ...], np.dtype]:
-        """Returns the (padded_shape, dtype) specification for a named buffer."""
         handle = self._name_to_handle.get(ref) if isinstance(ref, str) else ref
         if handle is None or handle not in self._handle_to_spec:
-            raise KeyError(f"No spec found for named reference: {ref}")
+            raise KeyError(f"No spec found for reference: {ref}")
         return self._handle_to_spec[handle]
 
 
 class PingPongManager:
     """Manages a pair of recyclable 'ping-pong' buffers for a reduction."""
 
-    def __init__(self, buffer_mgr: BufferManager, max_bytes: int):
-        self._buffer_mgr = buffer_mgr
-        self.ping: BufferHandle = buffer_mgr.acquire_transient_buffer(max_bytes)
-        self.pong: BufferHandle = buffer_mgr.acquire_transient_buffer(max_bytes)
+    def __init__(self):
+        self._buffer_mgr: Optional[BufferManager] = None
+        self.ping: Optional[BufferHandle] = None
+        self.pong: Optional[BufferHandle] = None
         self._is_ping_current_input = True
 
+    def initialize(self, buffer_mgr: BufferManager, max_bytes: int):
+        """Lazily initializes the manager and acquires transient buffers."""
+        if self.ping is not None or self.pong is not None:
+            raise RuntimeError("PingPongManager is already initialized.")
+        self._buffer_mgr = buffer_mgr
+        self.ping = buffer_mgr.acquire_transient_buffer(max_bytes)
+        self.pong = buffer_mgr.acquire_transient_buffer(max_bytes)
+
     def get_io(self) -> Tuple[BufferHandle, BufferHandle]:
-        """Returns the current (input, output) buffer handles."""
+        if self.ping is None or self.pong is None:
+            raise RuntimeError("PingPongManager must be initialized before use.")
         return (self.ping, self.pong) if self._is_ping_current_input else (self.pong, self.ping)
 
     def swap(self):
-        """Swaps the input/output roles of the buffers for the next reduction stage."""
         self._is_ping_current_input = not self._is_ping_current_input
 
     def release(self):
-        """Releases the managed buffers back to the BufferManager."""
-        self._buffer_mgr.release_transient_buffer(self.ping)
-        self._buffer_mgr.release_transient_buffer(self.pong)
+        if self._buffer_mgr and self.ping and self.pong:
+            self._buffer_mgr.release_transient_buffer(self.ping)
+            self._buffer_mgr.release_transient_buffer(self.pong)
+        self.__init__()  # Reset to uninitialized state
 
 
 # --- Kernel Launch Layer (The Abstract Contract and Pure Dispatcher) ---
 
 
 class KernelSignature(abc.ABC):
-    """Abstract base class for a kernel launch specification.
-
-    This object is a pure, self-contained, and contractually valid representation
-    of a single kernel launch. It holds all arguments and is responsible for
-    calculating its own launch grid. Its existence enforces correctness by design.
-    """
+    """Abstract base class for a kernel launch specification."""
 
     def __init__(self, buffer_mgr: BufferManager):
-        # A read-only reference to the buffer manager is required for signatures
-        # to derive their own parameters from buffer specifications.
         if not isinstance(buffer_mgr, BufferManager):
             raise TypeError("KernelSignature requires a valid BufferManager instance.")
         self._buffer_mgr = buffer_mgr
@@ -222,12 +217,7 @@ class KernelSignature(abc.ABC):
 
 
 class KernelExecutor:
-    """A pure, stateless dispatcher for KernelSignature objects.
-
-    This class has no knowledge of problem dimensions, buffer names, or
-    orchestration logic. Its sole purpose is to accept a fully-formed
-    KernelSignature and dispatch it to the device.
-    """
+    """A pure, stateless dispatcher for KernelSignature objects."""
 
     def __init__(self, program: cl.Program):
         if not isinstance(program, cl.Program):
@@ -237,12 +227,9 @@ class KernelExecutor:
     def launch(
         self, queue: cl.CommandQueue, signature: KernelSignature, wait_for: Optional[List[cl.Event]] = None
     ) -> cl.Event:
-        """Executes a single, fully-defined kernel launch."""
         if not isinstance(signature, KernelSignature):
             raise TypeError("The 'signature' argument must be an instance of KernelSignature.")
-
         kernel = getattr(self.program, signature.kernel_name)
         global_size, local_size = signature.get_grid()
         kernel_args = signature.get_args()
-
         return kernel(queue, global_size, local_size, *kernel_args, wait_for=wait_for)
