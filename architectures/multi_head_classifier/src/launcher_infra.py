@@ -14,7 +14,7 @@ and instead relying on explicit instructions from the orchestrator.
 
 Core Components:
 - BufferHandle & Enums: The canonical, type-safe lexicon for the host.
-- Workload Primitives (WorkTile, TilingScheme): Utilities to define work.
+- Workload Primitives (WorkTile, ExecutionGrid): Utilities to define work.
 - HostView: A utility for safe, padding-aware data reads from device to host.
 - BufferManager: The sole authority on device memory allocation and lifecycle.
 - PingPongManager: A stateful helper managing transient buffers for reductions.
@@ -40,6 +40,18 @@ SCALAR_NP_TYPE = np.float32
 
 
 # --- Canonical Lexicon & Data Structures (The Host-Side Contract) ---
+
+
+# --- Standardized Dependency Bundle ---
+@dataclass(frozen=True)
+class Services:
+    """A simple container for passing core system components for dependency injection."""
+
+    q: cl.CommandQueue
+    ex: KernelExecutor
+    bm: BufferManager
+    model_spec: ModelSpec
+    arch_consts: Dict[str, int]
 
 
 @dataclass(frozen=True, eq=True)

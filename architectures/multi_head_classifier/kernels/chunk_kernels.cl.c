@@ -594,7 +594,6 @@ __kernel void calculate_chunk_temp_gradients(
     SCALAR_TYPE p_grad_sum        = SCALAR_ZERO;
 
     // Threads in the work-group sum contributions over the batch dimension.
-    // This core computational logic is correct and remains unchanged.
     for (int b = lid; b < total_batch_size; b += lsize) {
         if (sample_mask[b] < 0.5f) {
             continue;

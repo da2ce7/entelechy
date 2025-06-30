@@ -1,41 +1,31 @@
 # compute_patterns.py
 
 """
-A Module of High-Level, Reusable Parallel Computing Patterns.
+A Module of Low-Level, Reusable Parallel Computing Components.
 
-(REV 5) This module provides the definitive, architecturally pure implementations
-for common parallel computing patterns. This version formalizes the concept of
-"gathering" partial results into a first-class declarative abstraction: the
-`GatherPrimitive`.
+(REV 6 - REFACTORED) This module provides the definitive, low-level components
+for implementing complex parallel patterns. The stateful, high-level
+`ReductionTreeExecutor` has been removed, as its logic is now captured in a
+stateless recipe in `graph_recipes.py`.
 
-This core change resolves all prior architectural discrepancies:
-- The `ReductionTreeExecutor` is now fully decoupled from the host's high-level
-  workload partitioning logic, consuming the `GatherPrimitive` as its sole source
-  of truth for memory layout.
-- The `N=1` reduction base case is now handled with a direct, efficient driver
-  call, upholding the "Primacy of Memory Strategy".
-- All stateful loop management, buffer sizing, and indirection list generation
-  is now flawlessly encapsulated within the `ReductionTreeExecutor`, presenting
-  a clean and declarative interface to the high-level orchestrator.
+This module now contains only the tactical, reusable tools and configuration
+objects consumed by those higher-level recipes.
 """
 
-import abc
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pyopencl as cl
 
 # --- Architectural Imports ---
-from .launcher_infra import BufferHandle, BufferManager, KernelExecutor, PingPongManager, SCALAR_UINT_TYPE
+from .launcher_infra import BufferHandle, BufferManager, KernelExecutor
 from .kernel_signatures import (
     AggregateRegisterReduceSignature,
     AggregateLocalReduceSignature,
 )
-from .workload_primitives import GatherPrimitive, ContiguousGather
 
-
-# === Section 1: Hierarchical Aggregation (Reduction) Pattern ===
+# === Configuration Object for Reductions ===
 
 
 @dataclass(frozen=True)
@@ -45,6 +35,9 @@ class ReductionPlan:
     k: int
 
 
+# === Tactical Tool for Executing a Single Reduction Stage ===
+
+
 class AggregationManager:
     """
     A stateless, tactical tool that executes a SINGLE stage of a reduction.
@@ -52,8 +45,9 @@ class AggregationManager:
     This class is the 'dumb' executor in the reduction hierarchy. Its sole
     responsibility is to select the correct kernel tier (register vs. local)
     and dispatch it against a given set of partials, as defined by an
+
     indirection table (`offset_list`). It has no knowledge of the overall
-    reduction tree.
+    reduction tree and is used internally by the `execute_reduction_tree` recipe.
     """
 
     def __init__(self, ex: KernelExecutor, bm: BufferManager, arch_consts: Dict[str, int]):
@@ -81,7 +75,7 @@ class AggregationManager:
 
         if num_partials_to_reduce <= self.max_reg_agg:
             sig = AggregateRegisterReduceSignature(
-                self.bm,
+                buffer_mgr=self.bm,
                 partial_collection_ref=collection_ref,
                 partial_offset_list_ref=offset_list_ref,
                 dest_ref=destination_ref,
@@ -91,7 +85,7 @@ class AggregationManager:
             )
         else:
             sig = AggregateLocalReduceSignature(
-                self.bm,
+                buffer_mgr=self.bm,
                 work_group_size_0=self.wgs0,
                 scalar_size_bytes=scalar_byte_size,
                 partial_collection_ref=collection_ref,
@@ -102,129 +96,3 @@ class AggregationManager:
                 operation_type=np.uint32(0),  # AGG_MODE_SUM
             )
         return self.ex.launch(queue, sig, wait_for=wait_for)
-
-
-class ReductionTreeExecutor:
-    """
-    A stateful process manager for a complete, multi-stage log_K(N) reduction.
-
-    This class is the embodiment of the hierarchical aggregation primitive. It
-    encapsulates the entire complex process of looping, managing transient
-    ping-pong buffers, and generating the necessary indirection tables
-    for each stage of the reduction, which it consumes via the declarative
-    `GatherPrimitive` abstraction.
-    """
-
-    def __init__(
-        self,
-        queue: cl.CommandQueue,
-        ex: KernelExecutor,
-        bm: BufferManager,
-        agg_mgr: AggregationManager,
-        plan: ReductionPlan,
-    ):
-        self.q = queue
-        self.ex = ex
-        self.bm = bm
-        self.agg_mgr = agg_mgr
-        self.plan = plan
-
-    def _create_offset_list(self, offsets_host: np.ndarray, wait_for: List[cl.Event]) -> Tuple[BufferHandle, cl.Event]:
-        """Creates and uploads an indirection table (offset list) from a host array."""
-        offset_list_ref = self.bm.acquire_transient_buffer(offsets_host.nbytes)
-        evt = cl.enqueue_copy(self.q, self.bm.get_cl_buffer(offset_list_ref), offsets_host, wait_for=wait_for)
-        return offset_list_ref, evt
-
-    def execute(
-        self,
-        gather_primitive: GatherPrimitive,
-        partial_collection_ref: BufferHandle,
-        final_dest_handle: BufferHandle,
-        wait_for: Optional[List[cl.Event]] = None,
-    ) -> cl.Event:
-        """Executes the full reduction tree from a collection of partials to a final dense buffer."""
-        wait_for = wait_for or []
-        n = gather_primitive.num_partials
-
-        if n <= 0:
-            user_event = cl.UserEvent(self.q.context)
-            user_event.set_status(cl.command_execution_status.COMPLETE)
-            return user_event
-
-        elements_per_partial = gather_primitive.elements_per_partial
-        scalar_byte_size = self.bm.get_spec(final_dest_handle)[1]().itemsize
-        partial_byte_size = elements_per_partial * scalar_byte_size
-
-        initial_offsets_host = gather_primitive.get_offsets()
-
-        if n == 1:
-            # Optimal N=1 case: A direct driver copy with the correct offset.
-            src_offset_bytes = int(initial_offsets_host[0] * scalar_byte_size)
-            return cl.enqueue_copy_buffer(
-                self.q,
-                src=self.bm.get_cl_buffer(partial_collection_ref),
-                dst=self.bm.get_cl_buffer(final_dest_handle),
-                byte_count=partial_byte_size,
-                src_offset=src_offset_bytes,
-                dst_offset=0,
-                wait_for=wait_for,
-            )
-
-        # --- Setup Resources for N > 1 Reduction Tree ---
-        ppm = PingPongManager()
-        stage_output_partials = (n + self.plan.k - 1) // self.plan.k
-        ppm_buffer_size_bytes = stage_output_partials * partial_byte_size
-        ppm.initialize(self.bm, max_bytes=ppm_buffer_size_bytes)
-        transient_handles = []
-        try:
-            # Stage 1: The Initial Gather from the source collection.
-            offset_list_ref, upload_evt = self._create_offset_list(initial_offsets_host, wait_for)
-            transient_handles.append(offset_list_ref)
-
-            current_n = n
-            current_collection_ref = partial_collection_ref
-            current_deps = [upload_evt]
-
-            # --- Main Reduction Loop ---
-            while current_n > self.plan.k:
-                stage_dest_ref, _ = ppm.get_io()
-                stage_event = self.agg_mgr.execute_stage(
-                    self.q,
-                    current_collection_ref,
-                    offset_list_ref,
-                    current_n,
-                    elements_per_partial,
-                    stage_dest_ref,
-                    current_deps,
-                )
-                current_deps = [stage_event]
-
-                # Prepare for the NEXT Iteration
-                next_n = (current_n + self.plan.k - 1) // self.plan.k
-
-                # The output of the last stage is the now-contiguous input for the next.
-                current_collection_ref = stage_dest_ref
-                next_gather_primitive = ContiguousGather(next_n, elements_per_partial)
-                next_offsets_host = next_gather_primitive.get_offsets()
-                offset_list_ref, upload_evt = self._create_offset_list(next_offsets_host, current_deps)
-                transient_handles.append(offset_list_ref)
-                current_deps = [upload_evt]
-                current_n = next_n
-                ppm.swap()
-
-            # --- Final Reduction Stage (writes to the persistent destination) ---
-            final_stage_event = self.agg_mgr.execute_stage(
-                self.q,
-                current_collection_ref,
-                offset_list_ref,
-                current_n,
-                elements_per_partial,
-                final_dest_handle,
-                current_deps,
-            )
-            return final_stage_event
-
-        finally:
-            ppm.release()
-            for handle in transient_handles:
-                self.bm.release_transient_buffer(handle)

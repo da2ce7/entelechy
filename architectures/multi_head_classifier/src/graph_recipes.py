@@ -17,24 +17,12 @@ import pyopencl as cl
 
 # --- Architectural Imports ---
 from execution_plan import ExecutionPlan, WorkTile
-from launcher_infra import BufferManager, KernelExecutor, BufferHandle, SCALAR_NP_TYPE, PingPongManager
+from launcher_infra import Services, BufferManager, KernelExecutor, BufferHandle, SCALAR_NP_TYPE, PingPongManager
 from kernel_signatures import *
 from model_spec import ModelSpec
 from parameter_space import ParameterSpace
 from compute_patterns import AggregationManager, ReductionPlan
 from workload_primitives import GatherPrimitive, ContiguousGather
-
-
-# --- Standardized Dependency Bundle ---
-@dataclass(frozen=True)
-class Services:
-    """A simple container for passing core system components for dependency injection."""
-
-    q: cl.CommandQueue
-    ex: KernelExecutor
-    bm: BufferManager
-    model_spec: ModelSpec
-    arch_consts: Dict[str, int]
 
 
 # =========================================================================
