@@ -3,13 +3,14 @@
 """
 The Definitive, Unified Streaming Classification Engine (Host Implementation).
 
-(REV 2 - ARCHITECTURALLY FINALIZED) This version represents the fully harmonized
-architecture, where every component strictly adheres to its designated role.
+(REV 3 - ARCHITECTURALLY FINALIZED) This version represents the fully harmonized
+architecture, including the implementation of the memory-constrained "Accumulate
+via Recompute" streaming model for Grad_H.
 
-The `TrainingOrchestrator` is now a pure strategist, authoring high-level,
+The `TrainingOrchestrator` is a pure strategist, authoring high-level,
 declarative execution plans.
 
-The `BatchProcessor` is now a pure conductor, supervising a linear sequence
+The `BatchProcessor` is a pure conductor, supervising a linear sequence
 of expert `PhaseExecutor` objects, each responsible for one cohesive stage of
 the training algorithm. The final separation of concerns is complete.
 """
@@ -17,6 +18,7 @@ the training algorithm. The final separation of concerns is complete.
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
+from functools import partial
 
 import numpy as np
 import pyopencl as cl
@@ -60,7 +62,9 @@ class BatchProcessor:
 
     def __init__(self, services: Services, param_space: ParameterSpace, plan: ExecutionPlan):
         """Initializes the conductor and its team of expert phase executors."""
+        self.svs = services
         self.plan = plan
+        self.param_space = param_space
         self.mod_path_exec = ModulePathExecutor(services)
         self.shared_bprop_exec = SharedBackpropExecutor(services)
         self.reduction_exec = ReductionPhaseExecutor(services, param_space)
@@ -75,24 +79,47 @@ class BatchProcessor:
 
         # Initial data uploads
         upload_x_evt = cl.enqueue_copy(q, bm.get_cl_buffer("input"), X_batch)
-        upload_y_evt = cl.enqueue_copy(q, bm.get_cl_buffer("targets_cce"), y_batch)  # Assumes CCE for demo
+        upload_y_evt = cl.enqueue_copy(q, bm.get_cl_buffer("targets_cce"), y_batch)
         initial_deps = [upload_x_evt, upload_y_evt]
 
         # --- Phase 1: Parallel Partial Gradient Production ---
+        # The standard module path and shared backprop paths still produce their partials.
+        # If Grad_H is being streamed, it will rely on the partial_probs produced in this phase.
         tile_completion_events = [
             self.mod_path_exec.run_for_tile(tile, self.plan, deps=initial_deps) for tile in self.plan.grid
         ]
         all_tiles_clipped_evt = cl.WaitForEvents(tile_completion_events)
+
+        # The shared backprop path needs `hidden_activations`, which it resolves via its own provider.
+        # However, its primary dependency is the *final* summed_grad_h.
+        grad_h_provider = self.plan.lifecycle_policy.get_provider("summed_grad_hidden_activations")
+        summed_grad_h_ref, summed_grad_h_evt = grad_h_provider.resolve(q, self.svs.ex, wait_for=initial_deps)
+
         shared_partials_clipped_evt = self.shared_bprop_exec.run(
-            plan=self.plan, num_batch_chunks=SHARED_BACKPROP_STREAM_CHUNKS, deps=initial_deps
+            plan=self.plan,
+            num_batch_chunks=SHARED_BACKPROP_STREAM_CHUNKS,
+            summed_grad_h_ref=summed_grad_h_ref,
+            deps=[summed_grad_h_evt],
         )
         print("    [Conductor] Sync Point 1: All partial gradients clipped.")
 
         # --- Phase 2: Gradient Aggregation ---
         all_partials_ready_deps = [all_tiles_clipped_evt, shared_partials_clipped_evt]
-        summed_grad_handles, all_grads_summed_evt = self.reduction_exec.run(
-            plan=self.plan, num_batch_chunks=SHARED_BACKPROP_STREAM_CHUNKS, deps=all_partials_ready_deps
+        summed_grad_handles = {}
+        reduction_events = [summed_grad_h_evt]  # Start with the event from the Grad_H provider
+        summed_grad_handles["hidden_activations"] = summed_grad_h_ref
+
+        # The standard reduction executor now only processes the *other* gradients.
+        other_handles, other_event = self.reduction_exec.run(
+            plan=self.plan,
+            num_batch_chunks=SHARED_BACKPROP_STREAM_CHUNKS,
+            deps=all_partials_ready_deps,
+            exclude_params=["hidden_activations"],  # CRITICAL: Exclude Grad_H
         )
+        summed_grad_handles.update(other_handles)
+        reduction_events.append(other_event)
+
+        all_grads_summed_evt = cl.WaitForEvents(reduction_events)
         print("    [Conductor] Sync Point 2: All gradients aggregated.")
 
         # --- Phase 3: Final Batch-Wide Update ---
@@ -133,6 +160,7 @@ class TrainingOrchestrator:
             q=self.compute_env.cl_bundle.queue,
             ex=ex,
             bm=bm,
+            agg_mgr=agg_mgr,
             model_spec=model_spec,
             arch_consts=self.compute_env.arch_consts,
         )
@@ -144,23 +172,17 @@ class TrainingOrchestrator:
         bm, spec = self.services.bm, self.model_spec
         print("INFO: Setting up all buffers from ParameterSpace manifest...")
 
-        # Create a grid just for sizing the partial gradient buffers
         grid_for_sizing = ExecutionGrid(
             num_module_chunks=(spec.num_modules + 15) // 16,
             num_class_chunks=(spec.output_classes + 15) // 16,
             total_modules=spec.num_modules,
             total_classes=spec.output_classes,
         )
-
-        # Get the complete, authoritative dictionary of memory layouts
         all_layouts = self.param_space.get_all_memory_layouts(
             batch_size=batch_size, grid=grid_for_sizing, num_batch_chunks=SHARED_BACKPROP_STREAM_CHUNKS
         )
-
-        # Create all buffers by iterating through the manifest
         for name, layout in all_layouts.items():
             bm.create_named_buffer(name, layout, spec.scalar_dtype)
-
         print("INFO: All buffers created successfully from manifest.")
 
     def _create_execution_plan(self, batch_size: int) -> ExecutionPlan:
@@ -177,15 +199,25 @@ class TrainingOrchestrator:
         )
         reduction_plan = ReductionPlan(k=self.compute_env.arch_consts.get("optimal_tile_size", 16))
 
-        # 2. Define the strategic DATA LIFECYCLE policy for hidden_activations
-        print(f"  [Orchestrator] Authoring plan with '{self.adaptation_strategy}' strategy for hidden activations.")
-        fwd_exec = ForwardPassExecutor(svs)
+        # 2. Define the strategic DATA LIFECYCLE policies
+        print(f"  [Orchestrator] Authoring plan with strategy: '{self.adaptation_strategy}'")
+
         if self.adaptation_strategy == "CACHE":
+            # --- High VRAM Strategy ---
+            # Pre-compute `hidden_activations` and cache the result.
+            fwd_exec = ForwardPassExecutor(svs)
             h_ref, h_ready_evt = fwd_exec.run(batch_size, deps=[])
             policy_providers["hidden_activations"] = CacheProvider(handle=h_ref, ready_event=h_ready_evt)
-        else:  # "RECOMPUTE"
-            # The RECOMPUTE strategy still implies a single, full recomputation in this design.
-            # A chunk-by-chunk recompute would be a further evolution.
+
+            # `summed_grad_h` is not provided here; it will be computed by the default
+            # `ReductionPhaseExecutor` path, which is what we want for this strategy.
+
+        elif self.adaptation_strategy == "RECOMPUTE_GRAD_H":
+            # --- Low VRAM Strategy: "Accumulate via Recompute" ---
+
+            # For this strategy, `hidden_activations` are ephemeral. We create a
+            # `RecomputeProvider` so any part of the DAG that needs them can get
+            # them on-demand by re-running the forward pass.
             h_shape, h_dtype = svs.bm.get_spec(svs.bm.get_handle_by_name("hidden_activations"))
             recompute_out_ref = svs.bm.acquire_transient_buffer(int(np.prod(h_shape) * h_dtype().itemsize))
             recompute_mask_ref = svs.bm.acquire_transient_buffer(int(np.prod(h_shape) * h_dtype().itemsize))
@@ -207,18 +239,47 @@ class TrainingOrchestrator:
                 signature=recompute_sig, output_handle=recompute_out_ref
             )
 
+            # The calculation of `summed_grad_h` is now a complex, staged process.
+            # We instantiate its specialist executor and create a placeholder for it.
+            grad_h_stream_executor = GradHStreamingExecutor(svs)
+            policy_providers["_grad_h_executor_placeholder"] = grad_h_stream_executor
+
+        else:
+            raise ValueError(f"Unknown adaptation strategy: '{self.adaptation_strategy}'")
+
         # 3. Assemble the Final, Immutable ExecutionPlan
-        return ExecutionPlan(
+        # This object is created first, then refined to solve the circular dependency.
+        plan = ExecutionPlan(
             grid=grid,
             reduction_plan=reduction_plan,
             lifecycle_policy=DataLifecyclePolicy(providers=policy_providers),
             effective_batch_size=batch_size,
-            # Pass through the strategic policies for the tactical executors to use.
             problem_type="CCE",
             clipping_strategy="GLOBAL",
             hyperparams=self.hyperparams,
             param_space=self.param_space,
+            adaptation_strategy=self.adaptation_strategy,
         )
+
+        # 4. Finalize the `StagedComputationProvider` for RECOMPUTE_GRAD_H
+        # This resolves the circular dependency where the provider needs the final plan.
+        if self.adaptation_strategy == "RECOMPUTE_GRAD_H":
+            executor_placeholder = plan.lifecycle_policy.providers.pop("_grad_h_executor_placeholder")
+            # Create a callable that binds the specialist executor's method to the final plan.
+            provider_fn = partial(executor_placeholder.compute_summed_grad_h, plan=plan)
+            plan.lifecycle_policy.providers["summed_grad_hidden_activations"] = StagedComputationProvider(
+                computation_fn=provider_fn
+            )
+        else:  # For CACHE strategy, the default reduction path IS the provider.
+            reduction_exec = ReductionPhaseExecutor(svs, self.param_space)
+            provider_fn = partial(
+                reduction_exec.run_single_flow, flow_name="hidden_activations", plan=plan, num_batch_chunks=0
+            )
+            plan.lifecycle_policy.providers["summed_grad_hidden_activations"] = StagedComputationProvider(
+                computation_fn=provider_fn
+            )
+
+        return plan
 
     def train(self, X_train: np.ndarray, y_train: np.ndarray):
         """The main training loop."""
@@ -245,8 +306,9 @@ if __name__ == "__main__":
     print("--- Step 1: Defining Logical Experiment ---")
     LOGICAL_HIDDEN_DIM = 32
     LOGICAL_NUM_MODULES = 8
-    ADAPTATION_STRATEGY = "CACHE"
-    KERNEL_SOURCE_DIR = "./"  # Assuming kernels are in the current directory for demo
+    # Select the strategy here: "CACHE" or "RECOMPUTE_GRAD_H"
+    ADAPTATION_STRATEGY = "RECOMPUTE_GRAD_H"
+    KERNEL_SOURCE_DIR = "./"
 
     HYPERPARAMS = TrainingHyperparams(
         epochs=5,
@@ -262,9 +324,8 @@ if __name__ == "__main__":
     # --- 2. Build the SELF-CONFIGURING Compute Environment ---
     print("\n--- Step 2: Building Self-Configuring Compute Environment ---")
     try:
-        manager = OpenCLContextManager(
-            kernel_source_dir=KERNEL_SOURCE_DIR, cl_filename="kernels.cl.h"
-        )  # Refined for demo
+        # Corrected for the provided file structure (single kernels.cl.h)
+        manager = OpenCLContextManager(kernel_source_dir=KERNEL_SOURCE_DIR)
         compute_env = manager.build_and_discover()
         print(f"  Successfully built environment. Discovered Constants: {compute_env.arch_consts}")
     except (cl.RuntimeError, FileNotFoundError) as e:

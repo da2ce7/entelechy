@@ -178,6 +178,7 @@ class ExecutionPlan:
     problem_type: str  # e.g., 'CCE' or 'BCE'
     clipping_strategy: str  # e.g., 'GLOBAL' or 'PER_ITEM'
     hyperparams: "TrainingHyperparams"  # Forward ref for type hint
+    shared_backprop_stream_chunks: int
 
 
 if __name__ == "__main__":
