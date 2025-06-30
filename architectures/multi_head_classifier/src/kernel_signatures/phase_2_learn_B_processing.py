@@ -166,7 +166,7 @@ class ClipPartialGradientsPerItemNormSignature(_ClipTiledModuleGradsBase):
 
 
 @dataclass(frozen=True)
-class GatherAndPermuteGradHSignature(KernelSignature):
+class GatherAndPermuteGradHiddenActivationsSignature(KernelSignature):
     """
     (REV 2) Signature for the `gather_and_permute_grad_hidden_activations` kernel.
 

@@ -3,24 +3,31 @@
 """
 The Definitive Abstraction for the Model's Learnable Parameter Space.
 
-This module provides the `ParameterSpace` class, a fundamental architectural
-primitive that serves as the declarative manifest for ALL learnable parameters
-in the model.
+(REV 2 - ARCHITECTURALLY RECTIFIED) This module provides the `ParameterSpace`
+class, a fundamental architectural primitive that serves as the declarative
+manifest for ALL learnable parameters and their associated data buffers.
 
-It programmatically generates a complete list of `ParameterFlowConfig` objects
-based on an input `ModelSpec`. It is also the single source of truth for the
-memory shapes of all parameters and their corresponding gradient buffers.
+This version fulfills its mandate as the single source of truth for buffer
+memory layouts. The new public method, `get_all_memory_layouts`, consumes the
+logical `ModelSpec` and runtime execution parameters (like batch size and the
+tiling grid) to produce a complete dictionary of fully-specified `MemoryLayout`
+objects.
 
-This abstraction completely decouples the definition of the model's learnable
-structure from the orchestration logic that trains it.
+This revision perfectly decouples the orchestration logic from memory layout
+concerns. The `TrainingOrchestrator` now asks the `ParameterSpace` for the layout
+plan instead of constructing it itself, thus upholding the system's core
+principles of architectural elegance and separation of concerns.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Iterator
+from typing import Dict, Iterator, List, Tuple
 
 import numpy as np
 
+# --- Foundational Imports from Sibling Modules ---
 from model_spec import ModelSpec
+from memory_layout import MemoryLayout, PaddingStrategy, PaddingType
+from compute_patterns import ExecutionGrid  # Required for sizing collection buffers
 
 
 @dataclass(frozen=True)
@@ -42,7 +49,7 @@ class ParameterFlowConfig:
 class ParameterSpace:
     """
     A manifest-like object that defines the entire learnable parameter space
-    of the model.
+    and the memory layout contracts for all associated buffers.
     """
 
     def __init__(self, spec: ModelSpec):
@@ -68,12 +75,7 @@ class ParameterSpace:
 
     def _create_flow(self, name: str, specialized_reduction: bool = False) -> ParameterFlowConfig:
         """A factory for a single ParameterFlowConfig object."""
-        # This pattern avoids long, repetitive dataclass instantiations.
-        if name == "temperatures":  # A special case with a different grad name
-            grad_name = "temps"
-        else:
-            grad_name = name
-
+        grad_name = "temps" if name == "temperatures" else name
         return ParameterFlowConfig(
             name=name,
             param_buffer_name=name,
@@ -86,32 +88,89 @@ class ParameterSpace:
             specialized_reduction=specialized_reduction,
         )
 
-    def get_param_shapes(self) -> Dict[str, Tuple[int, ...]]:
-        """Returns a dictionary of shapes for all primary parameter buffers."""
-        spec = self._spec
-        return {
-            "shared_weights": (spec.input_dim, spec.padded_hidden_dim),
-            "shared_biases": (spec.padded_hidden_dim,),
-            "module_weights": (spec.num_modules, spec.padded_hidden_dim, spec.padded_class_dim),
-            "module_biases": (spec.num_modules, spec.padded_class_dim),
-            "temperatures": (spec.num_modules,),
-            "hidden_activations": (1,),  # Not a real parameter, shape is batch-dependent
-        }
+    def get_all_memory_layouts(
+        self, batch_size: int, grid: ExecutionGrid, num_batch_chunks: int
+    ) -> Dict[str, MemoryLayout]:
+        """
+        The single source of truth for buffer layouts.
 
-    def get_partial_grad_shapes(
-        self, batch_size: int, total_tiles: int, modules_per_chunk: int, classes_per_chunk: int
-    ) -> Dict[str, Tuple[int, ...]]:
-        """Returns shapes for the large 'collection' buffers of partial gradients."""
+        This method translates the logical model spec and dynamic execution
+        parameters into a complete set of physical memory layout plans,
+        fulfilling all kernel padding contracts.
+
+        Args:
+            batch_size: The number of items in the current training batch.
+            grid: The `ExecutionGrid` defining the module/class tiling strategy.
+            num_batch_chunks: The number of chunks for streaming backpropagation.
+
+        Returns:
+            A dictionary mapping canonical buffer names to their `MemoryLayout` objects.
+        """
         spec = self._spec
-        return {
-            "partial_grad_shared_weights": (
-                batch_size,
-                spec.input_dim,
-                spec.padded_hidden_dim,
-            ),  # Placeholder for streaming
-            "partial_grad_shared_biases": (batch_size, spec.padded_hidden_dim),  # Placeholder for streaming
-            "partial_grad_module_weights": (total_tiles, modules_per_chunk, spec.padded_hidden_dim, classes_per_chunk),
-            "partial_grad_module_biases": (total_tiles, modules_per_chunk, classes_per_chunk),
-            "partial_grad_temps": (total_tiles, modules_per_chunk),
-            "partial_grad_hidden_activations": (total_tiles, modules_per_chunk, batch_size, spec.padded_hidden_dim),
-        }
+        layouts = {}
+
+        # --- Define Padding Strategies from Kernel Contracts ---
+        pad_to_simd = PaddingStrategy(type=PaddingType.ELEMENT_COUNT, value=spec.simd_width)
+        pad_to_cache = PaddingStrategy(type=PaddingType.BYTE_ALIGNMENT, value=spec.cache_line_bytes)
+
+        # --- Layouts for Learnable Parameters & Their Direct Derivatives ---
+        # These layouts are static and based purely on the ModelSpec.
+        layouts["shared_weights"] = MemoryLayout((spec.input_dim, spec.hidden_dim)).add_strategy(pad_to_simd)
+        layouts["shared_biases"] = MemoryLayout((spec.hidden_dim,)).add_strategy(pad_to_simd)
+        layouts["module_weights"] = MemoryLayout((spec.num_modules, spec.hidden_dim, spec.output_classes)).add_strategy(
+            pad_to_cache
+        )
+        layouts["module_biases"] = MemoryLayout((spec.num_modules, spec.output_classes)).add_strategy(pad_to_cache)
+        layouts["temperatures"] = MemoryLayout((spec.num_modules,))
+
+        # Derivative buffers (summed/final grads, optimizer state) share the same layout
+        # as their parent parameter buffer.
+        for flow in self._flows:
+            if flow.name in layouts and not flow.specialized_reduction:
+                param_layout = layouts[flow.name]
+                layouts[flow.summed_grad_buffer_name] = param_layout
+                layouts[flow.final_grad_buffer_name] = param_layout
+                layouts[flow.m1_buffer_name] = param_layout
+                layouts[flow.m2_buffer_name] = param_layout
+
+        # --- Layouts for Batch-Dependent Dataflow Buffers ---
+        layouts["input"] = MemoryLayout((batch_size, spec.input_dim)).add_strategy(pad_to_cache)
+        layouts["hidden_activations"] = MemoryLayout((batch_size, spec.hidden_dim)).add_strategy(pad_to_cache)
+        layouts["hidden_mask"] = layouts["hidden_activations"]  # Identical layout
+        layouts["logits"] = MemoryLayout((spec.num_modules, batch_size, spec.output_classes)).add_strategy(pad_to_cache)
+        layouts["sample_mask"] = MemoryLayout((batch_size,))
+        # For targets, we define both CCE and BCE layouts since they differ
+        layouts["targets_cce"] = MemoryLayout((batch_size,))
+        layouts["targets_bce"] = MemoryLayout((batch_size, spec.output_classes)).add_strategy(pad_to_cache)
+
+        # --- Layouts for Partial Gradient Collection Buffers ---
+        # These are the most complex, depending on the tiling/chunking strategy.
+        # We must use the *maximum* chunk size for allocation.
+        max_mods_per_tile = (spec.num_modules + grid.num_module_chunks - 1) // grid.num_module_chunks
+        max_cls_per_tile = (spec.output_classes + grid.num_class_chunks - 1) // grid.num_class_chunks
+        padded_hidden_dim = layouts["shared_biases"].get_padded_shape(spec.scalar_dtype)[0]
+
+        layouts["partial_grad_module_weights"] = MemoryLayout(
+            (grid.total_tiles, max_mods_per_tile, padded_hidden_dim, max_cls_per_tile)
+        )
+        layouts["partial_grad_module_biases"] = MemoryLayout((grid.total_tiles, max_mods_per_tile, max_cls_per_tile))
+        layouts["partial_grad_temps"] = MemoryLayout((grid.total_tiles, max_mods_per_tile))
+        layouts["partial_grad_hidden_activations"] = MemoryLayout(
+            (grid.total_tiles, max_mods_per_tile, batch_size, padded_hidden_dim)
+        )
+        # Shared grad collection buffers must account for the streaming chunks
+        padded_input_dim = layouts["input"].get_padded_shape(spec.scalar_dtype)[1]
+        layouts["partial_grad_shared_weights"] = MemoryLayout((num_batch_chunks, padded_input_dim, padded_hidden_dim))
+        layouts["partial_grad_shared_biases"] = MemoryLayout((num_batch_chunks, padded_hidden_dim))
+
+        # Clipped buffers share the same layout as their partial counterparts
+        for name in list(layouts.keys()):
+            if "partial_grad" in name:
+                layouts[name.replace("partial", "clipped")] = layouts[name]
+
+        # --- Layouts for Specialized Intermediates ---
+        layouts["permuted_grad_h"] = MemoryLayout((batch_size * padded_hidden_dim, spec.num_modules)).add_strategy(
+            pad_to_cache
+        )  # Pad the module dim for row alignment
+
+        return layouts

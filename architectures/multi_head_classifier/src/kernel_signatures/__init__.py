@@ -44,7 +44,7 @@ from .phase_2_learn_B_processing import (
     ClipPartialGradientsGlobalNormSignature,
     ClipPartialGradientsPerItemNormSignature,
     GradientHandles,
-    GatherAndPermuteGradHSignature,
+    GatherAndPermuteGradHiddenActivationsSignature,
 )
 
 # --- Phase 2, Set C: Learn (Aggregation & Reduction) ---
@@ -96,7 +96,7 @@ __all__ = [
     "ClipPartialGradientsGlobalNormSignature",
     "ClipPartialGradientsPerItemNormSignature",
     "GradientHandles",
-    "GatherAndPermuteGradHSignature",
+    "GatherAndPermuteGradHiddenActivationsSignature",
     # Phase 2C: Reduction
     "AggregateRegisterReduceSignature",
     "AggregateLocalReduceSignature",

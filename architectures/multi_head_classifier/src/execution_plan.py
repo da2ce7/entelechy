@@ -175,6 +175,9 @@ class ExecutionPlan:
     reduction_plan: ReductionPlan
     lifecycle_policy: DataLifecyclePolicy
     effective_batch_size: int
+    problem_type: str  # e.g., 'CCE' or 'BCE'
+    clipping_strategy: str  # e.g., 'GLOBAL' or 'PER_ITEM'
+    hyperparams: "TrainingHyperparams"  # Forward ref for type hint
 
 
 if __name__ == "__main__":

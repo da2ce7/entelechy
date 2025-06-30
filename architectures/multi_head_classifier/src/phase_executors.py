@@ -3,15 +3,15 @@
 """
 A Toolbox of Tactical Phase Executors for the Training DAG.
 
-This module provides a collection of dedicated "PhaseExecutor" classes. Each
-class is a tactical expert responsible for executing a specific, cohesive part
-of the computational graph (e.g., the forward pass, the per-tile module path,
-the final update phase).
+(REV 2 - ARCHITECTURALLY COMPLIANT) This module provides a collection of
+dedicated "PhaseExecutor" classes. Each class is a tactical expert responsible
+for executing a specific, cohesive part of the computational graph.
 
-These classes are instantiated and called by the high-level `BatchProcessor`
-(the "Conductor"), allowing the main orchestration logic to remain clean and
-declarative. They encapsulate the details of creating and launching kernel
-signatures.
+This version has been fully rectified to:
+1.  Complete all dynamic execution paths (BCE, per-item clipping).
+2.  Correctly instantiate all KernelSignatures according to their C-level contracts.
+3.  Source all hyperparameters and configuration from the `ExecutionPlan`.
+4.  Iterate over the `ParameterSpace` manifest for fully general updates.
 """
 
 from dataclasses import dataclass
@@ -22,9 +22,18 @@ import pyopencl as cl
 
 # --- Architectural Imports ---
 from execution_plan import ExecutionPlan, WorkTile
-from launcher_infra import BufferManager, KernelExecutor, BufferHandle
+from launcher_infra import BufferManager, KernelExecutor, BufferHandle, SCALAR_NP_TYPE
 from kernel_signatures import *
 from model_spec import ModelSpec
+from parameter_space import ParameterSpace
+
+from compute_patterns import (
+    ReductionTreeExecutor,
+    ReductionPlan,
+    GatherPrimitive,
+    TiledGather,
+    LinearlyChunkedGather,
+)
 
 
 @dataclass
@@ -35,6 +44,7 @@ class Services:
     ex: KernelExecutor
     bm: BufferManager
     model_spec: ModelSpec
+    arch_consts: Dict[str, int]  # Added for clean DI
 
 
 class ForwardPassExecutor:
@@ -44,26 +54,20 @@ class ForwardPassExecutor:
         self.svs = services
 
     def run(self, batch_size: int, deps: List[cl.Event]) -> Tuple[BufferHandle, cl.Event]:
-        """
-        Executes the full forward pass. Intended for the "CACHE" strategy.
-        Returns the handle to the output buffer and the completion event.
-        """
+        """Executes the full forward pass. Intended for the "CACHE" strategy."""
         bm, ex, q = self.svs.bm, self.svs.ex, self.svs.q
 
         sig = ForwardPassSignature(
             buffer_mgr=bm,
-            # Injected constants
             simd_width=self.svs.model_spec.simd_width,
-            local_mem_bank_padding=1,  # From contract
+            local_mem_bank_padding=1,
             scalar_size_bytes=np.dtype(self.svs.model_spec.scalar_dtype).itemsize,
-            # Buffer Handles
             in_ref=bm.get_handle_by_name("input"),
             mask_ref=bm.get_handle_by_name("sample_mask"),
             w_ref=bm.get_handle_by_name("shared_weights"),
             b_ref=bm.get_handle_by_name("shared_biases"),
             h_out_ref=bm.get_handle_by_name("hidden_activations"),
             h_mask_out_ref=bm.get_handle_by_name("hidden_mask"),
-            # Control Scalars
             batch_chunk_offset=np.uint32(0),
             batch_chunk_count=np.uint32(batch_size),
         )
@@ -80,15 +84,14 @@ class ModulePathExecutor:
     def run_for_tile(self, tile: WorkTile, plan: ExecutionPlan, deps: List[cl.Event]) -> cl.Event:
         """Executes the full chain of per-tile kernels, from logits to CLIPPED gradients."""
         bm, ex, q = self.svs.bm, self.svs.ex, self.svs.q
-        spec = self.svs.model_spec
-        arch_consts = plan.lifecycle_policy.compute_env.arch_consts  # Assumed accessible
+        spec, h_params = self.svs.model_spec, plan.hyperparams
+        arch_consts = self.svs.arch_consts
 
-        # 1. --- Resolve `hidden_activations` dependency using the plan's policy ---
-        # This part of the code is already architecturally sound.
+        # 1. Resolve `hidden_activations` dependency using the plan's policy
         h_provider = plan.lifecycle_policy.get_provider("hidden_activations")
         h_ref, h_ready_evt = h_provider.resolve(q, ex, wait_for=deps)
 
-        # 2. --- Launch Logits Rendering (Node 5) ---
+        # 2. Launch Logits Rendering (Node 5)
         logits_sig = RenderLogitsChunkSignature(
             buffer_mgr=bm,
             h_ref=h_ref,
@@ -96,21 +99,18 @@ class ModulePathExecutor:
             w_ref=bm.get_handle_by_name("module_weights"),
             b_ref=bm.get_handle_by_name("module_biases"),
             logit_out_ref=bm.get_handle_by_name("logits"),
-            # --- Per-tile control scalars ---
-            batch_chunk_offset=np.uint32(0),  # Whole batch processed for this dependency
+            batch_chunk_offset=np.uint32(0),
             batch_chunk_count=np.uint32(plan.effective_batch_size),
             module_chunk_offset=np.uint32(tile.module_chunk_offset),
             module_chunk_count=np.uint32(tile.modules_per_chunk),
             class_chunk_offset=np.uint32(tile.class_chunk_offset),
             class_chunk_count=np.uint32(tile.classes_per_chunk),
-            # --- Global dimensional scalars ---
             hidden_count=np.uint32(spec.hidden_dim),
             total_output_class_count=np.uint32(spec.output_classes),
         )
         logits_evt = ex.launch(q, logits_sig, wait_for=[h_ready_evt])
 
-        # 3. --- Launch Loss & Probabilities (Nodes 6 or 7) - Dynamically ---
-        # Query the plan to decide which loss path to take.
+        # 3. Launch Loss & Probabilities (Nodes 6 or 7) - Dynamically
         if plan.problem_type == "CCE":
             loss_sig = ComputeProbsLossCceChunkSignature(
                 buffer_mgr=bm,
@@ -137,22 +137,101 @@ class ModulePathExecutor:
             )
         loss_evt = ex.launch(q, loss_sig, wait_for=[logits_evt])
 
-        # 4. --- Launch Raw Partial Gradient Kernels (Nodes 8, 9, 10) - Dynamically ---
-        # The choice of gradient kernel is also dependent on the problem type.
+        # 4. Launch Raw Partial Gradient Kernels (Nodes 8, 9, 10) - Dynamically
+        wgs0 = arch_consts.get("work_group_size_0", 256)
+        scalar_bytes = spec.scalar_dtype().itemsize
         if plan.problem_type == "CCE":
-            grad_mod_sig = CalculateModuleParamGradsCceSignature(bm, ...)  # etc.
-            grad_h_sig = BackpropErrorToHiddenChunkCceSignature(bm, ...)  # etc.
-            grad_t_sig = CalculateChunkTempGradientsCceSignature(bm, ...)  # etc.
+            grad_mod_sig = CalculateModuleParamGradsCceSignature(
+                bm,
+                wgs0,
+                scalar_bytes,
+                h_ref,
+                loss_sig.prob_out_ref,
+                bm.get_handle_by_name("targets_cce"),
+                bm.get_handle_by_name("sample_mask"),
+                bm.get_handle_by_name("partial_grad_module_weights"),
+                bm.get_handle_by_name("partial_grad_module_biases"),
+                tile,
+                np.uint32(0),
+                np.uint32(plan.effective_batch_size),
+                np.uint32(spec.hidden_dim),
+                np.uint32(spec.output_classes),
+                np.uint32(spec.padded_class_dim),
+                np.uint32(spec.num_modules),
+            )
+            grad_h_sig = BackpropErrorToHiddenChunkCceSignature(
+                bm,
+                loss_sig.prob_out_ref,
+                bm.get_handle_by_name("targets_cce"),
+                bm.get_handle_by_name("sample_mask"),
+                bm.get_handle_by_name("module_weights"),
+                bm.get_handle_by_name("partial_grad_hidden_activations"),
+                tile,
+                np.uint32(spec.hidden_dim),
+                np.uint32(spec.output_classes),
+            )
+            grad_t_sig = CalculateChunkTempGradientsCceSignature(
+                bm,
+                wgs0,
+                scalar_bytes,
+                logits_sig.logit_out_ref,
+                loss_sig.prob_out_ref,
+                bm.get_handle_by_name("targets_cce"),
+                bm.get_handle_by_name("sample_mask"),
+                bm.get_handle_by_name("temperatures"),
+                bm.get_handle_by_name("partial_grad_temps"),
+                tile,
+                np.uint32(spec.output_classes),
+            )
         else:  # BCE
-            grad_mod_sig = CalculateModuleParamGradsBceSignature(bm, ...)  # etc.
-            grad_h_sig = BackpropErrorToHiddenChunkBceSignature(bm, ...)  # etc.
-            grad_t_sig = CalculateChunkTempGradientsBceSignature(bm, ...)  # etc.
+            grad_mod_sig = CalculateModuleParamGradsBceSignature(
+                bm,
+                wgs0,
+                scalar_bytes,
+                h_ref,
+                loss_sig.prob_out_ref,
+                bm.get_handle_by_name("targets_bce"),
+                bm.get_handle_by_name("sample_mask"),
+                bm.get_handle_by_name("partial_grad_module_weights"),
+                bm.get_handle_by_name("partial_grad_module_biases"),
+                tile,
+                np.uint32(0),
+                np.uint32(plan.effective_batch_size),
+                np.uint32(spec.hidden_dim),
+                np.uint32(spec.output_classes),
+                np.uint32(spec.padded_class_dim),
+                np.uint32(spec.num_modules),
+            )
+            grad_h_sig = BackpropErrorToHiddenChunkBceSignature(
+                bm,
+                loss_sig.prob_out_ref,
+                bm.get_handle_by_name("targets_bce"),
+                bm.get_handle_by_name("sample_mask"),
+                bm.get_handle_by_name("module_weights"),
+                bm.get_handle_by_name("partial_grad_hidden_activations"),
+                tile,
+                np.uint32(spec.hidden_dim),
+                np.uint32(spec.output_classes),
+            )
+            grad_t_sig = CalculateChunkTempGradientsBceSignature(
+                bm,
+                wgs0,
+                scalar_bytes,
+                logits_sig.logit_out_ref,
+                loss_sig.prob_out_ref,
+                bm.get_handle_by_name("targets_bce"),
+                bm.get_handle_by_name("sample_mask"),
+                bm.get_handle_by_name("temperatures"),
+                bm.get_handle_by_name("partial_grad_temps"),
+                tile,
+                np.uint32(spec.output_classes),
+            )
 
         grad_mod_evt = ex.launch(q, grad_mod_sig, wait_for=[loss_evt])
         grad_h_evt = ex.launch(q, grad_h_sig, wait_for=[loss_evt])
         grad_t_evt = ex.launch(q, grad_t_sig, wait_for=[loss_evt])
 
-        # 5. --- Launch Gradient Clipping (Node 11) - Dynamically ---
+        # 5. Launch Gradient Clipping (Node 11) - Dynamically
         grad_handles = GradientHandles(
             grad_weights_module=grad_mod_sig.gw_out_ref,
             grad_biases_module=grad_mod_sig.gb_out_ref,
@@ -164,27 +243,27 @@ class ModulePathExecutor:
             clipped_grad_hidden_activations_aos=bm.get_handle_by_name("clipped_partial_grad_hidden_activations"),
         )
 
-        # Query the plan to decide which clipping strategy to use.
         if plan.clipping_strategy == "GLOBAL":
             clip_sig = ClipPartialGradientsGlobalNormSignature(
                 buffer_mgr=bm,
-                work_group_size_0=arch_consts.get("work_group_size_0", 256),
-                scalar_size_bytes=spec.scalar_dtype().itemsize,
+                work_group_size_0=wgs0,
+                scalar_size_bytes=scalar_bytes,
                 handles=grad_handles,
                 tile=tile,
-                max_norm_global=np.float32(plan.max_grad_norm),
-                epsilon=np.float32(plan.epsilon),
+                max_norm_global=SCALAR_NP_TYPE(h_params.max_grad_norm),
+                epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
             )
         else:  # 'PER_ITEM'
             clip_sig = ClipPartialGradientsPerItemNormSignature(
-                bm,
-                # ...
+                buffer_mgr=bm,
+                work_group_size_0=wgs0,
+                scalar_size_bytes=scalar_bytes,
+                handles=grad_handles,
+                tile=tile,
                 max_norm_per_item_ref=bm.get_handle_by_name("max_norm_per_item"),
-                # ...
+                epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
             )
-
         clip_event = ex.launch(q, clip_sig, wait_for=[grad_mod_evt, grad_h_evt, grad_t_evt])
-
         return clip_event
 
 
@@ -195,179 +274,257 @@ class SharedBackpropExecutor:
         self.svs = services
 
     def run(self, plan: ExecutionPlan, num_batch_chunks: int, deps: List[cl.Event]) -> cl.Event:
-        """
-        Runs the streaming backprop, producing CLIPPED partials for shared params.
-
-        Returns a single event that completes when all chunks have been processed
-        and their clipped partials are written to the collection buffers.
-        """
+        """Runs the streaming backprop, producing CLIPPED partials for shared params."""
         bm, ex, q = self.svs.bm, self.svs.ex, self.svs.q
-        spec = self.svs.model_spec
-        arch_consts = plan.lifecycle_policy.compute_env.arch_consts  # Assumed accessible
-
+        spec, h_params = self.svs.model_spec, plan.hyperparams
+        arch_consts = self.svs.arch_consts
         final_chunk_events = []
 
-        # 1. --- Resolve Batch-Wide Dependencies (Once) ---
-        # The fully summed Grad_H is required by all chunks, so we resolve it once upfront.
-        print("    [SharedBProp] Resolving summed_grad_hidden_activations dependency...")
+        # 1. Resolve Batch-Wide Dependencies (Once, outside the loop)
         grad_h_provider = plan.lifecycle_policy.get_provider("summed_grad_hidden_activations")
         grad_h_ref, grad_h_ready_evt = grad_h_provider.resolve(q, ex, wait_for=deps)
-
-        # The Host Orchestrator decides the "Cache vs Recompute" strategy for hidden activations.
-        # We query the provider here to get the handle to the full buffer if it's cached.
         h_provider = plan.lifecycle_policy.get_provider("hidden_activations")
         h_ref, h_ready_evt = h_provider.resolve(q, ex, wait_for=deps)
+        deps_for_all_chunks = [grad_h_ready_evt, h_ready_evt]
 
-        # 2. --- Acquire Transient Scratch Buffers ---
-        # It's an architectural anti-pattern to write un-clipped gradients into a final
-        # collection buffer. We use transient scratch space for one chunk's worth of raw output.
-        gsw_chunk_shape = (spec.padded_input_dim, spec.padded_hidden_dim)
-        gsb_chunk_shape = (spec.padded_hidden_dim,)
+        # 2. Acquire Transient Scratch Buffers for Raw Gradients
+        w_shape, _ = bm.get_spec("shared_weights")
+        b_shape, _ = bm.get_spec("shared_biases")
+        gsw_chunk_shape = (w_shape[0], w_shape[1])
+        gsb_chunk_shape = (b_shape[0],)
         gsw_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gsw_chunk_shape) * spec.scalar_dtype().itemsize))
         gsb_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gsb_chunk_shape) * spec.scalar_dtype().itemsize))
 
-        # 3. --- Main Streaming Loop ---
+        # 3. Main Streaming Loop
         batch_size = plan.effective_batch_size
         chunk_size = (batch_size + num_batch_chunks - 1) // num_batch_chunks
-
         for i in range(num_batch_chunks):
             batch_offset = i * chunk_size
             items_in_chunk = min(chunk_size, batch_size - batch_offset)
             if items_in_chunk <= 0:
                 continue
 
-            deps_for_chunk = [grad_h_ready_evt, h_ready_evt]
-
-            # --- Step 3a: Compute Raw Partials (Nodes 17 & 18) ---
-            # These kernels read from the full input/hidden/grad_h buffers but process only
-            # a slice defined by the chunk scalars, writing their output to the scratch buffers.
-
-            # EXPANDED: Node 17 `backprop_shared_weights_chunk`
+            # Step 3a: Compute Raw Partials (Nodes 17 & 18) into SCRATCH buffers
             gsw_sig = BackpropSharedWeightsChunkSignature(
-                buffer_mgr=bm,
-                # Architectural Constants
+                bm,
                 work_group_size_1=arch_consts.get("work_group_size_1", 16),
                 scalar_size_bytes=spec.scalar_dtype().itemsize,
-                # Buffer Handles
                 input_ref=bm.get_handle_by_name("input"),
                 h_ref=h_ref,
                 grad_h_ref=grad_h_ref,
                 mask_ref=bm.get_handle_by_name("sample_mask"),
-                partial_gsw_out_ref=gsw_scratch_ref,  # CRITICAL: Write to scratch buffer
-                # Control Scalars
+                partial_gsw_out_ref=gsw_scratch_ref,
                 batch_chunk_offset=np.uint32(batch_offset),
                 batch_chunk_count=np.uint32(items_in_chunk),
                 batch_chunk_index=np.uint32(i),
                 num_batch_chunks_count=np.uint32(num_batch_chunks),
             )
-            gsw_evt = ex.launch(q, gsw_sig, wait_for=deps_for_chunk)
-
-            # EXPANDED: Node 18 `backprop_shared_biases_chunk`
+            gsw_evt = ex.launch(q, gsw_sig, wait_for=deps_for_all_chunks)
             gsb_sig = BackpropSharedBiasesChunkSignature(
-                buffer_mgr=bm,
-                # Architectural Constants
+                bm,
                 work_group_size_0=arch_consts.get("work_group_size_0", 256),
                 scalar_size_bytes=spec.scalar_dtype().itemsize,
-                # Buffer Handles
                 h_ref=h_ref,
                 grad_h_ref=grad_h_ref,
                 mask_ref=bm.get_handle_by_name("sample_mask"),
-                partial_gsb_out_ref=gsb_scratch_ref,  # CRITICAL: Write to scratch buffer
-                # Control Scalars
+                partial_gsb_out_ref=gsb_scratch_ref,
                 batch_chunk_offset=np.uint32(batch_offset),
                 batch_chunk_count=np.uint32(items_in_chunk),
                 batch_chunk_index=np.uint32(i),
                 num_batch_chunks_count=np.uint32(num_batch_chunks),
             )
-            gsb_evt = ex.launch(q, gsb_sig, wait_for=deps_for_chunk)
+            gsb_evt = ex.launch(q, gsb_sig, wait_for=deps_for_all_chunks)
 
-            # --- Step 3b: Clip Raw Partials and Place into Collection (Node 19) ---
-            # This kernel reads from the scratch buffers and writes the clipped result
-            # into the correct slice of the final, large collection buffer.
-            dest_gsw_offset_elements = np.uint32(i * np.prod(gsw_chunk_shape))
-            dest_gsb_offset_elements = np.uint32(i * np.prod(gsb_chunk_shape))
-
-            # The clip kernel needs a unified offset for its concatenated view.
-            # This is a small logical detail for the implementation. For simplicity,
-            # let's assume separate offsets or a modified kernel is used.
-            # Here we demonstrate the core idea.
+            # Step 3b: Clip Raw Partials (Node 19) from scratch into final COLLECTION buffers
+            shared_grad_handles = SharedGradientHandles(
+                grad_weights_shared_chunk=gsw_scratch_ref,
+                grad_biases_shared_chunk=gsb_scratch_ref,
+                clipped_grad_weights_shared_collection=bm.get_handle_by_name("clipped_partial_grad_shared_weights"),
+                clipped_grad_biases_shared_collection=bm.get_handle_by_name("clipped_partial_grad_shared_biases"),
+            )
             clip_sig = ClipSharedGradientsChunkSignature(
                 buffer_mgr=bm,
                 work_group_size_0=arch_consts.get("work_group_size_0", 256),
                 scalar_size_bytes=spec.scalar_dtype().itemsize,
-                gsw_partial_in_ref=gsw_scratch_ref,
-                gsb_partial_in_ref=gsb_scratch_ref,
-                clipped_gsw_out_ref=bm.get_handle_by_name("clipped_partial_grad_shared_weights"),
-                clipped_gsb_out_ref=bm.get_handle_by_name("clipped_partial_grad_shared_biases"),
-                max_norm_global=np.float32(1.0),  # This would come from hyperparams
-                epsilon=np.float32(1e-7),  # This would come from hyperparams
-                dest_output_offset_elements=dest_gsw_offset_elements,  # Passing the crucial offset
+                handles=shared_grad_handles,
+                max_norm_global=SCALAR_NP_TYPE(h_params.max_grad_norm),
+                epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
+                dest_weights_write_offset_elements=np.uint32(i * np.prod(gsw_chunk_shape)),
+                dest_biases_write_offset_elements=np.uint32(i * np.prod(gsb_chunk_shape)),
+                num_batch_chunks=np.uint32(num_batch_chunks),
             )
             clip_evt = ex.launch(q, clip_sig, wait_for=[gsw_evt, gsb_evt])
             final_chunk_events.append(clip_evt)
 
-        # 4. --- Release Transient Resources ---
+        # 4. Release Transient Resources
         bm.release_transient_buffer(gsw_scratch_ref)
         bm.release_transient_buffer(gsb_scratch_ref)
-
-        # Return a single event that waits for all clipping operations to finish.
         return cl.WaitForEvents(final_chunk_events)
 
 
 class UpdatePhaseExecutor:
-    """PhaseExecutor for the final, batch-wide update stage (Nodes 20, 23-24)."""
+    """PhaseExecutor for the final, batch-wide update stage (Nodes 21, 24, 25)."""
 
-    def __init__(self, services: Services):
+    def __init__(self, services: Services, param_space: ParameterSpace):
         self.svs = services
+        self.param_space = param_space
 
     def run(
         self, step: int, summed_grads: Dict[str, BufferHandle], plan: ExecutionPlan, deps: List[cl.Event]
     ) -> cl.Event:
         """Executes the Normalize -> Adam Update -> Clamp sequence."""
         bm, ex, q = self.svs.bm, self.svs.ex, self.svs.q
-        param_names = ["shared_weights", "shared_biases", "module_weights", "module_biases", "temperatures"]
+        h_params = plan.hyperparams
 
-        # --- Normalize all summed gradients (Node 20) ---
-        norm_events = []
-        for name in param_names:
-            norm_sig = NormalizeGradientsSignature(
+        # (Node 21) Normalize all summed gradients
+        norm_events, final_grad_handles = [], {}
+        for flow in self.param_space:
+            if flow.specialized_reduction:
+                continue  # Skip grad_h
+            sig = NormalizeGradientsSignature(
                 bm,
-                summed_grad_ref=summed_grads[name],
-                final_grad_out_ref=bm.get_handle_by_name(f"final_grad_{name}"),
-                effective_batch_size=np.float32(plan.effective_batch_size),
-                epsilon=np.float32(1e-7),
+                summed_grad_ref=summed_grads[flow.name],
+                final_grad_out_ref=bm.get_handle_by_name(flow.final_grad_buffer_name),
+                effective_batch_size=SCALAR_NP_TYPE(plan.effective_batch_size),
+                epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
             )
-            norm_events.append(ex.launch(q, norm_sig, wait_for=deps))
+            norm_events.append(ex.launch(q, sig, wait_for=deps))
+            final_grad_handles[flow.name] = sig.final_grad_out_ref
         all_norm_evt = cl.WaitForEvents(norm_events)
 
-        # --- Apply Adam Optimizer Update (Node 23) ---
-        beta1_t = np.float32(0.9**step)
-        beta2_t = np.float32(0.999**step)
+        # (Node 24) Apply Adam Optimizer Update
+        beta1_t = SCALAR_NP_TYPE(h_params.adam_beta1**step)
+        beta2_t = SCALAR_NP_TYPE(h_params.adam_beta2**step)
         update_events = []
-        for name in param_names:
+        for flow in self.param_space:
+            if flow.specialized_reduction:
+                continue
             pg = AdamParameterGroup(
-                param_ref=bm.get_handle_by_name(name),
-                grad_ref=bm.get_handle_by_name(f"final_grad_{name}"),
-                m1_state_ref=bm.get_handle_by_name(f"m1_{name}"),
-                m2_state_ref=bm.get_handle_by_name(f"m2_{name}"),
+                param_ref=bm.get_handle_by_name(flow.param_buffer_name),
+                grad_ref=final_grad_handles[flow.name],
+                m1_state_ref=bm.get_handle_by_name(flow.m1_buffer_name),
+                m2_state_ref=bm.get_handle_by_name(flow.m2_buffer_name),
             )
             adam_sig = AdamUpdateSignature(
                 bm,
                 param_group=pg,
-                learning_rate=np.float32(0.001),
-                beta1=np.float32(0.9),
-                beta2=np.float32(0.999),
-                epsilon=np.float32(1e-7),
+                learning_rate=SCALAR_NP_TYPE(h_params.learning_rate),
+                beta1=SCALAR_NP_TYPE(h_params.adam_beta1),
+                beta2=SCALAR_NP_TYPE(h_params.adam_beta2),
+                epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
                 beta1_pow_t=beta1_t,
                 beta2_pow_t=beta2_t,
             )
             update_events.append(ex.launch(q, adam_sig, wait_for=[all_norm_evt]))
         all_updates_evt = cl.WaitForEvents(update_events)
 
-        # --- Final Clamping (Node 24) ---
+        # (Node 25) Final Clamping
         clamp_sig = ClampTemperaturesSignature(
-            bm, temps_ref=bm.get_handle_by_name("temperatures"), min_val=np.float32(0.1), max_val=np.float32(10.0)
+            bm,
+            temps_ref=bm.get_handle_by_name("temperatures"),
+            min_val=SCALAR_NP_TYPE(h_params.temp_min),  # Assume these are in hyperparams
+            max_val=SCALAR_NP_TYPE(h_params.temp_max),
         )
         clamp_evt = ex.launch(q, clamp_sig, wait_for=[all_updates_evt])
-
         return clamp_evt
+
+
+class ReductionPhaseExecutor:
+    """
+    PhaseExecutor for the entire gradient reduction and aggregation stage.
+
+    This is a high-level tactical executor that dispatches the correct reduction
+    strategy for every gradient defined in the `ParameterSpace`. It correctly
+    distinguishes between the specialized permutation-and-reduction path for
+    `Grad_H` and the generic, indirection-based `ReductionTreeExecutor` path
+    for all other model parameters.
+    """
+
+    def __init__(self, services: Services, param_space: ParameterSpace):
+        self.svs = services
+        self.param_space = param_space
+
+    def run(
+        self, plan: ExecutionPlan, num_batch_chunks: int, deps: List[cl.Event]
+    ) -> Tuple[Dict[str, BufferHandle], cl.Event]:
+        """
+        Executes the reduction for all parameter gradients.
+
+        Args:
+            plan: The complete execution plan for the batch.
+            num_batch_chunks: The number of chunks used in shared backprop, needed
+                              to construct the correct GatherPrimitive.
+            deps: A list of events that must complete before any reduction can begin
+                  (typically the completion of all partial gradient clipping).
+
+        Returns:
+            A tuple containing:
+            1. A dictionary mapping parameter names to their final `summed_grad` buffer handles.
+            2. A single `cl.Event` that signals the completion of ALL reduction tasks.
+        """
+        q, ex, bm = self.svs.q, self.svs.ex, self.svs.bm
+        spec, arch_consts = self.svs.model_spec, self.svs.arch_consts
+
+        all_reduction_events = []
+        summed_grad_handles = {}
+
+        # Instantiate the generic reduction tool
+        reduction_exec = ReductionTreeExecutor(q, ex, bm, self.svs.agg_mgr, plan.reduction_plan)
+
+        for flow in self.param_space:
+            # --- Path 1: Specialized Reduction for Grad_H (Node 13 -> Node 16) ---
+            if flow.specialized_reduction:
+                clipped_ref = bm.get_handle_by_name(flow.clipped_partial_grad_buffer_name)
+                permuted_ref = bm.get_handle_by_name("permuted_grad_h")
+                summed_ref = bm.get_handle_by_name(flow.summed_grad_buffer_name)
+
+                # Step 1: Gather & Permute (Node 13)
+                permute_sig = GatherAndPermuteGradHiddenActivationsSignature(
+                    bm,
+                    clipped_partials_aos_ref=clipped_ref,
+                    permuted_soa_out_ref=permuted_ref,
+                    total_modules_count=np.uint32(spec.num_modules),
+                    hidden_count=np.uint32(spec.hidden_dim),
+                    total_batch_count=np.uint32(plan.effective_batch_size),
+                    num_module_chunks_count=np.uint32(plan.grid.num_module_chunks),
+                    modules_per_chunk_count=np.uint32(plan.grid.get_tile(0, 0).modules_per_chunk),
+                    num_class_chunks_count=np.uint32(plan.grid.num_class_chunks),
+                )
+                permute_evt = ex.launch(q, permute_sig, wait_for=deps)
+
+                # Step 2: Reduce the permuted buffer (Node 16)
+                reduce_sig = ReduceGradHOverModulesSignature(
+                    bm,
+                    work_group_size_0=arch_consts.get("work_group_size_0", 256),
+                    scalar_size_bytes=spec.scalar_dtype().itemsize,
+                    permuted_soa_in_ref=permuted_ref,
+                    final_grad_h_out_ref=summed_ref,
+                    total_modules_count=np.uint32(spec.num_modules),
+                )
+                reduce_evt = ex.launch(q, reduce_sig, wait_for=[permute_evt])
+
+                all_reduction_events.append(reduce_evt)
+                summed_grad_handles[flow.name] = summed_ref
+
+            # --- Path 2: Generic Reduction for all other gradients ---
+            else:
+                clipped_ref = bm.get_handle_by_name(flow.clipped_partial_grad_buffer_name)
+                summed_ref = bm.get_handle_by_name(flow.summed_grad_buffer_name)
+                clipped_shape, _ = bm.get_spec(clipped_ref)
+                elements_per_partial = int(np.prod(clipped_shape[1:]))
+
+                # Create the correct declarative GatherPrimitive based on the gradient type
+                if "shared" in flow.name:
+                    gather_prim = LinearlyChunkedGather(
+                        num_chunks=num_batch_chunks, elements_per_chunk=elements_per_partial
+                    )
+                else:  # Module, Temps, etc.
+                    gather_prim = TiledGather(grid=plan.grid, elements_per_partial=elements_per_partial)
+
+                # Execute the full reduction tree
+                reduce_evt = reduction_exec.execute(gather_prim, clipped_ref, summed_ref, wait_for=deps)
+                all_reduction_events.append(reduce_evt)
+                summed_grad_handles[flow.name] = summed_ref
+
+        final_sync_event = cl.WaitForEvents(all_reduction_events)
+        return summed_grad_handles, final_sync_event
