@@ -26,6 +26,15 @@ from launcher_infra import BufferManager, KernelExecutor, BufferHandle, SCALAR_N
 from kernel_signatures import *
 from model_spec import ModelSpec
 from parameter_space import ParameterSpace
+from kernel_signatures import (
+    ForwardPassSignature,
+    BackpropErrorToHiddenChunkCceSignature,
+    BackpropErrorToHiddenChunkBceSignature,
+    ClipPartialGradientsGlobalNormSignature,
+    ClipPartialGradientsPerItemNormSignature,
+    GatherAndPermuteGradHSignature,
+    ReduceGradHOverModulesSignature,
+)
 
 from compute_patterns import (
     ReductionTreeExecutor,
@@ -429,6 +438,163 @@ class UpdatePhaseExecutor:
         return clamp_evt
 
 
+class GradHStreamingExecutor:
+    """
+    A specialized PhaseExecutor for the "Model A: Accumulate via Recompute" strategy.
+
+    This executor manages the entire complex dataflow for Grad_H under memory
+    pressure. It iteratively recomputes chunks of hidden activations, calculates
+    their corresponding partial gradients, clips them, and accumulates them into
+    a single monolithic buffer, before performing the final permutation and reduction.
+
+    This executor is invoked via a StagedComputationProvider and is responsible
+    for delivering the final, fully-reduced `summed_grad_h` buffer.
+    """
+
+    def __init__(self, services: Services):
+        self.svs = services
+
+    def compute_summed_grad_h(self, plan: ExecutionPlan, deps: List[cl.Event]) -> Tuple[BufferHandle, cl.Event]:
+        """
+        Executes the full recompute->bprop->clip->permute->reduce pipeline for Grad_H.
+
+        Returns:
+            A tuple of (final_summed_grad_h_handle, final_completion_event).
+        """
+        q, ex, bm = self.svs.q, self.svs.ex, self.svs.bm
+        spec, h_params = self.svs.model_spec, plan.hyperparams
+        arch_consts, grid = self.svs.arch_consts, plan.grid
+        scalar_bytes = spec.scalar_dtype().itemsize
+
+        print("    [GradHStreamingExecutor] Executing 'Accumulate via Recompute' for Grad_H...")
+
+        # --- A. Acquire Monolithic Intermediates & Transient Scratch Buffers ---
+        # Get handles to the large, persistent buffers we will fill iteratively.
+        clipped_aos_ref = bm.get_handle_by_name("clipped_partial_grad_hidden_activations")
+        permuted_soa_ref = bm.get_handle_by_name("permuted_grad_h")
+        final_summed_grad_h_ref = bm.get_handle_by_name("summed_grad_hidden_activations")
+
+        # We need scratch space for ONE chunk's worth of hidden activations and raw gradients.
+        # These will be created and destroyed inside the loop.
+        h_chunk_shape, _ = bm.get_spec(bm.get_handle_by_name("hidden_activations"))
+        h_chunk_shape = (plan.effective_batch_size, h_chunk_shape[1])  # We only need one batch-chunk at a time
+
+        gh_chunk_shape, _ = bm.get_spec(bm.get_handle_by_name("partial_grad_hidden_activations"))
+        # Shape: (total_tiles, mods_per_chunk, batch, hidden) -> (1, mods_per_chunk, batch, hidden)
+        gh_chunk_shape = (
+            1,
+            gh_chunk_shape[1],
+            gh_chunk_shape[2],
+            gh_chunk_shape[3],
+        )  # Only need space for one tile's raw grad
+
+        h_chunk_scratch_ref = bm.acquire_transient_buffer(int(np.prod(h_chunk_shape) * scalar_bytes))
+        h_mask_chunk_scratch_ref = bm.acquire_transient_buffer(int(np.prod(h_chunk_shape) * scalar_bytes))
+        raw_gh_chunk_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gh_chunk_shape) * scalar_bytes))
+
+        # --- B. The Recomputation Loop ---
+        all_clip_events = []
+        # The loop must iterate over every tile to fill the monolithic buffer
+        for tile in grid:
+            # 1. Recompute Hidden Activations for the entire batch (since each tile needs it)
+            # This is a simplification; a more advanced version could chunk the batch dimension.
+            fwd_pass_sig = ForwardPassSignature(
+                bm,
+                simd_width=spec.simd_width,
+                local_mem_bank_padding=1,
+                scalar_size_bytes=scalar_bytes,
+                in_ref=bm.get_handle_by_name("input"),
+                mask_ref=bm.get_handle_by_name("sample_mask"),
+                w_ref=bm.get_handle_by_name("shared_weights"),
+                b_ref=bm.get_handle_by_name("shared_biases"),
+                h_out_ref=h_chunk_scratch_ref,
+                h_mask_out_ref=h_mask_chunk_scratch_ref,
+                batch_chunk_offset=np.uint32(0),
+                batch_chunk_count=np.uint32(plan.effective_batch_size),
+            )
+            h_ready_evt = ex.launch(q, fwd_pass_sig, wait_for=deps)
+
+            # 2. Backpropagate error for this tile (Node 9) writing to SCRATCH
+            if plan.problem_type == "CCE":
+                grad_h_sig = BackpropErrorToHiddenChunkCceSignature(
+                    bm,  # All required args...
+                    prob_ref=bm.get_handle_by_name("partial_probs"),
+                    targets_cce_ref=bm.get_handle_by_name("targets_cce"),
+                    mask_ref=bm.get_handle_by_name("sample_mask"),
+                    w_mod_ref=bm.get_handle_by_name("module_weights"),
+                    # CRITICAL: Write to the transient scratch buffer
+                    gh_out_ref=raw_gh_chunk_scratch_ref,
+                    tile=tile,
+                    hidden_count=np.uint32(spec.hidden_dim),
+                    total_output_class_count=np.uint32(spec.output_classes),
+                )
+            else:  # BCE
+                grad_h_sig = BackpropErrorToHiddenChunkBceSignature(...)  # Similar instantiation for BCE
+
+            # This grad calc depends on hidden state AND the partial probs from the main path
+            # Assume `partial_probs` are computed once and cached from the main execution path.
+            # This dependency needs to be passed in. For now, assume it's in `deps`.
+            raw_gh_ready_evt = ex.launch(q, grad_h_sig, wait_for=[h_ready_evt] + deps)
+
+            # 3. Clip gradients (Node 11) from SCRATCH -> MONOLITHIC buffer
+            # This is the "accumulation" step. The clipping kernel writes its output
+            # to the correctly-offset slice of the large `clipped_aos_ref` buffer.
+            grad_handles = GradientHandles(
+                # Only grad_h is being processed here. The other handle fields are unused by this specific call.
+                grad_hidden_activations_aos=raw_gh_chunk_scratch_ref,
+                clipped_grad_hidden_activations_aos=clipped_aos_ref,
+                # The other grads are computed in parallel by the standard ModulePathExecutor
+                grad_weights_module=bm.get_handle_by_name("partial_grad_module_weights"),
+                grad_biases_module=bm.get_handle_by_name("partial_grad_module_biases"),
+                grad_temps=bm.get_handle_by_name("partial_grad_temps"),
+                clipped_grad_weights_module=bm.get_handle_by_name("clipped_partial_grad_module_weights"),
+                clipped_grad_biases_module=bm.get_handle_by_name("clipped_partial_grad_module_biases"),
+                clipped_grad_temps=bm.get_handle_by_name("clipped_partial_grad_temps"),
+            )
+
+            # Using Global Norm clipping for this example
+            clip_sig = ClipPartialGradientsGlobalNormSignature(
+                bm,
+                work_group_size_0=arch_consts.get("work_group_size_0", 256),
+                scalar_size_bytes=scalar_bytes,
+                handles=grad_handles,
+                tile=tile,
+                max_norm_global=SCALAR_NP_TYPE(h_params.max_grad_norm),
+                epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
+            )
+            clip_evt = ex.launch(q, clip_sig, wait_for=[raw_gh_ready_evt])
+            all_clip_events.append(clip_evt)
+
+        # Release scratch buffers now that loop is done
+        bm.release_transient_buffer(h_chunk_scratch_ref)
+        bm.release_transient_buffer(h_mask_chunk_scratch_ref)
+        bm.release_transient_buffer(raw_gh_chunk_scratch_ref)
+
+        # --- C. Post-Loop Permute & Reduce ---
+        all_clips_done = cl.WaitForEvents(all_clip_events)
+
+        # 4. Permute the now-filled monolithic buffer (Node 13)
+        permute_sig = GatherAndPermuteGradHSignature(
+            bm,
+            clipped_partials_aos_ref=clipped_aos_ref,
+            permuted_soa_out_ref=permuted_soa_ref,
+            # ... all other required dimensional args
+        )
+        permute_evt = ex.launch(q, permute_sig, wait_for=[all_clips_done])
+
+        # 5. Reduce the permuted buffer (Node 16)
+        reduce_sig = ReduceGradHOverModulesSignature(
+            bm,
+            permuted_soa_in_ref=permuted_soa_ref,
+            final_grad_h_out_ref=final_summed_grad_h_ref,
+            # ... all other required args
+        )
+        final_reduce_evt = ex.launch(q, reduce_sig, wait_for=[permute_evt])
+
+        print("    [GradHStreamingExecutor] 'Accumulate via Recompute' pipeline launched.")
+        return final_summed_grad_h_ref, final_reduce_evt
+
+
 class ReductionPhaseExecutor:
     """
     PhaseExecutor for the entire gradient reduction and aggregation stage.
@@ -436,8 +602,8 @@ class ReductionPhaseExecutor:
     This is a high-level tactical executor that dispatches the correct reduction
     strategy for every gradient defined in the `ParameterSpace`. It correctly
     distinguishes between the specialized permutation-and-reduction path for
-    `Grad_H` and the generic, indirection-based `ReductionTreeExecutor` path
-    for all other model parameters.
+    `Grad_H` (which it now delegates) and the generic, indirection-based
+    `ReductionTreeExecutor` path for all other model parameters.
     """
 
     def __init__(self, services: Services, param_space: ParameterSpace):
@@ -445,86 +611,122 @@ class ReductionPhaseExecutor:
         self.param_space = param_space
 
     def run(
-        self, plan: ExecutionPlan, num_batch_chunks: int, deps: List[cl.Event]
+        self,
+        plan: ExecutionPlan,
+        num_batch_chunks: int,
+        deps: List[cl.Event],
+        exclude_params: List[str] = None,
     ) -> Tuple[Dict[str, BufferHandle], cl.Event]:
         """
-        Executes the reduction for all parameter gradients.
+        Executes the generic reduction for all applicable parameter gradients.
+
+        This method iterates through the ParameterSpace manifest and applies the
+        standard `ReductionTreeExecutor` to all flows that are not explicitly
+        excluded or marked for specialized reduction.
 
         Args:
             plan: The complete execution plan for the batch.
-            num_batch_chunks: The number of chunks used in shared backprop, needed
-                              to construct the correct GatherPrimitive.
-            deps: A list of events that must complete before any reduction can begin
-                  (typically the completion of all partial gradient clipping).
+            num_batch_chunks: The number of chunks used in shared backprop.
+            deps: Events that must complete before any reduction can begin.
+            exclude_params: A list of parameter names to skip, typically because
+                            they are handled by a different, specialized provider.
 
         Returns:
-            A tuple containing:
-            1. A dictionary mapping parameter names to their final `summed_grad` buffer handles.
-            2. A single `cl.Event` that signals the completion of ALL reduction tasks.
+            A tuple containing a dictionary of summed gradient handles and a
+            single event signaling completion of all reductions this executor managed.
         """
         q, ex, bm = self.svs.q, self.svs.ex, self.svs.bm
-        spec, arch_consts = self.svs.model_spec, self.svs.arch_consts
-
         all_reduction_events = []
         summed_grad_handles = {}
 
         # Instantiate the generic reduction tool
         reduction_exec = ReductionTreeExecutor(q, ex, bm, self.svs.agg_mgr, plan.reduction_plan)
+        exclude_params = exclude_params or []
 
         for flow in self.param_space:
-            # --- Path 1: Specialized Reduction for Grad_H (Node 13 -> Node 16) ---
-            if flow.specialized_reduction:
-                clipped_ref = bm.get_handle_by_name(flow.clipped_partial_grad_buffer_name)
-                permuted_ref = bm.get_handle_by_name("permuted_grad_h")
-                summed_ref = bm.get_handle_by_name(flow.summed_grad_buffer_name)
+            # Skip any flows that are explicitly excluded by the caller or
+            # are marked as requiring a specialized path.
+            if flow.name in exclude_params or flow.specialized_reduction:
+                continue
 
-                # Step 1: Gather & Permute (Node 13)
-                permute_sig = GatherAndPermuteGradHiddenActivationsSignature(
-                    bm,
-                    clipped_partials_aos_ref=clipped_ref,
-                    permuted_soa_out_ref=permuted_ref,
-                    total_modules_count=np.uint32(spec.num_modules),
-                    hidden_count=np.uint32(spec.hidden_dim),
-                    total_batch_count=np.uint32(plan.effective_batch_size),
-                    num_module_chunks_count=np.uint32(plan.grid.num_module_chunks),
-                    modules_per_chunk_count=np.uint32(plan.grid.get_tile(0, 0).modules_per_chunk),
-                    num_class_chunks_count=np.uint32(plan.grid.num_class_chunks),
+            # --- This is the Generic Reduction Path ---
+            clipped_ref = bm.get_handle_by_name(flow.clipped_partial_grad_buffer_name)
+            summed_ref = bm.get_handle_by_name(flow.summed_grad_buffer_name)
+            clipped_shape, _ = bm.get_spec(clipped_ref)
+            elements_per_partial = int(np.prod(clipped_shape[1:]))
+
+            # Create the correct declarative GatherPrimitive based on gradient type
+            if "shared" in flow.name:
+                gather_prim = LinearlyChunkedGather(
+                    num_chunks=num_batch_chunks, elements_per_chunk=elements_per_partial
                 )
-                permute_evt = ex.launch(q, permute_sig, wait_for=deps)
+            else:  # Module, Temps, etc. are tiled.
+                gather_prim = TiledGather(grid=plan.grid, elements_per_partial=elements_per_partial)
 
-                # Step 2: Reduce the permuted buffer (Node 16)
-                reduce_sig = ReduceGradHOverModulesSignature(
-                    bm,
-                    work_group_size_0=arch_consts.get("work_group_size_0", 256),
-                    scalar_size_bytes=spec.scalar_dtype().itemsize,
-                    permuted_soa_in_ref=permuted_ref,
-                    final_grad_h_out_ref=summed_ref,
-                    total_modules_count=np.uint32(spec.num_modules),
-                )
-                reduce_evt = ex.launch(q, reduce_sig, wait_for=[permute_evt])
+            # Execute the full reduction tree
+            reduce_evt = reduction_exec.execute(gather_prim, clipped_ref, summed_ref, wait_for=deps)
+            all_reduction_events.append(reduce_evt)
+            summed_grad_handles[flow.name] = summed_ref
 
-                all_reduction_events.append(reduce_evt)
-                summed_grad_handles[flow.name] = summed_ref
-
-            # --- Path 2: Generic Reduction for all other gradients ---
-            else:
-                clipped_ref = bm.get_handle_by_name(flow.clipped_partial_grad_buffer_name)
-                summed_ref = bm.get_handle_by_name(flow.summed_grad_buffer_name)
-                clipped_shape, _ = bm.get_spec(clipped_ref)
-                elements_per_partial = int(np.prod(clipped_shape[1:]))
-
-                # Create the correct declarative GatherPrimitive based on the gradient type
-                if "shared" in flow.name:
-                    gather_prim = LinearlyChunkedGather(
-                        num_chunks=num_batch_chunks, elements_per_chunk=elements_per_partial
-                    )
-                else:  # Module, Temps, etc.
-                    gather_prim = TiledGather(grid=plan.grid, elements_per_partial=elements_per_partial)
-
-                # Execute the full reduction tree
-                reduce_evt = reduction_exec.execute(gather_prim, clipped_ref, summed_ref, wait_for=deps)
-                all_reduction_events.append(reduce_evt)
-                summed_grad_handles[flow.name] = summed_ref
-
-        final_sync_event = cl.WaitForEvents(all_reduction_events)
+        final_sync_event = (
+            cl.WaitForEvents(all_reduction_events)
+            if all_reduction_events
+            else cl.UserEvent(q.context).set_status(cl.command_execution_status.COMPLETE)
+        )
         return summed_grad_handles, final_sync_event
+
+    def run_single_flow(
+        self,
+        flow_name: str,
+        plan: ExecutionPlan,
+        num_batch_chunks: int,  # Typically 0 when calling this for a specialized path
+        deps: List[cl.Event],
+    ) -> Tuple[BufferHandle, cl.Event]:
+        """
+        Executes the reduction for a single, specific parameter flow.
+
+        This method is designed to be wrapped by a StagedComputationProvider,
+        allowing the default reduction logic for a single parameter (like
+        Grad_H in the CACHE strategy) to be invoked as a self-contained stage.
+        """
+        q, ex, bm = self.svs.q, self.svs.ex, self.svs.bm
+        spec, arch_consts = self.svs.model_spec, self.svs.arch_consts
+
+        flow = next((f for f in self.param_space if f.name == flow_name), None)
+        if flow is None:
+            raise ValueError(f"Flow '{flow_name}' not found in ParameterSpace.")
+
+        if not flow.specialized_reduction:
+            raise ValueError(f"run_single_flow is intended for specialized flows. '{flow_name}' is generic.")
+
+        # --- Specialized Reduction Path for Grad_H (The Original Logic) ---
+        clipped_ref = bm.get_handle_by_name(flow.clipped_partial_grad_buffer_name)
+        permuted_ref = bm.get_handle_by_name("permuted_grad_h")
+        summed_ref = bm.get_handle_by_name(flow.summed_grad_buffer_name)
+
+        # Step 1: Gather & Permute (Node 13)
+        permute_sig = GatherAndPermuteGradHSignature(
+            bm,
+            clipped_partials_aos_ref=clipped_ref,
+            permuted_soa_out_ref=permuted_ref,
+            total_modules_count=np.uint32(spec.num_modules),
+            hidden_count=np.uint32(spec.hidden_dim),
+            total_batch_count=np.uint32(plan.effective_batch_size),
+            num_module_chunks_count=np.uint32(plan.grid.num_module_chunks),
+            modules_per_chunk_count=np.uint32(plan.grid.get_tile(0, 0).modules_per_chunk),
+            num_class_chunks_count=np.uint32(plan.grid.num_class_chunks),
+        )
+        permute_evt = ex.launch(q, permute_sig, wait_for=deps)
+
+        # Step 2: Reduce the permuted buffer (Node 16)
+        reduce_sig = ReduceGradHOverModulesSignature(
+            bm,
+            work_group_size_0=arch_consts.get("work_group_size_0", 256),
+            scalar_size_bytes=spec.scalar_dtype().itemsize,
+            permuted_soa_in_ref=permuted_ref,
+            final_grad_h_out_ref=summed_ref,
+            total_modules_count=np.uint32(spec.num_modules),
+        )
+        reduce_evt = ex.launch(q, reduce_sig, wait_for=[permute_evt])
+
+        return summed_ref, reduce_evt
