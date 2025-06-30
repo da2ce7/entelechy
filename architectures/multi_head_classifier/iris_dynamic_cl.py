@@ -91,7 +91,7 @@ class HostView:
 
 
 @dataclass(frozen=True)
-class ExecutionGrid:
+class TilingScheme:
     num_module_chunks: int
     num_class_chunks: int
     total_modules: int
@@ -128,7 +128,7 @@ class ReductionPlan:
 
 @dataclass
 class ExecutionPlan:
-    grid: ExecutionGrid
+    grid: TilingScheme
     shared_layer_batch_chunking: ChunkingConfig
     reduction_plan: ReductionPlan
     recompute_hidden: bool = False
@@ -161,7 +161,7 @@ class ExecutionStrategy:
                 nc_chunks += 1
             if (nm_chunks * nc_chunks) > (REDUCTION_BATCH_SIZE_K * 1024):
                 raise MemoryError("Cannot create a tile small enough for VRAM.")
-        grid = ExecutionGrid(nm_chunks, nc_chunks, NUM_MODULES, OUTPUT_CLASSES)
+        grid = TilingScheme(nm_chunks, nc_chunks, NUM_MODULES, OUTPUT_CLASSES)
         recompute_hidden, num_b_chunks = (hidden_size + mem_per_tile) > self.vram_budget, (
             batch_size + BACKPROP_STREAM_CHUNK_SIZE - 1
         ) // BACKPROP_STREAM_CHUNK_SIZE

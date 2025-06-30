@@ -27,7 +27,7 @@ import numpy as np
 # --- Foundational Imports from Sibling Modules ---
 from model_spec import ModelSpec
 from memory_layout import MemoryLayout, PaddingStrategy, PaddingType
-from compute_patterns import ExecutionGrid  # Required for sizing collection buffers
+from workload_primitives import TilingScheme  # Required for sizing collection buffers
 
 
 @dataclass(frozen=True)
@@ -89,7 +89,7 @@ class ParameterSpace:
         )
 
     def get_all_memory_layouts(
-        self, batch_size: int, grid: ExecutionGrid, num_batch_chunks: int
+        self, batch_size: int, grid: TilingScheme, num_batch_chunks: int
     ) -> Dict[str, MemoryLayout]:
         """
         The single source of truth for buffer layouts.
@@ -100,7 +100,7 @@ class ParameterSpace:
 
         Args:
             batch_size: The number of items in the current training batch.
-            grid: The `ExecutionGrid` defining the module/class tiling strategy.
+            grid: The `TilingScheme` defining the module/class tiling strategy.
             num_batch_chunks: The number of chunks for streaming backpropagation.
 
         Returns:

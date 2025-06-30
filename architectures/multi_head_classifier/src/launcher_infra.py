@@ -14,7 +14,7 @@ and instead relying on explicit instructions from the orchestrator.
 
 Core Components:
 - BufferHandle & Enums: The canonical, type-safe lexicon for the host.
-- Workload Primitives (WorkTile, ExecutionGrid): Utilities to define work.
+- Workload Primitives (WorkTile, TilingScheme): Utilities to define work.
 - HostView: A utility for safe, padding-aware data reads from device to host.
 - BufferManager: The sole authority on device memory allocation and lifecycle.
 - PingPongManager: A stateful helper managing transient buffers for reductions.

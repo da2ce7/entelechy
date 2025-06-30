@@ -65,8 +65,8 @@ from .phase_2_learn_D_backprop import (
 # --- Phase 3: Update (Normalization & Finalization) ---
 from .phase_3_update import (
     NormalizeGradientsSignature,
-    AdamUpdateSignature,
     AdamParameterGroup,
+    AdamUpdateSignature,
     ClampTemperaturesSignature,
 )
 
@@ -108,8 +108,8 @@ __all__ = [
     "ClipSharedGradientsChunkSignature",
     # Phase 3: Update
     "NormalizeGradientsSignature",
-    "AdamUpdateSignature",
     "AdamParameterGroup",
+    "AdamUpdateSignature",
     "ClampTemperaturesSignature",
     # Utility Kernels
     "TransposeChunkSignature",

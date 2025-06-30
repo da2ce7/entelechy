@@ -27,14 +27,15 @@ from typing import Dict, List, Tuple, Callable
 try:
     import pyopencl as cl
     from .launcher_infra import BufferHandle, KernelSignature, KernelExecutor
-    from .compute_patterns import ExecutionGrid, ReductionPlan
+    from .compute_patterns import ReductionPlan
+    from .workload_primitives import TilingScheme
 except ImportError:
     # Create mock types for standalone review and demonstration
     cl = type("cl", (), {"Event": type("Event", (), {})})
     BufferHandle = type("BufferHandle", (), {"id": int})
     KernelSignature = type("KernelSignature", (), {})
     KernelExecutor = type("KernelExecutor", (), {})
-    ExecutionGrid = type("ExecutionGrid", (), {})
+    TilingScheme = type("TilingScheme", (), {})
     ReductionPlan = type("ReductionPlan", (), {})
 
 
@@ -171,7 +172,7 @@ class ExecutionPlan:
     `BatchProcessor`, which executes it without question.
     """
 
-    grid: ExecutionGrid
+    grid: TilingScheme
     reduction_plan: ReductionPlan
     lifecycle_policy: DataLifecyclePolicy
     effective_batch_size: int
@@ -254,7 +255,7 @@ if __name__ == "__main__":
 
     # C. Strategist assembles the final plan.
     plan_a = ExecutionPlan(
-        grid=ExecutionGrid(),
+        grid=TilingScheme(),
         reduction_plan=ReductionPlan(),
         lifecycle_policy=DataLifecyclePolicy(providers=high_vram_providers),
         effective_batch_size=128,
@@ -276,7 +277,7 @@ if __name__ == "__main__":
 
     # C. Strategist assembles the final plan.
     plan_b = ExecutionPlan(
-        grid=ExecutionGrid(),
+        grid=TilingScheme(),
         reduction_plan=ReductionPlan(),
         lifecycle_policy=DataLifecyclePolicy(providers=low_vram_providers),
         effective_batch_size=128,

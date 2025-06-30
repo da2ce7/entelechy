@@ -23,6 +23,16 @@ import pyopencl as cl
 from ..launcher_infra import BufferHandle, KernelSignature, SCALAR_NP_TYPE
 
 
+@dataclass(frozen=True)
+class AdamParameterGroup:
+    """A helper dataclass to cleanly group buffers for the Adam optimizer."""
+
+    param_ref: BufferHandle  # The learnable parameter buffer (e.g., weights)
+    grad_ref: BufferHandle  # The corresponding final gradient buffer
+    m1_state_ref: BufferHandle  # The first moment vector (momentum)
+    m2_state_ref: BufferHandle  # The second moment vector (RMSProp)
+
+
 # === Pre-Update Normalization (Node 21) ===
 
 
@@ -75,16 +85,6 @@ class NormalizeGradientsSignature(KernelSignature):
 
 
 @dataclass(frozen=True)
-class AdamParameterGroup:
-    """A helper dataclass to cleanly group buffers for the Adam optimizer."""
-
-    param_ref: BufferHandle  # The learnable parameter buffer (e.g., weights)
-    grad_ref: BufferHandle  # The corresponding final gradient buffer
-    m1_state_ref: BufferHandle  # The first moment vector (momentum)
-    m2_state_ref: BufferHandle  # The second moment vector (RMSProp)
-
-
-@dataclass(frozen=True)
 class AdamUpdateSignature(KernelSignature):
     """(Node 24) Signature for the `adam_update` kernel."""
 
@@ -121,10 +121,15 @@ class AdamUpdateSignature(KernelSignature):
         """Returns all 11 arguments in exact contractual order."""
         pg = self.param_group
         return [
-            self._buffer_mgr.get_cl_buffer(pg.param_ref),
+            # Arg 1: The final, normalized gradient buffer.
             self._buffer_mgr.get_cl_buffer(pg.grad_ref),
+            # Arg 2: The parameter buffer to be updated in-place.
+            self._buffer_mgr.get_cl_buffer(pg.param_ref),
+            # Arg 3: The first moment vector (m1).
             self._buffer_mgr.get_cl_buffer(pg.m1_state_ref),
+            # Arg 4: The second moment vector (m2).
             self._buffer_mgr.get_cl_buffer(pg.m2_state_ref),
+            # Args 5-11: All scalar parameters in strict order.
             self.learning_rate,
             self.beta1_pow_t,
             self.beta2_pow_t,
