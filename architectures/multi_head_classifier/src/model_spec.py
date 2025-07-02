@@ -69,6 +69,15 @@ class ModelSpec:
         padded_row_bytes = (row_bytes + self.cache_line_bytes - 1) // self.cache_line_bytes * self.cache_line_bytes
         return padded_row_bytes // self.scalar_dtype().itemsize
 
+    @property
+    def padded_module_dim(self) -> int:
+        """Pads the module dimension's row stride for cache-line alignment."""
+        if self.cache_line_bytes == 0:
+            return self.num_modules
+        row_bytes = self.num_modules * self.scalar_dtype().itemsize
+        padded_row_bytes = (row_bytes + self.cache_line_bytes - 1) // self.cache_line_bytes * self.cache_line_bytes
+        return padded_row_bytes // self.scalar_dtype().itemsize
+
 
 if __name__ == "__main__":
     # This block serves as a live demonstration and unit test of the abstraction.

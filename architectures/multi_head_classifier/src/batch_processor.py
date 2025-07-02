@@ -1,16 +1,17 @@
 # batch_processor.py
 
 """
-The Definitive Implementation of the Batch Processing Conductor.
-
 This module provides the `BatchProcessor` class, a transient object whose sole
 responsibility is to execute a single, complete `ExecutionPlan`. It acts as the
 "Conductor" of the training process, directly consuming the pure, stateless functions
 from the `graph_recipes` module to orchestrate the entire computational sequence.
 
-This class is the embodiment of Jurisdictional Purity: it contains no
-algorithmic logic itself, only the high-level orchestration logic to sequence
-the recipes correctly based on the strategic plan it is given.
+This version is architecturally complete. It correctly differentiates between
+simple summation (for non-gradient data like BCE loss) and the sophisticated,
+policy-driven stabilized reduction required for all gradient parameters, calling
+the appropriate recipe for each. This class is the embodiment of Jurisdictional
+Purity: it contains no algorithmic logic itself, only the high-level orchestration
+logic to sequence the recipes correctly based on the strategic plan it is given.
 """
 
 from typing import Dict, List
@@ -19,7 +20,7 @@ import numpy as np
 import pyopencl as cl
 
 # --- Architectural Imports ---
-from execution_plan import ExecutionPlan
+from execution_plan import ExecutionPlan, BceStrategy
 from launcher_infra import Services
 from parameter_space import ParameterSpace
 from . import graph_recipes as recipes
@@ -34,8 +35,7 @@ class BatchProcessor:
 
     def __init__(self, services: Services, param_space: ParameterSpace, plan: ExecutionPlan):
         """
-        Initializes the conductor. It no longer needs a team of executors,
-        as it is now a self-sufficient orchestrator of recipes.
+        Initializes the conductor. It is a self-sufficient orchestrator of recipes.
         """
         self.svs = services
         self.plan = plan
@@ -51,7 +51,9 @@ class BatchProcessor:
 
         # --- Phase 1: Initial Data Uploads & Strategic Dependency Resolution ---
         upload_x_evt = cl.enqueue_copy(q, bm.get_cl_buffer("input"), X_batch)
-        upload_y_evt = cl.enqueue_copy(q, bm.get_cl_buffer("targets_cce"), y_batch)
+        # Upload to the target buffer dictated by the problem type strategy
+        targets_buffer_name = "targets_bce" if isinstance(self.plan.problem_type, BceStrategy) else "targets_cce"
+        upload_y_evt = cl.enqueue_copy(q, bm.get_cl_buffer(targets_buffer_name), y_batch)
         initial_deps = [upload_x_evt, upload_y_evt]
 
         # The Conductor blindly resolves the dependency for `hidden_activations`.
@@ -74,7 +76,6 @@ class BatchProcessor:
 
         # 2b. Run the appropriate backward paths based on the strategic plan.
         if self.plan.adaptation_strategy == "CACHE":
-            # In CACHE mode, we run a distinct backward pass for the module path.
             prob_refs = [res[0] for res in prob_results]
             bwd_mod_events = [
                 recipes.build_backward_module_path(
@@ -83,10 +84,7 @@ class BatchProcessor:
                 for i, tile in enumerate(self.plan.grid)
             ]
             all_module_grads_clipped_evt = cl.WaitForEvents(bwd_mod_events)
-        else:  # "RECOMPUTE_GRAD_H"
-            # In RECOMPUTE_GRAD_H mode, the specialized streaming pipeline for Grad_H
-            # will handle the module-path gradients implicitly. We simply pass the
-            # probability-ready event as the dependency for this stage.
+        else:
             all_module_grads_clipped_evt = all_probs_ready_evt
 
         # 2c. Launch the shared-layer backpropagation stream. This is always run.
@@ -96,54 +94,85 @@ class BatchProcessor:
         all_partials_ready_evt = cl.WaitForEvents([all_module_grads_clipped_evt, shared_grads_clipped_evt])
         print("    [Conductor] Sync Point 1: All partial gradients produced and clipped.")
 
-        # --- Phase 3: Gradient Aggregation (Reduction) ---
+        # --- Phase 3: Aggregation via Differentiated Reduction ---
+        # The Conductor now intelligently selects the correct reduction recipe.
         reduction_events = []
         summed_grad_handles = {}
+        deps_for_aggregation = [all_partials_ready_evt]
 
-        # 3a. Aggregate the shared-path gradients using the generic reduction tree.
+        # Action 1.1: Explicitly handle non-gradient summations first.
+        # This path is for diagnostic data like BCE loss (Node 14).
+        if isinstance(self.plan.problem_type, BceStrategy):
+            print("    [Conductor] Aggregating partial BCE loss (simple summation)...")
+            loss_partials_ref = bm.get_handle_by_name("partial_loss")
+            loss_summed_ref = bm.get_handle_by_name("final_loss")
+            loss_shape, _ = bm.get_spec(loss_partials_ref)
+            loss_elements_per_partial = int(np.prod(loss_shape[1:]))
+            loss_gather_prim = TiledGather(self.plan.grid, loss_elements_per_partial)
+
+            loss_sum_evt = recipes.execute_summation_tree(
+                svs=self.svs,
+                plan=self.plan,
+                gather_primitive=loss_gather_prim,
+                partial_collection_ref=loss_partials_ref,
+                final_dest_handle=loss_summed_ref,
+                wait_for=[all_probs_ready_evt],  # Depends only on forward pass
+            )
+            reduction_events.append(loss_sum_evt)
+
+        # Action 2.1: Use the STABILIZED reduction engine for all gradient parameters.
+        # This path is for all learnable parameter gradients (Nodes 15 & 20).
+        print("    [Conductor] Aggregating gradients (stabilized reduction)...")
+        # 3a. Aggregate the shared-path gradients.
         for flow in self.param_space:
             if flow.name in ["shared_weights", "shared_biases"]:
                 clipped_ref = bm.get_handle_by_name(flow.clipped_partial_grad_buffer_name)
                 summed_ref = bm.get_handle_by_name(flow.summed_grad_buffer_name)
                 clipped_shape, _ = bm.get_spec(clipped_ref)
-                elements = int(np.prod(clipped_shape[1:]))
-                gather_prim = LinearlyChunkedGather(self.plan.shared_backprop_stream_chunks, elements)
-                evt = recipes.execute_reduction_tree(
-                    self.svs, self.plan.reduction_plan, gather_prim, clipped_ref, summed_ref, [all_partials_ready_evt]
+                elements_per_partial = int(np.prod(clipped_shape[1:]))
+                gather_prim = LinearlyChunkedGather(self.plan.shared_backprop_stream_chunks, elements_per_partial)
+
+                evt = recipes.execute_stabilized_reduction_tree(
+                    svs=self.svs,
+                    plan=self.plan,
+                    gather_primitive=gather_prim,
+                    partial_collection_ref=clipped_ref,
+                    final_dest_handle=summed_ref,
+                    wait_for=deps_for_aggregation,
                 )
                 reduction_events.append(evt)
                 summed_grad_handles[flow.name] = summed_ref
 
-        # 3b. Aggregate the module-path gradients ONLY if not in recompute mode.
+        # 3b. Aggregate the module-path gradients (if not using recompute strategy).
         if self.plan.adaptation_strategy == "CACHE":
             for flow in self.param_space:
                 if flow.name in ["module_weights", "module_biases", "temperatures"]:
                     clipped_ref = bm.get_handle_by_name(flow.clipped_partial_grad_buffer_name)
                     summed_ref = bm.get_handle_by_name(flow.summed_grad_buffer_name)
                     clipped_shape, _ = bm.get_spec(clipped_ref)
-                    elements = int(np.prod(clipped_shape[1:]))
-                    gather_prim = TiledGather(self.plan.grid, elements)
-                    evt = recipes.execute_reduction_tree(
-                        self.svs,
-                        self.plan.reduction_plan,
-                        gather_prim,
-                        clipped_ref,
-                        summed_ref,
-                        [all_partials_ready_evt],
+                    elements_per_partial = int(np.prod(clipped_shape[1:]))
+                    gather_prim = TiledGather(self.plan.grid, elements_per_partial)
+
+                    evt = recipes.execute_stabilized_reduction_tree(
+                        svs=self.svs,
+                        plan=self.plan,
+                        gather_primitive=gather_prim,
+                        partial_collection_ref=clipped_ref,
+                        final_dest_handle=summed_ref,
+                        wait_for=deps_for_aggregation,
                     )
                     reduction_events.append(evt)
                     summed_grad_handles[flow.name] = summed_ref
 
-        # 3c. Resolve the dependency for `summed_grad_hidden_activations`.
-        # The plan's policy dictates whether this calls the simple permute-and-reduce recipe
-        # (for CACHE) or the entire streaming pipeline (for RECOMPUTE_GRAD_H).
+        # 3c. Resolve the dependency for `summed_grad_hidden_activations`. This is a
+        # specialized path handled by the plan's lifecycle policy.
         grad_h_provider = self.plan.lifecycle_policy.get_provider("summed_grad_hidden_activations")
-        grad_h_handle, grad_h_evt = grad_h_provider.resolve(q, self.svs.ex, wait_for=[all_partials_ready_evt])
+        grad_h_handle, grad_h_evt = grad_h_provider.resolve(q, self.svs.ex, wait_for=deps_for_aggregation)
         reduction_events.append(grad_h_evt)
         summed_grad_handles["hidden_activations"] = grad_h_handle
 
         all_grads_summed_evt = cl.WaitForEvents(reduction_events)
-        print("    [Conductor] Sync Point 2: All gradients aggregated.")
+        print("    [Conductor] Sync Point 2: All data aggregated.")
 
         # --- Phase 4: Final Batch-Wide Update ---
         final_event = recipes.build_update_subgraph(

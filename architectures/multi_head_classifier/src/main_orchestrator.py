@@ -48,6 +48,8 @@ class TrainingHyperparams:
     max_grad_norm: float
     temp_min: float
     temp_max: float
+    stabilization_lambda: float = 1.0
+    reduction_k_grad_h: int = 16
 
 
 class TrainingOrchestrator:

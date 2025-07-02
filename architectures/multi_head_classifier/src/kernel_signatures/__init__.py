@@ -51,7 +51,8 @@ from .phase_2_learn_B_processing import (
 from .phase_2_learn_C_reduction import (
     AggregateRegisterReduceSignature,
     AggregateLocalReduceSignature,
-    ReduceGradHOverModulesSignature,
+    ClipIntermediateGradSignature,
+    StabilizeAndReduceGradHiddenActivationsSignature,
 )
 
 # --- Phase 2, Set D: Learn (Shared Layer Backpropagation) ---
@@ -100,7 +101,8 @@ __all__ = [
     # Phase 2C: Reduction
     "AggregateRegisterReduceSignature",
     "AggregateLocalReduceSignature",
-    "ReduceGradHOverModulesSignature",
+    "ClipIntermediateGradSignature",
+    "StabilizeAndReduceGradHiddenActivationsSignature",
     # Phase 2D: Shared Backprop
     "BackpropSharedWeightsChunkSignature",
     "BackpropSharedBiasesChunkSignature",
