@@ -223,7 +223,7 @@ class ClipSharedGradientsChunkSignature(KernelSignature):
     handles: SharedGradientHandles
 
     # --- Control Scalars (from kernel contract) ---
-    max_norm_global: SCALAR_NP_TYPE
+    clipping_threshold_global: SCALAR_NP_TYPE
     epsilon: SCALAR_NP_TYPE
     dest_weights_write_offset_elements: np.uint32
     dest_biases_write_offset_elements: np.uint32
@@ -265,7 +265,7 @@ class ClipSharedGradientsChunkSignature(KernelSignature):
             self._buffer_mgr.get_cl_buffer(h.clipped_grad_weights_shared_collection),
             self._buffer_mgr.get_cl_buffer(h.clipped_grad_biases_shared_collection),
             # Arg 6-12: Scalars in strict contractual order
-            self.max_norm_global,
+            self.clipping_threshold_global,
             self.epsilon,
             self.weights_param_count,
             self.biases_param_count,

@@ -288,7 +288,7 @@ def build_backward_module_path(
             scalar_size_bytes=scalar_bytes,
             handles=grad_handles,
             tile=tile,
-            max_norm_global=SCALAR_NP_TYPE(h_params.max_grad_norm),
+            clipping_threshold_global=SCALAR_NP_TYPE(h_params.max_grad_norm),
             epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
         )
     else:  # 'PER_ITEM'
@@ -298,7 +298,7 @@ def build_backward_module_path(
             scalar_size_bytes=scalar_bytes,
             handles=grad_handles,
             tile=tile,
-            max_norm_per_item_ref=bm.get_handle_by_name("max_norm_per_item"),
+            clipping_threshold_per_item_ref=bm.get_handle_by_name("clipping_threshold_per_item"),
             epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
         )
 
@@ -394,7 +394,7 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
             work_group_size_0=arch_consts.get("work_group_size_0", 256),
             scalar_size_bytes=spec.scalar_dtype().itemsize,
             handles=shared_grad_handles,
-            max_norm_global=SCALAR_NP_TYPE(h_params.max_grad_norm),
+            clipping_threshold_global=SCALAR_NP_TYPE(h_params.max_grad_norm),
             epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
             dest_weights_write_offset_elements=np.uint32(i * np.prod(gsw_chunk_shape)),
             dest_biases_write_offset_elements=np.uint32(i * np.prod(gsb_chunk_shape)),
@@ -551,7 +551,7 @@ def execute_grad_h_streaming_pipeline(
                 scalar_size_bytes=scalar_bytes,
                 handles=grad_handles,
                 tile=tile,
-                max_norm_global=SCALAR_NP_TYPE(h_params.max_grad_norm),
+                clipping_threshold_global=SCALAR_NP_TYPE(h_params.max_grad_norm),
                 epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
             )
         else:

@@ -1,20 +1,18 @@
 # execution_plan.py
 
 """
-The Definitive Implementation of the Strategic Execution Plan Abstraction.
+(REV 2) The Definitive Implementation of the Strategic Execution Plan Abstraction.
 
-This module provides the data structures to create a complete, declarative
-manifest for a single training batch run. This formally decouples strategic
-planning (deciding *how* to run the batch) from tactical execution (actually
-running it), which is a cornerstone of the system's architectural elegance.
+This version introduces a major architectural enhancement: the `ProblemTypeStrategy`
+abstraction. This pattern replaces the brittle "stringly-typed" approach to
+selecting loss functions (`problem_type="CCE"`) with a robust, polymorphic
+class hierarchy.
 
-This is the canonical home for the "Dynamic Adaptation" logic (e.g., Cache vs.
-Recompute). This dynamic behavior is encapsulated by the DependencyProvider
-pattern, allowing the main orchestrator to remain clean, declarative, and
-unaware of the underlying fulfillment strategy for its data dependencies.
-
-The primary export of this module is the `ExecutionPlan` class, which serves
-as the single, immutable "program" for a `BatchProcessor` to execute.
+This change perfectly decouples the sequence-oriented recipes from the
+implementation details of any given loss function. The recipes no longer need
+`if/else` blocks to handle different problem types; they simply ask the strategy
+object provided in the plan to create the correct kernel signature, upholding
+the Open/Closed Principle.
 """
 
 import abc
@@ -22,25 +20,35 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Callable
 
 # --- Architectural Imports ---
-# These are imported for type hinting and to show the dependencies.
-# In a real project, these would resolve to the actual class definitions.
 try:
     import pyopencl as cl
     from .launcher_infra import BufferHandle, KernelSignature, KernelExecutor
     from .compute_patterns import ReductionPlan
-    from .workload_primitives import TilingScheme
+    from .workload_primitives import TilingScheme, WorkTile
+
+    # Import all signatures needed by the strategy factories
+    from .kernel_signatures import (
+        ComputeProbsLossCceChunkSignature,
+        ComputeProbsLossBceChunkSignature,
+        CalculateModuleParamGradsCceSignature,
+        CalculateModuleParamGradsBceSignature,
+        BackpropErrorToHiddenChunkCceSignature,
+        BackpropErrorToHiddenChunkBceSignature,
+        CalculateChunkTempGradientsCceSignature,
+        CalculateChunkTempGradientsBceSignature,
+    )
 except ImportError:
-    # Create mock types for standalone review and demonstration
+    # Create mock types for standalone review and documentation generation
     cl = type("cl", (), {"Event": type("Event", (), {})})
     BufferHandle = type("BufferHandle", (), {"id": int})
     KernelSignature = type("KernelSignature", (), {})
     KernelExecutor = type("KernelExecutor", (), {})
     TilingScheme = type("TilingScheme", (), {})
     ReductionPlan = type("ReductionPlan", (), {})
+    WorkTile = type("WorkTile", (), {})
 
 
 # === Abstraction Level 1: The DependencyProvider Contract ===
-# This is the core pattern that enables dynamic adaptation.
 
 
 class DependencyProvider(abc.ABC):
@@ -136,7 +144,7 @@ class StagedComputationProvider(DependencyProvider):
         return self.computation_fn(queue, ex, wait_for)
 
 
-# === Abstraction Level 2: The Policy Registry ===
+# === Abstraction Level 2: The Policy Registries ===
 
 
 @dataclass(frozen=True)
@@ -152,10 +160,80 @@ class DataLifecyclePolicy:
     providers: Dict[str, DependencyProvider] = field(default_factory=dict)
 
     def get_provider(self, buffer_name: str) -> DependencyProvider:
-        """Retrieves the provider strategy for a given conceptual buffer."""
         if buffer_name not in self.providers:
             raise KeyError(f"No lifecycle policy defined for buffer: '{buffer_name}'")
         return self.providers[buffer_name]
+
+
+# === (NEW) Abstraction: The ProblemTypeStrategy Contract ===
+
+
+class ProblemTypeStrategy(abc.ABC):
+    """
+    An abstract contract for a problem type (e.g., CCE, BCE).
+
+    This object acts as a "factory" for the specific kernel signatures required
+    by a given loss function, allowing recipes to be written polymorphically
+    without needing to know the details of CCE or BCE.
+    """
+
+    @abc.abstractmethod
+    def get_loss_signature(self, **kwargs) -> KernelSignature:
+        """Returns the appropriate signature for Node 6 or 7."""
+        pass
+
+    @abc.abstractmethod
+    def get_module_grad_signature(self, **kwargs) -> KernelSignature:
+        """Returns the appropriate signature for Node 8."""
+        pass
+
+    @abc.abstractmethod
+    def get_hidden_grad_signature(self, **kwargs) -> KernelSignature:
+        """Returns the appropriate signature for Node 9."""
+        pass
+
+    @abc.abstractmethod
+    def get_temp_grad_signature(self, **kwargs) -> KernelSignature:
+        """Returns the appropriate signature for Node 10."""
+        pass
+
+
+@dataclass(frozen=True)
+class CceStrategy(ProblemTypeStrategy):
+    """The concrete strategy for CCE (single-label classification)."""
+
+    targets_cce_ref: BufferHandle
+
+    def get_loss_signature(self, **kwargs) -> "ComputeProbsLossCceChunkSignature":
+        return ComputeProbsLossCceChunkSignature(target_ref=self.targets_cce_ref, **kwargs)
+
+    def get_module_grad_signature(self, **kwargs) -> "CalculateModuleParamGradsCceSignature":
+        return CalculateModuleParamGradsCceSignature(targets_cce_ref=self.targets_cce_ref, **kwargs)
+
+    def get_hidden_grad_signature(self, **kwargs) -> "BackpropErrorToHiddenChunkCceSignature":
+        return BackpropErrorToHiddenChunkCceSignature(targets_cce_ref=self.targets_cce_ref, **kwargs)
+
+    def get_temp_grad_signature(self, **kwargs) -> "CalculateChunkTempGradientsCceSignature":
+        return CalculateChunkTempGradientsCceSignature(targets_cce_ref=self.targets_cce_ref, **kwargs)
+
+
+@dataclass(frozen=True)
+class BceStrategy(ProblemTypeStrategy):
+    """The concrete strategy for BCE (multi-label classification)."""
+
+    targets_bce_ref: BufferHandle
+
+    def get_loss_signature(self, **kwargs) -> "ComputeProbsLossBceChunkSignature":
+        return ComputeProbsLossBceChunkSignature(target_ref=self.targets_bce_ref, **kwargs)
+
+    def get_module_grad_signature(self, **kwargs) -> "CalculateModuleParamGradsBceSignature":
+        return CalculateModuleParamGradsBceSignature(targets_bce_ref=self.targets_bce_ref, **kwargs)
+
+    def get_hidden_grad_signature(self, **kwargs) -> "BackpropErrorToHiddenChunkBceSignature":
+        return BackpropErrorToHiddenChunkBceSignature(targets_bce_ref=self.targets_bce_ref, **kwargs)
+
+    def get_temp_grad_signature(self, **kwargs) -> "CalculateChunkTempGradientsBceSignature":
+        return CalculateChunkTempGradientsBceSignature(targets_bce_ref=self.targets_bce_ref, **kwargs)
 
 
 # === Abstraction Level 3: The Complete Batch Manifest ===
@@ -164,19 +242,16 @@ class DataLifecyclePolicy:
 @dataclass(frozen=True)
 class ExecutionPlan:
     """
-    The single, immutable manifest describing the complete strategy for
+    (REV 2) The single, immutable manifest describing the complete strategy for
     executing one training batch.
-
-    This object is created by the `TrainingOrchestrator` based on its high-level
-    assessment of the problem and system resources. It is then passed to a
-    `BatchProcessor`, which executes it without question.
     """
 
     grid: TilingScheme
     reduction_plan: ReductionPlan
     lifecycle_policy: DataLifecyclePolicy
     effective_batch_size: int
-    problem_type: str  # e.g., 'CCE' or 'BCE'
+    # The `problem_type` field is now a polymorphic strategy object.
+    problem_type: "ProblemTypeStrategy"
     clipping_strategy: str  # e.g., 'GLOBAL' or 'PER_ITEM'
     hyperparams: "TrainingHyperparams"  # Forward ref for type hint
     shared_backprop_stream_chunks: int

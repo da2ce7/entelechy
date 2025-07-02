@@ -96,7 +96,7 @@ class _ClipTiledModuleGradsBase(KernelSignature):
 class ClipPartialGradientsGlobalNormSignature(_ClipTiledModuleGradsBase):
     """(Node 11 - Global) Type-safe signature for clipping module grads with a single global norm."""
 
-    max_norm_global: SCALAR_NP_TYPE
+    clipping_threshold_global: SCALAR_NP_TYPE
 
     def get_args(self) -> List:
         """Assembles all 20 arguments for the module path clipping operation."""
@@ -114,7 +114,7 @@ class ClipPartialGradientsGlobalNormSignature(_ClipTiledModuleGradsBase):
             self._buffer_mgr.get_cl_buffer(h.clipped_grad_temps),
             self._buffer_mgr.get_cl_buffer(h.clipped_grad_hidden_activations_aos),
             np.uint32(0),  # use_per_item_norm = FALSE
-            self.max_norm_global,
+            self.clipping_threshold_global,
             self.epsilon,
             np.uint32(self.tile.flat_tile_index),
             np.uint32(self.tile.num_class_chunks),
@@ -130,7 +130,7 @@ class ClipPartialGradientsGlobalNormSignature(_ClipTiledModuleGradsBase):
 class ClipPartialGradientsPerItemNormSignature(_ClipTiledModuleGradsBase):
     """(Node 11 - Per-Item) Type-safe signature for clipping module grads with a per-item norm buffer."""
 
-    max_norm_per_item_ref: BufferHandle
+    clipping_threshold_per_item_ref: BufferHandle
 
     def get_args(self) -> List:
         """Assembles all 20 arguments for the module path clipping operation."""
@@ -142,7 +142,7 @@ class ClipPartialGradientsPerItemNormSignature(_ClipTiledModuleGradsBase):
             self._buffer_mgr.get_cl_buffer(h.grad_biases_module),
             self._buffer_mgr.get_cl_buffer(h.grad_temps),
             self._buffer_mgr.get_cl_buffer(h.grad_hidden_activations_aos),
-            self._buffer_mgr.get_cl_buffer(self.max_norm_per_item_ref),
+            self._buffer_mgr.get_cl_buffer(self.clipping_threshold_per_item_ref),
             self._buffer_mgr.get_cl_buffer(h.clipped_grad_weights_module),
             self._buffer_mgr.get_cl_buffer(h.clipped_grad_biases_module),
             self._buffer_mgr.get_cl_buffer(h.clipped_grad_temps),
