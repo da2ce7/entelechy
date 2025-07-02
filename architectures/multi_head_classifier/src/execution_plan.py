@@ -1,32 +1,37 @@
 # execution_plan.py
 
 """
-(REV 2) The Definitive Implementation of the Strategic Execution Plan Abstraction.
+(REV 3) The Definitive Implementation of the Strategic Execution Plan Abstraction.
 
-This version introduces a major architectural enhancement: the `ProblemTypeStrategy`
-abstraction. This pattern replaces the brittle "stringly-typed" approach to
-selecting loss functions (`problem_type="CCE"`) with a robust, polymorphic
-class hierarchy.
+This version completes the architectural vision for the a `ProblemTypeStrategy`
+by elevating its role from a simple "Signature Factory" to a comprehensive
+"Sub-Graph Recipe Provider."
 
-This change perfectly decouples the sequence-oriented recipes from the
-implementation details of any given loss function. The recipes no longer need
-`if/else` blocks to handle different problem types; they simply ask the strategy
-object provided in the plan to create the correct kernel signature, upholding
-the Open/Closed Principle.
+This is achieved by extending the abstract contract to include methods for
+providing not just kernel signatures, but the complete, executable logic for
+problem-specific sub-graphs (e.g., loss aggregation). This change removes the
+last vestiges of strategy-specific logic from the `BatchProcessor`, making it a
+truly pure "Conductor" and perfecting the system's adherence to the Open/Closed
+Principle.
 """
 
 import abc
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Callable
+from typing import Dict, List, Tuple, Callable, Optional
+
+import numpy as np
 
 # --- Architectural Imports ---
 try:
     import pyopencl as cl
-    from .launcher_infra import BufferHandle, KernelSignature, KernelExecutor
-    from .compute_patterns import ReductionPlan
-    from .workload_primitives import TilingScheme, WorkTile
 
-    # Import all signatures needed by the strategy factories
+    # --- Local Infrastructure Imports ---
+    from .launcher_infra import BufferHandle, KernelSignature, KernelExecutor, Services
+    from .compute_patterns import ReductionPlan
+    from .workload_primitives import TilingScheme, WorkTile, TiledGather
+    from . import graph_recipes as recipes
+
+    # --- Kernel Signature Imports for Strategy Factories ---
     from .kernel_signatures import (
         ComputeProbsLossCceChunkSignature,
         ComputeProbsLossBceChunkSignature,
@@ -43,6 +48,7 @@ except ImportError:
     BufferHandle = type("BufferHandle", (), {"id": int})
     KernelSignature = type("KernelSignature", (), {})
     KernelExecutor = type("KernelExecutor", (), {})
+    Services = type("Services", (), {})
     TilingScheme = type("TilingScheme", (), {})
     ReductionPlan = type("ReductionPlan", (), {})
     WorkTile = type("WorkTile", (), {})
@@ -165,17 +171,30 @@ class DataLifecyclePolicy:
         return self.providers[buffer_name]
 
 
-# === (NEW) Abstraction: The ProblemTypeStrategy Contract ===
+# === (REV 3) Abstraction: The ProblemTypeStrategy Contract ===
 
 
 class ProblemTypeStrategy(abc.ABC):
     """
     An abstract contract for a problem type (e.g., CCE, BCE).
 
-    This object acts as a "factory" for the specific kernel signatures required
-    by a given loss function, allowing recipes to be written polymorphically
-    without needing to know the details of CCE or BCE.
+    This object acts as a factory for problem-specific kernel signatures and a
+    provider for problem-specific sub-graph recipes. This decouples the main
+    orchestration logic from the implementation details of any given loss function.
     """
+
+    @property
+    @abc.abstractmethod
+    def required_targets_buffer_name(self) -> str:
+        """The canonical name of the buffer this strategy consumes for targets."""
+        pass
+
+    @abc.abstractmethod
+    def build_loss_aggregation_subgraph(
+        self, svs: "Services", plan: "ExecutionPlan", deps: List[cl.Event]
+    ) -> Optional[cl.Event]:
+        """Builds the sub-graph for aggregating loss, if required. Returns None if not."""
+        pass
 
     @abc.abstractmethod
     def get_loss_signature(self, **kwargs) -> KernelSignature:
@@ -204,6 +223,14 @@ class CceStrategy(ProblemTypeStrategy):
 
     targets_cce_ref: BufferHandle
 
+    @property
+    def required_targets_buffer_name(self) -> str:
+        return "targets_cce"
+
+    def build_loss_aggregation_subgraph(self, svs: "Services", plan: "ExecutionPlan", deps: List[cl.Event]):
+        # CCE uses a direct scatter-write for loss, so no aggregation is needed.
+        return None
+
     def get_loss_signature(self, **kwargs) -> "ComputeProbsLossCceChunkSignature":
         return ComputeProbsLossCceChunkSignature(target_ref=self.targets_cce_ref, **kwargs)
 
@@ -222,6 +249,32 @@ class BceStrategy(ProblemTypeStrategy):
     """The concrete strategy for BCE (multi-label classification)."""
 
     targets_bce_ref: BufferHandle
+
+    @property
+    def required_targets_buffer_name(self) -> str:
+        return "targets_bce"
+
+    def build_loss_aggregation_subgraph(
+        self, svs: "Services", plan: "ExecutionPlan", deps: List[cl.Event]
+    ) -> Optional[cl.Event]:
+        # BCE loss is computed per-class and must be aggregated. This method
+        # encapsulates the logic for that aggregation.
+        bm = svs.bm
+        loss_partials_ref = bm.get_handle_by_name("partial_loss")
+        loss_summed_ref = bm.get_handle_by_name("final_loss")
+        loss_shape, _ = bm.get_spec(loss_partials_ref)
+        elements_per_partial = int(np.prod(loss_shape[1:]))
+        gather_prim = TiledGather(plan.grid, elements_per_partial)
+
+        # Call the generic summation recipe.
+        return recipes.execute_summation_tree(
+            svs=svs,
+            reduction_plan=plan.reduction_plan,
+            gather_primitive=gather_prim,
+            partial_collection_ref=loss_partials_ref,
+            final_dest_handle=loss_summed_ref,
+            wait_for=deps,
+        )
 
     def get_loss_signature(self, **kwargs) -> "ComputeProbsLossBceChunkSignature":
         return ComputeProbsLossBceChunkSignature(target_ref=self.targets_bce_ref, **kwargs)
@@ -242,7 +295,7 @@ class BceStrategy(ProblemTypeStrategy):
 @dataclass(frozen=True)
 class ExecutionPlan:
     """
-    (REV 2) The single, immutable manifest describing the complete strategy for
+    (REV 3) The single, immutable manifest describing the complete strategy for
     executing one training batch.
     """
 
@@ -253,5 +306,7 @@ class ExecutionPlan:
     # The `problem_type` field is now a polymorphic strategy object.
     problem_type: "ProblemTypeStrategy"
     clipping_strategy: str  # e.g., 'GLOBAL' or 'PER_ITEM'
+    stabilization_policy: "StabilizationPolicy"  # Forward ref for type hint
     hyperparams: "TrainingHyperparams"  # Forward ref for type hint
+    adaptation_strategy: str  # e.g., 'CACHE' or 'RECOMPUTE_GRAD_H'
     shared_backprop_stream_chunks: int

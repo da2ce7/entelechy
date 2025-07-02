@@ -537,198 +537,220 @@ def execute_grad_h_streaming_pipeline(
     svs: Services, plan: ExecutionPlan, deps: List[cl.Event]
 ) -> Tuple[BufferHandle, cl.Event]:
     """
-    (REV 2) Recipe for "Model A: Accumulate via Recompute".
+    (Node 8-16) The canonical recipe for the "Accumulate via Recompute" streaming model.
 
-    Implements the full sequence within its loop: for each tile, it recomputes
-    hidden activations, then computes ALL required partial gradients (Module
-    Weights, Biases, Temps, AND Hidden Activations), before calling the
-    holistic clipping kernel (Node 11). This fulfills the contract that
-    clipping is performed on the complete gradient vector for an item.
+    Architectural Mandate:
+    This recipe is a stateful, host-driven pipeline that fulfills the contract of
+    the `RECOMPUTE_GRAD_H` adaptation strategy. Its purpose is to produce the fully
+    reduced `summed_grad_hidden_activations` tensor without ever holding the full,
+    monolithic `hidden_activations` buffer in VRAM.
 
-    This version is architecturally complete, using the polymorphic
-    `ProblemTypeStrategy` to select gradient kernels and the correct,
-    policy-aware signature for the final specialized reduction (Node 16).
-
-    Returns:
-        A tuple of (final_summed_grad_h_handle, final_completion_event).
+    Contract Fulfillment:
+    This function embodies the "Primacy of Memory Strategy" by trading compute for
+    memory. It achieves this via a host-side loop that, for each `WorkTile`:
+    1. Recomputes the full `hidden_activations` tensor into a transient scratch buffer.
+    2. Immediately computes the raw partial gradients for that tile, also into scratch space.
+    3. Performs a holistic, group-wise clip (Node 11) on the complete gradient vector
+       for that tile, scattering the result into the final collection buffers.
+    4. Repeats this process, accumulating all clipped partials.
+    5. After the loop, it launches the standard permutation and specialized reduction
+       pipeline (Nodes 13 & 16) on the now-complete collection buffers.
     """
     q, ex, bm = svs.q, svs.ex, svs.q
-    spec, h_params = svs.model_spec, plan.hyperparams
-    arch_consts, grid = svs.arch_consts, plan.grid
+    spec, h_params, grid = svs.model_spec, plan.hyperparams, plan.grid
+    arch_consts = svs.arch_consts
     scalar_bytes = spec.scalar_dtype().itemsize
     wgs0 = arch_consts.get("work_group_size_0", 256)
 
-    # 1. Acquire Monolithic Collection Buffers & Sized Transient Scratch Buffers
+    # --- Step 1: Resource Acquisition ---
+    # Acquire handles for the final, monolithic COLLECTION buffers.
     clipped_gw_out_ref = bm.get_handle_by_name("clipped_partial_grad_module_weights")
     clipped_gb_out_ref = bm.get_handle_by_name("clipped_partial_grad_module_biases")
     clipped_gt_out_ref = bm.get_handle_by_name("clipped_partial_grad_temps")
     clipped_gh_out_ref = bm.get_handle_by_name("clipped_partial_grad_hidden_activations")
+    permuted_soa_ref = bm.get_handle_by_name("permuted_grad_h")
+    final_summed_grad_h_ref = bm.get_handle_by_name("summed_grad_hidden_activations")
 
+    # Acquire transient SCRATCH buffers. These are reused in every loop iteration.
     h_full_shape, _ = bm.get_spec(bm.get_handle_by_name("hidden_activations"))
-    gw_full_shape, _ = bm.get_spec(bm.get_handle_by_name("partial_grad_module_weights"))
-    gb_full_shape, _ = bm.get_spec(bm.get_handle_by_name("partial_grad_module_biases"))
-    gt_full_shape, _ = bm.get_spec(bm.get_handle_by_name("partial_grad_temps"))
-    gh_full_shape, _ = bm.get_spec(bm.get_handle_by_name("partial_grad_hidden_activations"))
+    gw_coll_shape, _ = bm.get_spec(clipped_gw_out_ref)
+    gb_coll_shape, _ = bm.get_spec(clipped_gb_out_ref)
+    gt_coll_shape, _ = bm.get_spec(clipped_gt_out_ref)
+    gh_coll_shape, _ = bm.get_spec(clipped_gh_out_ref)
 
+    # Architectural Justification for Scratch Buffer Sizing:
+    # 1. h_scratch must be full-sized to satisfy the host-side contract of
+    #    ForwardPassSignature, which derives its dimensions from the buffer spec.
+    # 2. Raw grad scratch buffers only need to hold ONE tile's worth of data,
+    #    as they are overwritten in each iteration of the streaming loop.
     h_scratch_ref = bm.acquire_transient_buffer(int(np.prod(h_full_shape) * scalar_bytes))
     h_mask_scratch_ref = bm.acquire_transient_buffer(int(np.prod(h_full_shape) * scalar_bytes))
-    raw_gw_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gw_full_shape[1:]) * scalar_bytes))
-    raw_gb_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gb_full_shape[1:]) * scalar_bytes))
-    raw_gt_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gt_full_shape[1:]) * scalar_bytes))
-    raw_gh_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gh_full_shape[1:]) * scalar_bytes))
+    raw_gw_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gw_coll_shape[1:]) * scalar_bytes))
+    raw_gb_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gb_coll_shape[1:]) * scalar_bytes))
+    raw_gt_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gt_coll_shape[1:]) * scalar_bytes))
+    raw_gh_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gh_coll_shape[1:]) * scalar_bytes))
 
-    all_clip_events = []
+    scratch_handles = [
+        h_scratch_ref,
+        h_mask_scratch_ref,
+        raw_gw_scratch_ref,
+        raw_gb_scratch_ref,
+        raw_gt_scratch_ref,
+        raw_gh_scratch_ref,
+    ]
 
-    # 2. Loop over module/class tiles to accumulate clipped partials
-    for tile in grid:
-        # Step 2a: Recompute hidden activations
-        fwd_pass_sig = ForwardPassSignature(
+    try:
+        all_clip_events = []
+        # --- Step 2: Host-Driven Streaming Loop ---
+        for tile in grid:
+            # Step 2a: Recompute hidden activations into scratch space
+            fwd_pass_sig = ForwardPassSignature(
+                buffer_mgr=bm,
+                simd_width=spec.simd_width,
+                local_mem_bank_padding=1,
+                scalar_size_bytes=scalar_bytes,
+                in_ref=bm.get_handle_by_name("input"),
+                mask_ref=bm.get_handle_by_name("sample_mask"),
+                w_ref=bm.get_handle_by_name("shared_weights"),
+                b_ref=bm.get_handle_by_name("shared_biases"),
+                h_out_ref=h_scratch_ref,
+                h_mask_out_ref=h_mask_scratch_ref,
+                batch_chunk_offset=np.uint32(0),
+                batch_chunk_count=np.uint32(plan.effective_batch_size),
+            )
+            h_ready_evt = ex.launch(q, fwd_pass_sig, wait_for=deps)
+            grad_calc_deps = [h_ready_evt]
+
+            # Step 2b: Compute all raw partial gradients for this tile into scratch buffers
+            grad_mod_sig = plan.problem_type.get_module_grad_signature(
+                buffer_mgr=bm,
+                work_group_size_0=wgs0,
+                scalar_size_bytes=scalar_bytes,
+                h_ref=h_scratch_ref,
+                prob_ref=bm.get_handle_by_name("partial_probs"),
+                mask_ref=bm.get_handle_by_name("sample_mask"),
+                gw_out_ref=raw_gw_scratch_ref,
+                gb_out_ref=raw_gb_scratch_ref,
+                tile=tile,
+                batch_chunk_offset=np.uint32(0),
+                batch_chunk_count=np.uint32(plan.effective_batch_size),
+                hidden_count=np.uint32(spec.hidden_dim),
+                total_output_class_count=np.uint32(spec.output_classes),
+                padded_total_output_class_count=np.uint32(spec.padded_class_dim),
+                total_modules_count=np.uint32(spec.num_modules),
+            )
+            grad_h_sig = plan.problem_type.get_hidden_grad_signature(
+                buffer_mgr=bm,
+                prob_ref=bm.get_handle_by_name("partial_probs"),
+                mask_ref=bm.get_handle_by_name("sample_mask"),
+                w_mod_ref=bm.get_handle_by_name("module_weights"),
+                gh_out_ref=raw_gh_scratch_ref,
+                tile=tile,
+                hidden_count=np.uint32(spec.hidden_dim),
+                total_output_class_count=np.uint32(spec.output_classes),
+            )
+            grad_t_sig = plan.problem_type.get_temp_grad_signature(
+                buffer_mgr=bm,
+                work_group_size_0=wgs0,
+                scalar_size_bytes=scalar_bytes,
+                logit_ref=bm.get_handle_by_name("logits"),
+                prob_ref=bm.get_handle_by_name("partial_probs"),
+                mask_ref=bm.get_handle_by_name("sample_mask"),
+                temp_ref=bm.get_handle_by_name("temperatures"),
+                gt_out_ref=raw_gt_scratch_ref,
+                tile=tile,
+                total_output_class_count=np.uint32(spec.output_classes),
+            )
+
+            grad_mod_evt = ex.launch(q, grad_mod_sig, wait_for=grad_calc_deps)
+            grad_t_evt = ex.launch(q, grad_t_sig, wait_for=grad_calc_deps)
+            grad_h_evt = ex.launch(q, grad_h_sig, wait_for=grad_calc_deps)
+            all_raw_grads_ready = [grad_mod_evt, grad_t_evt, grad_h_evt]
+
+            # Step 2c: Perform the holistic clip, scattering from scratch to the final collection buffers.
+            grad_handles = GradientHandles(
+                grad_weights_module=raw_gw_scratch_ref,
+                grad_biases_module=raw_gb_scratch_ref,
+                grad_temps=raw_gt_scratch_ref,
+                grad_hidden_activations_aos=raw_gh_scratch_ref,
+                clipped_grad_weights_module=clipped_gw_out_ref,
+                clipped_grad_biases_module=clipped_gb_out_ref,
+                clipped_grad_temps=clipped_gt_out_ref,
+                clipped_grad_hidden_activations_aos=clipped_gh_out_ref,
+            )
+
+            if plan.clipping_strategy == "GLOBAL":
+                clip_sig = ClipPartialGradientsGlobalNormSignature(
+                    buffer_mgr=bm,
+                    work_group_size_0=wgs0,
+                    scalar_size_bytes=scalar_bytes,
+                    handles=grad_handles,
+                    tile=tile,
+                    clipping_threshold_global=SCALAR_NP_TYPE(plan.stabilization_policy.get_leaf_safety_threshold()),
+                    epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
+                )
+            else:  # 'PER_ITEM'
+                clip_sig = ClipPartialGradientsPerItemNormSignature(
+                    buffer_mgr=bm,
+                    work_group_size_0=wgs0,
+                    scalar_size_bytes=scalar_bytes,
+                    handles=grad_handles,
+                    tile=tile,
+                    clipping_threshold_per_item_ref=bm.get_handle_by_name("clipping_threshold_per_item"),
+                    epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
+                )
+
+            # This event signals that all work for this single tile is complete.
+            clip_event = ex.launch(q, clip_sig, wait_for=all_raw_grads_ready)
+            all_clip_events.append(clip_event)
+
+        # --- Step 3: Synchronization Point & Downstream Execution ---
+        all_clips_done = cl.WaitForEvents(all_clip_events)
+
+        # Step 3a: Permute into SoA layout for reduction (Node 13).
+        permute_sig = GatherAndPermuteGradHiddenActivationsSignature(
             buffer_mgr=bm,
-            simd_width=spec.simd_width,
-            local_mem_bank_padding=1,
-            scalar_size_bytes=scalar_bytes,
-            in_ref=bm.get_handle_by_name("input"),
-            mask_ref=bm.get_handle_by_name("sample_mask"),
-            w_ref=bm.get_handle_by_name("shared_weights"),
-            b_ref=bm.get_handle_by_name("shared_biases"),
-            h_out_ref=h_scratch_ref,
-            h_mask_out_ref=h_mask_scratch_ref,
-            batch_chunk_offset=np.uint32(0),
-            batch_chunk_count=np.uint32(plan.effective_batch_size),
-        )
-        h_ready_evt = ex.launch(q, fwd_pass_sig, wait_for=deps)
-        grad_calc_deps = [h_ready_evt] + deps
-
-        # Step 2b: Use the polymorphic strategy to create gradient signatures
-        grad_mod_sig = plan.problem_type.get_module_grad_signature(
-            buffer_mgr=bm,
-            work_group_size_0=wgs0,
-            scalar_size_bytes=scalar_bytes,
-            h_ref=h_scratch_ref,
-            prob_ref=bm.get_handle_by_name("partial_probs"),
-            mask_ref=bm.get_handle_by_name("sample_mask"),
-            gw_out_ref=raw_gw_scratch_ref,
-            gb_out_ref=raw_gb_scratch_ref,
-            tile=tile,
-            batch_chunk_offset=np.uint32(0),
-            batch_chunk_count=np.uint32(plan.effective_batch_size),
-            hidden_count=np.uint32(spec.hidden_dim),
-            total_output_class_count=np.uint32(spec.output_classes),
-            padded_total_output_class_count=np.uint32(spec.padded_class_dim),
+            clipped_partials_aos_ref=clipped_gh_out_ref,
+            permuted_soa_out_ref=permuted_soa_ref,
             total_modules_count=np.uint32(spec.num_modules),
-        )
-        grad_h_sig = plan.problem_type.get_hidden_grad_signature(
-            buffer_mgr=bm,
-            prob_ref=bm.get_handle_by_name("partial_probs"),
-            mask_ref=bm.get_handle_by_name("sample_mask"),
-            w_mod_ref=bm.get_handle_by_name("module_weights"),
-            gh_out_ref=raw_gh_scratch_ref,
-            tile=tile,
             hidden_count=np.uint32(spec.hidden_dim),
-            total_output_class_count=np.uint32(spec.output_classes),
+            total_batch_count=np.uint32(plan.effective_batch_size),
+            num_module_chunks_count=np.uint32(grid.num_module_chunks),
+            modules_per_chunk_count=np.uint32(grid.get_tile(0, 0).modules_per_chunk),
+            num_class_chunks_count=np.uint32(grid.num_class_chunks),
         )
-        grad_t_sig = plan.problem_type.get_temp_grad_signature(
+        permute_evt = ex.launch(q, permute_sig, wait_for=[all_clips_done])
+
+        # Step 3b: Reduce the permuted buffer using the specialized, policy-aware kernel (Node 16).
+        policy_k = plan.stabilization_policy.get_specialized_reduction_policy_k(
+            user_policy_k=h_params.reduction_k_grad_h,
+            hardware_max_fan_in=wgs0,
+        )
+        reduce_sig = StabilizeAndReduceGradHiddenActivationsSignature(
             buffer_mgr=bm,
             work_group_size_0=wgs0,
             scalar_size_bytes=scalar_bytes,
-            logit_ref=bm.get_handle_by_name("logits"),
-            prob_ref=bm.get_handle_by_name("partial_probs"),
-            mask_ref=bm.get_handle_by_name("sample_mask"),
-            temp_ref=bm.get_handle_by_name("temperatures"),
-            gt_out_ref=raw_gt_scratch_ref,
-            tile=tile,
-            total_output_class_count=np.uint32(spec.output_classes),
+            permuted_soa_in_ref=permuted_soa_ref,
+            final_grad_h_out_ref=final_summed_grad_h_ref,
+            fp_max=SCALAR_NP_TYPE(plan.stabilization_policy.fp_format_max),
+            policy_t_algorithmic=SCALAR_NP_TYPE(h_params.max_grad_norm),
+            policy_lambda=SCALAR_NP_TYPE(h_params.stabilization_lambda),
+            policy_max_k=np.uint32(policy_k),
+            epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
+            total_batch_count=np.uint32(plan.effective_batch_size),
+            padded_hidden_count=np.uint32(spec.padded_hidden_dim),
+            total_modules_count=np.uint32(spec.num_modules),
+            padded_total_modules_count=np.uint32(spec.padded_module_dim),
         )
+        final_reduce_evt = ex.launch(q, reduce_sig, wait_for=[permute_evt])
 
-        grad_mod_evt = ex.launch(q, grad_mod_sig, wait_for=grad_calc_deps)
-        grad_t_evt = ex.launch(q, grad_t_sig, wait_for=grad_calc_deps)
-        grad_h_evt = ex.launch(q, grad_h_sig, wait_for=grad_calc_deps)
-        all_raw_grads_ready = [grad_mod_evt, grad_t_evt, grad_h_evt]
+        return final_summed_grad_h_ref, final_reduce_evt
 
-        # Step 2c-d: Holistic clipping for the tile's complete gradient vector
-        grad_handles = GradientHandles(
-            grad_weights_module=raw_gw_scratch_ref,
-            grad_biases_module=raw_gb_scratch_ref,
-            grad_temps=raw_gt_scratch_ref,
-            grad_hidden_activations_aos=raw_gh_scratch_ref,
-            clipped_grad_weights_module=clipped_gw_out_ref,
-            clipped_grad_biases_module=clipped_gb_out_ref,
-            clipped_grad_temps=clipped_gt_out_ref,
-            clipped_grad_hidden_activations_aos=clipped_gh_out_ref,
-        )
-        if plan.clipping_strategy == "GLOBAL":
-            clip_sig = ClipPartialGradientsGlobalNormSignature(
-                buffer_mgr=bm,
-                work_group_size_0=wgs0,
-                scalar_size_bytes=scalar_bytes,
-                handles=grad_handles,
-                tile=tile,
-                clipping_threshold_global=SCALAR_NP_TYPE(plan.stabilization_policy.get_leaf_safety_threshold()),
-                epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
-            )
-        else:  # 'PER_ITEM'
-            clip_sig = ClipPartialGradientsPerItemNormSignature(
-                buffer_mgr=bm,
-                work_group_size_0=wgs0,
-                scalar_size_bytes=scalar_bytes,
-                handles=grad_handles,
-                tile=tile,
-                clipping_threshold_per_item_ref=bm.get_handle_by_name("clipping_threshold_per_item"),
-                epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
-            )
-
-        clip_evt = ex.launch(q, clip_sig, wait_for=all_raw_grads_ready)
-        all_clip_events.append(clip_evt)
-
-    # 3. Release transient scratch buffers
-    bm.release_transient_buffer(h_scratch_ref)
-    bm.release_transient_buffer(h_mask_scratch_ref)
-    bm.release_transient_buffer(raw_gw_scratch_ref)
-    bm.release_transient_buffer(raw_gb_scratch_ref)
-    bm.release_transient_buffer(raw_gt_scratch_ref)
-    bm.release_transient_buffer(raw_gh_scratch_ref)
-    all_clips_done = cl.WaitForEvents(all_clip_events)
-
-    # 4. Permute into SoA layout for reduction (Node 13)
-    permuted_soa_ref = bm.get_handle_by_name("permuted_grad_h")
-    permute_sig = GatherAndPermuteGradHiddenActivationsSignature(
-        buffer_mgr=bm,
-        clipped_partials_aos_ref=clipped_gh_out_ref,
-        permuted_soa_out_ref=permuted_soa_ref,
-        total_modules_count=np.uint32(spec.num_modules),
-        hidden_count=np.uint32(spec.hidden_dim),
-        total_batch_count=np.uint32(plan.effective_batch_size),
-        num_module_chunks_count=np.uint32(plan.grid.num_module_chunks),
-        modules_per_chunk_count=np.uint32(plan.grid.get_tile(0, 0).modules_per_chunk),
-        num_class_chunks_count=np.uint32(plan.grid.num_class_chunks),
-    )
-    permute_evt = ex.launch(q, permute_sig, wait_for=[all_clips_done])
-
-    # 5. Reduce the permuted buffer using the specialized, policy-aware kernel (Node 16)
-    policy_k = plan.stabilization_policy.get_specialized_reduction_policy_k(
-        user_policy_k=h_params.reduction_k_grad_h,
-        hardware_max_fan_in=wgs0,
-    )
-    final_summed_grad_h_ref = bm.get_handle_by_name("summed_grad_hidden_activations")
-    reduce_sig = StabilizeAndReduceGradHiddenActivationsSignature(
-        buffer_mgr=bm,
-        work_group_size_0=wgs0,
-        scalar_size_bytes=scalar_bytes,
-        permuted_soa_in_ref=permuted_soa_ref,
-        final_grad_h_out_ref=final_summed_grad_h_ref,
-        fp_max=SCALAR_NP_TYPE(plan.stabilization_policy.fp_format_max),
-        policy_t_algorithmic=SCALAR_NP_TYPE(h_params.max_grad_norm),
-        policy_lambda=SCALAR_NP_TYPE(h_params.stabilization_lambda),
-        policy_max_k=np.uint32(policy_k),
-        epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
-        total_batch_count=np.uint32(plan.effective_batch_size),
-        padded_hidden_count=np.uint32(spec.padded_hidden_dim),
-        total_modules_count=np.uint32(spec.num_modules),
-        padded_total_modules_count=np.uint32(spec.padded_module_dim),
-    )
-    final_reduce_evt = ex.launch(q, reduce_sig, wait_for=[permute_evt])
-
-    return final_summed_grad_h_ref, final_reduce_evt
+    finally:
+        # --- Step 4: Resource Cleanup ---
+        # A contractually obligated step to prevent VRAM leakage from transient allocations.
+        for handle in scratch_handles:
+            bm.release_transient_buffer(handle)
 
 
 # =========================================================================
@@ -999,3 +1021,84 @@ def build_update_subgraph(
     clamp_evt = ex.launch(q, clamp_sig, wait_for=[all_updates_evt])
 
     return clamp_evt
+
+
+def execute_diagnostic_aggregation(svs: Services, plan: ExecutionPlan, deps: List[cl.Event]) -> Dict[str, cl.Event]:
+    """
+    (Node 14) A stateless recipe to aggregate all diagnostic results from the Act phase.
+
+    Architectural Mandate:
+    This function is the canonical implementation of the "Reduction (Act Results)"
+    step. It is responsible for consuming the scattered partial results generated during
+    the forward pass and reducing them into their final, batch-wide forms.
+    It guarantees the availability of `Final Probs` and, when applicable, `Final BCE Loss`.
+
+    This centralization enables two critical architectural improvements:
+    1.  It simplifies the `ProblemTypeStrategy` contracts, allowing them to be pure
+        "signature factories" without DAG-building logic.
+    2.  It allows the `BatchProcessor` to remain a pure "Conductor," ignorant of the
+        specific aggregation needs of different loss functions.
+
+    Supersedes:
+    - The `BceStrategy.build_loss_aggregation_subgraph` method, which is now obsolete.
+
+    Args:
+        svs: The bundle of core system services.
+        plan: The `ExecutionPlan` containing strategy and layout information.
+        deps: A list of `cl.Event` objects to wait for (e.g., from the forward pass).
+
+    Returns:
+        A dictionary mapping aggregated artifact names ("probs", "loss") to the
+        `cl.Event` signaling their completion.
+    """
+    bm = svs.bm
+    completion_events: Dict[str, cl.Event] = {}
+
+    # --- 1. Aggregate Probabilities (Universal Requirement) ---
+    # This step is always executed to produce the final, batch-wide probability tensor,
+    # which is essential for inference, validation, and debugging.
+    partial_probs_ref = bm.get_handle_by_name("partial_probs")
+    final_probs_ref = bm.get_handle_by_name("final_probs")
+
+    # Determine the memory footprint of a single partial probability tile from the
+    # collection buffer's specification.
+    partial_probs_shape, _ = bm.get_spec(partial_probs_ref)
+    elements_per_prob_partial = int(np.prod(partial_probs_shape[1:]))
+
+    # Instantiate the Gather Primitive that perfectly describes the memory layout
+    # of the scattered source partials for the reduction engine.
+    prob_gather_prim = TiledGather(scheme=plan.grid, _elements_per_partial=elements_per_prob_partial)
+
+    # Launch the reusable, generic summation tree recipe.
+    prob_agg_evt = execute_summation_tree(
+        svs=svs,
+        reduction_plan=plan.reduction_plan,
+        gather_primitive=prob_gather_prim,
+        partial_collection_ref=partial_probs_ref,
+        final_dest_handle=final_probs_ref,
+        wait_for=deps,
+    )
+    completion_events["probs"] = prob_agg_evt
+
+    # --- 2. Conditionally Aggregate Loss (For BCE Problem Type) ---
+    # We use the strategy's required buffer name as a clean, contract-driven check.
+    if plan.problem_type.required_targets_buffer_name == "targets_bce":
+        partial_loss_ref = bm.get_handle_by_name("partial_loss")
+        final_loss_ref = bm.get_handle_by_name("final_loss")
+
+        partial_loss_shape, _ = bm.get_spec(partial_loss_ref)
+        elements_per_loss_partial = int(np.prod(partial_loss_shape[1:]))
+
+        loss_gather_prim = TiledGather(scheme=plan.grid, _elements_per_partial=elements_per_loss_partial)
+
+        loss_agg_evt = execute_summation_tree(
+            svs=svs,
+            reduction_plan=plan.reduction_plan,
+            gather_primitive=loss_gather_prim,
+            partial_collection_ref=partial_loss_ref,
+            final_dest_handle=final_loss_ref,
+            wait_for=deps,
+        )
+        completion_events["loss"] = loss_agg_evt
+
+    return completion_events

@@ -168,6 +168,15 @@ class ParameterSpace:
             if "partial_grad" in name:
                 layouts[name.replace("partial", "clipped")] = layouts[name]
 
+        # --- Layouts for Diagnostic Collection Buffers ---
+        layouts["partial_probs"] = MemoryLayout((grid.total_tiles, max_mods_per_tile, batch_size, max_cls_per_tile))
+        layouts["partial_loss"] = MemoryLayout((grid.total_tiles, max_mods_per_tile, batch_size))
+        # The final loss buffer is a matrix of (modules, samples) for CCE.
+        # For BCE, it is a single scalar after full reduction. To unify, we will
+        # use a simple scalar buffer for the final reduced BCE loss and retrieve
+        # the CCE loss from its direct-write buffer when needed.
+        layouts["final_loss"] = MemoryLayout((1,))
+
         # --- Layouts for Specialized Intermediates ---
         layouts["permuted_grad_h"] = MemoryLayout((batch_size * padded_hidden_dim, spec.num_modules)).add_strategy(
             pad_to_cache

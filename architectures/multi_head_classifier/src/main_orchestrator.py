@@ -1,17 +1,10 @@
 # main_orchestrator.py
 
-"""
-The Definitive, Unified Streaming Classification Engine (Host Implementation).
-
-(REV 5) This file contains the top-level
-TrainingOrchestrator, which acts as a pure "Strategist". It is responsible for
-defining the model, managing the training lifecycle (e.g., epochs), and
-authoring high-level, declarative execution plans.
-
-It delegates all tactical, step-by-step execution to the `BatchProcessor`,
-which it instantiates on a per-batch basis. This file serves as the primary
-entry point and high-level controller for the application.
-"""
+# This module serves as the highest level of host-side control, embodying the
+# "Strategist" pattern. Its sole purpose is to translate high-level experimental
+# goals (model shape, hyperparameters, adaptation strategies) into a single,
+# declarative "ExecutionPlan" for a training batch. It owns the training
+# lifecycle (epochs) but delegates all per-batch tactical execution.
 
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
@@ -21,41 +14,65 @@ import numpy as np
 import pyopencl as cl
 from sklearn.datasets import load_iris
 
-# --- Foundational & Architectural Imports ---
+# --- Foundational Architectural Primitives ---
+# These imports represent the core "nouns" of the system architecture. The
+# Orchestrator's role is to compose these primitives into a coherent plan.
 from model_spec import ModelSpec, SCALAR_DTYPE
 from cl_context_manager import OpenCLContextManager, ComputeEnvironment
 from parameter_space import ParameterSpace
-from execution_plan import *
-from launcher_infra import *
-from memory_layout import *
-from kernel_signatures import *
+from execution_plan import (
+    ExecutionPlan,
+    DataLifecyclePolicy,
+    CacheProvider,
+    RecomputeProvider,
+    StagedComputationProvider,
+    CceStrategy,
+    BceStrategy,
+)
+from launcher_infra import Services, BufferManager, KernelExecutor
+from kernel_signatures import ForwardPassSignature
 from compute_patterns import ReductionPlan
 from workload_primitives import TilingScheme
-from . import graph_recipes as recipes
-from .batch_processor import BatchProcessor
+from stabilization_policy import StabilizationPolicy
+from batch_processor import BatchProcessor
+import graph_recipes as recipes
 
 
-# === Dataclasses for Structured Configuration ===
+@dataclass(frozen=True)
+class StabilizationConfig:
+    """A structured configuration primitive for stabilization policy."""
+
+    max_grad_norm: float
+    lambda_: float
+
+
 @dataclass(frozen=True)
 class TrainingHyperparams:
-    """A structured container for all training hyperparameters."""
+    """
+    The canonical, type-safe manifest for all training hyperparameters.
+    Nesting the `StabilizationConfig` enforces a logical grouping, making the
+    configuration hierarchy clear and explicit.
+    """
 
     epochs: int
     learning_rate: float
     adam_beta1: float
     adam_beta2: float
     adam_epsilon: float
-    max_grad_norm: float
     temp_min: float
     temp_max: float
-    stabilization_lambda: float = 1.0
+    stabilization: StabilizationConfig
     reduction_k_grad_h: int = 16
 
 
 class TrainingOrchestrator:
     """
-    The top-level System Owner. This class is the "Strategist." It authors
-    the ExecutionPlan but delegates all tactical execution.
+    The System Owner and "Strategist."
+
+    This class instantiates and owns all lower-level services. It is responsible
+    for authoring the strategic `ExecutionPlan` but delegates all tactical,
+    step-by-step execution to the `BatchProcessor`, which it creates on a
+    per-batch basis.
     """
 
     def __init__(
@@ -65,16 +82,23 @@ class TrainingOrchestrator:
         compute_env: ComputeEnvironment,
         hyperparams: TrainingHyperparams,
         adaptation_strategy: str,
+        problem_type_name: str,
+        clipping_strategy_name: str,
         batch_size: int,
     ):
+        # The constructor acts as the "System Assembler," gathering and owning
+        # all foundational components required for the entire training run.
         self.model_spec = model_spec
         self.param_space = param_space
         self.compute_env = compute_env
         self.hyperparams = hyperparams
         self.adaptation_strategy = adaptation_strategy
+        self.problem_type_name = problem_type_name
+        self.clipping_strategy_name = clipping_strategy_name
         self.global_step = 1
 
-        # Create the canonical Services bundle to be passed around
+        # The `Services` bundle is a key dependency injection pattern, allowing
+        # core components to be passed cleanly through the system layers.
         bm = BufferManager(self.compute_env.cl_bundle.context)
         ex = KernelExecutor(self.compute_env.cl_bundle.program)
         self.services = Services(
@@ -82,37 +106,46 @@ class TrainingOrchestrator:
             ex=ex,
             bm=bm,
             model_spec=model_spec,
-            arch_consts=self.compute_env.arch_consts,
+            arch_consts=compute_env.arch_consts,
         )
-        self.stream_chunks = 4  # This remains a strategic decision
+
+        self.stream_chunks = 4
         self._setup_buffers(batch_size, self.stream_chunks)
 
     def _setup_buffers(self, batch_size: int, num_stream_chunks: int):
-        """Creates all buffers by consuming the authoritative memory layouts."""
+        """
+        Orchestrates memory allocation by delegating to the `ParameterSpace`.
+        This fulfills the "Primacy of Memory Strategy" by ensuring that memory
+        layout decisions are centralized and contract-driven, not scattered
+        throughout the application logic.
+        """
         bm, spec = self.services.bm, self.model_spec
-        print("INFO: Setting up all buffers from ParameterSpace manifest...")
         grid = TilingScheme(
             num_module_chunks=(spec.num_modules + 15) // 16,
             num_class_chunks=(spec.output_classes + 15) // 16,
             total_modules=spec.num_modules,
             total_classes=spec.output_classes,
         )
+        # The Orchestrator asks the ParameterSpace for the complete memory plan...
         all_layouts = self.param_space.get_all_memory_layouts(
             batch_size=batch_size, grid=grid, num_batch_chunks=num_stream_chunks
         )
+        # ...and instructs the BufferManager to execute that plan.
         for name, layout in all_layouts.items():
             bm.create_named_buffer(name, layout, spec.scalar_dtype)
-        print("INFO: All buffers created successfully from manifest.")
 
     def _create_execution_plan(self, batch_size: int) -> ExecutionPlan:
         """
-        Authors the plan. This is a pure, high-level strategic method that
-        encapsulates all strategic decisions for a single batch run.
+        Authors the complete, immutable execution strategy for a single batch.
+
+        This method is the heart of the "Strategist" role. It makes no kernel
+        calls itself. Instead, it composes high-level policy and strategy
+        objects into a single `ExecutionPlan` manifest.
         """
-        svs, spec = self.services, self.model_spec
+        svs, spec, h_params = self.services, self.model_spec, self.hyperparams
         policy_providers = {}
 
-        # 1. Define Work Partitioning and Reduction Strategies
+        # --- Phase 1: Formulate Strategic Primitives ---
         grid = TilingScheme(
             num_module_chunks=(spec.num_modules + 15) // 16,
             num_class_chunks=(spec.output_classes + 15) // 16,
@@ -121,48 +154,79 @@ class TrainingOrchestrator:
         )
         reduction_plan = ReductionPlan(k=self.compute_env.arch_consts.get("optimal_tile_size", 16))
 
-        # 2. Define the strategic DATA LIFECYCLE policies
-        print(f"  [Orchestrator] Authoring plan with strategy: '{self.adaptation_strategy}'")
+        # --- Phase 2: Instantiate Polymorphic Strategy Objects ---
+        # This is the Strategy Pattern in action. The orchestrator translates a
+        # simple configuration string into a powerful, state-and-behavior
+        # encapsulating object.
+        if self.problem_type_name == "CCE":
+            problem_strategy = CceStrategy(targets_cce_ref=svs.bm.get_handle_by_name("targets_cce"))
+        elif self.problem_type_name == "BCE":
+            problem_strategy = BceStrategy(targets_bce_ref=svs.bm.get_handle_by_name("targets_bce"))
+        else:
+            raise ValueError(f"Unknown problem type: {self.problem_type_name}")
 
+        # The `StabilizationPolicy` is the host-side computational engine for the
+        # system's stabilization contract. Its creation here is an explicit
+        # architectural act.
+        fp_max = np.finfo(spec.scalar_dtype).max
+        stabilization_policy = StabilizationPolicy(
+            t_algorithmic=h_params.stabilization.max_grad_norm,
+            lambda_=h_params.stabilization.lambda_,
+            fp_format_max=fp_max,
+        )
+
+        # A placeholder is used to resolve a logical circular dependency: the `plan`
+        # is needed to create the providers, but the providers are needed to create
+        # the `plan`. The partial function is updated with the real plan later.
+        plan_placeholder = None
+
+        # --- Phase 3: Define Data Lifecycle Policies (`CACHE` vs. `RECOMPUTE`) ---
+        # This block implements the dynamic adaptation strategy by selecting the
+        # correct `DependencyProvider` for each critical data buffer.
         if self.adaptation_strategy == "CACHE":
-            # For CACHE, h is pre-computed and its provider is a simple CacheProvider.
             h_ref, h_ready_evt = recipes.execute_forward_pass(svs, batch_size, deps=[])
             policy_providers["hidden_activations"] = CacheProvider(handle=h_ref, ready_event=h_ready_evt)
-            # The provider for summed_grad_h uses the simple permute-and-reduce recipe.
-            provider_fn = partial(recipes.execute_specialized_grad_h_reduction, svs=svs, plan=plan)
+
+            # In CACHE mode, the recipe for `summed_grad_h` is the simpler,
+            # specialized reduction that assumes partial gradients are already made.
+            provider_fn = partial(recipes.execute_specialized_grad_h_reduction, svs=svs, plan=plan_placeholder)
             policy_providers["summed_grad_hidden_activations"] = StagedComputationProvider(computation_fn=provider_fn)
 
         elif self.adaptation_strategy == "RECOMPUTE_GRAD_H":
-            # For RECOMPUTE, h is provided on-demand by a RecomputeProvider.
-            # We must define the signature for the recomputation kernel.
-            recompute_handle = svs.bm.acquire_transient_buffer(...)  # Size logic omitted for brevity
-            recompute_mask = svs.bm.acquire_transient_buffer(...)
-            recompute_sig = ForwardPassSignature(
-                buffer_mgr=svs.bm,
-                # ... all params for ForwardPassSignature ...
+            # Architectural Mandate: In this strategy, `hidden_activations` is a
+            # transient artifact internal to the streaming pipeline. It is NOT
+            # exposed as a consumable dependency to the BatchProcessor.
+            # Therefore, no provider is defined for it.
+
+            # The `summed_grad_hidden_activations` buffer, however, IS the final
+            # output of the streaming pipeline and a required dependency for the
+            # Conductor. The provider for this dependency becomes the entire
+            # streaming pipeline recipe itself, encapsulated in a StagedComputationProvider.
+            provider_fn = partial(
+                recipes.execute_grad_h_streaming_pipeline,
+                svs=svs,
+                plan=plan_placeholder,
             )
-            policy_providers["hidden_activations"] = RecomputeProvider(
-                signature=recompute_sig, output_handle=recompute_handle
-            )
-            # The provider for summed_grad_h is the entire streaming pipeline recipe.
-            provider_fn = partial(recipes.execute_grad_h_streaming_pipeline, svs=svs, plan=plan)
             policy_providers["summed_grad_hidden_activations"] = StagedComputationProvider(computation_fn=provider_fn)
         else:
             raise ValueError(f"Unknown adaptation strategy: '{self.adaptation_strategy}'")
 
-        # 3. Assemble the Final, Immutable ExecutionPlan
+        # --- Phase 4: Assemble and Finalize the ExecutionPlan ---
         plan = ExecutionPlan(
             grid=grid,
             reduction_plan=reduction_plan,
             lifecycle_policy=DataLifecyclePolicy(providers=policy_providers),
             effective_batch_size=batch_size,
-            problem_type="CCE",
-            clipping_strategy="GLOBAL",
+            problem_type=problem_strategy,
+            clipping_strategy=self.clipping_strategy_name,
+            stabilization_policy=stabilization_policy,
             hyperparams=self.hyperparams,
             shared_backprop_stream_chunks=self.stream_chunks,
+            adaptation_strategy=self.adaptation_strategy,
         )
-        # We must re-bind the provider functions here because 'plan' was not defined
-        # when the partials were first created.
+
+        # The final act of plan creation: re-bind the provider functions with the
+        # now-complete `plan` object, resolving the circular dependency.
         for provider in policy_providers.values():
             if isinstance(provider, StagedComputationProvider):
                 provider.computation_fn.keywords["plan"] = plan
@@ -170,37 +234,36 @@ class TrainingOrchestrator:
         return plan
 
     def train(self, X_train: np.ndarray, y_train: np.ndarray):
-        """The main training loop. Now a clean, high-level controller."""
-        h = self.hyperparams
+        """
+        The main training loop. It is a pure controller that demonstrates the
+        system's core operational pattern: Plan -> Execute.
+        """
         batch_size = X_train.shape[0]
 
-        print(f"\n--- Beginning Training Run: {h.epochs} epochs ---")
-        for epoch in range(h.epochs):
-            print(f"\n--- Epoch {epoch+1}/{h.epochs} ---")
-
-            # Step 1: Author the high-level strategy for this batch.
+        for epoch in range(self.hyperparams.epochs):
+            # 1. Author the complete, high-level strategy for this batch.
             plan = self._create_execution_plan(batch_size)
 
-            # Step 2: Instantiate a dedicated conductor to execute the plan.
+            # 2. Instantiate a dedicated "Conductor" to execute the plan.
             processor = BatchProcessor(self.services, self.param_space, plan)
 
-            # Step 3: Run the processor and wait for it to complete the full batch.
+            # 3. Delegate execution and wait for the entire batch to complete.
             final_event = processor.run(X_train, y_train, self.global_step)
             final_event.wait()
-
-            print(f"  Epoch {epoch+1} complete.")
             self.global_step += 1
-        print("\n--- Training Finished ---")
 
 
-# =========================================================================
-# === The Application Entry Point & System Assembler ===
-# =========================================================================
 if __name__ == "__main__":
-    print("--- Step 1: Defining Logical Experiment ---")
+    # This block serves as the "System Assembler" at the application's
+    # entry point. It defines the experiment's configuration, instantiates
+    # all necessary architectural components, and initiates the training process.
+
+    # --- 1. Experiment Configuration ---
     LOGICAL_HIDDEN_DIM = 32
     LOGICAL_NUM_MODULES = 8
-    ADAPTATION_STRATEGY = "RECOMPUTE_GRAD_H"
+    ADAPTATION_STRATEGY = "CACHE"
+    PROBLEM_TYPE = "CCE"
+    CLIPPING_STRATEGY = "GLOBAL"
     KERNEL_SOURCE_DIR = "./"
 
     HYPERPARAMS = TrainingHyperparams(
@@ -209,27 +272,28 @@ if __name__ == "__main__":
         adam_beta1=0.9,
         adam_beta2=0.999,
         adam_epsilon=1e-7,
-        max_grad_norm=1.0,
         temp_min=0.1,
         temp_max=10.0,
+        stabilization=StabilizationConfig(
+            max_grad_norm=1.0,
+            lambda_=1.0,
+        ),
+        reduction_k_grad_h=16,
     )
 
-    print("\n--- Step 2: Building Self-Configuring Compute Environment ---")
+    # --- 2. System Assembly ---
     try:
         manager = OpenCLContextManager(kernel_source_dir=KERNEL_SOURCE_DIR)
         compute_env = manager.build_and_discover()
-        print(f"  Successfully built environment. Discovered Constants: {compute_env.arch_consts}")
-    except (cl.RuntimeError, FileNotFoundError) as e:
-        print(f"\nFATAL: Could not build OpenCL environment: {e}")
+    except Exception as e:
+        print(f"FATAL: Could not build OpenCL environment: {e}")
         exit(1)
 
-    print("\n--- Step 3: Loading Data ---")
     iris = load_iris()
     X_train_data = iris.data.astype(SCALAR_DTYPE)
     y_train_data = iris.target.astype(np.int32)
     batch_size = X_train_data.shape[0]
 
-    print("\n--- Step 4: Creating Architectural ModelSpec ---")
     iris_model_spec = ModelSpec(
         input_dim=X_train_data.shape[1],
         output_classes=len(np.unique(y_train_data)),
@@ -238,21 +302,18 @@ if __name__ == "__main__":
         simd_width=compute_env.arch_consts.get("simd_width"),
         cache_line_bytes=compute_env.arch_consts.get("global_mem_cacheline_size"),
     )
-    print(f"  Final ModelSpec created:\n{iris_model_spec}")
 
-    print("\n--- Step 5: Building Learnable ParameterSpace from ModelSpec ---")
     param_space = ParameterSpace(spec=iris_model_spec)
-    print("  ParameterSpace manifest created successfully.")
 
-    print("\n--- Step 6: Instantiating and Running the Orchestrator ---")
+    # --- 3. Orchestration and Execution ---
     orchestrator = TrainingOrchestrator(
         model_spec=iris_model_spec,
         param_space=param_space,
         compute_env=compute_env,
         hyperparams=HYPERPARAMS,
         adaptation_strategy=ADAPTATION_STRATEGY,
+        problem_type_name=PROBLEM_TYPE,
+        clipping_strategy_name=CLIPPING_STRATEGY,
         batch_size=batch_size,
     )
     orchestrator.train(X_train_data, y_train_data)
-
-    print("\n--- Run Finished ---")
