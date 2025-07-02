@@ -533,28 +533,23 @@ def execute_stabilized_reduction_tree(
             bm.release_transient_buffer(handle)
 
 
-def execute_grad_h_streaming_pipeline(
-    svs: Services, plan: ExecutionPlan, deps: List[cl.Event]
-) -> Tuple[BufferHandle, cl.Event]:
+def build_streaming_module_grad_path(svs: Services, plan: ExecutionPlan, deps: List[cl.Event]) -> Dict[str, cl.Event]:
     """
-    (Node 8-16) The canonical recipe for the "Accumulate via Recompute" streaming model.
+    (Nodes 8, 9, 10, 11) The canonical recipe for the "Accumulate via Recompute" model.
 
     Architectural Mandate:
-    This recipe is a stateful, host-driven pipeline that fulfills the contract of
-    the `RECOMPUTE_GRAD_H` adaptation strategy. Its purpose is to produce the fully
-    reduced `summed_grad_hidden_activations` tensor without ever holding the full,
-    monolithic `hidden_activations` buffer in VRAM.
+    This recipe fulfills the computational contract for the module gradient path
+    under the `RECOMPUTE_GRAD_H` adaptation strategy. Its purpose is to produce the complete,
+    clipped collections of all partial gradients (`Grad_ModW/B`, `Grad_Temps`, AND `Grad_H`)
+    without ever holding the full `hidden_activations` buffer in VRAM. It achieves
+    this via a host-driven streaming loop that, for each tile, recomputes inputs,
+    computes raw partials into scratch space, and scatters clipped results into final
+    collection buffers.
 
-    Contract Fulfillment:
-    This function embodies the "Primacy of Memory Strategy" by trading compute for
-    memory. It achieves this via a host-side loop that, for each `WorkTile`:
-    1. Recomputes the full `hidden_activations` tensor into a transient scratch buffer.
-    2. Immediately computes the raw partial gradients for that tile, also into scratch space.
-    3. Performs a holistic, group-wise clip (Node 11) on the complete gradient vector
-       for that tile, scattering the result into the final collection buffers.
-    4. Repeats this process, accumulating all clipped partials.
-    5. After the loop, it launches the standard permutation and specialized reduction
-       pipeline (Nodes 13 & 16) on the now-complete collection buffers.
+    Returns:
+        A dictionary mapping the canonical names of the final, clipped partial
+        gradient collection buffers to the single `cl.Event` signaling their simultaneous
+        completion.
     """
     q, ex, bm = svs.q, svs.ex, svs.q
     spec, h_params, grid = svs.model_spec, plan.hyperparams, plan.grid
@@ -563,13 +558,11 @@ def execute_grad_h_streaming_pipeline(
     wgs0 = arch_consts.get("work_group_size_0", 256)
 
     # --- Step 1: Resource Acquisition ---
-    # Acquire handles for the final, monolithic COLLECTION buffers.
+    # Acquire handles for the final, monolithic COLLECTION buffers this recipe populates.
     clipped_gw_out_ref = bm.get_handle_by_name("clipped_partial_grad_module_weights")
     clipped_gb_out_ref = bm.get_handle_by_name("clipped_partial_grad_module_biases")
     clipped_gt_out_ref = bm.get_handle_by_name("clipped_partial_grad_temps")
     clipped_gh_out_ref = bm.get_handle_by_name("clipped_partial_grad_hidden_activations")
-    permuted_soa_ref = bm.get_handle_by_name("permuted_grad_h")
-    final_summed_grad_h_ref = bm.get_handle_by_name("summed_grad_hidden_activations")
 
     # Acquire transient SCRATCH buffers. These are reused in every loop iteration.
     h_full_shape, _ = bm.get_spec(bm.get_handle_by_name("hidden_activations"))
@@ -578,13 +571,11 @@ def execute_grad_h_streaming_pipeline(
     gt_coll_shape, _ = bm.get_spec(clipped_gt_out_ref)
     gh_coll_shape, _ = bm.get_spec(clipped_gh_out_ref)
 
-    # Architectural Justification for Scratch Buffer Sizing:
-    # 1. h_scratch must be full-sized to satisfy the host-side contract of
-    #    ForwardPassSignature, which derives its dimensions from the buffer spec.
-    # 2. Raw grad scratch buffers only need to hold ONE tile's worth of data,
-    #    as they are overwritten in each iteration of the streaming loop.
+    # Scratch buffer for recomputed hidden activations must be full-sized to satisfy
+    # the contract of the ForwardPassSignature.
     h_scratch_ref = bm.acquire_transient_buffer(int(np.prod(h_full_shape) * scalar_bytes))
     h_mask_scratch_ref = bm.acquire_transient_buffer(int(np.prod(h_full_shape) * scalar_bytes))
+    # Scratch buffers for raw partial gradients only need to hold one tile's worth of data.
     raw_gw_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gw_coll_shape[1:]) * scalar_bytes))
     raw_gb_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gb_coll_shape[1:]) * scalar_bytes))
     raw_gt_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gt_coll_shape[1:]) * scalar_bytes))
@@ -603,7 +594,7 @@ def execute_grad_h_streaming_pipeline(
         all_clip_events = []
         # --- Step 2: Host-Driven Streaming Loop ---
         for tile in grid:
-            # Step 2a: Recompute hidden activations into scratch space
+            # Step 2a: Recompute hidden activations into scratch space (Node 4 logic)
             fwd_pass_sig = ForwardPassSignature(
                 buffer_mgr=bm,
                 simd_width=spec.simd_width,
@@ -700,57 +691,92 @@ def execute_grad_h_streaming_pipeline(
                     epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
                 )
 
-            # This event signals that all work for this single tile is complete.
             clip_event = ex.launch(q, clip_sig, wait_for=all_raw_grads_ready)
             all_clip_events.append(clip_event)
 
-        # --- Step 3: Synchronization Point & Downstream Execution ---
-        all_clips_done = cl.WaitForEvents(all_clip_events)
+        # --- Step 3: Synchronization and Return ---
+        all_clips_done_evt = cl.WaitForEvents(all_clip_events)
 
-        # Step 3a: Permute into SoA layout for reduction (Node 13).
-        permute_sig = GatherAndPermuteGradHiddenActivationsSignature(
-            buffer_mgr=bm,
-            clipped_partials_aos_ref=clipped_gh_out_ref,
-            permuted_soa_out_ref=permuted_soa_ref,
-            total_modules_count=np.uint32(spec.num_modules),
-            hidden_count=np.uint32(spec.hidden_dim),
-            total_batch_count=np.uint32(plan.effective_batch_size),
-            num_module_chunks_count=np.uint32(grid.num_module_chunks),
-            modules_per_chunk_count=np.uint32(grid.get_tile(0, 0).modules_per_chunk),
-            num_class_chunks_count=np.uint32(grid.num_class_chunks),
-        )
-        permute_evt = ex.launch(q, permute_sig, wait_for=[all_clips_done])
-
-        # Step 3b: Reduce the permuted buffer using the specialized, policy-aware kernel (Node 16).
-        policy_k = plan.stabilization_policy.get_specialized_reduction_policy_k(
-            user_policy_k=h_params.reduction_k_grad_h,
-            hardware_max_fan_in=wgs0,
-        )
-        reduce_sig = StabilizeAndReduceGradHiddenActivationsSignature(
-            buffer_mgr=bm,
-            work_group_size_0=wgs0,
-            scalar_size_bytes=scalar_bytes,
-            permuted_soa_in_ref=permuted_soa_ref,
-            final_grad_h_out_ref=final_summed_grad_h_ref,
-            fp_max=SCALAR_NP_TYPE(plan.stabilization_policy.fp_format_max),
-            policy_t_algorithmic=SCALAR_NP_TYPE(h_params.max_grad_norm),
-            policy_lambda=SCALAR_NP_TYPE(h_params.stabilization_lambda),
-            policy_max_k=np.uint32(policy_k),
-            epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
-            total_batch_count=np.uint32(plan.effective_batch_size),
-            padded_hidden_count=np.uint32(spec.padded_hidden_dim),
-            total_modules_count=np.uint32(spec.num_modules),
-            padded_total_modules_count=np.uint32(spec.padded_module_dim),
-        )
-        final_reduce_evt = ex.launch(q, reduce_sig, wait_for=[permute_evt])
-
-        return final_summed_grad_h_ref, final_reduce_evt
+        # Return a dictionary that maps the canonical names of the four final
+        # collection buffers to the single event that signals their completion.
+        return {
+            "clipped_partial_grad_module_weights": all_clips_done_evt,
+            "clipped_partial_grad_module_biases": all_clips_done_evt,
+            "clipped_partial_grad_temps": all_clips_done_evt,
+            "clipped_partial_grad_hidden_activations": all_clips_done_evt,
+        }
 
     finally:
         # --- Step 4: Resource Cleanup ---
         # A contractually obligated step to prevent VRAM leakage from transient allocations.
         for handle in scratch_handles:
             bm.release_transient_buffer(handle)
+
+
+def build_final_grad_h_reduction_path(
+    svs: Services, plan: ExecutionPlan, deps: List[cl.Event]
+) -> Tuple[BufferHandle, cl.Event]:
+    """
+    (Nodes 13, 16) The canonical recipe for permuting and reducing Grad_H.
+
+    Architectural Mandate:
+    This recipe is a simple, stateless sequencer for the two kernels that form
+    the Item Synchronization Point and the specialized reduction for `Grad_H`. It
+    is the terminal step in the `RECOMPUTE_GRAD_H` data path, consuming the
+    clipped partials produced by `build_streaming_module_grad_path` and yielding
+    the final `summed_grad_hidden_activations` tensor.
+
+    Returns:
+        A tuple of (handle_to_summed_grad_h, completion_event_for_this_recipe).
+    """
+    q, ex, bm = svs.q, svs.ex, svs.bm
+    spec, h_params = svs.model_spec, plan.hyperparams
+    arch_consts = svs.arch_consts
+
+    # Acquire handles for the three buffers involved in this specific pipeline.
+    clipped_ref = bm.get_handle_by_name("clipped_partial_grad_hidden_activations")
+    permuted_ref = bm.get_handle_by_name("permuted_grad_h")
+    summed_ref = bm.get_handle_by_name("summed_grad_hidden_activations")
+
+    # Step 1: Gather scattered partials and permute into a reduction-ready SoA layout (Node 13).
+    permute_sig = GatherAndPermuteGradHiddenActivationsSignature(
+        buffer_mgr=bm,
+        clipped_partials_aos_ref=clipped_ref,
+        permuted_soa_out_ref=permuted_ref,
+        total_modules_count=np.uint32(spec.num_modules),
+        hidden_count=np.uint32(spec.hidden_dim),
+        total_batch_count=np.uint32(plan.effective_batch_size),
+        num_module_chunks_count=np.uint32(plan.grid.num_module_chunks),
+        modules_per_chunk_count=np.uint32(plan.grid.get_tile(0, 0).modules_per_chunk),
+        num_class_chunks_count=np.uint32(plan.grid.num_class_chunks),
+    )
+    permute_evt = ex.launch(q, permute_sig, wait_for=deps)
+
+    # Step 2: Reduce the permuted buffer using the specialized, policy-aware kernel (Node 16).
+    wgs0 = arch_consts.get("work_group_size_0", 256)
+    policy_k = plan.stabilization_policy.get_specialized_reduction_policy_k(
+        user_policy_k=h_params.reduction_k_grad_h,
+        hardware_max_fan_in=wgs0,
+    )
+    reduce_sig = StabilizeAndReduceGradHiddenActivationsSignature(
+        buffer_mgr=bm,
+        work_group_size_0=wgs0,
+        scalar_size_bytes=spec.scalar_dtype().itemsize,
+        permuted_soa_in_ref=permuted_ref,
+        final_grad_h_out_ref=summed_ref,
+        fp_max=SCALAR_NP_TYPE(plan.stabilization_policy.fp_format_max),
+        policy_t_algorithmic=SCALAR_NP_TYPE(h_params.max_grad_norm),
+        policy_lambda=SCALAR_NP_TYPE(h_params.stabilization_lambda),
+        policy_max_k=np.uint32(policy_k),
+        epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
+        total_batch_count=np.uint32(plan.effective_batch_size),
+        padded_hidden_count=np.uint32(spec.padded_hidden_dim),
+        total_modules_count=np.uint32(spec.num_modules),
+        padded_total_modules_count=np.uint32(spec.padded_module_dim),
+    )
+    reduce_evt = ex.launch(q, reduce_sig, wait_for=[permute_evt])
+
+    return summed_ref, reduce_evt
 
 
 # =========================================================================
@@ -863,71 +889,90 @@ def execute_summation_tree(
             bm.release_transient_buffer(handle)
 
 
-def execute_specialized_grad_h_reduction(
-    svs: Services, plan: ExecutionPlan, deps: List[cl.Event]
-) -> Tuple[BufferHandle, cl.Event]:
+def compute_effective_batch_size(
+    svs: "Services",
+    batch_size: int,
+    deps: List[cl.Event],
+) -> Tuple[HostView, cl.Event]:
     """
-    (REV 2) Recipe for the specialized permutation and reduction of Grad_H.
+    (Node 21 Dependency) A stateless recipe to compute the effective batch size.
 
-    This version corrects a critical bug by instantiating the correct kernel signature,
-    `StabilizeAndReduceGradHiddenActivationsSignature`, and providing the full set of
-    policy and dimensional scalars mandated by its contract (Node 16).
+    Architectural Mandate:
+    This recipe is the sole, authoritative implementation of the `Calculability Proof`
+    for the `src_scalar_REAL_effective_batch_size` parameter in the `normalize_gradients`
+    kernel contract. Its purpose is to perform a reduction sum over the `sample_mask`
+    buffer on the device and make the resulting single scalar value available to the host.
+
+    Role:
+    As a foundational recipe, it abstracts away the complexity of reduction and
+    asynchronous data retrieval. It is invoked by the `BatchProcessor` to acquire
+    the correct normalization factor before launching the final update subgraph.
+
+    Return Value Contract:
+    This function returns a tuple containing:
+    1.  A `HostView` object: An asynchronous handle to the host-side result.
+    2.  A `cl.Event`: The final event that signals the completion of the device-to-host
+        copy. The caller MUST wait for this event before calling `.get()` on the
+        HostView object to safely retrieve the scalar value.
+
+    Args:
+        svs: The bundle of core system services.
+        batch_size: The logical size of the batch, used to define the gather primitive.
+        deps: A list of `cl.Event` objects to wait for before executing (e.g., the
+              event from uploading the `sample_mask` data).
+
+    Returns:
+        A tuple of (HostView, cl.Event) for asynchronous result retrieval.
     """
-    q, ex, bm = svs.q, svs.ex, svs.q
-    spec, h_params = svs.model_spec, plan.hyperparams
-    arch_consts = svs.arch_consts
+    bm, spec = svs.bm, svs.model_spec
 
-    clipped_ref = bm.get_handle_by_name("clipped_partial_grad_hidden_activations")
-    permuted_ref = bm.get_handle_by_name("permuted_grad_h")
-    summed_ref = bm.get_handle_by_name("summed_grad_hidden_activations")
+    # 1. Acquire a transient buffer to hold the single scalar result of the reduction.
+    #    This buffer is managed with a try/finally block to guarantee its release.
+    scalar_byte_size = spec.scalar_dtype().itemsize
+    result_buffer_ref = bm.acquire_transient_buffer(scalar_byte_size)
 
-    # Step 1: Gather & Permute (Node 13) - This step was already correct.
-    permute_sig = GatherAndPermuteGradHiddenActivationsSignature(
-        buffer_mgr=bm,
-        clipped_partials_aos_ref=clipped_ref,
-        permuted_soa_out_ref=permuted_ref,
-        total_modules_count=np.uint32(spec.num_modules),
-        hidden_count=np.uint32(spec.hidden_dim),
-        total_batch_count=np.uint32(plan.effective_batch_size),
-        num_module_chunks_count=np.uint32(plan.grid.num_module_chunks),
-        modules_per_chunk_count=np.uint32(plan.grid.get_tile(0, 0).modules_per_chunk),
-        num_class_chunks_count=np.uint32(plan.grid.num_class_chunks),
-    )
-    permute_evt = ex.launch(q, permute_sig, wait_for=deps)
+    try:
+        # 2. Define the reduction plan and the memory layout of the source data.
+        #    We model the 1D sample_mask as `batch_size` partials, each of size 1.
+        #    This allows us to reuse the generic reduction engine.
+        wgs0 = svs.arch_consts.get("work_group_size_0", 256)
+        reduction_plan = ReductionPlan(k=wgs0)
+        gather_prim = LinearlyChunkedGather(num_chunks=batch_size, elements_per_chunk=1)
+        sample_mask_ref = bm.get_handle_by_name("sample_mask")
 
-    # --- Step 2: Reduce the permuted buffer (Node 16) - Corrected Implementation ---
+        # 3. Launch the generic summation tree recipe to perform the reduction on the device.
+        reduction_complete_evt = execute_summation_tree(
+            svs=svs,
+            reduction_plan=reduction_plan,
+            gather_primitive=gather_prim,
+            partial_collection_ref=sample_mask_ref,
+            final_dest_handle=result_buffer_ref,
+            wait_for=deps,
+        )
 
-    # 2a. The Host must first synthesize the tactical `policy_max_k` scalar by
-    #     delegating to the StabilizationPolicy object, as mandated by the contract.
-    wgs0 = arch_consts.get("work_group_size_0", 256)
-    policy_k = plan.stabilization_policy.get_specialized_reduction_policy_k(
-        user_policy_k=h_params.reduction_k_grad_h,
-        hardware_max_fan_in=wgs0,
-    )
+        # 4. Prepare for the asynchronous download of the single scalar result.
+        #    The HostView acts as a padded numpy array on the host, ready to receive data.
+        host_view = HostView(
+            padded_shape=(1,),
+            dtype=spec.scalar_dtype,
+            real_shape=(1,),
+        )
 
-    # 2b. The Host then instantiates the correct signature with the full set of policy
-    #     and dimensional parameters, fully satisfying the kernel contract.
-    reduce_sig = StabilizeAndReduceGradHiddenActivationsSignature(
-        buffer_mgr=bm,
-        work_group_size_0=wgs0,
-        scalar_size_bytes=spec.scalar_dtype().itemsize,
-        permuted_soa_in_ref=permuted_ref,
-        final_grad_h_out_ref=summed_ref,
-        # -- Contractually Mandated Policy Scalars --
-        fp_max=SCALAR_NP_TYPE(plan.stabilization_policy.fp_format_max),
-        policy_t_algorithmic=SCALAR_NP_TYPE(h_params.max_grad_norm),
-        policy_lambda=SCALAR_NP_TYPE(h_params.stabilization_lambda),
-        policy_max_k=np.uint32(policy_k),
-        epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
-        # -- Contractually Mandated Dimensional Scalars --
-        total_batch_count=np.uint32(plan.effective_batch_size),
-        padded_hidden_count=np.uint32(spec.padded_hidden_dim),
-        total_modules_count=np.uint32(spec.num_modules),
-        padded_total_modules_count=np.uint32(spec.padded_module_dim),
-    )
-    reduce_evt = ex.launch(q, reduce_sig, wait_for=[permute_evt])
+        # 5. Enqueue the non-blocking copy from the transient device buffer to the host view.
+        download_complete_evt = host_view.enqueue_read(
+            queue=svs.q,
+            cl_buffer=bm.get_cl_buffer(result_buffer_ref),
+            wait_for=[reduction_complete_evt],
+        )
 
-    return summed_ref, reduce_evt
+        # 6. Return the host view and the final event. The caller now owns the
+        #    responsibility of waiting for the event and extracting the data.
+        return host_view, download_complete_evt
+
+    finally:
+        # 7. This is a contractually obligated step. The transient buffer used for
+        #    the reduction result MUST be released to prevent VRAM leakage.
+        bm.release_transient_buffer(result_buffer_ref)
 
 
 def build_update_subgraph(

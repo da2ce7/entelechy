@@ -190,13 +190,6 @@ class ProblemTypeStrategy(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def build_loss_aggregation_subgraph(
-        self, svs: "Services", plan: "ExecutionPlan", deps: List[cl.Event]
-    ) -> Optional[cl.Event]:
-        """Builds the sub-graph for aggregating loss, if required. Returns None if not."""
-        pass
-
-    @abc.abstractmethod
     def get_loss_signature(self, **kwargs) -> KernelSignature:
         """Returns the appropriate signature for Node 6 or 7."""
         pass
@@ -227,10 +220,6 @@ class CceStrategy(ProblemTypeStrategy):
     def required_targets_buffer_name(self) -> str:
         return "targets_cce"
 
-    def build_loss_aggregation_subgraph(self, svs: "Services", plan: "ExecutionPlan", deps: List[cl.Event]):
-        # CCE uses a direct scatter-write for loss, so no aggregation is needed.
-        return None
-
     def get_loss_signature(self, **kwargs) -> "ComputeProbsLossCceChunkSignature":
         return ComputeProbsLossCceChunkSignature(target_ref=self.targets_cce_ref, **kwargs)
 
@@ -253,28 +242,6 @@ class BceStrategy(ProblemTypeStrategy):
     @property
     def required_targets_buffer_name(self) -> str:
         return "targets_bce"
-
-    def build_loss_aggregation_subgraph(
-        self, svs: "Services", plan: "ExecutionPlan", deps: List[cl.Event]
-    ) -> Optional[cl.Event]:
-        # BCE loss is computed per-class and must be aggregated. This method
-        # encapsulates the logic for that aggregation.
-        bm = svs.bm
-        loss_partials_ref = bm.get_handle_by_name("partial_loss")
-        loss_summed_ref = bm.get_handle_by_name("final_loss")
-        loss_shape, _ = bm.get_spec(loss_partials_ref)
-        elements_per_partial = int(np.prod(loss_shape[1:]))
-        gather_prim = TiledGather(plan.grid, elements_per_partial)
-
-        # Call the generic summation recipe.
-        return recipes.execute_summation_tree(
-            svs=svs,
-            reduction_plan=plan.reduction_plan,
-            gather_primitive=gather_prim,
-            partial_collection_ref=loss_partials_ref,
-            final_dest_handle=loss_summed_ref,
-            wait_for=deps,
-        )
 
     def get_loss_signature(self, **kwargs) -> "ComputeProbsLossBceChunkSignature":
         return ComputeProbsLossBceChunkSignature(target_ref=self.targets_bce_ref, **kwargs)

@@ -1,25 +1,13 @@
 # batch_processor.py
 
-"""
-(REV 2) This module provides the `BatchProcessor`,
-the "Conductor" of the training process, which executes a single `ExecutionPlan`.
-
-This version is architecturally complete. It is now a pure Conductor, fully
-decoupled from the specifics of any problem type. It delegates all
-strategy-specific decisions (such as target buffer selection and loss
-aggregation) to the polymorphic `ProblemTypeStrategy` object provided in the plan.
-This fulfills the system's core principles by making the `BatchProcessor` a
-generic sequencer of abstract recipes.
-"""
-
-from typing import Dict, List
+from typing import Dict, Tuple
 
 import numpy as np
 import pyopencl as cl
 
 # --- Architectural Imports ---
 from execution_plan import ExecutionPlan
-from launcher_infra import Services
+from launcher_infra import Services, HostView
 from parameter_space import ParameterSpace
 from . import graph_recipes as recipes
 from workload_primitives import TiledGather, LinearlyChunkedGather
@@ -28,52 +16,61 @@ from workload_primitives import TiledGather, LinearlyChunkedGather
 class BatchProcessor:
     """
     A transient object that executes a single, complete ExecutionPlan.
-    This class is the "Conductor" of the DAG execution.
+    This class is the "Conductor" of the DAG execution. It sequences the
+    high-level recipes, but delegates all strategic and tactical decisions
+    to the `ExecutionPlan` and the recipes themselves.
     """
 
     def __init__(self, services: Services, param_space: ParameterSpace, plan: ExecutionPlan):
         """
-        Initializes the conductor. It is a self-sufficient orchestrator of recipes.
+        Initializes the conductor.
+
+        Args:
+            services: A bundle of core system services (queue, executor, etc.).
+            param_space: The manifest defining all learnable parameters.
+            plan: The immutable `ExecutionPlan` for this specific batch.
         """
         self.svs = services
         self.plan = plan
         self.param_space = param_space
 
-    def run(self, X_batch: np.ndarray, y_batch: np.ndarray, step: int) -> cl.Event:
+    def run(self, X_batch: np.ndarray, y_batch: np.ndarray, step: int) -> Tuple[cl.Event, cl.Event, HostView]:
         """
         Executes the full training step by directly calling the canonical recipes.
-        The logic is a clean, linear sequence of computational phases.
+        The logic is a clean, linear sequence of computational phases, with two
+        primary, parallel event chains: one for the learning update and one for
+        asynchronous diagnostic retrieval.
+
+        Returns:
+            A tuple containing the events and handles for asynchronous interaction:
+            1. `final_learn_event`: Signals completion of the entire backprop and update cycle.
+            2. `inference_event`: Signals completion of the D2H copy for `Final Probs`.
+            3. `final_probs_view`: The `HostView` object to call `.get()` on after
+                                   `inference_event` completes.
         """
         q, bm = self.svs.q, self.svs.ex
-        print("    [Conductor] Beginning batch processing...")
 
-        # --- Phase 1: Initial Data Uploads & Strategic Dependency Resolution ---
+        # Phase 1: Initial Data Uploads & Async Dependency Calculation
         upload_x_evt = cl.enqueue_copy(q, bm.get_cl_buffer("input"), X_batch)
-
-        # Simply ask the plan's strategy for the correct buffer name.
         targets_buffer_name = self.plan.problem_type.required_targets_buffer_name
         upload_y_evt = cl.enqueue_copy(q, bm.get_cl_buffer(targets_buffer_name), y_batch)
 
-        initial_deps = [upload_x_evt, upload_y_evt]
+        effective_bs_view, effective_bs_ready_evt = recipes.compute_effective_batch_size(
+            svs=self.svs,
+            batch_size=X_batch.shape[0],
+            deps=[upload_y_evt],
+        )
 
-        # The Conductor blindly resolves the dependency for `hidden_activations`.
-        # The plan's policy dictates whether this returns a cached handle instantly
-        # or launches a recomputation kernel.
         h_provider = self.plan.lifecycle_policy.get_provider("hidden_activations")
-        h_ref, h_ready_evt = h_provider.resolve(q, self.svs.ex, wait_for=initial_deps)
+        h_ref, h_ready_evt = h_provider.resolve(q, self.svs.ex, wait_for=[upload_x_evt, upload_y_evt])
 
-        # --- Phase 2: Parallel Partial Gradient Production ---
-        # The Conductor launches all the necessary forward and backward passes
-        # to produce the full set of clipped, partial gradients.
-
-        # 2a. Run the forward module path for every tile to get probabilities.
+        # Phase 2: Parallel Partial Gradient Production
         prob_results = [
             recipes.build_forward_module_path(self.svs, tile, self.plan, h_ref, h_ready_evt) for tile in self.plan.grid
         ]
         prob_events = [res[1] for res in prob_results]
         all_probs_ready_evt = cl.WaitForEvents(prob_events)
 
-        # 2b. Run the appropriate backward paths based on the strategic plan.
         if self.plan.adaptation_strategy == "CACHE":
             prob_refs = [res[0] for res in prob_results]
             bwd_mod_events = [
@@ -84,33 +81,28 @@ class BatchProcessor:
             ]
             all_module_grads_clipped_evt = cl.WaitForEvents(bwd_mod_events)
         else:
-            # If not caching, the grad_h stream will handle this path.
-            # We just need to sync on the probability calculations.
             all_module_grads_clipped_evt = all_probs_ready_evt
 
-        # 2c. Launch the shared-layer backpropagation stream. This is always run.
         shared_grads_clipped_evt = recipes.build_shared_backprop_subgraph(self.svs, self.plan, deps=[h_ready_evt])
 
-        # Synchronization point: Wait for all parallel tracks to finish their partials.
         all_partials_ready_evt = cl.WaitForEvents([all_module_grads_clipped_evt, shared_grads_clipped_evt])
-        print("    [Conductor] Sync Point 1: All partial gradients produced and clipped.")
 
-        # --- Phase 3: Aggregation via Differentiated Reduction ---
+        # Phase 3: Aggregation & Result Retrieval
         reduction_events = []
         summed_grad_handles = {}
 
-        # Blindly delegate the entire loss aggregation step to the strategy.
-        # The `build_loss_aggregation_subgraph` method will do nothing if no
-        # reduction is needed (e.g., for CCE), returning None.
-        loss_sum_evt = self.plan.problem_type.build_loss_aggregation_subgraph(
+        diag_agg_events = recipes.execute_diagnostic_aggregation(
             svs=self.svs, plan=self.plan, deps=[all_probs_ready_evt]
         )
-        if loss_sum_evt:
-            reduction_events.append(loss_sum_evt)
+        reduction_events.extend(diag_agg_events.values())
 
-        # Use the STABILIZED reduction engine for all gradient parameters.
-        print("    [Conductor] Aggregating gradients (stabilized reduction)...")
-        # 3a. Aggregate the shared-path gradients.
+        final_probs_ref = self.svs.bm.get_handle_by_name("final_probs")
+        final_probs_shape, dtype = self.svs.bm.get_spec(final_probs_ref)
+        final_probs_view = HostView(padded_shape=final_probs_shape, dtype=dtype, real_shape=final_probs_shape)
+        inference_event = final_probs_view.enqueue_read(
+            q, bm.get_cl_buffer(final_probs_ref), wait_for=[diag_agg_events["probs"]]
+        )
+
         for flow in self.param_space:
             if flow.name in ["shared_weights", "shared_biases"]:
                 clipped_ref = bm.get_handle_by_name(flow.clipped_partial_grad_buffer_name)
@@ -130,8 +122,6 @@ class BatchProcessor:
                 reduction_events.append(evt)
                 summed_grad_handles[flow.name] = summed_ref
 
-        # 3b. Aggregate the module-path gradients. This logic must run for BOTH "CACHE"
-        #     and "RECOMPUTE_GRAD_H" strategies, as both produce the necessary partials.
         for flow in self.param_space:
             if flow.name in ["module_weights", "module_biases", "temperatures"]:
                 clipped_ref = bm.get_handle_by_name(flow.clipped_partial_grad_buffer_name)
@@ -151,23 +141,25 @@ class BatchProcessor:
                 reduction_events.append(evt)
                 summed_grad_handles[flow.name] = summed_ref
 
-        # 3c. Resolve the dependency for `summed_grad_hidden_activations`.
         grad_h_provider = self.plan.lifecycle_policy.get_provider("summed_grad_hidden_activations")
         grad_h_handle, grad_h_evt = grad_h_provider.resolve(q, self.svs.ex, wait_for=[all_partials_ready_evt])
         reduction_events.append(grad_h_evt)
+        summed_grad_handles["hidden_activations"] = grad_h_handle
 
         all_grads_summed_evt = cl.WaitForEvents(reduction_events)
-        print("    [Conductor] Sync Point 2: All data aggregated.")
 
-        # --- Phase 4: Final Batch-Wide Update ---
-        final_event = recipes.build_update_subgraph(
+        # Phase 4: Final Batch-Wide Update
+        effective_bs_ready_evt.wait()
+        effective_batch_size_scalar = effective_bs_view.get()[0]
+
+        update_deps = [all_grads_summed_evt, effective_bs_ready_evt]
+        final_learn_event = recipes.build_update_subgraph(
             svs=self.svs,
             param_space=self.param_space,
             step=step,
             summed_grads=summed_grad_handles,
-            plan=self.plan,
-            deps=[all_grads_summed_evt],
+            effective_batch_size=float(effective_batch_size_scalar),
+            deps=update_deps,
         )
-        print("    [Conductor] Final update phase launched.")
 
-        return final_event
+        return final_learn_event, inference_event, final_probs_view
