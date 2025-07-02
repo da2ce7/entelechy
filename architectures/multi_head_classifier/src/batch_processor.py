@@ -72,6 +72,8 @@ class BatchProcessor:
         all_probs_ready_evt = cl.WaitForEvents(prob_events)
 
         if self.plan.adaptation_strategy == "CACHE":
+            # In CACHE mode, h_ref is persistent, so we can directly launch the
+            # standard backward pass for each tile.
             prob_refs = [res[0] for res in prob_results]
             bwd_mod_events = [
                 recipes.build_backward_module_path(
@@ -80,8 +82,20 @@ class BatchProcessor:
                 for i, tile in enumerate(self.plan.grid)
             ]
             all_module_grads_clipped_evt = cl.WaitForEvents(bwd_mod_events)
+
+        elif self.plan.adaptation_strategy == "RECOMPUTE_GRAD_H":
+            # In RECOMPUTE_GRAD_H mode, we MUST explicitly launch the streaming
+            # recipe that generates all partial module gradients.
+            module_grad_events_map = recipes.build_streaming_module_grad_path(
+                svs=self.svs, plan=self.plan, deps=[all_probs_ready_evt]
+            )
+            # The final synchronization point for this path is the event that signals
+            # all collections are populated.
+            all_module_grads_clipped_evt = module_grad_events_map["clipped_partial_grad_hidden_activations"]
+
         else:
-            all_module_grads_clipped_evt = all_probs_ready_evt
+            # Enforce correctness by failing loudly if an unknown strategy is provided.
+            raise ValueError(f"Unknown adaptation strategy: '{self.plan.adaptation_strategy}'")
 
         shared_grads_clipped_evt = recipes.build_shared_backprop_subgraph(self.svs, self.plan, deps=[h_ready_evt])
 

@@ -1,4 +1,4 @@
-# Entelechy
+# Entelechy  (unstable, history will be re-written)
 
 ![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)
