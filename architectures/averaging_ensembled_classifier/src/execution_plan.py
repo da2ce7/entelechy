@@ -22,7 +22,8 @@ correctness are made manifest.
 
 import abc
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Callable, Optional, TYPE_CHECKING
+from functools import partial
+from typing import Dict, List, Tuple, Optional, TYPE_CHECKING
 
 import numpy as np
 import pyopencl as cl
@@ -115,16 +116,12 @@ class RecomputeProvider(DependencyProvider):
 class StagedComputationProvider(DependencyProvider):
     """A generic, powerful provider for complex, multi-kernel dependency chains."""
 
-    # WHY: This provider serves as an elegant "escape hatch." It allows for the
-    # encapsulation of arbitrarily complex logic (e.g., a permutation followed by
-    # a reduction) behind the same simple `resolve` interface. It keeps the
-    # core provider contract clean while allowing for limitless extensibility.
-    computation_fn: Callable[[cl.CommandQueue, KernelExecutor, List[cl.Event]], Tuple[BufferHandle, cl.Event]]
+    computation_fn: partial
 
     def resolve(
         self, queue: cl.CommandQueue, ex: KernelExecutor, wait_for: List[cl.Event]
     ) -> Tuple[BufferHandle, cl.Event]:
-        # Delegates the entire complex resolution to the injected function.
+        # Delegates the entire complex resolution to the injected partial function.
         return self.computation_fn(queue, ex, wait_for)
 
 
@@ -198,16 +195,16 @@ class CceStrategy(ProblemTypeStrategy):
         return "targets_cce"
 
     def get_loss_signature(self, **kwargs) -> "ComputeProbsLossCceChunkSignature":
-        return ComputeProbsLossCceChunkSignature(target_ref=self.targets_cce_ref, **kwargs)
+        return ComputeProbsLossCceChunkSignature(**kwargs, target_ref=self.targets_cce_ref)
 
     def get_module_grad_signature(self, **kwargs) -> "CalculateModuleParamGradsCceSignature":
-        return CalculateModuleParamGradsCceSignature(targets_cce_ref=self.targets_cce_ref, **kwargs)
+        return CalculateModuleParamGradsCceSignature(**kwargs, targets_cce_ref=self.targets_cce_ref)
 
     def get_hidden_grad_signature(self, **kwargs) -> "BackpropErrorToHiddenChunkCceSignature":
-        return BackpropErrorToHiddenChunkCceSignature(targets_cce_ref=self.targets_cce_ref, **kwargs)
+        return BackpropErrorToHiddenChunkCceSignature(**kwargs, targets_cce_ref=self.targets_cce_ref)
 
     def get_temp_grad_signature(self, **kwargs) -> "CalculateChunkTempGradientsCceSignature":
-        return CalculateChunkTempGradientsCceSignature(targets_cce_ref=self.targets_cce_ref, **kwargs)
+        return CalculateChunkTempGradientsCceSignature(**kwargs, targets_cce_ref=self.targets_cce_ref)
 
 
 @dataclass(frozen=True)
@@ -221,16 +218,16 @@ class BceStrategy(ProblemTypeStrategy):
         return "targets_bce"
 
     def get_loss_signature(self, **kwargs) -> "ComputeProbsLossBceChunkSignature":
-        return ComputeProbsLossBceChunkSignature(target_ref=self.targets_bce_ref, **kwargs)
+        return ComputeProbsLossBceChunkSignature(**kwargs, target_ref=self.targets_bce_ref)
 
     def get_module_grad_signature(self, **kwargs) -> "CalculateModuleParamGradsBceSignature":
-        return CalculateModuleParamGradsBceSignature(targets_bce_ref=self.targets_bce_ref, **kwargs)
+        return CalculateModuleParamGradsBceSignature(**kwargs, targets_bce_ref=self.targets_bce_ref)
 
     def get_hidden_grad_signature(self, **kwargs) -> "BackpropErrorToHiddenChunkBceSignature":
-        return BackpropErrorToHiddenChunkBceSignature(targets_bce_ref=self.targets_bce_ref, **kwargs)
+        return BackpropErrorToHiddenChunkBceSignature(**kwargs, targets_bce_ref=self.targets_bce_ref)
 
     def get_temp_grad_signature(self, **kwargs) -> "CalculateChunkTempGradientsBceSignature":
-        return CalculateChunkTempGradientsBceSignature(targets_bce_ref=self.targets_bce_ref, **kwargs)
+        return CalculateChunkTempGradientsBceSignature(**kwargs, targets_bce_ref=self.targets_bce_ref)
 
 
 # =========================================================================

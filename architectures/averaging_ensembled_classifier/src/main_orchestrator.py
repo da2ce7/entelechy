@@ -51,7 +51,7 @@ from .execution_plan import (
     CceStrategy,
     BceStrategy,
 )
-from .launcher_infra import Services, BufferManager, KernelExecutor
+from .launcher_infra import Services, BufferManager, KernelExecutor, BufferHandle
 from .compute_patterns import ReductionPlan
 from .workload_primitives import TilingScheme
 from .stabilization_policy import StabilizationPolicy

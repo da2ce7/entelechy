@@ -60,7 +60,7 @@ class BatchProcessor:
 
         effective_bs_view, effective_bs_ready_evt = recipes.compute_effective_batch_size(
             svs=self.svs,
-            batch_size=X_batch.shape[0],
+            plan=self.plan,
             deps=[upload_y_evt],
         )
 
