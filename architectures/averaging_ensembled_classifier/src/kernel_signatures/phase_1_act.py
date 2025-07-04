@@ -70,8 +70,8 @@ class ForwardPassSignature(KernelSignature):
     def get_grid(self) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
         """Calculates the execution grid based on derived dimensions."""
         global_size = (
-            _pad_to_multiple(self.batch_chunk_count, self.simd_width),
-            self.padded_hidden_count // self.simd_width,
+            _pad_to_multiple(int(self.batch_chunk_count), self.simd_width),
+            int(self.padded_hidden_count) // self.simd_width,
         )
         local_size = (self.simd_width, 1)
         return global_size, local_size
@@ -139,7 +139,11 @@ class RenderLogitsChunkSignature(KernelSignature):
         return "render_logits_chunk"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        global_size = (self.module_chunk_count, self.batch_chunk_count, self.class_chunk_count)
+        global_size = (
+            int(self.module_chunk_count),
+            int(self.batch_chunk_count),
+            int(self.class_chunk_count),
+        )
         return global_size, None
 
     def get_args(self) -> List:
@@ -202,7 +206,11 @@ class ComputeProbsLossCceChunkSignature(KernelSignature):
         return "compute_probs_loss_cce_chunk"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        global_size = (self.tile.modules_per_chunk, self.total_batch_count, self.tile.classes_per_chunk)
+        global_size = (
+            self.tile.modules_per_chunk,
+            int(self.total_batch_count),
+            self.tile.classes_per_chunk,
+        )
         return global_size, None
 
     def get_args(self) -> List:
@@ -263,7 +271,11 @@ class ComputeProbsLossBceChunkSignature(KernelSignature):
         return "compute_probs_loss_bce_chunk"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        global_size = (self.tile.modules_per_chunk, self.total_batch_count, self.tile.classes_per_chunk)
+        global_size = (
+            self.tile.modules_per_chunk,
+            int(self.total_batch_count),
+            self.tile.classes_per_chunk,
+        )
         return global_size, None
 
     def get_args(self) -> List:

@@ -10,6 +10,7 @@ from .execution_plan import ExecutionPlan
 from .launcher_infra import Services, HostView
 from .parameter_space import ParameterSpace
 from .workload_primitives import TiledGather, LinearlyChunkedGather
+from . import graph_recipes as recipes
 
 
 class BatchProcessor:

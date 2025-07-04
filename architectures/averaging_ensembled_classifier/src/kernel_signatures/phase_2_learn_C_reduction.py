@@ -232,7 +232,7 @@ class StabilizeAndReduceGradHiddenActivationsSignature(KernelSignature):
         Sets up a grid where each work-group reduces one row of the SoA matrix.
         The kernel internally divides its work among its work-items.
         """
-        num_rows = self.total_batch_count * self.padded_hidden_count
+        num_rows = int(self.total_batch_count) * int(self.padded_hidden_count)
         global_size = (num_rows * self.work_group_size_0,)
         local_size = (self.work_group_size_0,)
         return global_size, local_size

@@ -236,7 +236,10 @@ class GatherAndPermuteGradHiddenActivationsSignature(KernelSignature):
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
         # Dispatch one work-item per element in the output buffer
-        global_size = (self.total_batch_count * self.padded_hidden_count, self.padded_total_modules_count)
+        global_size = (
+            int(self.total_batch_count) * int(self.padded_hidden_count),
+            int(self.padded_total_modules_count),
+        )
         return global_size, None
 
     def get_args(self) -> List:

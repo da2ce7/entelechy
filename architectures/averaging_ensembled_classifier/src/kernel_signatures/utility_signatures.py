@@ -58,7 +58,10 @@ class TransposeChunkSignature(KernelSignature):
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
         """Calculates global and local work sizes for a tiled algorithm."""
-        global_size = (_pad_to_multiple(self.width, self.c_tile_size), _pad_to_multiple(self.height, self.c_tile_size))
+        global_size = (
+            _pad_to_multiple(int(self.width), self.c_tile_size),
+            _pad_to_multiple(int(self.height), self.c_tile_size),
+        )
         local_size = (self.c_tile_size, self.c_tile_size)
         return global_size, local_size
 

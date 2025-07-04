@@ -35,8 +35,7 @@ from .compute_patterns import ReductionPlan
 from .workload_primitives import TilingScheme
 from .stabilization_policy import StabilizationPolicy
 from .batch_processor import BatchProcessor
-from .graph_recipes import graph_recipes as recipes
-
+from . import graph_recipes as recipes
 
 @dataclass(frozen=True)
 class StabilizationConfig:

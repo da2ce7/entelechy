@@ -21,7 +21,7 @@ import numpy as np
 import pyopencl as cl
 
 # --- Local Infrastructure Imports ---
-from ..launcher_infra import BufferHandle, KernelSignature
+from ..launcher_infra import BufferHandle, KernelSignature, SCALAR_NP_TYPE
 from ..memory_layout import _pad_to_multiple
 
 
@@ -93,7 +93,10 @@ class BackpropSharedWeightsChunkSignature(KernelSignature):
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
         """Calculates 2D grid: (input_dim, hidden_dim)."""
-        global_size = (self.padded_input_count, _pad_to_multiple(int(self.padded_hidden_count), self.work_group_size_1))
+        global_size = (
+            int(self.padded_input_count),
+            _pad_to_multiple(int(self.padded_hidden_count), self.work_group_size_1),
+        )
         local_size = (1, self.work_group_size_1)
         return global_size, local_size
 

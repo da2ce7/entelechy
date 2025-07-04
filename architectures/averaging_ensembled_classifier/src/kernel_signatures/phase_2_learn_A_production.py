@@ -64,7 +64,11 @@ class _CalculateModuleParamGradsBase(KernelSignature):
         return "calculate_module_param_grads_chunk"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        global_size = (self.tile.modules_per_chunk, self.hidden_count, self.tile.classes_per_chunk)
+        global_size = (
+            self.tile.modules_per_chunk,
+            int(self.hidden_count),
+            self.tile.classes_per_chunk,
+        )
         return global_size, None
 
 
@@ -168,7 +172,11 @@ class _BackpropErrorToHiddenChunkBase(KernelSignature):
         return "backprop_error_to_hidden_chunk"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        global_size = (self.tile.modules_per_chunk, self.total_batch_count, self.padded_hidden_count)
+        global_size = (
+            self.tile.modules_per_chunk,
+            int(self.total_batch_count),
+            int(self.padded_hidden_count),
+        )
         return global_size, None
 
 
