@@ -1,19 +1,24 @@
 # kernel_signatures/phase_2_learn_A_production.py
 
 """
-Concrete KernelSignature Implementations for Gradient Production (Nodes 8-10).
+The Definitive, Executable Contracts for the Initial Gradient Production Stage (Nodes 8-10).
 
-This file contains the final, canonical implementations for the kernel launch
-signatures related to the first and most parallelizable stage of the 'Learn'
-phase. These kernels are responsible for calculating the initial, un-aggregated
-partial gradients for a single tile of work.
+Jurisdictional Mandate:
+This file is the canonical Python-side embodiment of the C-level kernel
+contracts for the first, massively parallel stage of the 'Learn' phase. Its
+jurisdiction is to define the immutable, self-sufficient 'artisan' classes
+responsible for producing the raw, un-aggregated partial gradients for all
+module-specific parameters (`Grad_ModW`, `Grad_ModB`, `Grad_H`, `Grad_Temps`).
 
-This implementation follows a rectified design pattern: for each kernel that
-depends on `problem_type` (CCE vs. BCE), a private base class encapsulates
-shared logic, while two public, type-safe derived classes are exposed to the
-orchestrator. This eliminates type ambiguity for the `targets` buffer and
-removes the need for the orchestrator to manage the problem type flag, thus
-enforcing correctness by design.
+Architectural Rectification:
+This version formalizes a powerful design pattern: for each kernel whose
+logic depends on the problem type (CCE vs. BCE), an internal base class
+encapsulates shared logic, while two distinct, public, type-safe classes
+are exposed. This is a profound architectural improvement:
+  1. It enforces correctness by design, making it impossible to pass the
+     wrong type of 'targets' buffer to the wrong kernel variant.
+  2. It absolves the higher-level recipes of managing a 'problem_type' flag,
+     as the choice of signature class itself encodes this information.
 """
 
 from dataclasses import dataclass, field
@@ -22,22 +27,31 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pyopencl as cl
 
-# --- Local Infrastructure Imports ---
+# --- Foundational Primitives & Core Infrastructure ---
 from ..workload_primitives import WorkTile
 from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
+from ..cl_context_manager import DiscoveredArchConstants
 
 
-# === Node 8: Calculate Module Parameter Gradients ===
+# =========================================================================
+# === Node 8: Calculate Module Parameter Gradients (`Grad_ModW`, `Grad_ModB`)
+# =========================================================================
 
 
 @dataclass(frozen=True)
 class _CalculateModuleParamGradsBase(KernelSignature):
-    """(Internal) Shared base for Node 8 gradient production (`Grad_ModW`, `Grad_ModB`)."""
+    """
+    (Internal) A shared base class to enforce consistency and prevent code
+    duplication for the Node 8 `calculate_module_param_grads_chunk` kernel.
+    This class is an implementation detail and not part of the public API.
+    """
 
+    # --- Injected System Context (The Architectural Mandate) ---
     _buffer_mgr: BufferManager
+    _arch_consts: DiscoveredArchConstants
 
+    # --- Kernel-Specific Needs ---
     work_group_size_0: int
-    scalar_size_bytes: int
     h_ref: BufferHandle
     prob_ref: BufferHandle
     mask_ref: BufferHandle
@@ -50,11 +64,15 @@ class _CalculateModuleParamGradsBase(KernelSignature):
     total_output_class_count: np.uint32
     padded_total_output_class_count: np.uint32
     total_modules_count: np.uint32
+
+    # --- Derived Fields ---
     padded_hidden_count: np.uint32 = field(init=False)
     total_batch_count: np.uint32 = field(init=False)
     total_tile_count: np.uint32 = field(init=False)
 
     def __post_init__(self):
+        """Derives physical dimensions from the injected memory context."""
+        super().__post_init__()
         h_shape, _ = self._buffer_mgr.get_spec(self.h_ref)
         gw_shape, _ = self._buffer_mgr.get_spec(self.gw_out_ref)
         object.__setattr__(self, "padded_hidden_count", np.uint32(h_shape[1]))
@@ -76,12 +94,14 @@ class _CalculateModuleParamGradsBase(KernelSignature):
 
 @dataclass(frozen=True)
 class CalculateModuleParamGradsCceSignature(_CalculateModuleParamGradsBase):
-    """(Node 8 - CCE) Type-safe signature for CCE-based param gradients."""
+    """(Node 8 - CCE) The type-safe, public signature for CCE-based param gradients."""
 
-    targets_cce_ref: BufferHandle
+    targets_cce_ref: BufferHandle  # Contractually accepts the CCE (int) targets buffer.
 
     def get_args(self) -> List:
-        local_mem_size = self.work_group_size_0 * self.scalar_size_bytes
+        """Assembles arguments, injecting the correct `problem_type` flag (0)."""
+        scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
+        local_mem_size = self.work_group_size_0 * scalar_size_bytes
         return [
             cl.LocalMemory(local_mem_size),
             self._buffer_mgr.get_cl_buffer(self.h_ref),
@@ -90,7 +110,7 @@ class CalculateModuleParamGradsCceSignature(_CalculateModuleParamGradsBase):
             self._buffer_mgr.get_cl_buffer(self.mask_ref),
             self._buffer_mgr.get_cl_buffer(self.gw_out_ref),
             self._buffer_mgr.get_cl_buffer(self.gb_out_ref),
-            np.uint32(0),
+            np.uint32(0),  # PROBLEM_TYPE_CCE
             np.uint32(self.tile.flat_tile_index),
             self.batch_chunk_offset,
             self.batch_chunk_count,
@@ -109,12 +129,14 @@ class CalculateModuleParamGradsCceSignature(_CalculateModuleParamGradsBase):
 
 @dataclass(frozen=True)
 class CalculateModuleParamGradsBceSignature(_CalculateModuleParamGradsBase):
-    """(Node 8 - BCE) Type-safe signature for BCE-based param gradients."""
+    """(Node 8 - BCE) The type-safe, public signature for BCE-based param gradients."""
 
-    targets_bce_ref: BufferHandle
+    targets_bce_ref: BufferHandle  # Contractually accepts the BCE (float) targets buffer.
 
     def get_args(self) -> List:
-        local_mem_size = self.work_group_size_0 * self.scalar_size_bytes
+        """Assembles arguments, injecting the correct `problem_type` flag (1)."""
+        scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
+        local_mem_size = self.work_group_size_0 * scalar_size_bytes
         return [
             cl.LocalMemory(local_mem_size),
             self._buffer_mgr.get_cl_buffer(self.h_ref),
@@ -123,7 +145,7 @@ class CalculateModuleParamGradsBceSignature(_CalculateModuleParamGradsBase):
             self._buffer_mgr.get_cl_buffer(self.mask_ref),
             self._buffer_mgr.get_cl_buffer(self.gw_out_ref),
             self._buffer_mgr.get_cl_buffer(self.gb_out_ref),
-            np.uint32(1),
+            np.uint32(1),  # PROBLEM_TYPE_BCE
             np.uint32(self.tile.flat_tile_index),
             self.batch_chunk_offset,
             self.batch_chunk_count,
@@ -140,14 +162,17 @@ class CalculateModuleParamGradsBceSignature(_CalculateModuleParamGradsBase):
         ]
 
 
-# === Node 9: Backpropagate Error to Hidden Layer ===
+# =========================================================================
+# === Node 9: Backpropagate Error to Hidden Layer (`Grad_H`)
+# =========================================================================
 
 
 @dataclass(frozen=True)
 class _BackpropErrorToHiddenChunkBase(KernelSignature):
-    """(Internal) Shared base for Node 9 gradient production (`Grad_H`)."""
+    """(Internal) Shared base for the Node 9 `backprop_error_to_hidden_chunk` kernel."""
 
     _buffer_mgr: BufferManager
+    _arch_consts: DiscoveredArchConstants
 
     prob_ref: BufferHandle
     mask_ref: BufferHandle
@@ -156,6 +181,7 @@ class _BackpropErrorToHiddenChunkBase(KernelSignature):
     tile: WorkTile
     hidden_count: np.uint32
     total_output_class_count: np.uint32
+
     padded_hidden_count: np.uint32 = field(init=False)
     padded_total_output_class_count: np.uint32 = field(init=False)
     total_batch_count: np.uint32 = field(init=False)
@@ -163,6 +189,7 @@ class _BackpropErrorToHiddenChunkBase(KernelSignature):
     total_tile_count: np.uint32 = field(init=False)
 
     def __post_init__(self):
+        super().__post_init__()
         w_shape, _ = self._buffer_mgr.get_spec(self.w_mod_ref)
         gh_shape, _ = self._buffer_mgr.get_spec(self.gh_out_ref)
         object.__setattr__(self, "total_modules_count", np.uint32(w_shape[0]))
@@ -186,7 +213,7 @@ class _BackpropErrorToHiddenChunkBase(KernelSignature):
 
 @dataclass(frozen=True)
 class BackpropErrorToHiddenChunkCceSignature(_BackpropErrorToHiddenChunkBase):
-    """(Node 9 - CCE) Type-safe signature for CCE-based `Grad_H` calculation."""
+    """(Node 9 - CCE) The type-safe, public signature for CCE-based `Grad_H` calculation."""
 
     targets_cce_ref: BufferHandle
 
@@ -214,7 +241,7 @@ class BackpropErrorToHiddenChunkCceSignature(_BackpropErrorToHiddenChunkBase):
 
 @dataclass(frozen=True)
 class BackpropErrorToHiddenChunkBceSignature(_BackpropErrorToHiddenChunkBase):
-    """(Node 9 - BCE) Type-safe signature for BCE-based `Grad_H` calculation."""
+    """(Node 9 - BCE) The type-safe, public signature for BCE-based `Grad_H` calculation."""
 
     targets_bce_ref: BufferHandle
 
@@ -240,17 +267,19 @@ class BackpropErrorToHiddenChunkBceSignature(_BackpropErrorToHiddenChunkBase):
         ]
 
 
-# === Node 10: Calculate Temperature Gradients ===
+# =========================================================================
+# === Node 10: Calculate Temperature Gradients (`Grad_Temps`)
+# =========================================================================
 
 
 @dataclass(frozen=True)
 class _CalculateChunkTempGradientsBase(KernelSignature):
-    """(Internal) Shared base for Node 10 gradient production (`Grad_Temps`)."""
+    """(Internal) Shared base for the Node 10 `calculate_chunk_temp_gradients` kernel."""
 
     _buffer_mgr: BufferManager
+    _arch_consts: DiscoveredArchConstants
 
     work_group_size_0: int
-    scalar_size_bytes: int
     logit_ref: BufferHandle
     prob_ref: BufferHandle
     mask_ref: BufferHandle
@@ -258,12 +287,14 @@ class _CalculateChunkTempGradientsBase(KernelSignature):
     gt_out_ref: BufferHandle
     tile: WorkTile
     total_output_class_count: np.uint32
+
     padded_total_output_class_count: np.uint32 = field(init=False)
     total_batch_count: np.uint32 = field(init=False)
     total_modules_count: np.uint32 = field(init=False)
     total_tile_count: np.uint32 = field(init=False)
 
     def __post_init__(self):
+        super().__post_init__()
         logit_shape, _ = self._buffer_mgr.get_spec(self.logit_ref)
         gt_shape, _ = self._buffer_mgr.get_spec(self.gt_out_ref)
         object.__setattr__(self, "total_modules_count", np.uint32(logit_shape[0]))
@@ -283,12 +314,13 @@ class _CalculateChunkTempGradientsBase(KernelSignature):
 
 @dataclass(frozen=True)
 class CalculateChunkTempGradientsCceSignature(_CalculateChunkTempGradientsBase):
-    """(Node 10 - CCE) Type-safe signature for CCE-based temperature gradients."""
+    """(Node 10 - CCE) The type-safe, public signature for CCE-based temperature gradients."""
 
     targets_cce_ref: BufferHandle
 
     def get_args(self) -> List:
-        local_mem_size = self.work_group_size_0 * self.scalar_size_bytes
+        scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
+        local_mem_size = self.work_group_size_0 * scalar_size_bytes
         return [
             cl.LocalMemory(local_mem_size),
             self._buffer_mgr.get_cl_buffer(self.logit_ref),
@@ -312,12 +344,13 @@ class CalculateChunkTempGradientsCceSignature(_CalculateChunkTempGradientsBase):
 
 @dataclass(frozen=True)
 class CalculateChunkTempGradientsBceSignature(_CalculateChunkTempGradientsBase):
-    """(Node 10 - BCE) Type-safe signature for BCE-based temperature gradients."""
+    """(Node 10 - BCE) The type-safe, public signature for BCE-based temperature gradients."""
 
     targets_bce_ref: BufferHandle
 
     def get_args(self) -> List:
-        local_mem_size = self.work_group_size_0 * self.scalar_size_bytes
+        scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
+        local_mem_size = self.work_group_size_0 * scalar_size_bytes
         return [
             cl.LocalMemory(local_mem_size),
             self._buffer_mgr.get_cl_buffer(self.logit_ref),

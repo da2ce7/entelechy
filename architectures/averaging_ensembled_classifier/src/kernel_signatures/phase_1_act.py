@@ -1,17 +1,22 @@
 # kernel_signatures/phase_1_act.py
 
 """
-Concrete KernelSignature Implementations for the 'Act' Phase (Nodes 4-7).
+The Definitive, Executable Contract for the 'Act' Phase (Nodes 4-7).
 
-This file contains the final, executable implementations for the kernel launch
-signatures related to the forward pass and initial loss calculation. Each class
-is a direct, Pythonic embodiment of its corresponding C kernel contract defined
-in `kernels.cl.h`.
+Jurisdictional Mandate:
+This file is the canonical Python-side embodiment of the C-level kernel
+contracts defined in `kernels.cl.h` for the 'Act' (forward pass and loss
+computation) phase of the system's Directed Acyclic Graph (DAG). Each class
+herein is not merely a data container, but an immutable, self-sufficient
+'artisan' responsible for a single kernel dispatch.
 
-These classes are designed to be instantiated by the Host Orchestrator and
-dispatched by the pure KernelExecutor. Their design enforces correctness by
-requiring all necessary parameters at instantiation and deriving internal
-scalars from the provided buffer specifications.
+Architectural Role:
+These signature classes serve as the sole, verifiable bridge between the
+Host Orchestrator's strategic intent and the KernelExecutor's tactical
+dispatch. By being instantiated with the system's core context
+(`BufferManager`, `DiscoveredArchConstants`), they fulfill the Axiom of Interface
+Verifiability, possessing all knowledge required to derive their own execution
+parameters and marshal their arguments, thus ensuring correctness by design.
 """
 
 from dataclasses import dataclass, field
@@ -20,25 +25,28 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pyopencl as cl
 
-# --- Local Infrastructure Imports ---
-# These are the foundational components upon which these signatures are built.
+# --- Foundational Primitives (The Vocabulary of Work) ---
+# These are the low-level, stateless descriptors of the workload.
 from ..workload_primitives import WorkTile
+
+# --- Core Infrastructure (The Tools of the Artisan) ---
+# These are the foundational components upon which all signatures are built.
 from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
 from ..memory_layout import _pad_to_multiple
+from ..cl_context_manager import DiscoveredArchConstants
 
 
 @dataclass(frozen=True)
 class ForwardPassSignature(KernelSignature):
     """(Node 4) Signature for the `forward_pass` shared layer kernel."""
 
+    # --- Injected System Context (The Architectural Mandate) ---
+    # These objects provide the complete memory and hardware context, making the
+    # signature self-sufficient and fulfilling its role as a pure 'artisan'.
     _buffer_mgr: BufferManager
+    _arch_consts: DiscoveredArchConstants
 
-    # --- Injected Architectural Constants (Edict #3 Compliance) ---
-    simd_width: int
-    local_mem_bank_padding: int
-    scalar_size_bytes: int
-
-    # --- Buffer Handles (from kernel contract) ---
+    # --- Kernel-Specific Buffers (The Materials for this Operation) ---
     in_ref: BufferHandle
     mask_ref: BufferHandle
     w_ref: BufferHandle
@@ -46,21 +54,24 @@ class ForwardPassSignature(KernelSignature):
     h_out_ref: BufferHandle
     h_mask_out_ref: BufferHandle
 
-    # --- Control Scalars (from kernel contract) ---
+    # --- Kernel-Specific Control Scalars (The Blueprint for this Operation) ---
     batch_chunk_offset: np.uint32
     batch_chunk_count: np.uint32
 
-    # --- Derived Scalar Fields (Edict #2 Compliance) ---
+    # --- Derived Scalar Fields (The Self-Sufficiency Contract) ---
+    # These fields are derived internally from the buffer specifications, ensuring
+    # the signature is the sole authority on the physical dimensions it commands.
     total_batch_count: np.uint32 = field(init=False)
     padded_input_count: np.uint32 = field(init=False)
     padded_hidden_count: np.uint32 = field(init=False)
 
     def __post_init__(self):
-        """Derives dimensional parameters from provided buffer handles."""
+        """Derives physical dimensions from the injected memory context."""
+        super().__post_init__()
         in_shape, _ = self._buffer_mgr.get_spec(self.in_ref)
         h_out_shape, _ = self._buffer_mgr.get_spec(self.h_out_ref)
 
-        # Use object.__setattr__ as the dataclass is frozen (Edict #4)
+        # Using object.__setattr__ as the dataclass is frozen and immutable.
         object.__setattr__(self, "total_batch_count", np.uint32(in_shape[0]))
         object.__setattr__(self, "padded_input_count", np.uint32(in_shape[1]))
         object.__setattr__(self, "padded_hidden_count", np.uint32(h_out_shape[1]))
@@ -70,17 +81,22 @@ class ForwardPassSignature(KernelSignature):
         return "forward_pass"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
-        """Calculates the execution grid based on derived dimensions."""
+        """Calculates the execution grid from the injected hardware context."""
+        simd = self._arch_consts.simd_width
         global_size = (
-            _pad_to_multiple(int(self.batch_chunk_count), self.simd_width),
-            int(self.padded_hidden_count) // self.simd_width,
+            _pad_to_multiple(int(self.batch_chunk_count), simd),
+            int(self.padded_hidden_count) // simd,
         )
-        local_size = (self.simd_width, 1)
+        local_size = (simd, 1)
         return global_size, local_size
 
     def get_args(self) -> List:
-        """Returns arguments in the exact order mandated by kernels.cl.h (Edict #5)."""
-        local_mem_size = self.simd_width * (self.simd_width + self.local_mem_bank_padding) * self.scalar_size_bytes
+        """Assembles arguments in the exact order mandated by `kernels.cl.h`."""
+        simd = self._arch_consts.simd_width
+        scalar_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
+        # The padding is a fixed architectural constant from the System Contract.
+        local_mem_padding = 1
+        local_mem_size = simd * (simd + local_mem_padding) * scalar_bytes
 
         return [
             cl.LocalMemory(local_mem_size),
@@ -103,15 +119,14 @@ class RenderLogitsChunkSignature(KernelSignature):
     """(Node 5) Signature for the `render_logits_chunk` kernel."""
 
     _buffer_mgr: BufferManager
+    _arch_consts: DiscoveredArchConstants
 
-    # --- Buffer Handles ---
     h_ref: BufferHandle
     h_mask_ref: BufferHandle
     w_ref: BufferHandle
     b_ref: BufferHandle
     logit_out_ref: BufferHandle
 
-    # --- Control Scalars ---
     batch_chunk_offset: np.uint32
     batch_chunk_count: np.uint32
     module_chunk_offset: np.uint32
@@ -119,18 +134,16 @@ class RenderLogitsChunkSignature(KernelSignature):
     class_chunk_offset: np.uint32
     class_chunk_count: np.uint32
 
-    # --- Unpadded Dimensions (must be known by orchestrator) ---
     hidden_count: np.uint32
     total_output_class_count: np.uint32
 
-    # --- Derived Scalar Fields ---
     total_batch_count: np.uint32 = field(init=False)
     padded_hidden_count: np.uint32 = field(init=False)
     padded_total_output_class_count: np.uint32 = field(init=False)
     total_modules_count: np.uint32 = field(init=False)
 
     def __post_init__(self):
-        """Derives padded and total dimensional parameters from buffer specs."""
+        super().__post_init__()
         h_shape, _ = self._buffer_mgr.get_spec(self.h_ref)
         w_shape, _ = self._buffer_mgr.get_spec(self.w_ref)
         object.__setattr__(self, "total_batch_count", np.uint32(h_shape[0]))
@@ -175,11 +188,11 @@ class RenderLogitsChunkSignature(KernelSignature):
 
 @dataclass(frozen=True)
 class ComputeProbsLossCceChunkSignature(KernelSignature):
-    """(Node 6) Signature for the fused CCE loss kernel."""
+    """(Node 6) Signature for the fused `compute_probs_loss_cce_chunk` kernel."""
 
     _buffer_mgr: BufferManager
+    _arch_consts: DiscoveredArchConstants
 
-    # --- Buffer Handles ---
     logit_ref: BufferHandle
     temp_ref: BufferHandle
     target_ref: BufferHandle
@@ -187,19 +200,17 @@ class ComputeProbsLossCceChunkSignature(KernelSignature):
     prob_out_ref: BufferHandle
     loss_out_ref: BufferHandle
 
-    # --- Control Object ---
     tile: WorkTile
 
-    # --- Unpadded Dimension ---
     total_output_class_count: np.uint32
 
-    # --- Derived Scalar Fields ---
     total_batch_count: np.uint32 = field(init=False)
     padded_total_output_class_count: np.uint32 = field(init=False)
     total_modules_count: np.uint32 = field(init=False)
     total_tile_count: np.uint32 = field(init=False)
 
     def __post_init__(self):
+        super().__post_init__()
         logit_shape, _ = self._buffer_mgr.get_spec(self.logit_ref)
         prob_shape, _ = self._buffer_mgr.get_spec(self.prob_out_ref)
         object.__setattr__(self, "total_modules_count", np.uint32(logit_shape[0]))
@@ -242,31 +253,30 @@ class ComputeProbsLossCceChunkSignature(KernelSignature):
 
 @dataclass(frozen=True)
 class ComputeProbsLossBceChunkSignature(KernelSignature):
-    """(Node 7) Signature for the BCE loss kernel."""
+    """(Node 7) Signature for the `compute_probs_loss_bce_chunk` kernel."""
 
     _buffer_mgr: BufferManager
+    _arch_consts: DiscoveredArchConstants
 
-    # --- Buffer Handles ---
     logit_ref: BufferHandle
     temp_ref: BufferHandle
     target_ref: BufferHandle
     mask_ref: BufferHandle
     prob_out_ref: BufferHandle
-    partial_loss_out_ref: BufferHandle  # Note the difference from CCE
+    # This kernel is a "PARTIAL" renderer for loss, requiring a later reduction.
+    partial_loss_out_ref: BufferHandle
 
-    # --- Control Object ---
     tile: WorkTile
 
-    # --- Unpadded Dimension ---
     total_output_class_count: np.uint32
 
-    # --- Derived Scalar Fields (identical to CCE) ---
     total_batch_count: np.uint32 = field(init=False)
     padded_total_output_class_count: np.uint32 = field(init=False)
     total_modules_count: np.uint32 = field(init=False)
     total_tile_count: np.uint32 = field(init=False)
 
     def __post_init__(self):
+        super().__post_init__()
         logit_shape, _ = self._buffer_mgr.get_spec(self.logit_ref)
         prob_shape, _ = self._buffer_mgr.get_spec(self.prob_out_ref)
         object.__setattr__(self, "total_modules_count", np.uint32(logit_shape[0]))

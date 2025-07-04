@@ -818,54 +818,8 @@ __kernel void clip_partial_gradients(
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_total_tile_count);
 
-// --- Phase 12-13: Data Layout Transformation & Permutation ---
+// --- Phase 13: Data Layout Transformation & Permutation ---
 
-/**
- * @brief (Node 12) Transposes a rectangular slice (chunk) of a matrix. General-purpose utility.
- * @kernel_contract
- *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Idempotency: "Strictly Idempotent"
- *        - Synchronization Model: "Streamable Utility"
- */
-__kernel void transpose_chunk(
-    /**
-     * @param update_buffer_LOCAL_transpose_tile Local memory for optimizing the transpose via tiling.
-     *        - Tensor Shape: (C_TILE_SIZE, C_TILE_SIZE + LOCAL_MEM_BANK_PADDING)
-     *        - Padding Contract: {Type: BANK_CONFLICT_AVOIDANCE, Formula: "Pad row stride by LOCAL_MEM_BANK_PADDING"}
-     *        - Calculability Proof: [Compile-time constant: C_TILE_SIZE, System Contract constant: LOCAL_MEM_BANK_PADDING]
-     *        - Validation Preconditions: [1] Host shall allocate size according to the formula derived from this contract. [2] Host must dispatch this kernel with a 2D local work-group size of
-     * (C_TILE_SIZE, C_TILE_SIZE).
-     */
-    __local SCALAR_TYPE *update_buffer_LOCAL_transpose_tile,
-
-    /**
-     * @param src_buffer_GLOBAL_input The source buffer containing the slice to transpose.
-     *        - Tensor Shape: (src_scalar_NATURAL_in_total_element_count)
-     *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_in_total_element_count]
-     *        - Validation Preconditions: The sub-region defined by kernel arguments must be within the buffer's physical bounds, as proven by: (src_scalar_NATURAL_in_offset +
-     * ((src_scalar_NATURAL_height - 1) * src_scalar_NATURAL_in_stride) + (src_scalar_NATURAL_width - 1)) < src_scalar_NATURAL_in_total_element_count.
-     */
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_input,
-
-    /**
-     * @param dest_buffer_GLOBAL_output The destination buffer for the transposed slice.
-     *        - Tensor Shape: (src_scalar_NATURAL_out_total_element_count)
-     *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_out_total_element_count]
-     *        - Validation Preconditions: The sub-region defined by kernel arguments must be within the buffer's physical bounds, as proven by: (src_scalar_NATURAL_out_offset +
-     * ((src_scalar_NATURAL_width - 1) * src_scalar_NATURAL_out_stride) + (src_scalar_NATURAL_height - 1)) < src_scalar_NATURAL_out_total_element_count.
-     */
-    __global SCALAR_TYPE *dest_buffer_GLOBAL_output,
-
-    uint src_scalar_NATURAL_in_offset,
-    uint src_scalar_NATURAL_out_offset,
-    uint src_scalar_NATURAL_height,
-    uint src_scalar_NATURAL_width,
-    uint src_scalar_NATURAL_in_stride,
-    uint src_scalar_NATURAL_out_stride,
-    uint src_scalar_NATURAL_in_total_element_count,
-    uint src_scalar_NATURAL_out_total_element_count);
 /**
  * @brief (Node 13) Specialized Kernel: Gathers scattered partial gradients into a single, reduction-ready buffer.
  * @kernel_contract

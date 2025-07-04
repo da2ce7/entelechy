@@ -32,6 +32,7 @@
         "nosetests",
         "optim",
         "padder",
+        "physicalize",
         "pipenv",
         "Pipfile",
         "precomputation",

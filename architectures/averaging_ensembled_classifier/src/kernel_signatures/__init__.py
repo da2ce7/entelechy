@@ -71,12 +71,6 @@ from .phase_3_update import (
     ClampTemperaturesSignature,
 )
 
-# --- General Purpose Utility Signature Imports ---
-from .utility_signatures import (
-    TransposeChunkSignature,
-)
-
-
 # --- Public API Contract (`__all__`) ---
 # This list explicitly defines all symbols that are considered part of the
 # public, stable API of this package. Consumers should only rely on these names.
@@ -113,6 +107,4 @@ __all__ = [
     "AdamParameterGroup",
     "AdamUpdateSignature",
     "ClampTemperaturesSignature",
-    # Utility Kernels
-    "TransposeChunkSignature",
 ]

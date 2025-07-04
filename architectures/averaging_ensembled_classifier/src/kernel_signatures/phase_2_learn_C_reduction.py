@@ -1,16 +1,23 @@
 # kernel_signatures/phase_2_learn_C_reduction.py
 
 """
-Concrete KernelSignature Implementations for Reduction & Aggregation (Nodes 14-16, 19).
+The Definitive, Executable Contracts for Gradient Reduction & Aggregation.
 
-This file contains the final, canonical implementations for the kernel launch
-signatures related to the third stage of the 'Learn' phase.
+Jurisdictional Mandate:
+This file is the canonical Python-side embodiment of the C-level kernel
+contracts for the third stage of the 'Learn' phase: Reduction. Its jurisdiction
+covers the full spectrum of aggregation, from the generic, host-driven "sum-then-clip"
+engine to the specialized, self-contained, policy-aware reduction of the `Grad_H`
+vector.
 
-(REV 3): The generic aggregation signatures have been completely refactored to
-support the superior "Device-Side Gather" model. They now accept an indirection
-table (offset list) on the device, allowing the kernel to perform the gather
-operation implicitly. This avoids a massive, host-orchestrated memory copy and
-is a key performance optimization.
+Architectural Role:
+This module provides the 'artisan' classes that physicalize the system's
+"Primacy of Memory Strategy." The tiered aggregation signatures (`Aggregate*`)
+are the core building blocks of the `log_K(N)` reduction tree, operating via an
+indirection list to avoid costly intermediate memory copies. They work in tandem
+with the `ClipIntermediateGradSignature`, which applies the host's dynamic
+stabilization policy at each stage, transforming a simple sum into a robust,
+numerically-stable learning primitive.
 """
 
 from dataclasses import dataclass, field
@@ -19,26 +26,32 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pyopencl as cl
 
-# --- Local Infrastructure Imports ---
+# --- Foundational Primitives & Core Infrastructure ---
 from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
 from ..memory_layout import _pad_to_multiple
+from ..cl_context_manager import DiscoveredArchConstants
 
 
-# === Generic, Tiered Aggregation Engine Signatures (Nodes 14, 15, 20) ===
+# =========================================================================
+# === Generic, Tiered Aggregation Engine Signatures (Nodes 14, 15a, 20a)
+# =========================================================================
 
 
 @dataclass(frozen=True)
 class AggregateRegisterReduceSignature(KernelSignature):
-    """(Node 15a, 20a) Signature for `aggregate_register_reduce` using an indirection table."""
+    """(Tier 1) Signature for `aggregate_register_reduce` using an indirection table."""
 
+    # --- Injected System Context (The Architectural Mandate) ---
     _buffer_mgr: BufferManager
+    _arch_consts: DiscoveredArchConstants
 
-    partial_collection_ref: BufferHandle
-    partial_offset_list_ref: BufferHandle  # The indirection table
+    # --- Kernel-Specific Buffers & Control Scalars (The Indirection Contract) ---
+    partial_collection_ref: BufferHandle  # The memory pool of scattered partials
+    partial_offset_list_ref: BufferHandle  # The indirection table for the gather
     dest_ref: BufferHandle
-    partial_offset_list_count: np.uint32  # Number of partials to reduce
-    partial_width: np.uint32  # Number of elements per partial
-    operation_type: np.uint32  # 0=SUM, 1=AVERAGE
+    partial_offset_list_count: np.uint32
+    partial_width: np.uint32
+    operation_type: np.uint32
 
     def __post_init__(self):
         super().__post_init__()
@@ -48,11 +61,12 @@ class AggregateRegisterReduceSignature(KernelSignature):
         return "aggregate_register_reduce"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        # One work-item per element of the final reduced partial
+        # This kernel is optimized for small `N`. It dispatches one work-item per
+        # element of the final output, using registers for the summation.
         return (int(self.partial_width),), None
 
     def get_args(self) -> List:
-        """Returns all 6 arguments in exact contractual order."""
+        """Assembles all 6 arguments in exact contractual order."""
         return [
             self._buffer_mgr.get_cl_buffer(self.partial_collection_ref),
             self._buffer_mgr.get_cl_buffer(self.partial_offset_list_ref),
@@ -65,18 +79,17 @@ class AggregateRegisterReduceSignature(KernelSignature):
 
 @dataclass(frozen=True)
 class AggregateLocalReduceSignature(KernelSignature):
-    """(Node 15a, 20a) Signature for `aggregate_local_reduce` using an indirection table."""
+    """(Tier 2) Signature for `aggregate_local_reduce` using an indirection table."""
 
     _buffer_mgr: BufferManager
+    _arch_consts: DiscoveredArchConstants
 
-    work_group_size_0: int
-    scalar_size_bytes: int
     partial_collection_ref: BufferHandle
-    partial_offset_list_ref: BufferHandle  # The indirection table
+    partial_offset_list_ref: BufferHandle
     dest_ref: BufferHandle
-    partial_offset_list_count: np.uint32  # Number of partials to reduce
-    partial_width: np.uint32  # Number of elements per partial
-    operation_type: np.uint32  # 0=SUM, 1=AVERAGE
+    partial_offset_list_count: np.uint32
+    partial_width: np.uint32
+    operation_type: np.uint32
 
     def __post_init__(self):
         super().__post_init__()
@@ -86,13 +99,19 @@ class AggregateLocalReduceSignature(KernelSignature):
         return "aggregate_local_reduce"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        global_size = (_pad_to_multiple(int(self.partial_width), self.work_group_size_0),)
-        local_size = (self.work_group_size_0,)
+        # This kernel is for larger `N`. It dispatches a 1D grid of work-groups,
+        # where each work-group is responsible for reducing one slice of the
+        # output vector across all input partials, using local memory for scalability.
+        work_group_size = self._arch_consts.optimal_tile_size
+        global_size = (_pad_to_multiple(int(self.partial_width), work_group_size),)
+        local_size = (work_group_size,)
         return global_size, local_size
 
     def get_args(self) -> List:
-        """Returns all 7 arguments, prepending local memory."""
-        local_mem_size = self.work_group_size_0 * self.scalar_size_bytes
+        """Assembles arguments, including the required local memory allocation."""
+        work_group_size = self._arch_consts.optimal_tile_size
+        scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
+        local_mem_size = work_group_size * scalar_size_bytes
         return [
             cl.LocalMemory(local_mem_size),
             self._buffer_mgr.get_cl_buffer(self.partial_collection_ref),
@@ -109,32 +128,24 @@ class ClipIntermediateGradSignature(KernelSignature):
     """
     (Node 15b, 20b) Signature for the `clip_intermediate_grad` utility kernel.
 
-    This class provides the host-side contract for the kernel that performs the
-    "clip" half of the atomic `sum-then-clip` pattern. It is a critical component
-    of the Recursive Clip-Aggregation Engine, used by recipes to apply the
-    gradient stabilization policy to intermediate results at each stage of a
-    reduction tree.
+    This signature represents the "clip" half of the atomic "sum-then-clip"
+    pattern. It is the physical mechanism by which the host's `StabilizationPolicy`
+    is enforced upon the intermediate results of the Recursive Clip-Aggregation Engine.
     """
 
     _buffer_mgr: BufferManager
+    _arch_consts: DiscoveredArchConstants
 
-    # --- Injected Architectural Constants ---
-    work_group_size_0: int
-    scalar_size_bytes: int
+    intermediate_grad_ref: BufferHandle  # This buffer is modified in-place.
 
-    # --- Buffer Handle ---
-    # The kernel operates in-place on this buffer.
-    intermediate_grad_ref: BufferHandle
+    # The threshold for this specific stage 'j' of the reduction tree.
+    # This value is the final, authoritative output of the StabilizationPolicy.
+    clipping_threshold_t_j: np.float32
+    epsilon: np.float32
 
-    # --- Control & Policy Scalars ---
-    clipping_threshold_t_j: SCALAR_NP_TYPE  # The threshold for this stage 'j'
-    epsilon: SCALAR_NP_TYPE
-
-    # --- Derived Scalar Field ---
     parameter_count: np.uint32 = field(init=False)
 
     def __post_init__(self):
-        """Derives the parameter count from the buffer specification."""
         super().__post_init__()
         shape, _ = self._buffer_mgr.get_spec(self.intermediate_grad_ref)
         object.__setattr__(self, "parameter_count", np.uint32(np.prod(shape)))
@@ -144,91 +155,79 @@ class ClipIntermediateGradSignature(KernelSignature):
         return "clip_intermediate_grad"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        """
-        Calculates a 1D grid. The kernel computes one L2 norm over the entire
-        buffer, so all work-items are dispatched to cover all elements in parallel
-        for the initial sum-of-squares reduction.
-        """
-        num_elements = self.parameter_count
-        global_size = (_pad_to_multiple(int(num_elements), self.work_group_size_0),)
-        local_size = (self.work_group_size_0,)
+        """Dispatches enough work-items to compute a single L2 norm over the entire buffer."""
+        work_group_size = self._arch_consts.optimal_tile_size
+        global_size = (_pad_to_multiple(int(self.parameter_count), work_group_size),)
+        local_size = (work_group_size,)
         return global_size, local_size
 
     def get_args(self) -> List:
-        """Returns all 5 arguments in the exact order mandated by kernels.cl.h."""
-        local_mem_size = self.work_group_size_0 * self.scalar_size_bytes
+        """Assembles arguments in the exact order mandated by the kernel contract."""
+        work_group_size = self._arch_consts.optimal_tile_size
+        scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
+        local_mem_size = work_group_size * scalar_size_bytes
         return [
-            # Arg 1: Local memory for the norm reduction
             cl.LocalMemory(local_mem_size),
-            # Arg 2: The global buffer to be clipped in-place
             self._buffer_mgr.get_cl_buffer(self.intermediate_grad_ref),
-            # Arg 3-4: Policy and stability scalars
             self.clipping_threshold_t_j,
             self.epsilon,
-            # Arg 5: The total element count for bounds checking
             self.parameter_count,
         ]
 
 
-# === Specialized Reduction Signature (Node 16) ===
+# =========================================================================
+# === Specialized, Policy-Aware Reduction Signature (Node 16)
+# =========================================================================
 
 
 @dataclass(frozen=True)
 class StabilizeAndReduceGradHiddenActivationsSignature(KernelSignature):
     """
-    (Node 16) Signature for the kernel.
+    (Node 16) Signature for the specialized `stabilize_and_reduce_grad_hidden_activations` kernel.
 
-    This version is a direct, 1:1, executable embodiment of its C-level kernel
-    contract. It accepts all mandated parameters, removes all extraneous ones,
-    and delegates all computational responsibility to the device as specified.
+    This is not a generic reduction. It is a specialized, self-contained engine
+    for the critical upstream gradient, `Grad_H`. It operates on the pre-gathered,
+    contiguous SoA buffer from Node 13 and has the system's stabilization policy
+    baked directly into its C-level contract, ensuring maximum signal fidelity.
     """
 
     _buffer_mgr: BufferManager
+    _arch_consts: DiscoveredArchConstants
 
-    # --- Injected Architectural Constants ---
-    work_group_size_0: int
-    scalar_size_bytes: int
-
-    # --- Buffer Handles (from kernel contract) ---
     permuted_soa_in_ref: BufferHandle
     final_grad_h_out_ref: BufferHandle
 
-    # === Contractual Policy & Control Scalars ===
-    # These must be provided by the Host Orchestrator.
-    fp_max: SCALAR_NP_TYPE
-    policy_t_algorithmic: SCALAR_NP_TYPE
-    policy_lambda: SCALAR_NP_TYPE
+    # --- Contractual Policy & Control Scalars (The Host's Final Command) ---
+    fp_max: np.float32
+    policy_t_algorithmic: np.float32
+    policy_lambda: np.float32
     policy_max_k: np.uint32
-    epsilon: SCALAR_NP_TYPE
+    epsilon: np.float32
 
-    # --- Explicit Dimensional Parameters (from kernel contract) ---
-    # These are now passed directly, removing brittle internal derivations.
+    # --- Explicit Dimensional Parameters ---
     total_batch_count: np.uint32
     padded_hidden_count: np.uint32
     total_modules_count: np.uint32
     padded_total_modules_count: np.uint32
 
     def __post_init__(self):
-        """
-        Performs host-side assurance checks, validating that the provided
-        parameters are consistent with the physical buffer allocations.
-        """
+        """Performs host-side assurance, validating the plan against physical memory."""
         super().__post_init__()
         soa_shape, _ = self._buffer_mgr.get_spec(self.permuted_soa_in_ref)
         final_shape, _ = self._buffer_mgr.get_spec(self.final_grad_h_out_ref)
 
-        # --- Contractual Verification (Host-Side Assurance) ---
-        total_rows_expected_from_params = self.total_batch_count * self.padded_hidden_count
-        assert soa_shape[0] == total_rows_expected_from_params, (
-            f"Buffer spec mismatch for permuted_soa_in_ref: Expected {total_rows_expected_from_params} rows, "
+        total_rows_expected = self.total_batch_count * self.padded_hidden_count
+        assert soa_shape[0] == total_rows_expected, (
+            f"Buffer spec mismatch for permuted_soa_in_ref: Expected {total_rows_expected} rows, "
             f"but buffer has {soa_shape[0]}."
         )
-        assert (
-            soa_shape[1] == self.padded_total_modules_count
-        ), f"Buffer spec mismatch: Expected {self.padded_total_modules_count} padded modules, but buffer has {soa_shape[1]}."
+        assert soa_shape[1] == self.padded_total_modules_count, (
+            f"Buffer spec mismatch: Expected {self.padded_total_modules_count} padded modules, "
+            f"but buffer has {soa_shape[1]}."
+        )
         assert final_shape == (self.total_batch_count, self.padded_hidden_count), (
-            f"Buffer spec mismatch for final_grad_h_out_ref: Expected shape {(self.total_batch_count, self.padded_hidden_count)}, "
-            f"but buffer has {final_shape}."
+            f"Buffer spec mismatch for final_grad_h_out_ref: Expected shape "
+            f"{(self.total_batch_count, self.padded_hidden_count)}, but has {final_shape}."
         )
 
     @property
@@ -236,31 +235,27 @@ class StabilizeAndReduceGradHiddenActivationsSignature(KernelSignature):
         return "stabilize_and_reduce_grad_hidden_activations"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
-        """
-        Sets up a grid where each work-group reduces one row of the SoA matrix.
-        The kernel internally divides its work among its work-items.
-        """
+        """Dispatches one work-group per row of the SoA matrix for reduction."""
+        work_group_size = self._arch_consts.optimal_tile_size
         num_rows = int(self.total_batch_count) * int(self.padded_hidden_count)
-        global_size = (num_rows * self.work_group_size_0,)
-        local_size = (self.work_group_size_0,)
+        global_size = (num_rows * work_group_size,)
+        local_size = (work_group_size,)
         return global_size, local_size
 
     def get_args(self) -> List:
-        """Returns all 13 arguments in exact contractual order."""
-        local_mem_size = self.work_group_size_0 * self.scalar_size_bytes
+        """Returns all 13 arguments, translating the Host's policy into device primitives."""
+        work_group_size = self._arch_consts.optimal_tile_size
+        scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
+        local_mem_size = work_group_size * scalar_size_bytes
         return [
-            # Arg 1: Local Memory
             cl.LocalMemory(local_mem_size),
-            # Arg 2-3: Buffers
             self._buffer_mgr.get_cl_buffer(self.permuted_soa_in_ref),
             self._buffer_mgr.get_cl_buffer(self.final_grad_h_out_ref),
-            # Arg 4-8: Policy & Control Scalars
             self.fp_max,
             self.policy_t_algorithmic,
             self.policy_lambda,
             self.policy_max_k,
             self.epsilon,
-            # Arg 9-12: Dimensional Parameters
             self.total_batch_count,
             self.padded_hidden_count,
             self.total_modules_count,
