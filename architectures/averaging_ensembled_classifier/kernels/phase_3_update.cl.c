@@ -1,4 +1,4 @@
-// parameter_optim.cl.c
+// phase_3_update.cl.c
 
 #ifdef __OPENCL_VERSION__
 #else

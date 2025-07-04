@@ -1,4 +1,4 @@
-// backprop_kernels.cl.c
+// phase_2_learn_D_backprop.cl.c
 
 #ifdef __OPENCL_VERSION__
 #else
