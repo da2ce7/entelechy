@@ -20,7 +20,7 @@ import numpy as np
 import pyopencl as cl
 
 # --- Local Infrastructure Imports ---
-from ..launcher_infra import BufferHandle, KernelSignature, SCALAR_NP_TYPE
+from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,9 @@ class NormalizeGradientsSignature(KernelSignature):
     which was missing the mandatory 'epsilon' argument. This signature is
     now in full compliance with the kernel's 5-argument contract.
     """
+
+    _buffer_mgr: BufferManager
+
 
     summed_grad_ref: BufferHandle
     final_grad_out_ref: BufferHandle
@@ -87,6 +90,8 @@ class NormalizeGradientsSignature(KernelSignature):
 @dataclass(frozen=True)
 class AdamUpdateSignature(KernelSignature):
     """(Node 24) Signature for the `adam_update` kernel."""
+
+    _buffer_mgr: BufferManager
 
     # --- Buffer Handles (grouped for clarity) ---
     param_group: AdamParameterGroup
@@ -143,6 +148,8 @@ class AdamUpdateSignature(KernelSignature):
 @dataclass(frozen=True)
 class ClampTemperaturesSignature(KernelSignature):
     """(Node 25) Signature for the `clamp_temperatures` domain constraint kernel."""
+
+    _buffer_mgr: BufferManager
 
     temps_ref: BufferHandle  # Operates in-place
     min_val: SCALAR_NP_TYPE

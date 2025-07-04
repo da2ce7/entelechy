@@ -22,7 +22,7 @@ import pyopencl as cl
 
 # --- Local Infrastructure Imports ---
 from ..workload_primitives import WorkTile
-from ..launcher_infra import BufferHandle, KernelSignature, SCALAR_NP_TYPE
+from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
 from ..memory_layout import _pad_to_multiple
 
 
@@ -53,6 +53,8 @@ class GradientHandles:
 @dataclass(frozen=True)
 class _ClipTiledModuleGradsBase(KernelSignature):
     """(Internal) The unified base for all Node 11 clipping operations."""
+
+    _buffer_mgr: BufferManager
 
     # --- Merged attributes from the former BaseBase ---
     work_group_size_0: int
@@ -177,6 +179,8 @@ class GatherAndPermuteGradHiddenActivationsSignature(KernelSignature):
     C-level kernel interface. Its validation logic now serves as the final
     assurance check against the host's provided plan.
     """
+
+    _buffer_mgr: BufferManager
 
     # --- Buffer Handles (from kernel contract) ---
     clipped_partials_aos_ref: BufferHandle

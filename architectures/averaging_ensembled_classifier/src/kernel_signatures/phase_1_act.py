@@ -23,13 +23,15 @@ import pyopencl as cl
 # --- Local Infrastructure Imports ---
 # These are the foundational components upon which these signatures are built.
 from ..workload_primitives import WorkTile
-from ..launcher_infra import BufferHandle, KernelSignature
+from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
 from ..memory_layout import _pad_to_multiple
 
 
 @dataclass(frozen=True)
 class ForwardPassSignature(KernelSignature):
     """(Node 4) Signature for the `forward_pass` shared layer kernel."""
+
+    _buffer_mgr: BufferManager
 
     # --- Injected Architectural Constants (Edict #3 Compliance) ---
     simd_width: int
@@ -99,6 +101,8 @@ class ForwardPassSignature(KernelSignature):
 @dataclass(frozen=True)
 class RenderLogitsChunkSignature(KernelSignature):
     """(Node 5) Signature for the `render_logits_chunk` kernel."""
+
+    _buffer_mgr: BufferManager
 
     # --- Buffer Handles ---
     h_ref: BufferHandle
@@ -173,6 +177,8 @@ class RenderLogitsChunkSignature(KernelSignature):
 class ComputeProbsLossCceChunkSignature(KernelSignature):
     """(Node 6) Signature for the fused CCE loss kernel."""
 
+    _buffer_mgr: BufferManager
+
     # --- Buffer Handles ---
     logit_ref: BufferHandle
     temp_ref: BufferHandle
@@ -237,6 +243,9 @@ class ComputeProbsLossCceChunkSignature(KernelSignature):
 @dataclass(frozen=True)
 class ComputeProbsLossBceChunkSignature(KernelSignature):
     """(Node 7) Signature for the BCE loss kernel."""
+
+    _buffer_mgr: BufferManager
+
 
     # --- Buffer Handles ---
     logit_ref: BufferHandle

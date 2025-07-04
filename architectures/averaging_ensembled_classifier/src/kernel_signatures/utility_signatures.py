@@ -20,13 +20,15 @@ import numpy as np
 import pyopencl as cl
 
 # --- Local Infrastructure Imports ---
-from ..launcher_infra import BufferHandle, KernelSignature
+from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
 from ..memory_layout import _pad_to_multiple
 
 
 @dataclass(frozen=True)
 class TransposeChunkSignature(KernelSignature):
     """(Node 12) Signature for the general-purpose, tiled `transpose_chunk` kernel."""
+
+    _buffer_mgr: BufferManager
 
     c_tile_size: int
     local_mem_bank_padding: int

@@ -24,7 +24,7 @@ import pyopencl as cl
 
 # --- Local Infrastructure Imports ---
 from ..workload_primitives import WorkTile
-from ..launcher_infra import BufferHandle, KernelSignature
+from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
 
 
 # === Node 8: Calculate Module Parameter Gradients ===
@@ -33,6 +33,8 @@ from ..launcher_infra import BufferHandle, KernelSignature
 @dataclass(frozen=True)
 class _CalculateModuleParamGradsBase(KernelSignature):
     """(Internal) Shared base for Node 8 gradient production (`Grad_ModW`, `Grad_ModB`)."""
+
+    _buffer_mgr: BufferManager
 
     work_group_size_0: int
     scalar_size_bytes: int
@@ -145,6 +147,8 @@ class CalculateModuleParamGradsBceSignature(_CalculateModuleParamGradsBase):
 class _BackpropErrorToHiddenChunkBase(KernelSignature):
     """(Internal) Shared base for Node 9 gradient production (`Grad_H`)."""
 
+    _buffer_mgr: BufferManager
+
     prob_ref: BufferHandle
     mask_ref: BufferHandle
     w_mod_ref: BufferHandle
@@ -242,6 +246,8 @@ class BackpropErrorToHiddenChunkBceSignature(_BackpropErrorToHiddenChunkBase):
 @dataclass(frozen=True)
 class _CalculateChunkTempGradientsBase(KernelSignature):
     """(Internal) Shared base for Node 10 gradient production (`Grad_Temps`)."""
+
+    _buffer_mgr: BufferManager
 
     work_group_size_0: int
     scalar_size_bytes: int

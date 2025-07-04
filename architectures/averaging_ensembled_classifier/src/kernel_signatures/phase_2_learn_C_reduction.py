@@ -20,8 +20,8 @@ import numpy as np
 import pyopencl as cl
 
 # --- Local Infrastructure Imports ---
-from ..launcher_infra import BufferHandle, KernelSignature
-from ..memory_layout import _pad_to_multiple, SCALAR_NP_TYPE
+from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
+from ..memory_layout import _pad_to_multiple
 
 
 # === Generic, Tiered Aggregation Engine Signatures (Nodes 14, 15, 20) ===
@@ -30,6 +30,8 @@ from ..memory_layout import _pad_to_multiple, SCALAR_NP_TYPE
 @dataclass(frozen=True)
 class AggregateRegisterReduceSignature(KernelSignature):
     """(Node 15a, 20a) Signature for `aggregate_register_reduce` using an indirection table."""
+
+    _buffer_mgr: BufferManager
 
     partial_collection_ref: BufferHandle
     partial_offset_list_ref: BufferHandle  # The indirection table
@@ -64,6 +66,8 @@ class AggregateRegisterReduceSignature(KernelSignature):
 @dataclass(frozen=True)
 class AggregateLocalReduceSignature(KernelSignature):
     """(Node 15a, 20a) Signature for `aggregate_local_reduce` using an indirection table."""
+
+    _buffer_mgr: BufferManager
 
     work_group_size_0: int
     scalar_size_bytes: int
@@ -111,6 +115,8 @@ class ClipIntermediateGradSignature(KernelSignature):
     gradient stabilization policy to intermediate results at each stage of a
     reduction tree.
     """
+
+    _buffer_mgr: BufferManager
 
     # --- Injected Architectural Constants ---
     work_group_size_0: int
@@ -176,6 +182,8 @@ class StabilizeAndReduceGradHiddenActivationsSignature(KernelSignature):
     contract. It accepts all mandated parameters, removes all extraneous ones,
     and delegates all computational responsibility to the device as specified.
     """
+
+    _buffer_mgr: BufferManager
 
     # --- Injected Architectural Constants ---
     work_group_size_0: int

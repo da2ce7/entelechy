@@ -17,7 +17,7 @@ import pyopencl as cl
 
 # --- Architectural Imports ---
 from .execution_plan import ExecutionPlan
-from .launcher_infra import Services, BufferManager, KernelExecutor, BufferHandle, SCALAR_NP_TYPE, PingPongManager
+from .launcher_infra import Services, BufferManager, KernelExecutor, BufferHandle, PingPongManager
 from .kernel_signatures import *
 from .model_spec import ModelSpec
 from .parameter_space import ParameterSpace

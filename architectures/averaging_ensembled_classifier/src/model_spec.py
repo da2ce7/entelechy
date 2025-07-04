@@ -16,6 +16,13 @@ the dynamic training and execution logic.
 from dataclasses import dataclass, field
 import numpy as np
 
+class ScalarType(enum.Enum):
+    """Type-safe enumeration for floating-point precision."""
+
+    FLOAT32 = np.float32
+    FLOAT16 = np.float16
+    # Future extension: FLOAT64 = np.float64
+
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -36,7 +43,8 @@ class ModelSpec:
     # Architectural constraints for padding calculations
     simd_width: int
     cache_line_bytes: int
-    scalar_dtype: np.dtype = SCALAR_DTYPE
+
+    scalar_type: ScalarType
 
     @field(init=False)
     @property

@@ -202,12 +202,7 @@ class PingPongManager:
 
 class KernelSignature(abc.ABC):
     """Abstract base class for a kernel launch specification."""
-
-    def __init__(self, buffer_mgr: BufferManager):
-        if not isinstance(buffer_mgr, BufferManager):
-            raise TypeError("KernelSignature requires a valid BufferManager instance.")
-        self._buffer_mgr = buffer_mgr
-
+    
     @property
     @abc.abstractmethod
     def kernel_name(self) -> str:

@@ -21,7 +21,7 @@ import numpy as np
 import pyopencl as cl
 
 # --- Local Infrastructure Imports ---
-from ..launcher_infra import BufferHandle, KernelSignature, SCALAR_NP_TYPE
+from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
 from ..memory_layout import _pad_to_multiple
 
 
@@ -49,6 +49,8 @@ class BackpropSharedWeightsChunkSignature(KernelSignature):
     is now in full compliance with the kernel's 14-argument contract defined
     in `kernels.cl.h`.
     """
+
+    _buffer_mgr: BufferManager
 
     # --- Injected Architectural Constants ---
     work_group_size_1: int
@@ -137,6 +139,8 @@ class BackpropSharedBiasesChunkSignature(KernelSignature):
     in `kernels.cl.h`.
     """
 
+    _buffer_mgr: BufferManager
+
     # --- Injected Architectural Constants ---
     work_group_size_0: int
     scalar_size_bytes: int
@@ -217,6 +221,8 @@ class ClipSharedGradientsChunkSignature(KernelSignature):
     C-level kernel contract, which now includes offset and dimensional parameters
     to fulfill the Placement Contract for the streaming backpropagation model.
     """
+
+    _buffer_mgr: BufferManager
 
     # --- Injected Architectural Constants ---
     work_group_size_0: int
