@@ -140,12 +140,31 @@ class OpenCLContextManager:
 
         print(f"INFO: Compiling with options: {' '.join(options)}")
         try:
+            # Attempt to build the OpenCL program with the provided options.
             program = cl.Program(ctx, full_source).build(options=options)
             print("INFO: Kernel compilation successful.")
-        except cl.BuildError as e:
+
+        # Here, we catch the broader cl.Error for static type checker compatibility (e.g., mypy).
+        # mypy may not be able to resolve the full inheritance chain and might flag
+        # a direct catch of cl.BuildError as an undefined attribute of the 'cl' module.
+        except cl.Error as e:
             print("\n" + "=" * 80 + "\n--- KERNEL BUILD FAILED ---\n" + "=" * 80)
-            log = "\n\n".join([f"Device: {dev.name}\n--- Build Log ---\n{log}" for dev, log in e.device_logs])
-            print(log)
+
+            # At runtime, we inspect the caught exception to see if it has the specific
+            # 'device_logs' attribute. This is a robust way to check if the error is,
+            # in fact, the more detailed cl.BuildError, without making static assumptions.
+            if hasattr(e, 'device_logs'):
+                # If it is a BuildError, we can safely access 'device_logs'.
+                # This provides the detailed, device-specific compiler output which is
+                # essential for debugging kernel code.
+                log = "\n\n".join([f"Device: {dev.name}\n--- Build Log --- \n{log}" for dev, log in e.device_logs])
+                print(log)
+            else:
+                # If it's another type of cl.Error (e.g., a runtime error not related
+                # to compilation), it won't have 'device_logs'. In this case, we print a
+                # general error message to avoid an `AttributeError`.
+                print(f"An unexpected OpenCL error occurred: {e}")
+
             print("=" * 80)
             raise
 
