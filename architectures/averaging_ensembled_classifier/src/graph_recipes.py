@@ -79,6 +79,7 @@ def build_forward_module_path(
         svs: The bundle of core system services.
         tile: The `WorkTile` defining this specific unit of work.
         plan: The `ExecutionPlan` containing strategy and hyperparameter details.
+        effective_batch_size: The actual calculated batch size, used for normalization.
         h_ref: The handle to the `hidden_activations` buffer (cached or recomputed).
         h_ready_evt: The event signaling that the `hidden_activations` buffer is ready.
 
@@ -980,6 +981,7 @@ def build_update_subgraph(
     param_space: ParameterSpace,
     step: int,
     summed_grads: Dict[str, BufferHandle],
+    effective_batch_size: float,
     plan: ExecutionPlan,
     deps: List[cl.Event],
 ) -> cl.Event:
@@ -1011,7 +1013,7 @@ def build_update_subgraph(
             buffer_mgr=bm,
             summed_grad_ref=summed_grads[flow.name],
             final_grad_out_ref=bm.get_handle_by_name(flow.final_grad_buffer_name),
-            effective_batch_size=SCALAR_NP_TYPE(plan.effective_batch_size),
+            effective_batch_size=SCALAR_NP_TYPE(effective_batch_size),
             epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
         )
         norm_events.append(ex.launch(q, sig, wait_for=deps))

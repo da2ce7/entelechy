@@ -1,13 +1,13 @@
 # batch_processor.py
 
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pyopencl as cl
 
 # --- Architectural Imports ---
 from .execution_plan import ExecutionPlan
-from .launcher_infra import Services, HostView
+from .launcher_infra import Services, HostView, BufferHandle
 from .parameter_space import ParameterSpace
 from .workload_primitives import TiledGather, LinearlyChunkedGather
 from . import graph_recipes as recipes
@@ -48,7 +48,8 @@ class BatchProcessor:
             3. `final_probs_view`: The `HostView` object to call `.get()` on after
                                    `inference_event` completes.
         """
-        q, bm = self.svs.q, self.svs.ex
+        # Rectified Assignment: Clearly separate BufferManager (bm) and KernelExecutor (ex)
+        q, bm, ex = self.svs.q, self.svs.bm, self.svs.ex
 
         # Phase 1: Initial Data Uploads & Async Dependency Calculation
         upload_x_evt = cl.enqueue_copy(q, bm.get_cl_buffer("input"), X_batch)
@@ -69,7 +70,7 @@ class BatchProcessor:
             recipes.build_forward_module_path(self.svs, tile, self.plan, h_ref, h_ready_evt) for tile in self.plan.grid
         ]
         prob_events = [res[1] for res in prob_results]
-        all_probs_ready_evt = cl.WaitForEvents(prob_events)
+        all_probs_ready_evt = cl.wait_for_events(prob_events)
 
         if self.plan.adaptation_strategy == "CACHE":
             # In CACHE mode, h_ref is persistent, so we can directly launch the
@@ -81,7 +82,7 @@ class BatchProcessor:
                 )
                 for i, tile in enumerate(self.plan.grid)
             ]
-            all_module_grads_clipped_evt = cl.WaitForEvents(bwd_mod_events)
+            all_module_grads_clipped_evt = cl.wait_for_events(bwd_mod_events)
 
         elif self.plan.adaptation_strategy == "RECOMPUTE_GRAD_H":
             # In RECOMPUTE_GRAD_H mode, we MUST explicitly launch the streaming
@@ -99,11 +100,11 @@ class BatchProcessor:
 
         shared_grads_clipped_evt = recipes.build_shared_backprop_subgraph(self.svs, self.plan, deps=[h_ready_evt])
 
-        all_partials_ready_evt = cl.WaitForEvents([all_module_grads_clipped_evt, shared_grads_clipped_evt])
+        all_partials_ready_evt = cl.wait_for_events([all_module_grads_clipped_evt, shared_grads_clipped_evt])
 
         # Phase 3: Aggregation & Result Retrieval
-        reduction_events = []
-        summed_grad_handles = {}
+        reduction_events: List[cl.Event] = []
+        summed_grad_handles: Dict[str, BufferHandle] = {}
 
         diag_agg_events = recipes.execute_diagnostic_aggregation(
             svs=self.svs, plan=self.plan, deps=[all_probs_ready_evt]
@@ -123,12 +124,14 @@ class BatchProcessor:
                 summed_ref = bm.get_handle_by_name(flow.summed_grad_buffer_name)
                 clipped_shape, _ = bm.get_spec(clipped_ref)
                 elements_per_partial = int(np.prod(clipped_shape[1:]))
-                gather_prim = LinearlyChunkedGather(self.plan.shared_backprop_stream_chunks, elements_per_partial)
+                gather_prim_linear = LinearlyChunkedGather(
+                    self.plan.shared_backprop_stream_chunks, elements_per_partial
+                )
 
                 evt = recipes.execute_stabilized_reduction_tree(
                     svs=self.svs,
                     plan=self.plan,
-                    gather_primitive=gather_prim,
+                    gather_primitive=gather_prim_linear,
                     partial_collection_ref=clipped_ref,
                     final_dest_handle=summed_ref,
                     wait_for=[all_partials_ready_evt],
@@ -142,12 +145,12 @@ class BatchProcessor:
                 summed_ref = bm.get_handle_by_name(flow.summed_grad_buffer_name)
                 clipped_shape, _ = bm.get_spec(clipped_ref)
                 elements_per_partial = int(np.prod(clipped_shape[1:]))
-                gather_prim = TiledGather(self.plan.grid, elements_per_partial)
+                gather_prim_tiled = TiledGather(self.plan.grid, _elements_per_partial=elements_per_partial)
 
                 evt = recipes.execute_stabilized_reduction_tree(
                     svs=self.svs,
                     plan=self.plan,
-                    gather_primitive=gather_prim,
+                    gather_primitive=gather_prim_tiled,
                     partial_collection_ref=clipped_ref,
                     final_dest_handle=summed_ref,
                     wait_for=[all_partials_ready_evt],
@@ -160,10 +163,10 @@ class BatchProcessor:
         reduction_events.append(grad_h_evt)
         summed_grad_handles["hidden_activations"] = grad_h_handle
 
-        all_grads_summed_evt = cl.WaitForEvents(reduction_events)
+        all_grads_summed_evt = cl.wait_for_events(reduction_events)
 
         # Phase 4: Final Batch-Wide Update
-        effective_bs_ready_evt.wait()
+        effective_bs_ready_evt.wait()  # type: ignore
         effective_batch_size_scalar = effective_bs_view.get()[0]
 
         update_deps = [all_grads_summed_evt, effective_bs_ready_evt]
@@ -172,7 +175,8 @@ class BatchProcessor:
             param_space=self.param_space,
             step=step,
             summed_grads=summed_grad_handles,
-            effective_batch_size=float(effective_batch_size_scalar),
+            plan=self.plan,  # Pass the plan for hyperparameters
+            effective_batch_size=float(effective_batch_size_scalar),  # Pass the actual calculated size
             deps=update_deps,
         )
 
