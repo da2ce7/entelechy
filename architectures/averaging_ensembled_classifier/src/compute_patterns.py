@@ -25,6 +25,8 @@ from .kernel_signatures import (
     AggregateLocalReduceSignature,
 )
 
+from .cl_context_manager import DiscoveredArchConstants
+
 # === Configuration Object for Reductions ===
 
 
@@ -50,7 +52,7 @@ class AggregationManager:
     reduction tree and is used internally by the `execute_reduction_tree` recipe.
     """
 
-    def __init__(self, ex: KernelExecutor, bm: BufferManager, arch_consts: Dict[str, int]):
+    def __init__(self, ex: KernelExecutor, bm: BufferManager, arch_consts: DiscoveredArchConstants):
         self.ex = ex
         self.bm = bm
         self.wgs0 = arch_consts.get("work_group_size_0", 256)

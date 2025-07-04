@@ -34,6 +34,7 @@ import pyopencl as cl
 # This module relies on the MemoryLayout abstraction being in a separate, co-located file.
 from .memory_layout import MemoryLayout
 from .model_spec import ModelSpec
+from .cl_context_manager import DiscoveredArchConstants
 
 
 # --- Canonical Lexicon & Data Structures (The Host-Side Contract) ---
@@ -48,7 +49,7 @@ class Services:
     ex: KernelExecutor
     bm: BufferManager
     model_spec: ModelSpec
-    arch_consts: Dict[str, int]
+    arch_consts: DiscoveredArchConstants
 
 
 @dataclass(frozen=True, eq=True)

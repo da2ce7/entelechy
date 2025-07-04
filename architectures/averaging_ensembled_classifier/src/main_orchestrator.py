@@ -6,7 +6,7 @@
 # declarative "ExecutionPlan" for a training batch. It owns the training
 # lifecycle (epochs) but delegates all per-batch tactical execution.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict  # MODIFIED: Imported asdict
 from typing import Dict, List, Tuple
 from functools import partial
 
@@ -17,8 +17,9 @@ from sklearn.datasets import load_iris
 # --- Foundational Architectural Primitives ---
 # These imports represent the core "nouns" of the system architecture. The
 # Orchestrator's role is to compose these primitives into a coherent plan.
-from .model_spec import ModelSpec
-from .cl_context_manager import OpenCLContextManager, ComputeEnvironment
+
+from .model_spec import ModelSpec, Float32ModelSpec, Float16ModelSpec
+from .cl_context_manager import OpenCLContextManager, ComputeEnvironment, Float32ComputeEnvironment
 from .parameter_space import ParameterSpace
 from .execution_plan import (
     ExecutionPlan,
@@ -36,6 +37,7 @@ from .workload_primitives import TilingScheme
 from .stabilization_policy import StabilizationPolicy
 from .batch_processor import BatchProcessor
 from . import graph_recipes as recipes
+
 
 @dataclass(frozen=True)
 class StabilizationConfig:
@@ -131,7 +133,8 @@ class TrainingOrchestrator:
         )
         # ...and instructs the BufferManager to execute that plan.
         for name, layout in all_layouts.items():
-            bm.create_named_buffer(name, layout, spec.scalar_type)
+            # MODIFIED: Use the SCALAR_NP_TYPE from the concrete model spec
+            bm.create_named_buffer(name, layout, spec.SCALAR_NP_TYPE)
 
     def _create_execution_plan(self, batch_size: int) -> ExecutionPlan:
         """
@@ -151,7 +154,7 @@ class TrainingOrchestrator:
             total_modules=spec.num_modules,
             total_classes=spec.output_classes,
         )
-        reduction_plan = ReductionPlan(k=self.compute_env.arch_consts.get("optimal_tile_size", 16))
+        reduction_plan = ReductionPlan(k=self.compute_env.arch_consts.optimal_tile_size)
 
         # --- Phase 2: Instantiate Polymorphic Strategy Objects ---
         if self.problem_type_name == "CCE":
@@ -161,11 +164,12 @@ class TrainingOrchestrator:
         else:
             raise ValueError(f"Unknown problem type: {self.problem_type_name}")
 
-        fp_max = np.finfo(spec.scalar_type).max
+        # MODIFIED: Use the SCALAR_NP_TYPE from the concrete modelspec
+        fp_max = np.finfo(spec.SCALAR_NP_TYPE).max
         stabilization_policy = StabilizationPolicy(
             t_algorithmic=h_params.stabilization.max_grad_norm,
             lambda_=h_params.stabilization.lambda_,
-            fp_format_max=fp_max,
+            fp_format_max=float(fp_max),  # Ensure it's a standard float
         )
 
         plan_placeholder = None
@@ -259,7 +263,8 @@ if __name__ == "__main__":
     ADAPTATION_STRATEGY = "CACHE"  # Switch to "RECOMPUTE_GRAD_H" to test other path
     PROBLEM_TYPE = "CCE"
     CLIPPING_STRATEGY = "GLOBAL"
-    KERNEL_SOURCE_DIR = "./"
+    # MODIFIED: Path assumes being run from root of project, not inside `src`
+    KERNEL_SOURCE_DIR = "architectures/averaging_ensembled_classifier/kernels"
 
     HYPERPARAMS = TrainingHyperparams(
         epochs=5,
@@ -285,18 +290,31 @@ if __name__ == "__main__":
         exit(1)
 
     iris = load_iris()
-    X_train_data = iris.data.astype(scalar_type)
+    # MODIFIED: Cast data *after* compute_env is built, using its type
+    X_train_data = iris.data.astype(compute_env.SCALAR_NP_TYPE)
     y_train_data = iris.target.astype(np.int32)
     batch_size = X_train_data.shape[0]
 
-    iris_model_spec = ModelSpec(
-        input_dim=X_train_data.shape[1],
-        output_classes=len(np.unique(y_train_data)),
-        hidden_dim=LOGICAL_HIDDEN_DIM,
-        num_modules=LOGICAL_NUM_MODULES,
-        simd_width=compute_env.arch_consts.get("simd_width"),
-        cache_line_bytes=compute_env.arch_consts.get("global_mem_cacheline_size"),
-    )
+    # MODIFIED: Instantiate the correct *concrete* ModelSpec class
+    if isinstance(compute_env, Float32ComputeEnvironment):
+        iris_model_spec = Float32ModelSpec(
+            input_dim=X_train_data.shape[1],
+            output_classes=len(np.unique(y_train_data)),
+            hidden_dim=LOGICAL_HIDDEN_DIM,
+            num_modules=LOGICAL_NUM_MODULES,
+            simd_width=compute_env.arch_consts.simd_width,
+            cache_line_bytes=compute_env.arch_consts.global_mem_cacheline_size,
+        )
+    else:
+        # Fallback for other precisions like Float16
+        iris_model_spec = Float16ModelSpec(
+            input_dim=X_train_data.shape[1],
+            output_classes=len(np.unique(y_train_data)),
+            hidden_dim=LOGICAL_HIDDEN_DIM,
+            num_modules=LOGICAL_NUM_MODULES,
+            simd_width=compute_env.arch_consts.simd_width,
+            cache_line_bytes=compute_env.arch_consts.global_mem_cacheline_size,
+        )
 
     param_space = ParameterSpace(spec=iris_model_spec)
 
