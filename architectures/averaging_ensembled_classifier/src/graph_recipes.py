@@ -49,7 +49,7 @@ def execute_forward_pass(svs: Services, batch_size: int, deps: List[cl.Event]) -
     sig = ForwardPassSignature(
         simd_width=spec.simd_width,
         local_mem_bank_padding=1,
-        scalar_size_bytes=np.dtype(spec.scalar_dtype).itemsize,
+        scalar_size_bytes=np.dtype(spec.scalar_type).itemsize,
         in_ref=bm.get_handle_by_name("input"),
         mask_ref=bm.get_handle_by_name("sample_mask"),
         w_ref=bm.get_handle_by_name("shared_weights"),
@@ -170,7 +170,7 @@ def build_backward_module_path(
     # The recipe is now ignorant of "CCE" vs "BCE". It simply asks the strategy
     # object in the plan to provide the correct signature.
     wgs0 = arch_consts.get("work_group_size_0", 256)
-    scalar_bytes = spec.scalar_dtype().itemsize
+    scalar_bytes = spec.scalar_type().itemsize
     padded_class_dim = spec.padded_class_dim
 
     grad_mod_sig = plan.problem_type.get_module_grad_signature(
@@ -288,8 +288,8 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
     b_shape, _ = bm.get_spec(bm.get_handle_by_name("shared_biases"))
     gsw_chunk_shape = (w_shape[0], w_shape[1])
     gsb_chunk_shape = (b_shape[0],)
-    gsw_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gsw_chunk_shape) * spec.scalar_dtype().itemsize))
-    gsb_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gsb_chunk_shape) * spec.scalar_dtype().itemsize))
+    gsw_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gsw_chunk_shape) * spec.scalar_type().itemsize))
+    gsb_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gsb_chunk_shape) * spec.scalar_type().itemsize))
 
     # 3. Main Streaming Loop over batch chunks
     batch_size = plan.effective_batch_size
@@ -303,7 +303,7 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
         # Step 3a: Compute Raw Partials (Nodes 17 & 18) into SCRATCH buffers
         gsw_sig = BackpropSharedWeightsChunkSignature(
             work_group_size_1=arch_consts.get("work_group_size_1", 16),
-            scalar_size_bytes=spec.scalar_dtype().itemsize,
+            scalar_size_bytes=spec.scalar_type().itemsize,
             input_ref=bm.get_handle_by_name("input"),
             h_ref=h_ref,
             grad_h_ref=grad_h_ref,
@@ -317,7 +317,7 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
         gsw_evt = ex.launch(q, gsw_sig, wait_for=deps_for_all_chunks)
         gsb_sig = BackpropSharedBiasesChunkSignature(
             work_group_size_0=arch_consts.get("work_group_size_0", 256),
-            scalar_size_bytes=spec.scalar_dtype().itemsize,
+            scalar_size_bytes=spec.scalar_type().itemsize,
             h_ref=h_ref,
             grad_h_ref=grad_h_ref,
             mask_ref=bm.get_handle_by_name("sample_mask"),
@@ -338,7 +338,7 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
         )
         clip_sig = ClipSharedGradientsChunkSignature(
             work_group_size_0=arch_consts.get("work_group_size_0", 256),
-            scalar_size_bytes=spec.scalar_dtype().itemsize,
+            scalar_size_bytes=spec.scalar_type().itemsize,
             handles=shared_grad_handles,
             clipping_threshold_global=SCALAR_NP_TYPE(plan.stabilization_policy.get_leaf_safety_threshold()),
             epsilon=SCALAR_NP_TYPE(h_params.adam_epsilon),
@@ -547,7 +547,7 @@ def build_streaming_module_grad_path(svs: Services, plan: ExecutionPlan, deps: L
     q, ex, bm = svs.q, svs.ex, svs.q
     spec, h_params, grid = svs.model_spec, plan.hyperparams, plan.grid
     arch_consts = svs.arch_consts
-    scalar_bytes = spec.scalar_dtype().itemsize
+    scalar_bytes = spec.scalar_type().itemsize
     wgs0 = arch_consts.get("work_group_size_0", 256)
 
     # --- Step 1: Resource Acquisition ---
@@ -749,7 +749,7 @@ def build_final_grad_h_reduction_path(
     )
     reduce_sig = StabilizeAndReduceGradHiddenActivationsSignature(
         work_group_size_0=wgs0,
-        scalar_size_bytes=spec.scalar_dtype().itemsize,
+        scalar_size_bytes=spec.scalar_type().itemsize,
         permuted_soa_in_ref=permuted_ref,
         final_grad_h_out_ref=summed_ref,
         fp_max=SCALAR_NP_TYPE(plan.stabilization_policy.fp_format_max),
@@ -916,7 +916,7 @@ def compute_effective_batch_size(
 
     # 1. Acquire a transient buffer to hold the single scalar result of the reduction.
     #    This buffer is managed with a try/finally block to guarantee its release.
-    scalar_byte_size = spec.scalar_dtype().itemsize
+    scalar_byte_size = spec.scalar_type().itemsize
     result_buffer_ref = bm.acquire_transient_buffer(scalar_byte_size)
 
     try:
@@ -942,7 +942,7 @@ def compute_effective_batch_size(
         #    The HostView acts as a padded numpy array on the host, ready to receive data.
         host_view = HostView(
             padded_shape=(1,),
-            dtype=spec.scalar_dtype,
+            dtype=spec.scalar_type,
             real_shape=(1,),
         )
 

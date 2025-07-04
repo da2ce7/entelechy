@@ -246,7 +246,6 @@ class ComputeProbsLossBceChunkSignature(KernelSignature):
 
     _buffer_mgr: BufferManager
 
-
     # --- Buffer Handles ---
     logit_ref: BufferHandle
     temp_ref: BufferHandle

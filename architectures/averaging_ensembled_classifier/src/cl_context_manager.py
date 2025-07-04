@@ -17,12 +17,16 @@ This manager embodies the principle of "intelligent self-configuration":
 """
 
 import os
+import abc
 from dataclasses import dataclass
 from typing import Dict, List, Union, Optional
+from typing import Type
 import math
 import shutil
 
 import pyopencl as cl
+
+from .arch_primitives import PrecisionContext, Float32Context, Float16Context
 
 
 # ====== The Data Structures for the Compute Environment ======
@@ -49,39 +53,62 @@ class DiscoveredArchConstants:
 
 
 @dataclass(frozen=True)
-class ComputeEnvironment:
-    """The complete, ready-to-use compute environment, including the CLBundle
-    and the discovered hardware parameters."""
+class ComputeEnvironment(PrecisionContext, abc.ABC):
+    """
+    An *abstract* contract for a runtime environment.
+
+    By inheriting from PrecisionContext, this class is now abstract. Any attempt
+    to instantiate it directly will result in a TypeError, as it does not
+    implement the abstract properties `SCALAR_NP_TYPE` and `SCALAR_C_TYPE_NAME`.
+    This enforces the architectural rule that every compute environment MUST
+    have a defined precision.
+    """
 
     cl_bundle: CLBundle
     arch_consts: DiscoveredArchConstants
+
+
+@dataclass(frozen=True)
+class Float32ComputeEnvironment(ComputeEnvironment, Float32Context):
+    """
+    A concrete, instantiable runtime environment for FP32.
+    It fulfills the data contract of ComputeEnvironment and the precision
+    contract of Float32Context, making it a valid, complete object.
+    """
+
+    pass
+
+
+@dataclass(frozen=True)
+class Float16ComputeEnvironment(ComputeEnvironment, Float16Context):
+    """A concrete, instantiable runtime environment for FP16."""
+
+    pass
 
 
 # ====== The Manager Class ======
 
 
 class OpenCLContextManager:
-    """Builds a complete, self-configured OpenCL environment."""
+    """Builds a complete, self-configured, and precision-aware OpenCL environment."""
 
     def __init__(self, kernel_source_dir: str):
         """
         Initializes the manager with the path to the kernel source code.
 
         Args:
-            kernel_source_dir: The a path to the directory containing all
-                               .cl.h and .cl.c files.
+            kernel_source_dir: Path to the directory containing .cl.h and .cl.c files.
         """
         if not os.path.isdir(kernel_source_dir):
-            raise FileNotFoundError(f"The specified kernel source directory does not exist: {kernel_source_dir}")
+            raise FileNotFoundError(f"Kernel source directory does not exist: {kernel_source_dir}")
         self.kernel_source_dir = kernel_source_dir
 
     def _find_kernel_files(self) -> List[str]:
         """Recursively finds all .cl.h and .cl.c files in the source directory."""
         all_files = [os.path.join(path, name) for path, _, files in os.walk(self.kernel_source_dir) for name in files]
-        # Robustness: Process headers first to ensure definitions are available before use.
         headers = sorted([f for f in all_files if f.endswith(".cl.h")])
         sources = sorted([f for f in all_files if f.endswith(".cl.c")])
-        if not (headers or sources):
+        if not headers and not sources:
             raise FileNotFoundError(f"No kernel files (.cl.h, .cl.c) found in '{self.kernel_source_dir}'")
         return headers + sources
 
@@ -95,12 +122,34 @@ class OpenCLContextManager:
                 full_source += f.read() + "\n\n"
         return full_source
 
-    def build_and_discover(self) -> ComputeEnvironment:
+    def build_and_discover(self, precision: str = "float32") -> ComputeEnvironment:
         """
-        The primary public method. Creates the context, discovers hardware
-        parameters, builds the program, and returns the complete environment.
+        The primary factory method. Creates the context, discovers hardware
+        parameters, builds the program for a specific precision, and returns the
+        complete, concrete compute environment.
+
+        Args:
+            precision: The target precision ("float32" or "float16").
+
+        Returns:
+            A concrete subclass of ComputeEnvironment (e.g., Float32ComputeEnvironment).
         """
-        print("\n--- Building and Discovering OpenCL Environment ---")
+        print(f"\n--- Building and Discovering OpenCL Environment for Precision: {precision.upper()} ---")
+
+        # Step A: Select the Precision Context and Environment Class
+        # This is the core of the factory pattern.
+        context_mixin: PrecisionContext
+        env_class: Type[ComputeEnvironment]
+
+        if precision == "float32":
+            context_mixin = Float32Context()
+            env_class = Float32ComputeEnvironment
+        elif precision == "float16":
+            context_mixin = Float16Context()
+            env_class = Float16ComputeEnvironment
+        else:
+            raise ValueError(f"Unsupported precision '{precision}'. Choose 'float32' or 'float16'.")
+
         try:
             ctx = cl.create_some_context(interactive=False)
         except cl.RuntimeError as e:
@@ -112,90 +161,55 @@ class OpenCLContextManager:
         device = ctx.devices[0]
         print(f"INFO: Using device: {device.name} ({device.vendor})")
 
-        # --- 1. Device Introspection ---
-        print("INFO: Discovering hardware parameters through introspection...")
-        simd_width = device.preferred_vector_width_float or 4
-        max_wg_size = device.max_work_group_size
-        optimal_tile_size = int(math.sqrt(max_wg_size)) & ~1
-        cacheline_bytes = device.global_mem_cacheline_size or 64
-        local_mem_bytes = device.local_mem_size
-
+        # Step B: Device Introspection
+        print("INFO: Discovering hardware parameters...")
+        simd_width = (
+            device.preferred_vector_width_float if precision == "float32" else device.preferred_vector_width_half
+        )
         discovered_consts = DiscoveredArchConstants(
-            simd_width=simd_width,
-            optimal_tile_size=optimal_tile_size,
-            global_mem_cacheline_size=cacheline_bytes,
-            local_mem_size_bytes=local_mem_bytes,
+            simd_width=simd_width or 4,
+            optimal_tile_size=int(math.sqrt(device.max_work_group_size)) & ~1,
+            global_mem_cacheline_size=device.global_mem_cacheline_size or 64,
+            local_mem_size_bytes=device.local_mem_size,
         )
         print(f"      - Discovered Constants: {discovered_consts}")
 
-        # --- 2. Program Compilation ---
+        # Step C: Link Python Type System to C Preprocessor and Compile
         kernel_files = self._find_kernel_files()
         full_source = self._load_and_concatenate_sources(kernel_files)
 
-        # Build compiler options from discovered constants
         options = ["-cl-std=CL1.2"]
+        # Use the selected context to set the C-level type.
+        options.append(f"-D SCALAR_TYPE={context_mixin.SCALAR_C_TYPE_NAME}")
         options.append(f"-D SIMD_WIDTH={discovered_consts.simd_width}")
         options.append(f"-D C_TILE_SIZE={discovered_consts.optimal_tile_size}")
-        options.append(f"-D LOCAL_MEM_BANK_PADDING=1")  # This could also be a configurable static define
+        options.append(f"-D LOCAL_MEM_BANK_PADDING=1")
+        if precision == "float16":
+            # FP16 is an optional extension that must be explicitly enabled.
+            options.append("-cl-fp32-correctly-rounded-divide-sqrt")  # Often good practice
+            options.append("-D cl_khr_fp16")
 
         print(f"INFO: Compiling with options: {' '.join(options)}")
         try:
-            # Attempt to build the OpenCL program with the provided options.
             program = cl.Program(ctx, full_source).build(options=options)
             print("INFO: Kernel compilation successful.")
-
-        # Here, we catch the broader cl.Error for static type checker compatibility (e.g., mypy).
-        # mypy may not be able to resolve the full inheritance chain and might flag
-        # a direct catch of cl.BuildError as an undefined attribute of the 'cl' module.
         except cl.Error as e:
-            print("\n" + "=" * 80 + "\n--- KERNEL BUILD FAILED ---\n" + "=" * 80)
-
-            # At runtime, we inspect the caught exception to see if it has the specific
-            # 'device_logs' attribute. This is a robust way to check if the error is,
-            # in fact, the more detailed cl.BuildError, without making static assumptions.
-            if hasattr(e, 'device_logs'):
-                # If it is a BuildError, we can safely access 'device_logs'.
-                # This provides the detailed, device-specific compiler output which is
-                # essential for debugging kernel code.
-                log = "\n\n".join([f"Device: {dev.name}\n--- Build Log --- \n{log}" for dev, log in e.device_logs])
-                print(log)
+            # (Detailed error logging as before)
+            log_header = "\n" + "=" * 80 + "\n--- KERNEL BUILD FAILED ---\n" + "=" * 80
+            if hasattr(e, "device_logs"):
+                log_details = "\n\n".join(
+                    [f"Device: {dev.name}\n--- Build Log ---\n{log}" for dev, log in e.device_logs]
+                )
+                print(log_header, log_details, "=" * 80, sep="\n")
             else:
-                # If it's another type of cl.Error (e.g., a runtime error not related
-                # to compilation), it won't have 'device_logs'. In this case, we print a
-                # general error message to avoid an `AttributeError`.
-                print(f"An unexpected OpenCL error occurred: {e}")
-
-            print("=" * 80)
+                print(log_header, f"An unexpected OpenCL error occurred: {e}", "=" * 80, sep="\n")
             raise
 
-        # --- 3. Assemble and Return the Final Environment ---
+        # Step D: Assemble and Return the Final, Concrete Environment
         queue = cl.CommandQueue(ctx, properties=cl.command_queue_properties.OUT_OF_ORDER_EXEC_MODE_ENABLE)
         cl_bundle = CLBundle(context=ctx, queue=queue, program=program)
 
-        return ComputeEnvironment(cl_bundle=cl_bundle, arch_consts=discovered_consts)
+        # Instantiate the correct subclass (e.g., Float32ComputeEnvironment).
+        final_environment = env_class(cl_bundle=cl_bundle, arch_consts=discovered_consts)
 
-
-if __name__ == "__main__":
-    print("--- OpenCL Context Manager: Demonstration ---")
-    DUMMY_KERNEL_DIR = "./temp_kernels_demo"
-    try:
-        os.makedirs(DUMMY_KERNEL_DIR, exist_ok=True)
-        with open(os.path.join(DUMMY_KERNEL_DIR, "contract.cl.h"), "w") as f:
-            f.write("/* Header */\n")
-        with open(os.path.join(DUMMY_KERNEL_DIR, "kernel.cl.c"), "w") as f:
-            f.write("__kernel void test_kernel() {}\n")
-
-        manager = OpenCLContextManager(kernel_source_dir=DUMMY_KERNEL_DIR)
-
-        print("\nAttempting to build and discover...")
-        # compute_env = manager.build_and_discover() # This line would be active in a real run
-        print("\n(Simulating successful build and discovery for demonstration.)")
-
-    except (cl.RuntimeError, FileNotFoundError) as e:
-        print(f"\nCaught expected error during demonstration: {e}")
-        print("This is normal if OpenCL drivers are not installed on this machine.")
-    finally:
-        if os.path.exists(DUMMY_KERNEL_DIR):
-            shutil.rmtree(DUMMY_KERNEL_DIR)
-
-    print("\n--- Context Manager demonstration complete. ---")
+        return final_environment

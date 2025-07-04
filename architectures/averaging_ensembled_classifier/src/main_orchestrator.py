@@ -131,7 +131,7 @@ class TrainingOrchestrator:
         )
         # ...and instructs the BufferManager to execute that plan.
         for name, layout in all_layouts.items():
-            bm.create_named_buffer(name, layout, spec.scalar_dtype)
+            bm.create_named_buffer(name, layout, spec.scalar_type)
 
     def _create_execution_plan(self, batch_size: int) -> ExecutionPlan:
         """
@@ -161,7 +161,7 @@ class TrainingOrchestrator:
         else:
             raise ValueError(f"Unknown problem type: {self.problem_type_name}")
 
-        fp_max = np.finfo(spec.scalar_dtype).max
+        fp_max = np.finfo(spec.scalar_type).max
         stabilization_policy = StabilizationPolicy(
             t_algorithmic=h_params.stabilization.max_grad_norm,
             lambda_=h_params.stabilization.lambda_,
@@ -285,7 +285,7 @@ if __name__ == "__main__":
         exit(1)
 
     iris = load_iris()
-    X_train_data = iris.data.astype(SCALAR_DTYPE)
+    X_train_data = iris.data.astype(scalar_type)
     y_train_data = iris.target.astype(np.int32)
     batch_size = X_train_data.shape[0]
 

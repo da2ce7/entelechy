@@ -148,7 +148,7 @@ class ParameterSpace:
         # We must use the *maximum* chunk size for allocation.
         max_mods_per_tile = (spec.num_modules + grid.num_module_chunks - 1) // grid.num_module_chunks
         max_cls_per_tile = (spec.output_classes + grid.num_class_chunks - 1) // grid.num_class_chunks
-        padded_hidden_dim = layouts["shared_biases"].get_padded_shape(spec.scalar_dtype)[0]
+        padded_hidden_dim = layouts["shared_biases"].get_padded_shape(spec.scalar_type)[0]
 
         layouts["partial_grad_module_weights"] = MemoryLayout(
             (grid.total_tiles, max_mods_per_tile, padded_hidden_dim, max_cls_per_tile)
@@ -159,7 +159,7 @@ class ParameterSpace:
             (grid.total_tiles, max_mods_per_tile, batch_size, padded_hidden_dim)
         )
         # Shared grad collection buffers must account for the streaming chunks
-        padded_input_dim = layouts["input"].get_padded_shape(spec.scalar_dtype)[1]
+        padded_input_dim = layouts["input"].get_padded_shape(spec.scalar_type)[1]
         layouts["partial_grad_shared_weights"] = MemoryLayout((num_batch_chunks, padded_input_dim, padded_hidden_dim))
         layouts["partial_grad_shared_biases"] = MemoryLayout((num_batch_chunks, padded_hidden_dim))
 
