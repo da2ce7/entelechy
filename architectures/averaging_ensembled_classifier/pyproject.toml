@@ -1,0 +1,56 @@
+# architectures/averaging_ensembled_classifier/pyproject.toml
+
+# This file specifies the Python dependencies for the 'averaging_ensembled_classifier'.
+# It follows the principle of Architectural Autonomy, making this module a self-contained
+# and independently verifiable unit.
+
+[build-system]
+requires = [
+    "meson-python>=0.15.0",
+    "meson>=1.2.0",
+    "ninja"
+]
+build-backend = "mesonpy"
+
+
+[project]
+name = "averaging_ensembled_classifier"
+version = "0.1.0"
+description = "A Unified, Memory-Aware Streaming Classification Engine."
+readme = "README.md"
+requires-python = ">=3.11"
+
+# == Core Runtime Dependencies ==
+# These are the non-negotiable packages required for the orchestrator to function.
+dependencies = ["numpy", "pyopencl", "scikit-learn"]
+
+[project.optional-dependencies]
+# == Development & Validation Dependencies ==
+# These tools are required to run the validation scenarios and ensure code quality,
+# but are not needed in a pure production runtime environment.
+dev = [
+    "pytest",
+    "black",
+    "isort",
+    "flake8",
+    "mypy",
+    "black",
+]
+
+[tool.black]
+line-length = 120
+target-version = ['py310', 'py311', 'py312']
+include = '\.pyi?$'
+exclude = '''
+/(
+  \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''

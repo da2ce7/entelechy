@@ -9,7 +9,6 @@ import pyopencl as cl
 from execution_plan import ExecutionPlan
 from launcher_infra import Services, HostView
 from parameter_space import ParameterSpace
-from . import graph_recipes as recipes
 from workload_primitives import TiledGather, LinearlyChunkedGather
 
 

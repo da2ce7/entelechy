@@ -29,7 +29,6 @@ try:
     from .launcher_infra import BufferHandle, KernelSignature, KernelExecutor, Services
     from .compute_patterns import ReductionPlan
     from .workload_primitives import TilingScheme, WorkTile, TiledGather
-    from . import graph_recipes as recipes
 
     # --- Kernel Signature Imports for Strategy Factories ---
     from .kernel_signatures import (

@@ -1,4 +1,4 @@
-### **Framework Design Philosophy and Specification**
+### **Repository Structure: Philosophy and Specification**
 
 #### **Preamble**
 

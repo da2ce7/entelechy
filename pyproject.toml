@@ -1,17 +1,14 @@
-[tool.black]
-line-length = 120
-target-version = ['py310', 'py311', 'py312']
-include = '\.pyi?$'
-exclude = '''
-/(
-  \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | _build
-  | buck-out
-  | build
-  | dist
-)/
-'''
+# pyproject.toml (at the root of your project)
+
+# NO [build-system] section - this is not a package.
+# NO [project] section - this is not a package.
+
+[project.optional-dependencies]
+# This is perfect. It defines the development toolset for the entire monorepo.
+# A developer can run `pip install -e .[dev]` in the root to get these tools.
+dev = [
+    # Note: I'm adding setuptools here because `-e` needs it for this to work.
+    "setuptools",
+    "meson>=1.2.0",
+    "ninja",
+]
