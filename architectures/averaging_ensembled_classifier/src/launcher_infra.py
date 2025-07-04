@@ -48,9 +48,8 @@ class Services:
     It ensures that functions and objects receive all necessary context without
     relying on global state, making the system's data flows explicit and traceable.
     """
+
     q: cl.CommandQueue
-    # Forward references are used here as a form of architectural courtesy,
-    # preventing circular import dependencies at runtime.
     ex: "KernelExecutor"
     bm: "BufferManager"
     model_spec: ModelSpec
@@ -62,6 +61,7 @@ class BufferHandle:
     """An opaque, immutable handle to a device memory buffer. It serves as a
     token of authority, granted by the BufferManager, abstracting away the
     raw details of memory addresses."""
+
     id: int
 
 
@@ -77,15 +77,10 @@ class HostView:
     only the true, logical data.
     """
 
-    def __init__(self, padded_shape: Tuple, dtype: Union[np.dtype, Type[np.floating]], real_shape: Tuple):
+    def __init__(self, padded_shape: Tuple, dtype: Union[np.dtype, Type[np.floating]], real_shape: Tuple) -> None:
         self.padded_shape = padded_shape
-        # WHY: This normalization step makes the constructor robust. It can
-        # accept either a raw type (e.g., np.float32) or a dtype object,
-        # ensuring consistent internal state.
         self.dtype = np.dtype(dtype)
         self.real_shape = real_shape
-        # The host-side buffer is allocated with the full padded shape to
-        # perfectly match the device-side source.
         self.host_data = np.empty(self.padded_shape, dtype=self.dtype)
 
     def enqueue_read(self, queue: cl.CommandQueue, cl_buffer: cl.Buffer, wait_for=None) -> cl.Event:
@@ -113,13 +108,11 @@ class BufferManager:
     provides access via opaque `BufferHandle` tokens.
     """
 
-    def __init__(self, context: cl.Context):
+    def __init__(self, context: cl.Context) -> None:
         self._context = context
         self._next_handle_id = 0
         self._handle_to_buffer: Dict[BufferHandle, cl.Buffer] = {}
         self._handle_to_spec: Dict[BufferHandle, Tuple[Tuple[int, ...], Type[np.floating]]] = {}
-        # REFINEMENT: The lexicon is now internally consistent. This dictionary
-        # contractually maps a string name to its unique BufferHandle object.
         self._name_to_handle: Dict[str, BufferHandle] = {}
 
     def _get_new_handle(self) -> BufferHandle:
@@ -131,13 +124,11 @@ class BufferManager:
         """Creates a permanent, named buffer according to a memory layout plan."""
         if name in self._name_to_handle:
             raise ValueError(f"Buffer with name '{name}' already exists.")
-        # The manager honors the layout contract, computing the padded shape.
         padded_shape = layout.get_padded_shape(np.dtype(dtype))
         byte_size = int(np.prod(padded_shape) * np.dtype(dtype).itemsize) if padded_shape else 4
         handle = self._get_new_handle()
         self._name_to_handle[name] = handle
         self._handle_to_buffer[handle] = cl.Buffer(self._context, cl.mem_flags.READ_WRITE, size=max(4, byte_size))
-        # Only named buffers have a "spec" that is tracked by the manager.
         self._handle_to_spec[handle] = (padded_shape, dtype)
         return handle
 
@@ -147,18 +138,14 @@ class BufferManager:
         self._handle_to_buffer[handle] = cl.Buffer(self._context, cl.mem_flags.READ_WRITE, size=max(4, size_bytes))
         return handle
 
-    def release_transient_buffer(self, handle: BufferHandle):
+    def release_transient_buffer(self, handle: BufferHandle) -> None:
         """Releases a temporary buffer. A contractually obligated cleanup step."""
         if handle in self._handle_to_buffer:
             self._handle_to_buffer[handle].release()
             del self._handle_to_buffer[handle]
-        # REFINEMENT: Removed deletion from `_handle_to_spec`. Transient buffers
-        # are not recorded there, making the check unnecessary and bringing the
-        # logic into perfect alignment with its architectural purpose.
 
     def get_cl_buffer(self, ref: Union[str, BufferHandle]) -> cl.Buffer:
         """Retrieves the raw PyOpenCL buffer object for a given reference."""
-        # This logic is now certifiably correct due to the refined type hint.
         handle = self._name_to_handle[ref] if isinstance(ref, str) else ref
         if handle not in self._handle_to_buffer:
             raise KeyError(f"No buffer found for reference: {ref}")
@@ -174,8 +161,6 @@ class BufferManager:
         """Retrieves the (padded_shape, dtype) spec for a named buffer."""
         handle = self._name_to_handle[ref] if isinstance(ref, str) else ref
         if handle not in self._handle_to_spec:
-            # It is architecturally correct to raise an error for transient
-            # buffers, as they have no predefined shape or type spec.
             raise KeyError(f"No spec found for reference: {ref}. (Is it a transient buffer?)")
         return self._handle_to_spec[handle]
 
@@ -183,17 +168,17 @@ class BufferManager:
 class PingPongManager:
     """Manages a pair of recyclable 'ping-pong' buffers, typically for reductions."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._reset()
 
-    def _reset(self):
+    def _reset(self) -> None:
         """A private helper to restore the manager to its initial, uninitialized state."""
         self._buffer_mgr: Optional[BufferManager] = None
         self.ping: Optional[BufferHandle] = None
         self.pong: Optional[BufferHandle] = None
         self._is_ping_current_input = True
 
-    def initialize(self, buffer_mgr: BufferManager, max_bytes: int):
+    def initialize(self, buffer_mgr: BufferManager, max_bytes: int) -> None:
         """Acquires two transient buffers of a given size to begin operations."""
         if self.ping is not None or self.pong is not None:
             raise RuntimeError("PingPongManager is already initialized.")
@@ -207,15 +192,17 @@ class PingPongManager:
             raise RuntimeError("PingPongManager must be initialized before use.")
         return (self.ping, self.pong) if self._is_ping_current_input else (self.pong, self.ping)
 
-    def swap(self):
+    def swap(self) -> None:
         """Swaps the input and output roles of the internal buffers."""
         self._is_ping_current_input = not self._is_ping_current_input
 
-    def release(self):
+    def release(self) -> None:
         """Releases the managed transient buffers and resets the manager."""
         if self._buffer_mgr:
-            if self.ping: self._buffer_mgr.release_transient_buffer(self.ping)
-            if self.pong: self._buffer_mgr.release_transient_buffer(self.pong)
+            if self.ping:
+                self._buffer_mgr.release_transient_buffer(self.ping)
+            if self.pong:
+                self._buffer_mgr.release_transient_buffer(self.pong)
         self._reset()
 
 
@@ -230,10 +217,13 @@ class KernelSignature(abc.ABC):
     signature is a complete, self-contained, and verifiable specification for a
     single kernel dispatch.
     """
-    def __post_init__(self):
+
+    def __post_init__(self) -> None:
         # WHY: This exists to provide a no-op `__post_init__` for subclasses,
         # so they do not need to call `super()` if the base class behavior
-        # is ever extended. It is a gesture of forward-looking design.
+        # is ever extended. It is a gesture of forward-looking design. The
+        # `-> None` annotation is the formal promise that this method returns
+        # no value, completing its contract and enabling static analysis.
         pass
 
     @property
@@ -256,7 +246,11 @@ class KernelSignature(abc.ABC):
 class KernelExecutor:
     """A pure, stateless dispatcher. Its sole function is to execute a `KernelSignature`."""
 
-    def __init__(self, program: cl.Program):
+    def __init__(self, program: cl.Program) -> None:
+        # WHY: The `-> None` annotation is the contract for all __init__ methods.
+        # It makes an explicit promise that the constructor's sole purpose is
+        # to initialize the object, returning nothing. This allows MyPy to
+        # fully verify the constructor's logic.
         if not isinstance(program, cl.Program):
             raise TypeError("KernelExecutor requires a valid pyopencl.Program instance.")
         self.program = program
@@ -270,5 +264,4 @@ class KernelExecutor:
         kernel = getattr(self.program, signature.kernel_name)
         global_size, local_size = signature.get_grid()
         kernel_args = signature.get_args()
-        # The robust `wait_for or []` idiom handles the optional event list.
         return kernel(queue, global_size, local_size, *kernel_args, wait_for=wait_for or [])

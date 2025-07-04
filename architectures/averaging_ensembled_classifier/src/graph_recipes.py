@@ -91,7 +91,7 @@ def execute_forward_pass(svs: Services, batch_size: int, deps: List[cl.Event]) -
     """Recipe for the initial shared layer forward pass (Node 4)."""
     bm, ex, q = svs.bm, svs.ex, svs.q
 
-    # The signature is now instantiated with high-level context, allowing it
+    # The signature is instantiated with high-level context, allowing it
     # to derive its own low-level parameters, fulfilling its contract.
     sig = ForwardPassSignature(
         _buffer_mgr=bm,
@@ -137,7 +137,9 @@ def build_forward_module_path(
 
     # Node 6/7: Compute Loss & Probabilities via Polymorphic Delegation.
     # WHY: This single call to the strategy object replaces a complex if/else
-    # block, making the recipe agnostic to the specific loss function.
+    # block, making the recipe agnostic to the specific loss function. This
+    # embodies the Open/Closed Principle: the system is extensible without
+    # modification of this core logic.
     loss_sig_base = plan.problem_type.get_loss_signature(
         _buffer_mgr=bm,
         _arch_consts=svs.arch_consts,
@@ -282,6 +284,10 @@ def build_backward_module_path(
     grad_t_evt = ex.launch(q, grad_t_sig, wait_for=prior_deps)
 
     # Node 11: The foundational stability primitive, clipping the raw gradients.
+    # WHY: A clipping strategy (e.g., GLOBAL vs PER_ITEM) is chosen at the
+    # highest level and encoded in the ExecutionPlan. This recipe simply executes
+    # that strategy by selecting the appropriate signature class, again freeing
+    # this tactical layer from making strategic decisions.
     grad_handles = GradientHandles(
         grad_weights_module=grad_mod_sig.gw_out_ref,
         grad_biases_module=grad_mod_sig.gb_out_ref,
@@ -453,10 +459,12 @@ def build_streaming_module_grad_path(svs: Services, plan: ExecutionPlan, deps: L
             clip_event = ex.launch(q, clip_sig, wait_for=all_raw_grads_ready)
             all_clip_events.append(clip_event)
 
+        # WHY: This is the dialect-corrected synchronization point. A barrier is
+        # the correct tool to join multiple parallel streams (the clip events for
+        # each tile) into a single event that signals the entire phase is complete.
         all_clips_done_evt = (
-            cl.WaitForEvents(all_clip_events) if all_clip_events else cl.enqueue_marker(q, wait_for=deps)
+            cl.enqueue_barrier(q, wait_for=all_clip_events) if all_clip_events else cl.enqueue_marker(q, wait_for=deps)
         )
-        # Return a dictionary mapping collection buffer names to the single completion event.
         return {
             "clipped_partial_grad_module_weights": all_clips_done_evt,
             "clipped_partial_grad_module_biases": all_clips_done_evt,
@@ -464,6 +472,9 @@ def build_streaming_module_grad_path(svs: Services, plan: ExecutionPlan, deps: L
             "clipped_partial_grad_hidden_activations": all_clips_done_evt,
         }
     finally:
+        # WHY: A contractually obligated cleanup step. Using a `finally` block
+        # guarantees that we release all transient memory, even if an error
+        # occurs, preventing VRAM leaks and upholding architectural robustness.
         for handle in scratch_handles:
             bm.release_transient_buffer(handle)
 
@@ -609,22 +620,18 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
             final_chunk_events.append(clip_evt)
 
     finally:
-        # A contractually obligated step to prevent VRAM leakage.
         bm.release_transient_buffer(gsw_scratch_ref)
         bm.release_transient_buffer(gsb_scratch_ref)
 
-    # Return a single synchronization event for the entire streaming operation.
     if not final_chunk_events:
-        user_event = cl.UserEvent(q.context)
-        user_event.set_status(cl.command_execution_status.COMPLETE)
-        return user_event
-    return cl.WaitForEvents(final_chunk_events)
+        return cl.enqueue_marker(q, wait_for=deps)
+    return cl.enqueue_barrier(q, wait_for=final_chunk_events)
 
 
 # =========================================================================
 # === Section 4: The Core Reduction Engine & Its Public Recipes         ===
 # =========================================================================
-# This section contains the new, unified reduction pipeline and the two distinct,
+# This section contains the unified reduction pipeline and the two distinct,
 # intention-revealing public recipes that use it.
 # =========================================================================
 
@@ -659,13 +666,18 @@ def _execute_reduction_pipeline(
     scalar_byte_size = spec.SCALAR_NP_TYPE().itemsize
     partial_byte_size = elements_per_partial * scalar_byte_size
 
+    # WHY: An elegant optimization. If there is only one partial to "reduce,"
+    # the correct action is a direct memory copy, not a redundant kernel call.
+    # This avoids the overhead of launching a kernel for a no-op aggregation.
     if n == 1:
         initial_offsets = gather_primitive.get_offsets()
         src_offset_bytes = int(initial_offsets[0] * scalar_byte_size)
-        return cl.enqueue_copy_buffer(
+        # WHY: This is the dialect-corrected function for all copies, including
+        # device-to-device. It's a top-level function in the `pyopencl` module.
+        return cl.enqueue_copy(
             q,
+            dest=bm.get_cl_buffer(final_dest_handle),
             src=bm.get_cl_buffer(partial_collection_ref),
-            dst=bm.get_cl_buffer(final_dest_handle),
             byte_count=partial_byte_size,
             src_offset=src_offset_bytes,
             dst_offset=0,
@@ -689,7 +701,6 @@ def _execute_reduction_pipeline(
                 num_partials=n, hardware_max_fan_in=reduction_plan.k
             )
         else:
-            # For a simple sum, use the hardware-optimal K and num_stages is irrelevant.
             safe_k, num_stages = reduction_plan.k, 0
 
         stage_output_partials = (n + safe_k - 1) // safe_k
@@ -838,30 +849,19 @@ def execute_summation_tree(
     )
 
 
-# =========================================================================
-# === Section 5: Finalization & Update Recipes                          ===
-# =========================================================================
-# This final section contains the recipes for the culmination of a learning
-# step: normalizing the batch-wide gradients and applying the stateful
-# optimizer update.
-# =========================================================================
-
-
 def compute_effective_batch_size(
     svs: "Services", plan: "ExecutionPlan", deps: List[cl.Event]
 ) -> Tuple[HostView, cl.Event]:
     """Recipe to compute the effective batch size by summing the sample_mask."""
-    bm, spec, arch_consts = svs.bm, svs.model_spec, svs.arch_consts
+    bm, spec = svs.bm, svs.model_spec
     scalar_byte_size = spec.SCALAR_NP_TYPE().itemsize
     result_buffer_ref = bm.acquire_transient_buffer(scalar_byte_size)
-    batch_size = plan.effective_batch_size  # Derive batch size from the plan
+    batch_size = plan.effective_batch_size
 
     try:
-        # NO LONGER CREATE A REDUCTION PLAN HERE. It is sourced from the master plan.
         gather_prim = LinearlyChunkedGather(num_chunks=batch_size, elements_per_chunk=1)
         sample_mask_ref = bm.get_handle_by_name("sample_mask")
 
-        # THE CORRECTED CALL: Pass the master 'plan' object.
         reduction_complete_evt = execute_summation_tree(
             svs=svs,
             plan=plan,
@@ -880,6 +880,16 @@ def compute_effective_batch_size(
         return host_view, download_complete_evt
     finally:
         bm.release_transient_buffer(result_buffer_ref)
+
+
+# =========================================================================
+# === Section 5: Finalization & Update Recipes                          ===
+# =========================================================================
+# This final section contains the recipes for the culmination of a learning
+# step: normalizing the batch-wide gradients and applying the stateful
+# optimizer update.
+# =========================================================================
+
 
 def build_update_subgraph(
     svs: Services,
@@ -913,10 +923,15 @@ def build_update_subgraph(
 
     if "hidden_activations" in summed_grads:
         final_grad_handles["hidden_activations"] = summed_grads["hidden_activations"]
-    all_norm_evt = cl.WaitForEvents(norm_events) if norm_events else cl.enqueue_marker(q, wait_for=deps)
+
+    # This barrier joins all parallel normalization streams.
+    all_norm_evt = cl.enqueue_barrier(q, wait_for=norm_events) if norm_events else cl.enqueue_marker(q, wait_for=deps)
 
     # Node 24: Apply Adam Optimizer Update.
-    # The sensitive exponentiation is performed here, on the host, in high precision.
+    # WHY: A CRITICAL ARCHITECTURAL MANDATE. The sensitive exponentiation is
+    # performed here on the host, in high precision, and passed as a primitive
+    # scalar to the kernel. This prevents on-device precision loss and underflow
+    # during long training runs, guaranteeing numerical stability indefinitely.
     beta1_t = spec.SCALAR_NP_TYPE(h_params.adam_beta1**step)
     beta2_t = spec.SCALAR_NP_TYPE(h_params.adam_beta2**step)
     update_events: List[cl.Event] = []
@@ -941,7 +956,9 @@ def build_update_subgraph(
             beta2_pow_t=beta2_t,
         )
         update_events.append(ex.launch(q, adam_sig, wait_for=[all_norm_evt]))
-    all_updates_evt = cl.WaitForEvents(update_events) if update_events else all_norm_evt
+
+    # This is the final Batch Synchronization Point before the cycle ends.
+    all_updates_evt = cl.enqueue_barrier(q, wait_for=update_events) if update_events else all_norm_evt
 
     # Node 25: Final Clamping for domain-specific constraints.
     clamp_sig = ClampTemperaturesSignature(
