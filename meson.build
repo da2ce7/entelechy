@@ -10,7 +10,7 @@ project('ml_engine_framework',
   default_options: ['warning_level=2'],
   subproject_dir: 'architectures')
 
-averaging_module = subproject('averaging_ensembled_classifier')
+subproject('averaging_ensembled_classifier')
 
 # Example of how you would add another autonomous architecture:
 # subdir('architectures/transformer_diffusion_model')

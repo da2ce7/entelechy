@@ -75,7 +75,6 @@ class AggregationManager:
 
         if num_partials_to_reduce <= self.max_reg_agg:
             sig = AggregateRegisterReduceSignature(
-                buffer_mgr=self.bm,
                 partial_collection_ref=collection_ref,
                 partial_offset_list_ref=offset_list_ref,
                 dest_ref=destination_ref,
@@ -85,7 +84,6 @@ class AggregationManager:
             )
         else:
             sig = AggregateLocalReduceSignature(
-                buffer_mgr=self.bm,
                 work_group_size_0=self.wgs0,
                 scalar_size_bytes=scalar_byte_size,
                 partial_collection_ref=collection_ref,

@@ -16,9 +16,6 @@ the dynamic training and execution logic.
 from dataclasses import dataclass, field
 import numpy as np
 
-# A shared type definition is appropriate here as it's part of the spec's contract.
-SCALAR_DTYPE = np.float32
-
 
 @dataclass(frozen=True)
 class ModelSpec:

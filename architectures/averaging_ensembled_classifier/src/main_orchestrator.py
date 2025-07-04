@@ -17,7 +17,7 @@ from sklearn.datasets import load_iris
 # --- Foundational Architectural Primitives ---
 # These imports represent the core "nouns" of the system architecture. The
 # Orchestrator's role is to compose these primitives into a coherent plan.
-from .model_spec import ModelSpec, SCALAR_DTYPE
+from .model_spec import ModelSpec
 from .cl_context_manager import OpenCLContextManager, ComputeEnvironment
 from .parameter_space import ParameterSpace
 from .execution_plan import (

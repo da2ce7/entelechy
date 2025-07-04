@@ -33,10 +33,7 @@ import pyopencl as cl
 # --- Local Imports ---
 # This module relies on the MemoryLayout abstraction being in a separate, co-located file.
 from .memory_layout import MemoryLayout
-
-
-# --- Global Type Definitions ---
-SCALAR_NP_TYPE = np.float32
+from .model_spec import ModelSpec
 
 
 # --- Canonical Lexicon & Data Structures (The Host-Side Contract) ---

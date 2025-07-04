@@ -16,13 +16,13 @@ import numpy as np
 import pyopencl as cl
 
 # --- Architectural Imports ---
-from .execution_plan import ExecutionPlan, WorkTile
+from .execution_plan import ExecutionPlan
 from .launcher_infra import Services, BufferManager, KernelExecutor, BufferHandle, SCALAR_NP_TYPE, PingPongManager
 from .kernel_signatures import *
 from .model_spec import ModelSpec
 from .parameter_space import ParameterSpace
 from .compute_patterns import AggregationManager, ReductionPlan
-from .workload_primitives import GatherPrimitive, ContiguousGather
+from .workload_primitives import GatherPrimitive, ContiguousGather, TiledGather, WorkTile
 
 
 # =========================================================================
@@ -47,7 +47,6 @@ def execute_forward_pass(svs: Services, batch_size: int, deps: List[cl.Event]) -
     spec = svs.model_spec
 
     sig = ForwardPassSignature(
-        buffer_mgr=bm,
         simd_width=spec.simd_width,
         local_mem_bank_padding=1,
         scalar_size_bytes=np.dtype(spec.scalar_dtype).itemsize,
@@ -91,7 +90,6 @@ def build_forward_module_path(
 
     # 1. Launch Logits Rendering (Node 5)
     logits_sig = RenderLogitsChunkSignature(
-        buffer_mgr=bm,
         h_ref=h_ref,
         h_mask_ref=bm.get_handle_by_name("hidden_mask"),
         w_ref=bm.get_handle_by_name("module_weights"),
@@ -115,7 +113,7 @@ def build_forward_module_path(
     # This recipe is now completely ignorant of CCE vs. BCE.
     loss_sig = plan.problem_type.get_loss_signature(
         # Pass all common arguments.
-        buffer_mgr=bm,
+        buffer_mgr=svs.bm,
         logit_ref=logits_sig.logit_out_ref,
         temp_ref=bm.get_handle_by_name("temperatures"),
         mask_ref=bm.get_handle_by_name("sample_mask"),
@@ -176,7 +174,7 @@ def build_backward_module_path(
     padded_class_dim = spec.padded_class_dim
 
     grad_mod_sig = plan.problem_type.get_module_grad_signature(
-        buffer_mgr=bm,
+        buffer_mgr=svs.bm,
         work_group_size_0=wgs0,
         scalar_size_bytes=scalar_bytes,
         h_ref=h_ref,
@@ -194,7 +192,7 @@ def build_backward_module_path(
     )
 
     grad_h_sig = plan.problem_type.get_hidden_grad_signature(
-        buffer_mgr=bm,
+        buffer_mgr=svs.bm,
         prob_ref=prob_ref,
         mask_ref=bm.get_handle_by_name("sample_mask"),
         w_mod_ref=bm.get_handle_by_name("module_weights"),
@@ -205,7 +203,7 @@ def build_backward_module_path(
     )
 
     grad_t_sig = plan.problem_type.get_temp_grad_signature(
-        buffer_mgr=bm,
+        buffer_mgr=svs.bm,
         work_group_size_0=wgs0,
         scalar_size_bytes=scalar_bytes,
         logit_ref=bm.get_handle_by_name("logits"),
@@ -236,7 +234,6 @@ def build_backward_module_path(
 
     if plan.clipping_strategy == "GLOBAL":
         clip_sig = ClipPartialGradientsGlobalNormSignature(
-            buffer_mgr=bm,
             work_group_size_0=wgs0,
             scalar_size_bytes=scalar_bytes,
             handles=grad_handles,
@@ -246,7 +243,6 @@ def build_backward_module_path(
         )
     else:  # 'PER_ITEM'
         clip_sig = ClipPartialGradientsPerItemNormSignature(
-            buffer_mgr=bm,
             work_group_size_0=wgs0,
             scalar_size_bytes=scalar_bytes,
             handles=grad_handles,
@@ -306,7 +302,6 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
 
         # Step 3a: Compute Raw Partials (Nodes 17 & 18) into SCRATCH buffers
         gsw_sig = BackpropSharedWeightsChunkSignature(
-            buffer_mgr=bm,
             work_group_size_1=arch_consts.get("work_group_size_1", 16),
             scalar_size_bytes=spec.scalar_dtype().itemsize,
             input_ref=bm.get_handle_by_name("input"),
@@ -321,7 +316,6 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
         )
         gsw_evt = ex.launch(q, gsw_sig, wait_for=deps_for_all_chunks)
         gsb_sig = BackpropSharedBiasesChunkSignature(
-            buffer_mgr=bm,
             work_group_size_0=arch_consts.get("work_group_size_0", 256),
             scalar_size_bytes=spec.scalar_dtype().itemsize,
             h_ref=h_ref,
@@ -343,7 +337,6 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
             clipped_grad_biases_shared_collection=bm.get_handle_by_name("clipped_partial_grad_shared_biases"),
         )
         clip_sig = ClipSharedGradientsChunkSignature(
-            buffer_mgr=bm,
             work_group_size_0=arch_consts.get("work_group_size_0", 256),
             scalar_size_bytes=spec.scalar_dtype().itemsize,
             handles=shared_grad_handles,
@@ -493,7 +486,6 @@ def execute_stabilized_reduction_tree(
             )
 
             clip_sig = ClipIntermediateGradSignature(
-                buffer_mgr=bm,
                 work_group_size_0=arch_consts.get("work_group_size_0", 256),
                 scalar_size_bytes=scalar_byte_size,
                 intermediate_grad_ref=stage_sum_dest_ref,
@@ -597,7 +589,6 @@ def build_streaming_module_grad_path(svs: Services, plan: ExecutionPlan, deps: L
         for tile in grid:
             # Step 2a: Recompute hidden activations into scratch space (Node 4 logic)
             fwd_pass_sig = ForwardPassSignature(
-                buffer_mgr=bm,
                 simd_width=spec.simd_width,
                 local_mem_bank_padding=1,
                 scalar_size_bytes=scalar_bytes,
@@ -615,7 +606,7 @@ def build_streaming_module_grad_path(svs: Services, plan: ExecutionPlan, deps: L
 
             # Step 2b: Compute all raw partial gradients for this tile into scratch buffers
             grad_mod_sig = plan.problem_type.get_module_grad_signature(
-                buffer_mgr=bm,
+                buffer_mgr=svs.bm,
                 work_group_size_0=wgs0,
                 scalar_size_bytes=scalar_bytes,
                 h_ref=h_scratch_ref,
@@ -632,7 +623,7 @@ def build_streaming_module_grad_path(svs: Services, plan: ExecutionPlan, deps: L
                 total_modules_count=np.uint32(spec.num_modules),
             )
             grad_h_sig = plan.problem_type.get_hidden_grad_signature(
-                buffer_mgr=bm,
+                buffer_mgr=svs.bm,
                 prob_ref=bm.get_handle_by_name("partial_probs"),
                 mask_ref=bm.get_handle_by_name("sample_mask"),
                 w_mod_ref=bm.get_handle_by_name("module_weights"),
@@ -642,7 +633,7 @@ def build_streaming_module_grad_path(svs: Services, plan: ExecutionPlan, deps: L
                 total_output_class_count=np.uint32(spec.output_classes),
             )
             grad_t_sig = plan.problem_type.get_temp_grad_signature(
-                buffer_mgr=bm,
+                buffer_mgr=svs.bm,
                 work_group_size_0=wgs0,
                 scalar_size_bytes=scalar_bytes,
                 logit_ref=bm.get_handle_by_name("logits"),
@@ -673,7 +664,6 @@ def build_streaming_module_grad_path(svs: Services, plan: ExecutionPlan, deps: L
 
             if plan.clipping_strategy == "GLOBAL":
                 clip_sig = ClipPartialGradientsGlobalNormSignature(
-                    buffer_mgr=bm,
                     work_group_size_0=wgs0,
                     scalar_size_bytes=scalar_bytes,
                     handles=grad_handles,
@@ -683,7 +673,6 @@ def build_streaming_module_grad_path(svs: Services, plan: ExecutionPlan, deps: L
                 )
             else:  # 'PER_ITEM'
                 clip_sig = ClipPartialGradientsPerItemNormSignature(
-                    buffer_mgr=bm,
                     work_group_size_0=wgs0,
                     scalar_size_bytes=scalar_bytes,
                     handles=grad_handles,
@@ -741,7 +730,6 @@ def build_final_grad_h_reduction_path(
 
     # Step 1: Gather scattered partials and permute into a reduction-ready SoA layout (Node 13).
     permute_sig = GatherAndPermuteGradHiddenActivationsSignature(
-        buffer_mgr=bm,
         clipped_partials_aos_ref=clipped_ref,
         permuted_soa_out_ref=permuted_ref,
         total_modules_count=np.uint32(spec.num_modules),
@@ -760,7 +748,6 @@ def build_final_grad_h_reduction_path(
         hardware_max_fan_in=wgs0,
     )
     reduce_sig = StabilizeAndReduceGradHiddenActivationsSignature(
-        buffer_mgr=bm,
         work_group_size_0=wgs0,
         scalar_size_bytes=spec.scalar_dtype().itemsize,
         permuted_soa_in_ref=permuted_ref,
@@ -1010,7 +997,6 @@ def build_update_subgraph(
             continue
 
         sig = NormalizeGradientsSignature(
-            buffer_mgr=bm,
             summed_grad_ref=summed_grads[flow.name],
             final_grad_out_ref=bm.get_handle_by_name(flow.final_grad_buffer_name),
             effective_batch_size=SCALAR_NP_TYPE(effective_batch_size),
@@ -1045,7 +1031,6 @@ def build_update_subgraph(
             m2_state_ref=bm.get_handle_by_name(flow.m2_buffer_name),
         )
         adam_sig = AdamUpdateSignature(
-            buffer_mgr=bm,
             param_group=pg,
             learning_rate=SCALAR_NP_TYPE(h_params.learning_rate),
             beta1=SCALAR_NP_TYPE(h_params.adam_beta1),
@@ -1060,7 +1045,6 @@ def build_update_subgraph(
 
     # Step 3 (Node 25): Final Clamping
     clamp_sig = ClampTemperaturesSignature(
-        buffer_mgr=bm,
         temps_ref=bm.get_handle_by_name("temperatures"),
         min_val=SCALAR_NP_TYPE(h_params.temp_min),
         max_val=SCALAR_NP_TYPE(h_params.temp_max),
