@@ -6,10 +6,10 @@ import numpy as np
 import pyopencl as cl
 
 # --- Architectural Imports ---
-from execution_plan import ExecutionPlan
-from launcher_infra import Services, HostView
-from parameter_space import ParameterSpace
-from workload_primitives import TiledGather, LinearlyChunkedGather
+from .execution_plan import ExecutionPlan
+from .launcher_infra import Services, HostView
+from .parameter_space import ParameterSpace
+from .workload_primitives import TiledGather, LinearlyChunkedGather
 
 
 class BatchProcessor:

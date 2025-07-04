@@ -25,9 +25,9 @@ from typing import Dict, Iterator, List, Tuple
 import numpy as np
 
 # --- Foundational Imports from Sibling Modules ---
-from model_spec import ModelSpec
-from memory_layout import MemoryLayout, PaddingStrategy, PaddingType
-from workload_primitives import TilingScheme  # Required for sizing collection buffers
+from .model_spec import ModelSpec
+from .memory_layout import MemoryLayout, PaddingStrategy, PaddingType
+from .workload_primitives import TilingScheme  # Required for sizing collection buffers
 
 
 @dataclass(frozen=True)

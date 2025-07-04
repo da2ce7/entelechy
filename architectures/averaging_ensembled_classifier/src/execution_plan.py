@@ -22,35 +22,25 @@ from typing import Dict, List, Tuple, Callable, Optional
 import numpy as np
 
 # --- Architectural Imports ---
-try:
-    import pyopencl as cl
 
-    # --- Local Infrastructure Imports ---
-    from .launcher_infra import BufferHandle, KernelSignature, KernelExecutor, Services
-    from .compute_patterns import ReductionPlan
-    from .workload_primitives import TilingScheme, WorkTile, TiledGather
+import pyopencl as cl
 
-    # --- Kernel Signature Imports for Strategy Factories ---
-    from .kernel_signatures import (
-        ComputeProbsLossCceChunkSignature,
-        ComputeProbsLossBceChunkSignature,
-        CalculateModuleParamGradsCceSignature,
-        CalculateModuleParamGradsBceSignature,
-        BackpropErrorToHiddenChunkCceSignature,
-        BackpropErrorToHiddenChunkBceSignature,
-        CalculateChunkTempGradientsCceSignature,
-        CalculateChunkTempGradientsBceSignature,
-    )
-except ImportError:
-    # Create mock types for standalone review and documentation generation
-    cl = type("cl", (), {"Event": type("Event", (), {})})
-    BufferHandle = type("BufferHandle", (), {"id": int})
-    KernelSignature = type("KernelSignature", (), {})
-    KernelExecutor = type("KernelExecutor", (), {})
-    Services = type("Services", (), {})
-    TilingScheme = type("TilingScheme", (), {})
-    ReductionPlan = type("ReductionPlan", (), {})
-    WorkTile = type("WorkTile", (), {})
+# --- Local Infrastructure Imports ---
+from .launcher_infra import BufferHandle, KernelSignature, KernelExecutor, Services
+from .compute_patterns import ReductionPlan
+from .workload_primitives import TilingScheme, WorkTile, TiledGather
+
+# --- Kernel Signature Imports for Strategy Factories ---
+from .kernel_signatures import (
+    ComputeProbsLossCceChunkSignature,
+    ComputeProbsLossBceChunkSignature,
+    CalculateModuleParamGradsCceSignature,
+    CalculateModuleParamGradsBceSignature,
+    BackpropErrorToHiddenChunkCceSignature,
+    BackpropErrorToHiddenChunkBceSignature,
+    CalculateChunkTempGradientsCceSignature,
+    CalculateChunkTempGradientsBceSignature,
+)
 
 
 # === Abstraction Level 1: The DependencyProvider Contract ===

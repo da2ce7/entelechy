@@ -32,7 +32,7 @@ import pyopencl as cl
 
 # --- Local Imports ---
 # This module relies on the MemoryLayout abstraction being in a separate, co-located file.
-from memory_layout import MemoryLayout
+from .memory_layout import MemoryLayout
 
 
 # --- Global Type Definitions ---

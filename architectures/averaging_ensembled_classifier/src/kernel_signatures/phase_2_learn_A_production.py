@@ -23,7 +23,8 @@ import numpy as np
 import pyopencl as cl
 
 # --- Local Infrastructure Imports ---
-from ..launcher_infra import BufferHandle, KernelSignature, WorkTile
+from ..workload_primitives import WorkTile
+from ..launcher_infra import BufferHandle, KernelSignature
 
 
 # === Node 8: Calculate Module Parameter Gradients ===

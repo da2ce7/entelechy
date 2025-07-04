@@ -1,14 +1,35 @@
 # pyproject.toml (at the root of your project)
 
-# NO [build-system] section - this is not a package.
-# NO [project] section - this is not a package.
+# --- Build System Definition ---
+# This is required for `pip install -e` to work. We use setuptools because it's
+# simple and we can tell it to install nothing.
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
+
+# --- Minimal "Dummy" Project Definition ---
+# We define a project just to satisfy pip's parser and to hold our
+# optional dependencies. This project itself installs no files.
+[project]
+name = "ml-engine-framework-workspace"  # A descriptive name for the workspace
+version = "0.0.1"
+
+
+# --- The Magic Trick: Tell Setuptools to Install Nothing ---
+[tool.setuptools]
+# By declaring no packages, setuptools will not install any Python modules
+# from this directory during the editable install.
+packages = []
+
+
+# --- Our Actual Goal: The Development Dependencies ---
 [project.optional-dependencies]
-# This is perfect. It defines the development toolset for the entire monorepo.
+# This section remains our primary reason for this file.
 # A developer can run `pip install -e .[dev]` in the root to get these tools.
 dev = [
-    # Note: I'm adding setuptools here because `-e` needs it for this to work.
-    "setuptools",
     "meson>=1.2.0",
     "ninja",
+    # You could add other tools here like 'black', 'pytest', etc.,
+    # if you want a single command to install everything for all subprojects.
 ]

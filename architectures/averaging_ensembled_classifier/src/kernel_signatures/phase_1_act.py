@@ -22,7 +22,8 @@ import pyopencl as cl
 
 # --- Local Infrastructure Imports ---
 # These are the foundational components upon which these signatures are built.
-from ..launcher_infra import BufferHandle, KernelSignature, WorkTile
+from ..workload_primitives import WorkTile
+from ..launcher_infra import BufferHandle, KernelSignature
 from ..memory_layout import _pad_to_multiple
 
 

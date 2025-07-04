@@ -16,13 +16,13 @@ import numpy as np
 import pyopencl as cl
 
 # --- Architectural Imports ---
-from execution_plan import ExecutionPlan, WorkTile
-from launcher_infra import Services, BufferManager, KernelExecutor, BufferHandle, SCALAR_NP_TYPE, PingPongManager
-from kernel_signatures import *
-from model_spec import ModelSpec
-from parameter_space import ParameterSpace
-from compute_patterns import AggregationManager, ReductionPlan
-from workload_primitives import GatherPrimitive, ContiguousGather
+from .execution_plan import ExecutionPlan, WorkTile
+from .launcher_infra import Services, BufferManager, KernelExecutor, BufferHandle, SCALAR_NP_TYPE, PingPongManager
+from .kernel_signatures import *
+from .model_spec import ModelSpec
+from .parameter_space import ParameterSpace
+from .compute_patterns import AggregationManager, ReductionPlan
+from .workload_primitives import GatherPrimitive, ContiguousGather
 
 
 # =========================================================================

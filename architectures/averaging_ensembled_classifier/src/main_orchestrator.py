@@ -17,10 +17,10 @@ from sklearn.datasets import load_iris
 # --- Foundational Architectural Primitives ---
 # These imports represent the core "nouns" of the system architecture. The
 # Orchestrator's role is to compose these primitives into a coherent plan.
-from model_spec import ModelSpec, SCALAR_DTYPE
-from cl_context_manager import OpenCLContextManager, ComputeEnvironment
-from parameter_space import ParameterSpace
-from execution_plan import (
+from .model_spec import ModelSpec, SCALAR_DTYPE
+from .cl_context_manager import OpenCLContextManager, ComputeEnvironment
+from .parameter_space import ParameterSpace
+from .execution_plan import (
     ExecutionPlan,
     DataLifecyclePolicy,
     CacheProvider,
@@ -29,13 +29,13 @@ from execution_plan import (
     CceStrategy,
     BceStrategy,
 )
-from launcher_infra import Services, BufferManager, KernelExecutor
-from kernel_signatures import ForwardPassSignature
-from compute_patterns import ReductionPlan
-from workload_primitives import TilingScheme
-from stabilization_policy import StabilizationPolicy
-from batch_processor import BatchProcessor
-import graph_recipes as recipes
+from .launcher_infra import Services, BufferManager, KernelExecutor
+from .kernel_signatures import ForwardPassSignature
+from .compute_patterns import ReductionPlan
+from .workload_primitives import TilingScheme
+from .stabilization_policy import StabilizationPolicy
+from .batch_processor import BatchProcessor
+from .graph_recipes import graph_recipes as recipes
 
 
 @dataclass(frozen=True)

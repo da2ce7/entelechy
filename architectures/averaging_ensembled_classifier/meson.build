@@ -33,6 +33,7 @@ py_sources = files(
   'src/stabilization_policy.py',
   'src/utility_kernels.py',
   'src/workload_primitives.py',
+  '__init__.py',
 )
 
 cl_kernels = files(
@@ -44,14 +45,11 @@ cl_kernels = files(
 
 all_sources = py_sources + cl_kernels
 
-py.install_sources(
-  py_sources,
-  subdir: 'averaging_ensembled_classifier'
-)
+py.install_sources(py_sources, subdir: 'averaging_ensembled_classifier')
 
 install_data(
   cl_kernels,
-  install_dir: py.get_install_dir() / 'averaging_ensembled_classifier' / 'kernels'
+  install_dir: py.get_install_dir() / 'averaging_ensembled_classifier' / 'kernels',
 )
 
 # This tells meson-python about your project's Python dependencies.

@@ -21,7 +21,8 @@ import numpy as np
 import pyopencl as cl
 
 # --- Local Infrastructure Imports ---
-from ..launcher_infra import BufferHandle, KernelSignature, WorkTile, SCALAR_NP_TYPE
+from ..workload_primitives import WorkTile
+from ..launcher_infra import BufferHandle, KernelSignature, SCALAR_NP_TYPE
 from ..memory_layout import _pad_to_multiple
 
 
