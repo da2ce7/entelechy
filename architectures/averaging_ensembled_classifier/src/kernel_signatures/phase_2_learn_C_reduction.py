@@ -102,14 +102,14 @@ class AggregateLocalReduceSignature(KernelSignature):
         # This kernel is for larger `N`. It dispatches a 1D grid of work-groups,
         # where each work-group is responsible for reducing one slice of the
         # output vector across all input partials, using local memory for scalability.
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         global_size = (_pad_to_multiple(int(self.partial_width), work_group_size),)
         local_size = (work_group_size,)
         return global_size, local_size
 
     def get_args(self) -> List:
         """Assembles arguments, including the required local memory allocation."""
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
         local_mem_size = work_group_size * scalar_size_bytes
         return [
@@ -156,14 +156,14 @@ class ClipIntermediateGradSignature(KernelSignature):
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
         """Dispatches enough work-items to compute a single L2 norm over the entire buffer."""
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         global_size = (_pad_to_multiple(int(self.parameter_count), work_group_size),)
         local_size = (work_group_size,)
         return global_size, local_size
 
     def get_args(self) -> List:
         """Assembles arguments in the exact order mandated by the kernel contract."""
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
         local_mem_size = work_group_size * scalar_size_bytes
         return [
@@ -236,7 +236,7 @@ class StabilizeAndReduceGradHiddenActivationsSignature(KernelSignature):
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
         """Dispatches one work-group per row of the SoA matrix for reduction."""
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         num_rows = int(self.total_batch_count) * int(self.padded_hidden_count)
         global_size = (num_rows * work_group_size,)
         local_size = (work_group_size,)
@@ -244,7 +244,7 @@ class StabilizeAndReduceGradHiddenActivationsSignature(KernelSignature):
 
     def get_args(self) -> List:
         """Returns all 13 arguments, translating the Host's policy into device primitives."""
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
         local_mem_size = work_group_size * scalar_size_bytes
         return [

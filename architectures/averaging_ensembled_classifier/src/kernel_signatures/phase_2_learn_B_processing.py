@@ -114,7 +114,7 @@ class _ClipTiledModuleGradsBase(KernelSignature):
         work-group is dispatched to atomically process the entire gradient vector
         for one parallel work item.
         """
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         total_elements_in_tile = (
             (self.padded_hidden_count * self.tile.classes_per_chunk)  # weights
             + self.tile.classes_per_chunk  # biases
@@ -134,7 +134,7 @@ class ClipPartialGradientsGlobalNormSignature(_ClipTiledModuleGradsBase):
 
     def get_args(self) -> List:
         """Assembles arguments, setting the `use_per_item_norm` flag to FALSE (0)."""
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
         local_mem_size = work_group_size * scalar_size_bytes
         h = self.handles
@@ -170,7 +170,7 @@ class ClipPartialGradientsPerItemNormSignature(_ClipTiledModuleGradsBase):
 
     def get_args(self) -> List:
         """Assembles arguments, setting the `use_per_item_norm` flag to TRUE (1)."""
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
         local_mem_size = work_group_size * scalar_size_bytes
         h = self.handles

@@ -154,7 +154,7 @@ class TrainingOrchestrator:
             total_modules=spec.num_modules,
             total_classes=spec.output_classes,
         )
-        reduction_plan = ReductionPlan(k=self.compute_env.arch_consts.optimal_tile_size)
+        reduction_plan = ReductionPlan(k=self.compute_env.arch_consts.optimal_workgroup_size_1d_reduction)
 
         # --- Phase 2: Instantiate Polymorphic Strategy Objects ---
         if self.problem_type_name == "CCE":

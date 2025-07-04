@@ -92,7 +92,7 @@ class BackpropSharedWeightsChunkSignature(KernelSignature):
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
         """Calculates a 2D grid, deriving its tiling dimensions from the arch constants."""
-        work_group_size_1 = self._arch_consts.optimal_tile_size_dim1
+        work_group_size_1 = self._arch_consts.optimal_rectangular_tile_dim1
         global_size = (
             int(self.padded_input_count),
             _pad_to_multiple(int(self.padded_hidden_count), work_group_size_1),
@@ -103,7 +103,7 @@ class BackpropSharedWeightsChunkSignature(KernelSignature):
     def get_args(self) -> List:
         """Assembles all 14 arguments in the exact order mandated by the C contract."""
         scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
-        work_group_size_1 = self._arch_consts.optimal_tile_size_dim1
+        work_group_size_1 = self._arch_consts.optimal_rectangular_tile_dim1
         local_mem_size = work_group_size_1 * scalar_size_bytes
         return [
             cl.LocalMemory(local_mem_size),
@@ -161,7 +161,7 @@ class BackpropSharedBiasesChunkSignature(KernelSignature):
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
         """Calculates a 1D grid for reduction over the hidden dimension."""
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         num_work_groups = self.padded_hidden_count
         global_size = (int(num_work_groups) * work_group_size,)
         local_size = (work_group_size,)
@@ -170,7 +170,7 @@ class BackpropSharedBiasesChunkSignature(KernelSignature):
     def get_args(self) -> List:
         """Assembles all 12 arguments in the exact order mandated by the C contract."""
         scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         local_mem_size = work_group_size * scalar_size_bytes
         return [
             cl.LocalMemory(local_mem_size),
@@ -225,7 +225,7 @@ class ClipSharedGradientsChunkSignature(KernelSignature):
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
         """Calculates grid to cover all elements in the concatenated gradient vector."""
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         total_elements = self.weights_param_count + self.biases_param_count
         global_size = (_pad_to_multiple(int(total_elements), work_group_size),)
         local_size = (work_group_size,)
@@ -233,7 +233,7 @@ class ClipSharedGradientsChunkSignature(KernelSignature):
 
     def get_args(self) -> List:
         """Assembles all 12 arguments in exact C-level contractual order."""
-        work_group_size = self._arch_consts.optimal_tile_size
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
         local_mem_size = work_group_size * scalar_size_bytes
         h = self.handles
