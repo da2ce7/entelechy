@@ -26,6 +26,7 @@
         "logit",
         "logits",
         "mkdocs",
+        "modelspec",
         "mypy",
         "nbytes",
         "ndarray",

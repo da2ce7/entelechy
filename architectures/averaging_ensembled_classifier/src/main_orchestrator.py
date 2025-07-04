@@ -1,37 +1,57 @@
 # main_orchestrator.py
 
-# This module serves as the highest level of host-side control, embodying the
-# "Strategist" pattern. Its sole purpose is to translate high-level experimental
-# goals (model shape, hyperparameters, adaptation strategies) into a single,
-# declarative "ExecutionPlan" for a training batch. It owns the training
-# lifecycle (epochs) but delegates all per-batch tactical execution.
+"""
+The System's "Strategist": The Definitive Host-Side Orchestrator.
 
-from dataclasses import dataclass, asdict  # MODIFIED: Imported asdict
-from typing import Dict, List, Tuple
+Jurisdictional Mandate:
+This module constitutes the highest level of host-side control. Its sole
+and sacred jurisdiction is to translate a high-level experimental goal
+(defined by model shape, hyperparameters, and adaptation strategies) into a
+single, immutable, and declarative `ExecutionPlan`. It owns the training
+lifecycle (i.e., the epoch loop) but humbly delegates all per-batch tactical
+execution to subordinate modules.
+
+Architectural Role:
+This class embodies the "Strategist" pattern. It assembles the system's core
+services, authors the strategic plan, and then passes that plan to a
+transient `BatchProcessor` to be conducted. It makes no direct kernel calls;
+its work is the pure art of composition, ensuring that the system's execution
+is a direct and verifiable reflection of its stated intent.
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, cast
 from functools import partial
 
 import numpy as np
 import pyopencl as cl
 from sklearn.datasets import load_iris
+from sklearn.utils import Bunch
 
 # --- Foundational Architectural Primitives ---
-# These imports represent the core "nouns" of the system architecture. The
-# Orchestrator's role is to compose these primitives into a coherent plan.
-
+# WHY: The Orchestrator's primary function is to compose these primitive "nouns"
+# into a coherent, executable "sentence" (the ExecutionPlan).
 from .model_spec import ModelSpec, Float32ModelSpec, Float16ModelSpec
-from .cl_context_manager import OpenCLContextManager, ComputeEnvironment, Float32ComputeEnvironment
+from .cl_context_manager import (
+    OpenCLContextManager,
+    ComputeEnvironment,
+    Float32ComputeEnvironment,
+    Float16ComputeEnvironment,
+    Float32Context,
+    Float16Context,
+)
 from .parameter_space import ParameterSpace
 from .execution_plan import (
     ExecutionPlan,
     DataLifecyclePolicy,
+    DependencyProvider,
     CacheProvider,
-    RecomputeProvider,
     StagedComputationProvider,
+    ProblemTypeStrategy,
     CceStrategy,
     BceStrategy,
 )
 from .launcher_infra import Services, BufferManager, KernelExecutor
-from .kernel_signatures import ForwardPassSignature
 from .compute_patterns import ReductionPlan
 from .workload_primitives import TilingScheme
 from .stabilization_policy import StabilizationPolicy
@@ -41,20 +61,14 @@ from . import graph_recipes as recipes
 
 @dataclass(frozen=True)
 class StabilizationConfig:
-    """A structured configuration primitive for stabilization policy."""
-
+    """A structured configuration primitive for the stabilization policy."""
     max_grad_norm: float
     lambda_: float
 
 
 @dataclass(frozen=True)
 class TrainingHyperparams:
-    """
-    The canonical, type-safe manifest for all training hyperparameters.
-    Nesting the `StabilizationConfig` enforces a logical grouping, making the
-    configuration hierarchy clear and explicit.
-    """
-
+    """The canonical, type-safe manifest for all training hyperparameters."""
     epochs: int
     learning_rate: float
     adam_beta1: float
@@ -67,14 +81,7 @@ class TrainingHyperparams:
 
 
 class TrainingOrchestrator:
-    """
-    The System Owner and "Strategist."
-
-    This class instantiates and owns all lower-level services. It is responsible
-    for authoring the strategic `ExecutionPlan` but delegates all tactical,
-    step-by-step execution to the `BatchProcessor`, which it creates on a
-    per-batch basis.
-    """
+    """The System Owner, "Strategist," and author of the ExecutionPlan."""
 
     def __init__(
         self,
@@ -87,8 +94,8 @@ class TrainingOrchestrator:
         clipping_strategy_name: str,
         batch_size: int,
     ):
-        # The constructor acts as the "System Assembler," gathering and owning
-        # all foundational components required for the entire training run.
+        # WHY: The constructor acts as the "System Assembler," gathering and
+        # owning all foundational components for the entire training run.
         self.model_spec = model_spec
         self.param_space = param_space
         self.compute_env = compute_env
@@ -98,28 +105,25 @@ class TrainingOrchestrator:
         self.clipping_strategy_name = clipping_strategy_name
         self.global_step = 1
 
-        # The `Services` bundle is a key dependency injection pattern, allowing
-        # core components to be passed cleanly through the system layers.
+        # WHY: The `Services` bundle is a key dependency injection pattern.
+        # It allows core components to be passed cleanly and explicitly
+        # through the system layers, avoiding global state.
         bm = BufferManager(self.compute_env.cl_bundle.context)
         ex = KernelExecutor(self.compute_env.cl_bundle.program)
         self.services = Services(
-            q=self.compute_env.cl_bundle.queue,
-            ex=ex,
-            bm=bm,
-            model_spec=model_spec,
-            arch_consts=compute_env.arch_consts,
+            q=self.compute_env.cl_bundle.queue, ex=ex, bm=bm, model_spec=model_spec, arch_consts=compute_env.arch_consts
         )
 
         self.stream_chunks = 4
         self._setup_buffers(batch_size, self.stream_chunks)
 
     def _setup_buffers(self, batch_size: int, num_stream_chunks: int):
-        """
-        Orchestrates memory allocation by delegating to the `ParameterSpace`.
-        This fulfills the "Primacy of Memory Strategy" by ensuring that memory
-        layout decisions are centralized and contract-driven, not scattered
-        throughout the application logic.
-        """
+        """Orchestrates memory allocation by delegating to the ParameterSpace."""
+        # WHY: This method upholds the "Primacy of Memory Strategy." The
+        # Orchestrator does not decide layouts; it asks the `ParameterSpace`
+        # for the complete memory plan and instructs the `BufferManager` to
+        # execute that plan, perfectly separating strategic intent from
+        # implementation details.
         bm, spec = self.services.bm, self.model_spec
         grid = TilingScheme(
             num_module_chunks=(spec.num_modules + 15) // 16,
@@ -127,25 +131,16 @@ class TrainingOrchestrator:
             total_modules=spec.num_modules,
             total_classes=spec.output_classes,
         )
-        # The Orchestrator asks the ParameterSpace for the complete memory plan...
         all_layouts = self.param_space.get_all_memory_layouts(
             batch_size=batch_size, grid=grid, num_batch_chunks=num_stream_chunks
         )
-        # ...and instructs the BufferManager to execute that plan.
         for name, layout in all_layouts.items():
-            # MODIFIED: Use the SCALAR_NP_TYPE from the concrete model spec
             bm.create_named_buffer(name, layout, spec.SCALAR_NP_TYPE)
 
     def _create_execution_plan(self, batch_size: int) -> ExecutionPlan:
-        """
-        Authors the complete, immutable execution strategy for a single batch.
-
-        This method is the heart of the "Strategist" role. It makes no kernel
-        calls itself. Instead, it composes high-level policy and strategy
-        objects into a single `ExecutionPlan` manifest.
-        """
+        """Authors the complete, immutable execution strategy for one batch."""
         svs, spec, h_params = self.services, self.model_spec, self.hyperparams
-        policy_providers = {}
+        policy_providers: Dict[str, DependencyProvider] = {}
 
         # --- Phase 1: Formulate Strategic Primitives ---
         grid = TilingScheme(
@@ -157,42 +152,45 @@ class TrainingOrchestrator:
         reduction_plan = ReductionPlan(k=self.compute_env.arch_consts.optimal_workgroup_size_1d_reduction)
 
         # --- Phase 2: Instantiate Polymorphic Strategy Objects ---
+        # WHY: This block uses the Strategy Pattern to select the correct set of
+        # kernel factories, making the rest of the system blissfully unaware
+        # of the specific loss function being used (CCE vs. BCE).
+        problem_strategy: ProblemTypeStrategy
         if self.problem_type_name == "CCE":
             problem_strategy = CceStrategy(targets_cce_ref=svs.bm.get_handle_by_name("targets_cce"))
-        elif self.problem_type_name == "BCE":
-            problem_strategy = BceStrategy(targets_bce_ref=svs.bm.get_handle_by_name("targets_bce"))
         else:
-            raise ValueError(f"Unknown problem type: {self.problem_type_name}")
+            problem_strategy = BceStrategy(targets_bce_ref=svs.bm.get_handle_by_name("targets_bce"))
 
-        # MODIFIED: Use the SCALAR_NP_TYPE from the concrete modelspec
         fp_max = np.finfo(spec.SCALAR_NP_TYPE).max
         stabilization_policy = StabilizationPolicy(
             t_algorithmic=h_params.stabilization.max_grad_norm,
             lambda_=h_params.stabilization.lambda_,
-            fp_format_max=float(fp_max),  # Ensure it's a standard float
+            fp_format_max=float(fp_max),
         )
 
-        plan_placeholder = None
+        # --- Phase 3: Define Data Lifecycle Policies (The Core of Adaptation) ---
 
-        # --- Phase 3: Define Data Lifecycle Policies (`CACHE` vs. `RECOMPUTE`) ---
-        # The `StagedComputationProvider` below points to a unified recipe. This is
-        # the architectural simplification: the logic for permuting and reducing `Grad_H`
-        # is identical regardless of how its partials were created.
-        summed_grad_h_provider_fn = partial(recipes.build_final_grad_h_reduction_path, svs=svs, plan=plan_placeholder)
+        # WHY: This function and the `partial` object below are an elegant
+        # solution to a circular dependency. The StagedComputationProvider needs a
+        # reference to the final `ExecutionPlan`, but it must be created *before*
+        # the plan itself is constructed. This placeholder approach resolves the paradox.
+        def _resolve_grad_h_with_plan(
+            queue: cl.CommandQueue, ex: KernelExecutor, wait_for: List[cl.Event], *, plan: ExecutionPlan
+        ) -> Tuple[BufferHandle, cl.Event]:
+            return recipes.build_final_grad_h_reduction_path(svs, plan, wait_for)
+
         policy_providers["summed_grad_hidden_activations"] = StagedComputationProvider(
-            computation_fn=summed_grad_h_provider_fn
+            computation_fn=partial(_resolve_grad_h_with_plan)
         )
 
-        # Now, we define the policy for the `hidden_activations` themselves based on strategy.
+        # Here, the high-level adaptation strategy is translated into a concrete
+        # `DependencyProvider` for the `hidden_activations` themselves.
         if self.adaptation_strategy == "CACHE":
             h_ref, h_ready_evt = recipes.execute_forward_pass(svs, batch_size, deps=[])
             policy_providers["hidden_activations"] = CacheProvider(handle=h_ref, ready_event=h_ready_evt)
-
         elif self.adaptation_strategy == "RECOMPUTE_GRAD_H":
-            # In this strategy, `hidden_activations` are transient scratch space internal
-            # to the `build_streaming_module_grad_path` recipe. There is no persistent
-            # `hidden_activations` buffer available to the Conductor, so no provider
-            # is defined for it. This is architecturally correct.
+            # Architecturally correct: no provider is defined. `hidden_activations`
+            # becomes a transient internal artifact of the recipe.
             pass
         else:
             raise ValueError(f"Unknown adaptation strategy: '{self.adaptation_strategy}'")
@@ -202,7 +200,6 @@ class TrainingOrchestrator:
             grid=grid,
             reduction_plan=reduction_plan,
             lifecycle_policy=DataLifecyclePolicy(providers=policy_providers),
-            # This is a placeholder; the Conductor calculates the true value.
             effective_batch_size=batch_size,
             problem_type=problem_strategy,
             clipping_strategy=self.clipping_strategy_name,
@@ -212,7 +209,12 @@ class TrainingOrchestrator:
             adaptation_strategy=self.adaptation_strategy,
         )
 
-        # Re-bind the provider function with the now-complete `plan` object.
+        # The Final Polish: The completed `plan` is now bound to the placeholder function.
+        # This replaces the `cast` with a verifiable `isinstance` check. This is
+        # not a command to the type checker, but a question. If the provider is
+        # of the expected type, the type checker understands that its attributes
+        # are safe to access within the `if` block. This preserves the
+        # unbroken chain of static verification.
         for provider in policy_providers.values():
             if isinstance(provider, StagedComputationProvider):
                 provider.computation_fn.keywords["plan"] = plan
@@ -220,10 +222,7 @@ class TrainingOrchestrator:
         return plan
 
     def train(self, X_train: np.ndarray, y_train: np.ndarray):
-        """
-        The main training loop. It is a pure controller that demonstrates the
-        system's core operational pattern: Plan -> Execute.
-        """
+        """The main training loop, demonstrating the Plan -> Execute pattern."""
         batch_size = X_train.shape[0]
 
         for epoch in range(self.hyperparams.epochs):
@@ -235,35 +234,25 @@ class TrainingOrchestrator:
             # 2. Instantiate a dedicated "Conductor" to execute the plan.
             processor = BatchProcessor(self.services, self.param_space, plan)
 
-            # 3. Delegate execution and receive handles to the two event chains.
+            # 3. Delegate execution and receive asynchronous event handles.
             learn_event, infer_event, probs_view = processor.run(X_train, y_train, self.global_step)
 
-            # The host can choose to wait on the chains separately or together.
-            # Here, we block for the learning to complete before the next step.
+            # Blocks for learning to complete before the next step.
             learn_event.wait()
             print(f"--- Step {self.global_step} Complete. ---")
-
-            # Example of using the inference event for non-blocking diagnostics.
-            # In a real app, this could be passed to a separate logging thread.
-            # infer_event.wait()
-            # print("    [Host] Inference results are ready.")
-            # final_probs = probs_view.get()
-
             self.global_step += 1
 
 
 if __name__ == "__main__":
-    # This block serves as the "System Assembler" at the application's
-    # entry point. It defines the experiment's configuration, instantiates
-    # all necessary architectural components, and initiates the training process.
+    # This block serves as the "System Assembler" at the application's entry point.
+    # It defines the experiment, instantiates components, and starts the process.
 
     # --- 1. Experiment Configuration ---
     LOGICAL_HIDDEN_DIM = 32
     LOGICAL_NUM_MODULES = 8
-    ADAPTATION_STRATEGY = "CACHE"  # Switch to "RECOMPUTE_GRAD_H" to test other path
+    ADAPTATION_STRATEGY = "CACHE"
     PROBLEM_TYPE = "CCE"
     CLIPPING_STRATEGY = "GLOBAL"
-    # MODIFIED: Path assumes being run from root of project, not inside `src`
     KERNEL_SOURCE_DIR = "architectures/averaging_ensembled_classifier/kernels"
 
     HYPERPARAMS = TrainingHyperparams(
@@ -274,28 +263,29 @@ if __name__ == "__main__":
         adam_epsilon=1e-7,
         temp_min=0.1,
         temp_max=10.0,
-        stabilization=StabilizationConfig(
-            max_grad_norm=1.0,
-            lambda_=1.0,
-        ),
+        stabilization=StabilizationConfig(max_grad_norm=1.0, lambda_=1.0),
         reduction_k_grad_h=16,
     )
 
-    # --- 2. System Assembly ---
+    # --- 2. Precision-Aware System Assembly ---
     try:
         manager = OpenCLContextManager(kernel_source_dir=KERNEL_SOURCE_DIR)
-        compute_env = manager.build_and_discover()
+        # The first critical decision: select the precision context. This choice
+        # dictates the concrete types for the rest of the assembly process.
+        compute_env = manager.build_and_discover(Float32Context)
     except Exception as e:
         print(f"FATAL: Could not build OpenCL environment: {e}")
         exit(1)
 
-    iris = load_iris()
-    # MODIFIED: Cast data *after* compute_env is built, using its type
+    # Load data and use the *concrete* compute environment's type for casting.
+    iris = cast(Bunch, load_iris())
     X_train_data = iris.data.astype(compute_env.SCALAR_NP_TYPE)
     y_train_data = iris.target.astype(np.int32)
     batch_size = X_train_data.shape[0]
 
-    # MODIFIED: Instantiate the correct *concrete* ModelSpec class
+    # Use the concrete environment type to select the concrete ModelSpec. This
+    # creates a verifiable, end-to-end chain of type consistency.
+    iris_model_spec: ModelSpec
     if isinstance(compute_env, Float32ComputeEnvironment):
         iris_model_spec = Float32ModelSpec(
             input_dim=X_train_data.shape[1],
@@ -305,8 +295,7 @@ if __name__ == "__main__":
             simd_width=compute_env.arch_consts.simd_width,
             cache_line_bytes=compute_env.arch_consts.global_mem_cacheline_size,
         )
-    else:
-        # Fallback for other precisions like Float16
+    else:  # Example for extending to other precisions
         iris_model_spec = Float16ModelSpec(
             input_dim=X_train_data.shape[1],
             output_classes=len(np.unique(y_train_data)),

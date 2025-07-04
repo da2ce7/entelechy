@@ -10,7 +10,6 @@ project('averaging_ensembled_classifier-sub', 'c', version: '0.1.0')
 
 py = import('python').find_installation()
 
-# --- 1. Automated Source File Discovery ---
 py_sources = files(
   'src/batch_processor.py',
   'src/cl_context_manager.py',

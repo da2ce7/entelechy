@@ -1,36 +1,37 @@
 # execution_plan.py
 
 """
-(REV 3) The Definitive Implementation of the Strategic Execution Plan Abstraction.
+A Module Defining the Abstract Vocabulary of Strategic Intent.
 
-This version completes the architectural vision for the a `ProblemTypeStrategy`
-by elevating its role from a simple "Signature Factory" to a comprehensive
-"Sub-Graph Recipe Provider."
+Jurisdictional Mandate:
+This module is the definitive source for the abstract data structures that
+constitute an "Execution Plan." It does not contain logic for execution;
+rather, it provides the formal, immutable contracts that describe a strategy
+for execution. Its jurisdiction is to define the "what," leaving the "how" to
+other, subordinate layers of the system.
 
-This is achieved by extending the abstract contract to include methods for
-providing not just kernel signatures, but the complete, executable logic for
-problem-specific sub-graphs (e.g., loss aggregation). This change removes the
-last vestiges of strategy-specific logic from the `BatchProcessor`, making it a
-truly pure "Conductor" and perfecting the system's adherence to the Open/Closed
-Principle.
+Architectural Role:
+This module provides the formal bridge between the high-level "Strategist"
+(the `TrainingOrchestrator`) and the tactical "Conductor" (the
+`BatchProcessor`). The classes herein are the system's lingua franca—a
+declarative, verifiable language for expressing a complete computational plan
+for a single training batch. It is through the instantiation of these humble
+primitives that the principles of dynamic adaptation and polymorphic
+correctness are made manifest.
 """
 
 import abc
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Callable, Optional
+from typing import Dict, List, Tuple, Callable, Optional, TYPE_CHECKING
 
 import numpy as np
-
-# --- Architectural Imports ---
-
 import pyopencl as cl
 
-# --- Local Infrastructure Imports ---
+# --- Local Infrastructure & Primitive Imports ---
+# These are the foundational components upon which our strategic contracts are built.
 from .launcher_infra import BufferHandle, KernelSignature, KernelExecutor, Services
 from .compute_patterns import ReductionPlan
 from .workload_primitives import TilingScheme, WorkTile, TiledGather
-
-# --- Kernel Signature Imports for Strategy Factories ---
 from .kernel_signatures import (
     ComputeProbsLossCceChunkSignature,
     ComputeProbsLossBceChunkSignature,
@@ -42,47 +43,44 @@ from .kernel_signatures import (
     CalculateChunkTempGradientsBceSignature,
 )
 
+# --- Type-Checking Guard for Circular Dependencies ---
+# A humble acknowledgment of a necessary complexity. For the static type
+# checker to understand our complete contracts, it must see these types.
+# To prevent a circular import at runtime, we place them behind this guard.
+if TYPE_CHECKING:
+    from .stabilization_policy import StabilizationPolicy
+    from .main_orchestrator import TrainingHyperparams
 
-# === Abstraction Level 1: The DependencyProvider Contract ===
+
+# =========================================================================
+# === Abstraction 1: The DependencyProvider Contract                      ===
+# =========================================================================
 
 
 class DependencyProvider(abc.ABC):
     """
-    An abstract contract describing how a data dependency is fulfilled.
+    Function: An abstract contract for the fulfillment of a data dependency.
 
-    This pattern is the heart of the dynamic adaptation strategy. An object
-    implementing this interface represents a promise to provide a specific
-    buffer handle and the event signaling its readiness, without exposing
-    *how* that is achieved (be it from a cache or through on-demand computation).
+    Architectural Mandate:
+    This class embodies a profound architectural principle: the decoupling of
+    the *need* for a resource from the *method of its acquisition*. An object
+    adhering to this contract makes a simple promise: to provide a buffer and a
+    signal of its readiness. It deliberately hides the complexity of whether
+    that data is retrieved from a cache or recomputed on demand, thereby
+    enabling the system's core adaptive memory strategies.
     """
 
     @abc.abstractmethod
     def resolve(
         self, queue: cl.CommandQueue, ex: KernelExecutor, wait_for: List[cl.Event]
     ) -> Tuple[BufferHandle, cl.Event]:
-        """
-        The core action. Fulfills the promise to provide the dependency.
-
-        Args:
-            queue: The OpenCL command queue for potential kernel launches.
-            ex: The KernelExecutor for launching kernels.
-            wait_for: A list of events that must complete before this resolution
-                      can begin.
-
-        Returns:
-            A tuple containing:
-            1. The `BufferHandle` for the requested data.
-            2. The `cl.Event` that signals when the data is ready for consumption.
-        """
+        """Fulfills the promise to provide the dependency."""
         pass
 
 
 @dataclass(frozen=True)
 class CacheProvider(DependencyProvider):
-    """
-    A concrete provider for dependencies that are already computed and resident
-    in VRAM. This is the "do nothing" strategy.
-    """
+    """The 'do nothing' strategy: provides a dependency that is already resident in device memory."""
 
     handle: BufferHandle
     ready_event: cl.Event
@@ -90,19 +88,15 @@ class CacheProvider(DependencyProvider):
     def resolve(
         self, queue: cl.CommandQueue, ex: KernelExecutor, wait_for: List[cl.Event]
     ) -> Tuple[BufferHandle, cl.Event]:
-        """
-        Simply returns the pre-computed handle and event. Ignores all inputs
-        as no new computation is required.
-        """
+        # WHY: As the dependency is already computed, we simply return the
+        # existing handle and event, ignoring all other inputs. This is the
+        # lowest-overhead path, chosen when memory permits.
         return self.handle, self.ready_event
 
 
 @dataclass(frozen=True)
 class RecomputeProvider(DependencyProvider):
-    """
-    A concrete provider for dependencies that are computed on-demand by
-    launching a single kernel.
-    """
+    """The 'on-demand' strategy: provides a dependency by launching a single kernel."""
 
     signature: KernelSignature
     output_handle: BufferHandle
@@ -110,48 +104,36 @@ class RecomputeProvider(DependencyProvider):
     def resolve(
         self, queue: cl.CommandQueue, ex: KernelExecutor, wait_for: List[cl.Event]
     ) -> Tuple[BufferHandle, cl.Event]:
-        """
-        Launches the stored kernel signature and returns its output handle
-        and the resulting completion event.
-        """
+        # WHY: This provider encapsulates a single computational step, trading
+        # VRAM for compute time. It is the tactical fulfillment of the system's
+        # choice to prioritize survival over speed under memory pressure.
         event = ex.launch(queue, self.signature, wait_for=wait_for)
         return self.output_handle, event
 
 
 @dataclass(frozen=True)
 class StagedComputationProvider(DependencyProvider):
-    """
-    A powerful, generic provider for complex dependencies that require a
-    multi-step computation sequence (e.g., a permutation followed by a reduction).
-    """
+    """A generic, powerful provider for complex, multi-kernel dependency chains."""
 
-    # A callable that encapsulates the entire multi-kernel launch sequence.
-    # It must adhere to the same signature as the `resolve` method.
+    # WHY: This provider serves as an elegant "escape hatch." It allows for the
+    # encapsulation of arbitrarily complex logic (e.g., a permutation followed by
+    # a reduction) behind the same simple `resolve` interface. It keeps the
+    # core provider contract clean while allowing for limitless extensibility.
     computation_fn: Callable[[cl.CommandQueue, KernelExecutor, List[cl.Event]], Tuple[BufferHandle, cl.Event]]
 
     def resolve(
         self, queue: cl.CommandQueue, ex: KernelExecutor, wait_for: List[cl.Event]
     ) -> Tuple[BufferHandle, cl.Event]:
-        """
-        Delegates the entire resolution logic to the provided computation function.
-        This allows for arbitrary complexity without polluting the provider itself.
-        """
+        # Delegates the entire complex resolution to the injected function.
         return self.computation_fn(queue, ex, wait_for)
-
-
-# === Abstraction Level 2: The Policy Registries ===
 
 
 @dataclass(frozen=True)
 class DataLifecyclePolicy:
-    """
-    A registry that maps a conceptual buffer's name to its concrete provider.
-
-    This object acts as a "switchboard" for the BatchProcessor. When a dependency
-    is needed, the processor queries this policy to get the correct provider,
-    then asks that provider to resolve the dependency.
-    """
-
+    """A registry mapping a conceptual buffer to its concrete fulfillment strategy."""
+    # WHY: This object acts as a "switchboard" for the Conductor. It translates
+    # a logical request ("I need `summed_grad_hidden_activations`") into a
+    # concrete `DependencyProvider`, which orchestrates the necessary steps.
     providers: Dict[str, DependencyProvider] = field(default_factory=dict)
 
     def get_provider(self, buffer_name: str) -> DependencyProvider:
@@ -160,50 +142,56 @@ class DataLifecyclePolicy:
         return self.providers[buffer_name]
 
 
-# === (REV 3) Abstraction: The ProblemTypeStrategy Contract ===
+# =========================================================================
+# === Abstraction 2: The ProblemTypeStrategy Contract                 ===
+# =========================================================================
 
 
 class ProblemTypeStrategy(abc.ABC):
     """
-    An abstract contract for a problem type (e.g., CCE, BCE).
+    Function: An abstract contract for a problem type (e.g., CCE, BCE).
 
-    This object acts as a factory for problem-specific kernel signatures and a
-    provider for problem-specific sub-graph recipes. This decouples the main
-    orchestration logic from the implementation details of any given loss function.
+    Architectural Mandate:
+    This is the embodiment of the classical Strategy Pattern. It replaces messy,
+    procedural `if/elif/else` blocks in the core execution logic with a clean,
+    polymorphic interface. By doing so, it upholds the Open/Closed Principle:
+    the system is open to extension (one can add a new loss function by creating
+    a new strategy class) but closed for modification (the `BatchProcessor`
+    need never be changed).
     """
 
     @property
     @abc.abstractmethod
     def required_targets_buffer_name(self) -> str:
-        """The canonical name of the buffer this strategy consumes for targets."""
+        """The canonical name of the buffer this strategy requires for ground truth."""
         pass
 
     @abc.abstractmethod
     def get_loss_signature(self, **kwargs) -> KernelSignature:
-        """Returns the appropriate signature for Node 6 or 7."""
+        """A factory for the appropriate loss computation signature (Node 6/7)."""
         pass
 
     @abc.abstractmethod
     def get_module_grad_signature(self, **kwargs) -> KernelSignature:
-        """Returns the appropriate signature for Node 8."""
+        """A factory for the module parameter gradient signature (Node 8)."""
         pass
 
     @abc.abstractmethod
     def get_hidden_grad_signature(self, **kwargs) -> KernelSignature:
-        """Returns the appropriate signature for Node 9."""
+        """A factory for the upstream hidden gradient signature (Node 9)."""
         pass
 
     @abc.abstractmethod
     def get_temp_grad_signature(self, **kwargs) -> KernelSignature:
-        """Returns the appropriate signature for Node 10."""
+        """A factory for the temperature gradient signature (Node 10)."""
         pass
 
 
 @dataclass(frozen=True)
 class CceStrategy(ProblemTypeStrategy):
-    """The concrete strategy for CCE (single-label classification)."""
+    """The type-safe, concrete strategy for CCE (single-label classification)."""
 
-    targets_cce_ref: BufferHandle
+    targets_cce_ref: BufferHandle  # Contractually binds this strategy to the integer-typed targets buffer.
 
     @property
     def required_targets_buffer_name(self) -> str:
@@ -224,9 +212,9 @@ class CceStrategy(ProblemTypeStrategy):
 
 @dataclass(frozen=True)
 class BceStrategy(ProblemTypeStrategy):
-    """The concrete strategy for BCE (multi-label classification)."""
+    """The type-safe, concrete strategy for BCE (multi-label classification)."""
 
-    targets_bce_ref: BufferHandle
+    targets_bce_ref: BufferHandle  # Contractually binds this strategy to the float-typed targets buffer.
 
     @property
     def required_targets_buffer_name(self) -> str:
@@ -245,24 +233,43 @@ class BceStrategy(ProblemTypeStrategy):
         return CalculateChunkTempGradientsBceSignature(targets_bce_ref=self.targets_bce_ref, **kwargs)
 
 
-# === Abstraction Level 3: The Complete Batch Manifest ===
+# =========================================================================
+# === Abstraction 3: The Complete Batch Manifest                        ===
+# =========================================================================
 
 
 @dataclass(frozen=True)
 class ExecutionPlan:
     """
-    (REV 3) The single, immutable manifest describing the complete strategy for
-    executing one training batch.
+    Function: The single, immutable manifest describing the complete
+    strategy for executing one training batch.
+
+    Architectural Role:
+    This is the final artifact of the Strategist's work. It is a sacred,
+    declarative contract given to the Conductor. It contains no active logic,
+    only a complete and verifiable description of the work to be done,
+    encompassing the spatial partitioning of the problem (`grid`), the memory
+    and temporal trade-offs (`lifecycle_policy`, `adaptation_strategy`), and
+    the core algorithmic choices (`problem_type`, `stabilization_policy`).
     """
 
+    # The spatial partitioning of the problem space.
     grid: TilingScheme
+    # The hardware-aware fan-in plan for reduction kernels.
     reduction_plan: ReductionPlan
+    # The policy for fulfilling data dependencies (cache vs. recompute).
     lifecycle_policy: DataLifecyclePolicy
+    # The actual number of valid samples in the batch.
     effective_batch_size: int
-    # The `problem_type` field is now a polymorphic strategy object.
+    # The polymorphic strategy object for the loss function and gradients.
     problem_type: "ProblemTypeStrategy"
-    clipping_strategy: str  # e.g., 'GLOBAL' or 'PER_ITEM'
-    stabilization_policy: "StabilizationPolicy"  # Forward ref for type hint
-    hyperparams: "TrainingHyperparams"  # Forward ref for type hint
-    adaptation_strategy: str  # e.g., 'CACHE' or 'RECOMPUTE_GRAD_H'
+    # The strategy for applying the initial, leaf-level clipping.
+    clipping_strategy: str
+    # The policy object for staged reduction stabilization.
+    stabilization_policy: "StabilizationPolicy"
+    # A manifest of all training hyperparameters.
+    hyperparams: "TrainingHyperparams"
+    # The top-level memory adaptation strategy (e.g., 'CACHE' or 'RECOMPUTE_GRAD_H').
+    adaptation_strategy: str
+    # The number of chunks for the streaming shared-layer backpropagation.
     shared_backprop_stream_chunks: int
