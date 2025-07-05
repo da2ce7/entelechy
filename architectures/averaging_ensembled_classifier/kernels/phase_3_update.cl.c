@@ -5,82 +5,124 @@
 #include "kernels.cl.h"
 #endif
 
-// --- Implementation: adam_update (Node 18) ---
-// Strategy: An embarrassingly parallel map kernel. Each work-item is assigned
-// to a single parameter and performs the update completely independently.
-// The `param_offset` enables this generic kernel to be dispatched multiple times,
-// applying updates to distinct slices of the overall parameter set.
-//
-// By accepting the raw global step `t`, this kernel guarantees numerical stability
-// for training runs of any length. It performs the sensitive bias correction
-// power calculation (`beta**t`) on the device, avoiding potential host-side
-// precision loss when `t` becomes very large, as described in the
-// "Marathon" validation scenario.
-__kernel void adam_update(
-    __global const SCALAR_TYPE *__restrict grad,
-    SCALAR_TYPE beta1,
-    SCALAR_TYPE beta2,
-    SCALAR_TYPE learning_rate,
-    SCALAR_TYPE epsilon,
-    uint        t,
-    __global SCALAR_TYPE *__restrict param,
-    __global SCALAR_TYPE *__restrict m1,
-    __global SCALAR_TYPE *__restrict m2,
-    int param_offset,
-    int num_params_to_update) {
+// --- Implementation: normalize_gradients (Node 21) ---
+// Strategy: A simple and highly efficient "map" kernel. Each work-item is assigned
+// to normalize exactly one element of the summed gradient buffer. Its architectural
+// role is critical: it converts the batch-wide gradient *sum* from the reduction
+// engine into a true *average* gradient. This ensures that the learning dynamics
+// are independent of the batch size, a fundamental requirement for stable and
+// reproducible training.
+__kernel void normalize_gradients(
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_summed_grad,
+    __global SCALAR_TYPE       *dest_buffer_GLOBAL_final_grad,
+    SCALAR_TYPE                 src_scalar_REAL_effective_batch_size,
+    SCALAR_TYPE                 src_scalar_REAL_epsilon,
+    uint                        src_scalar_NATURAL_parameter_count) {
 
-    const int local_idx = get_global_id(0);
+    // --- 1. Work-Item to Element Mapping ---
+    // A 1D dispatch where each thread operates on one gradient component. This is an
+    // "embarrassingly parallel" problem, allowing for maximum GPU throughput.
+    const uint i = get_global_id(0);
 
-    if (local_idx >= num_params_to_update) {
+    // Standard boundary check.
+    if (i >= src_scalar_NATURAL_parameter_count) {
         return;
     }
 
-    // Map the work-item's local index within this dispatch to the global index
-    // into the full parameter and momentum buffers.
-    const int global_idx = param_offset + local_idx;
+    // --- 2. Normalization Calculation ---
+    // Pre-calculate the reciprocal of the divisor. Multiplication is often faster
+    // than division on GPU hardware. The epsilon term prevents division by zero
+    // if the effective batch size is 0 (e.g., all samples were masked).
+    const SCALAR_TYPE normalizer = 1.0f / (src_scalar_REAL_effective_batch_size + src_scalar_REAL_epsilon);
 
-    const SCALAR_TYPE g      = grad[global_idx];
-    const SCALAR_TYPE m_prev = m1[global_idx];
-    const SCALAR_TYPE v_prev = m2[global_idx];
-
-    // Update biased first moment estimate (m_t).
-    const SCALAR_TYPE m_new = beta1 * m_prev + (1.0f - beta1) * g;
-
-    // Update biased second raw moment estimate (v_t).
-    const SCALAR_TYPE v_new = beta2 * v_prev + (1.0f - beta2) * (g * g);
-
-    // Perform bias correction calculation internally for maximum numerical stability.
-    const SCALAR_TYPE beta1_t = pown(beta1, (int)t);
-    const SCALAR_TYPE beta2_t = pown(beta2, (int)t);
-
-    // Compute bias-corrected first moment estimate (m_hat_t).
-    const SCALAR_TYPE m_hat = m_new / (1.0f - beta1_t);
-
-    // Compute bias-corrected second raw moment estimate (v_hat_t).
-    const SCALAR_TYPE v_hat = v_new / (1.0f - beta2_t);
-
-    // Update the parameter.
-    const SCALAR_TYPE param_update = learning_rate * m_hat / (MATH_FN sqrt(v_hat) + epsilon);
-    param[global_idx] -= param_update;
-
-    // Store the updated momentum values.
-    m1[global_idx] = m_new;
-    m2[global_idx] = v_new;
+    // Apply the normalization.
+    dest_buffer_GLOBAL_final_grad[i] = src_buffer_GLOBAL_summed_grad[i] * normalizer;
 }
 
-// --- Implementation: clamp_temperatures (Node 19) ---
-// Strategy: An embarrassingly parallel map kernel. Each work-item is assigned to
-// a single temperature parameter and performs the clamp operation independently.
-// This is the final operation in the training graph.
-__kernel void clamp_temperatures(__global SCALAR_TYPE *__restrict temps_buf, SCALAR_TYPE min_temp, SCALAR_TYPE max_temp, int total_modules) {
+// --- Implementation: adam_update (Node 24) ---
+// Strategy: A stateful, embarrassingly parallel "map" kernel. Each work-item is assigned
+// to update a single parameter and its corresponding moment vectors. Its most critical
+// feature is its strict adherence to the behavioral contract forbidding on-device power
+// calculations. By accepting pre-computed bias correction terms from the host, this kernel
+// guarantees long-term numerical stability for training runs of any length.
+__kernel void adam_update(
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_final_grad,
+    __global SCALAR_TYPE       *update_buffer_GLOBAL_parameters,
+    __global SCALAR_TYPE       *update_buffer_GLOBAL_m1,
+    __global SCALAR_TYPE       *update_buffer_GLOBAL_m2,
+    SCALAR_TYPE                 src_scalar_REAL_learning_rate,
+    SCALAR_TYPE                 src_scalar_REAL_beta1_pow_t,
+    SCALAR_TYPE                 src_scalar_REAL_beta2_pow_t,
+    SCALAR_TYPE                 src_scalar_REAL_beta1,
+    SCALAR_TYPE                 src_scalar_REAL_beta2,
+    SCALAR_TYPE                 src_scalar_REAL_epsilon,
+    uint                        src_scalar_NATURAL_parameter_count) {
 
-    const int idx = get_global_id(0);
-
-    // Use the standardized `total_modules` parameter name.
-    if (idx >= total_modules) {
+    // --- 1. Work-Item to Parameter Mapping ---
+    // A 1D dispatch where each thread operates on one parameter. This is the most
+    // efficient parallelization strategy for this independent operation.
+    const uint i = get_global_id(0);
+    if (i >= src_scalar_NATURAL_parameter_count) {
         return;
     }
 
-    // Read, clamp, and write back in one operation.
-    temps_buf[idx] = clamp(temps_buf[idx], min_temp, max_temp);
+    // --- 2. Load Current State ---
+    const SCALAR_TYPE g      = src_buffer_GLOBAL_final_grad[i];
+    const SCALAR_TYPE m_prev = update_buffer_GLOBAL_m1[i];
+    const SCALAR_TYPE v_prev = update_buffer_GLOBAL_m2[i];
+
+    // --- 3. Update Biased Moment Estimates ---
+    // Update the first moment (moving average of the gradients).
+    const SCALAR_TYPE m_new = src_scalar_REAL_beta1 * m_prev + (1.0f - src_scalar_REAL_beta1) * g;
+    // Update the second moment (moving average of the squared gradients).
+    const SCALAR_TYPE v_new = src_scalar_REAL_beta2 * v_prev + (1.0f - src_scalar_REAL_beta2) * (g * g);
+
+    // --- 4. Compute Bias-Corrected Estimates ---
+    // The kernel performs the final division using pre-computed powers of beta.
+    // This offloads the sensitive `beta**t` calculation to the host, which can use
+    // high-precision arithmetic to prevent underflow, thus guaranteeing stability.
+    const SCALAR_TYPE m_hat = m_new / (1.0f - src_scalar_REAL_beta1_pow_t);
+    const SCALAR_TYPE v_hat = v_new / (1.0f - src_scalar_REAL_beta2_pow_t);
+
+    // --- 5. Compute Final Parameter Update ---
+    const SCALAR_TYPE param_update = src_scalar_REAL_learning_rate * m_hat / (MATH_FN sqrt(v_hat) + src_scalar_REAL_epsilon);
+
+    // --- 6. Atomically Apply Updates ---
+    // Update the parameter and its corresponding moment vectors in-place.
+    update_buffer_GLOBAL_parameters[i] -= param_update;
+    update_buffer_GLOBAL_m1[i] = m_new;
+    update_buffer_GLOBAL_m2[i] = v_new;
+}
+
+// --- Implementation: clamp_temperatures (Node 25) ---
+// Strategy: An embarrassingly parallel "map" kernel. This is the simplest and most
+// efficient parallel pattern, as each work-item operates on a single temperature
+// parameter independently, with no need for communication or synchronization.
+// Its architectural role is that of a "parameter governor," applying a final,
+// domain-specific constraint to ensure the learnable temperatures remain in a
+// stable and meaningful range.
+__kernel void clamp_temperatures(
+    __global SCALAR_TYPE *update_buffer_GLOBAL_temps,
+    SCALAR_TYPE src_scalar_REAL_min_value,
+    SCALAR_TYPE src_scalar_REAL_max_value,
+    uint src_scalar_NATURAL_total_modules_count) {
+
+    // --- 1. Work-Item to Parameter Mapping ---
+    // A 1D dispatch where each thread operates on one temperature parameter.
+    const uint idx = get_global_id(0);
+
+    // Standard boundary check.
+    if (idx >= src_scalar_NATURAL_total_modules_count) {
+        return;
+    }
+
+    // --- 2. In-Place Clamping Operation ---
+    // This single operation enforces the physical constraints on the temperature
+    // parameter. It prevents the value from becoming negative or excessively large,
+    // which could lead to numerical instability in the Softmax/Sigmoid functions.
+    // The `clamp` intrinsic is a highly optimized, standard OpenCL function.
+    update_buffer_GLOBAL_temps[idx] = clamp(
+        update_buffer_GLOBAL_temps[idx],
+        src_scalar_REAL_min_value,
+        src_scalar_REAL_max_value);
 }

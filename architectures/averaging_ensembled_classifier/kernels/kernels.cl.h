@@ -64,6 +64,9 @@
 #ifndef C_TILE_SIZE
 #error "System Contract Violation: C_TILE_SIZE must be defined by the host build system."
 #endif
+#ifndef NUMERICAL_STABILITY_EPSILON
+#error "System Contract Violation: NUMERICAL_STABILITY_EPSILON must be defined by the host build system."
+#endif
 
 #else
 // Host/C++ mode stub definitions
@@ -79,6 +82,9 @@
 #endif
 #ifndef __global
 #define __global
+#endif
+#ifndef DEBUG_MODE
+#define DEBUG_MODE 1
 #endif
 #ifndef uint
 #define uint int
@@ -97,9 +103,17 @@
 #ifndef C_TILE_SIZE
 #define C_TILE_SIZE 1
 #endif
+#ifndef NUMERICAL_STABILITY_EPSILON
+#define NUMERICAL_STABILITY_EPSILON 1
+#endif
 #define CLK_LOCAL_MEM_FENCE 0x01
 #define CLK_GLOBAL_MEM_FENCE 0x02
+#ifndef max
+#define max(a, b) (((a) > (b)) ? (a) : (b))
+#endif
+#ifndef min
 #define min(a, b) (((a) < (b)) ? (a) : (b))
+#endif
 inline int         get_global_id(int dim) { return 0; }
 inline int         get_local_id(int dim) { return 0; }
 inline int         get_group_id(int dim) { return 0; }
@@ -864,55 +878,6 @@ __kernel void gather_and_permute_grad_hidden_activations(
 // --- Phase 14, 15 & 20: Aggregation Engine ---
 
 /**
- * @brief (Node 15b, 20b) [Utility Kernel] Applies partial-group-wise clipping to a single, contiguous, intermediate gradient buffer.
- * @kernel_contract
- *        - Holistic Constraints: "This kernel is a core component of the host-driven, recursive clip-aggregation engine. It atomically computes an L2 norm over its entire input buffer and
- * conditionally scales that buffer in-place."
- *        - Behavioral Invariants: "An epsilon term shall be used to prevent division by zero when calculating the scaling factor. The implementation must use local memory for the norm reduction to be
- * scalable."
- *        - Idempotency: "Associatively Non-Idempotent"
- *        - Synchronization Model: "Reduction Engine Stage Clip Primitive"
- */
-__kernel void clip_intermediate_grad(
-    /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for performing the intra-work-group reduction of the sum-of-squares for the L2 norm.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(SCALAR_TYPE)`.
-     */
-    __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
-
-    /**
-     * @param update_buffer_GLOBAL_intermediate_grad The buffer to be clipped in-place. This is typically the output of a preceding `aggregate_*` kernel.
-     *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
-     *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]
-     *        - Validation Preconditions: Host must provide a valid buffer containing exactly `src_scalar_NATURAL_parameter_count` elements.
-     */
-    __global SCALAR_TYPE *update_buffer_GLOBAL_intermediate_grad,
-
-    /**
-     * @param src_scalar_REAL_clipping_threshold_t_j The clipping threshold for this specific reduction stage `j`.
-     *        - Calculability Proof: [Host-side calculation based on the active stabilization policy (e.g., Normalized Log-Space Quadratic Scaling)]
-     *        - Validation Preconditions: The value must be a positive real number.
-     */
-    SCALAR_TYPE src_scalar_REAL_clipping_threshold_t_j,
-
-    /**
-     * @param src_scalar_REAL_epsilon A small constant to prevent division by zero during norm calculation.
-     *        - Validation Preconditions: Must be a small, positive real number (e.g., 1e-6).
-     */
-    SCALAR_TYPE src_scalar_REAL_epsilon,
-
-    /**
-     * @param src_scalar_NATURAL_parameter_count The total number of elements in the `update_buffer_GLOBAL_intermediate_grad` buffer.
-     *        - Calculability Proof: [Known by Host Orchestrator based on the parameter group being processed]
-     *        - Validation Preconditions: Must match the element count of the `update_buffer_GLOBAL_intermediate_grad` buffer.
-     */
-    uint src_scalar_NATURAL_parameter_count);
-
-/**
  * @brief (Node 14, 15a & 20a) Tier 1 (N is small): Reduces scattered partial results using registers and an indirection list.
  * @kernel_contract
  *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a collection buffer, located via an explicit offset list. This avoids host-side staging
@@ -1005,6 +970,55 @@ __kernel void aggregate_local_reduce(
     uint src_scalar_NATURAL_partial_width,
     uint src_scalar_FLAG_operation_type);
 
+/**
+ * @brief (Node 15b, 20b) [Utility Kernel] Applies partial-group-wise clipping to a single, contiguous, intermediate gradient buffer.
+ * @kernel_contract
+ *        - Holistic Constraints: "This kernel is a core component of the host-driven, recursive clip-aggregation engine. It atomically computes an L2 norm over its entire input buffer and
+ * conditionally scales that buffer in-place."
+ *        - Behavioral Invariants: "An epsilon term shall be used to prevent division by zero when calculating the scaling factor. The implementation must use local memory for the norm reduction to be
+ * scalable."
+ *        - Idempotency: "Associatively Non-Idempotent"
+ *        - Synchronization Model: "Reduction Engine Stage Clip Primitive"
+ */
+__kernel void clip_intermediate_grad(
+    /**
+     * @param update_buffer_LOCAL_reduction_tile Local memory for performing the intra-work-group reduction of the sum-of-squares for the L2 norm.
+     *        - Tensor Shape: (get_local_size(0))
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [Implicit from work-group dispatch]
+     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(SCALAR_TYPE)`.
+     */
+    __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
+
+    /**
+     * @param update_buffer_GLOBAL_intermediate_grad The buffer to be clipped in-place. This is typically the output of a preceding `aggregate_*` kernel.
+     *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]
+     *        - Validation Preconditions: Host must provide a valid buffer containing exactly `src_scalar_NATURAL_parameter_count` elements.
+     */
+    __global SCALAR_TYPE *update_buffer_GLOBAL_intermediate_grad,
+
+    /**
+     * @param src_scalar_REAL_clipping_threshold_t_j The clipping threshold for this specific reduction stage `j`.
+     *        - Calculability Proof: [Host-side calculation based on the active stabilization policy (e.g., Normalized Log-Space Quadratic Scaling)]
+     *        - Validation Preconditions: The value must be a positive real number.
+     */
+    SCALAR_TYPE src_scalar_REAL_clipping_threshold_t_j,
+
+    /**
+     * @param src_scalar_REAL_epsilon A small constant to prevent division by zero during norm calculation.
+     *        - Validation Preconditions: Must be a small, positive real number (e.g., 1e-6).
+     */
+    SCALAR_TYPE src_scalar_REAL_epsilon,
+
+    /**
+     * @param src_scalar_NATURAL_parameter_count The total number of elements in the `update_buffer_GLOBAL_intermediate_grad` buffer.
+     *        - Calculability Proof: [Known by Host Orchestrator based on the parameter group being processed]
+     *        - Validation Preconditions: Must match the element count of the `update_buffer_GLOBAL_intermediate_grad` buffer.
+     */
+    uint src_scalar_NATURAL_parameter_count);
+
 // --- Phase 16: Specialized Grad_H Reduction ---
 /**
  * @brief (Node 16) Specialized Kernel: Reduces the permuted Grad_H buffer using a self-contained, multi-stage, numerically-stable reduction algorithm.
@@ -1025,15 +1039,15 @@ __kernel void aggregate_local_reduce(
  *          This sequence is the sole valid method for stabilizing the reduction. Deviation is a contract violation."
  *        - Synchronization Model: "Specialized Reduction Kernel / Global Barrier"
  *        - Idempotency: "Associatively Non-Idempotent"
- *        - Architectural Justification: "This kernel's contract directly addresses a potential logical fallacy. A naive analysis might conclude that: (a) the kernel's internal planning violates host/device
- *          jurisdictional separation, or (b) the threshold calculation is logically circular (`K` depends on `T` which depends on `J` which depends on `K`). This contract asserts that the design is
- *          sound by mandating a strict two-phase execution model that resolves both issues.
+ *        - Architectural Justification: "This kernel's contract directly addresses a potential logical fallacy. A naive analysis might conclude that: (a) the kernel's internal planning violates
+ * host/device jurisdictional separation, or (b) the threshold calculation is logically circular (`K` depends on `T` which depends on `J` which depends on `K`). This contract asserts that the design
+ * is sound by mandating a strict two-phase execution model that resolves both issues.
  *
  *          The `Pre-computation Phase` firmly establishes the kernel's role as a 'Computational Agent,' not a 'Silent Monolith.' It synthesizes the Host's policy (`policy_max_k`) with its own runtime
  *          context (`get_local_size(0)`) to produce a fixed, non-negotiable reduction plan (`K_plan`, `num_stages`). This linearizes the problem.
  *
- *          The subsequent `Per-Stage Execution Phase` then executes this plan, with all dependencies resolved. This model confirms the Host retains sole control of stabilization policy, while the Device
- *          retains sole control of its immediate execution geometry. The public formula in `Behavioral Invariants` makes this collaboration transparent and verifiable, not hidden."
+ *          The subsequent `Per-Stage Execution Phase` then executes this plan, with all dependencies resolved. This model confirms the Host retains sole control of stabilization policy, while the
+ * Device retains sole control of its immediate execution geometry. The public formula in `Behavioral Invariants` makes this collaboration transparent and verifiable, not hidden."
  */
 __kernel void stabilize_and_reduce_grad_hidden_activations(
     /**
@@ -1098,7 +1112,6 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
     uint        src_scalar_NATURAL_padded_hidden_count,
     uint        src_scalar_NATURAL_total_modules_count,
     uint        src_scalar_NATURAL_padded_total_modules_count);
-
 
 // --- Phase 17-18: Streaming Shared Layer Backpropagation ---
 

@@ -5,363 +5,394 @@
 #include "kernels.cl.h"
 #endif
 
-
 // --- Implementation: forward_pass (Node 4) ---
-// Strategy: A tiled matrix-vector multiplication.
-// The `batch_offset` parameter allows this single kernel to handle both full-batch
-// precomputation and smaller, streamed chunks for memory-constrained scenarios.
-// Tiling with __local memory provides data reuse for inputs and weights within
-// a work-group, improving performance.
+// Strategy: A tiled matrix-vector multiplication. Each work-group computes a tile of
+// the output hidden activations. The core optimization is the use of local memory
+// to broadcast a slice of an input vector to all threads in a work-group,
+// drastically reducing global memory bandwidth requirements.
 __kernel void forward_pass(
-    __local SCALAR_TYPE *local_mem,
-    __global const SCALAR_TYPE *__restrict input_buf,
-    __global const SCALAR_TYPE *__restrict sample_mask,
-    __global const SCALAR_TYPE *__restrict weights_simd_major_buf,
-    __global const SCALAR_TYPE *__restrict biases_buf,
-    __global SCALAR_TYPE *__restrict hidden_out_buf,
-    __global SCALAR_TYPE *__restrict hidden_mask_out,
-    int batch_offset,
-    int num_batch_samples,
-    int padded_input_dim,
-    int padded_hidden_dim) {
-    const uint bid     = get_global_id(0); // Index within the current chunk
-    const uint h_block = get_global_id(1); // Hidden dimension block
-    const uint lid     = get_local_id(0);  // SIMD-lane index
+    __local SCALAR_TYPE        *update_buffer_LOCAL_simd_tile,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_input,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_CONST_weights_shared_simd_major,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_CONST_biases_shared,
+    __global SCALAR_TYPE       *dest_buffer_GLOBAL_hidden_activations,
+    __global SCALAR_TYPE       *dest_buffer_GLOBAL_hidden_mask,
+    uint                        src_scalar_NATURAL_batch_chunk_offset,
+    uint                        src_scalar_NATURAL_batch_chunk_count,
+    uint                        src_scalar_NATURAL_total_batch_count,
+    uint                        src_scalar_NATURAL_padded_input_count,
+    uint                        src_scalar_NATURAL_padded_hidden_count) {
 
-    // Guard against out-of-bounds work-items for the chunk
-    if (bid >= num_batch_samples) {
+    // --- 1. Work-Item to Logical Coordinate Mapping ---
+    // Each work-item is responsible for computing one element of the hidden activation tensor.
+    const uint bid     = get_global_id(0); // This thread's index along the batch dimension of the current chunk.
+    const uint h_block = get_global_id(1); // The block of hidden neurons this work-group is processing.
+    const uint lid     = get_local_id(0);  // The SIMD lane index within the work-group.
+
+    // Boundary check for the current chunk of work.
+    if (bid >= src_scalar_NATURAL_batch_chunk_count) {
         return;
     }
 
-    const uint effective_bid = batch_offset + bid;
+    // --- 2. Handle Padded Samples ---
+    // Convert the chunk-local batch index to a global index.
+    const uint effective_bid = src_scalar_NATURAL_batch_chunk_offset + bid;
+    // Calculate the final destination index for this work-item's output.
+    const uint hidden_idx = effective_bid * src_scalar_NATURAL_padded_hidden_count + h_block * SIMD_WIDTH + lid;
 
-    // Propagate validity mask. Masked samples do not need the barrier, so they exit early.
-    if (sample_mask[effective_bid] < (SCALAR_TYPE)0.5f) {
-        if (lid == 0) {
-            hidden_mask_out[effective_bid] = sample_mask[effective_bid];
-        }
+    // Early exit for padded samples to avoid wasted computation and synchronization.
+    // Both activation and mask are set to zero to propagate the invalid state.
+    if (src_buffer_GLOBAL_sample_mask[effective_bid] < (SCALAR_TYPE)0.5f) {
+        dest_buffer_GLOBAL_hidden_activations[hidden_idx] = SCALAR_ZERO;
+        dest_buffer_GLOBAL_hidden_mask[hidden_idx]        = SCALAR_ZERO;
         return;
     }
-    // Only one thread writes the valid mask to avoid a race condition.
-    if (lid == 0) {
-        hidden_mask_out[effective_bid] = sample_mask[effective_bid];
-    }
 
+    // --- 3. Tiled Computation using Local Memory ---
     const uint TILE_SIZE = SIMD_WIDTH;
-    // This partitioning dedicates local memory to a shared input tile (reused by all threads) and the locally-owned weight columns.
-    __local SCALAR_TYPE *tile_input   = local_mem;             // Size: TILE_SIZE
-    __local SCALAR_TYPE *tile_weights = &local_mem[TILE_SIZE]; // Size: TILE_SIZE * TILE_SIZE
 
-    // Each thread accumulates its partial dot product for one output neuron.
-    SCALAR_TYPE accum = biases_buf[h_block * SIMD_WIDTH + lid];
+    // Partition the work-group's local memory. This is a manual allocation scheme.
+    // 'tile_input' is shared by all threads in the work-group to enable data reuse.
+    __local SCALAR_TYPE *tile_input = update_buffer_LOCAL_simd_tile;
+    // 'tile_weights' holds the portion of the weight matrix relevant to this work-group's tile.
+    __local SCALAR_TYPE *tile_weights = &update_buffer_LOCAL_simd_tile[TILE_SIZE];
 
-    // Loop over the input dimension in tiles
-    for (uint t = 0; t < padded_input_dim; t += TILE_SIZE) {
+    // Initialize accumulator with the bias value for this specific hidden neuron.
+    SCALAR_TYPE accum = src_buffer_GLOBAL_CONST_biases_shared[h_block * TILE_SIZE + lid];
+
+    // Loop over the input dimension in tiles of size SIMD_WIDTH.
+    for (uint t = 0; t < src_scalar_NATURAL_padded_input_count; t += TILE_SIZE) {
         // --- Coordinated Load from Global to Local Memory ---
-
-        // 1. Load a tile of the input vector. All threads in the work-group cooperate.
-        const uint input_idx = effective_bid * padded_input_dim + t + lid;
-        if (t + lid < padded_input_dim) {
-            tile_input[lid] = input_buf[input_idx];
+        // Load a tile of the input vector. All threads in the work-group cooperate.
+        const uint input_idx = effective_bid * src_scalar_NATURAL_padded_input_count + t + lid;
+        if (t + lid < src_scalar_NATURAL_padded_input_count) {
+            tile_input[lid] = src_buffer_GLOBAL_input[input_idx];
         } else {
-            tile_input[lid] = SCALAR_ZERO;
+            tile_input[lid] = SCALAR_ZERO; // Zero-out padding within the tile.
         }
 
-        // 2. Load a tile of the weight matrix. Each thread `lid` cooperatively loads
-        //    the column of the weight tile corresponding to its output neuron.
+        // Cooperatively load a tile of the weight matrix. The SIMD-major layout ensures
+        // that accesses by adjacent threads (different `lid`) are coalesced.
         for (int i = 0; i < TILE_SIZE; ++i) {
-            const uint weight_idx = h_block * padded_input_dim * SIMD_WIDTH + (t + i) * SIMD_WIDTH + lid;
-            if (t + i < padded_input_dim) {
-                tile_weights[i * SIMD_WIDTH + lid] = weights_simd_major_buf[weight_idx];
+            const uint weight_idx = h_block * src_scalar_NATURAL_padded_input_count * TILE_SIZE + (t + i) * TILE_SIZE + lid;
+            if (t + i < src_scalar_NATURAL_padded_input_count) {
+                tile_weights[i * TILE_SIZE + lid] = src_buffer_GLOBAL_CONST_weights_shared_simd_major[weight_idx];
             } else {
-                tile_weights[i * SIMD_WIDTH + lid] = SCALAR_ZERO;
+                tile_weights[i * TILE_SIZE + lid] = SCALAR_ZERO;
             }
         }
+        // Synchronize work-group to ensure all local memory is populated before proceeding.
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // --- Computation from Fast __local Memory ---
-        // Each thread computes its partial sum using the shared input tile
-        // and its own column from the weight tile.
+        // --- Computation from Fast Local Memory ---
+        // Each thread computes its partial sum using the shared input tile. This is the
+        // core of the optimization: 'tile_input' is read from global memory once per
+        // tile but read from fast local memory SIMD_WIDTH times.
         for (uint k = 0; k < TILE_SIZE; ++k) {
-            accum += tile_input[k] * tile_weights[k * SIMD_WIDTH + lid];
+            accum += tile_input[k] * tile_weights[k * TILE_SIZE + lid];
         }
+        // Synchronize before loading the next tile to prevent race conditions.
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // Write final result with ReLU activation.
-    const uint hidden_idx      = GET_PHYSICAL_HIDDEN_IDX(effective_bid, h_block * SIMD_WIDTH + lid, padded_hidden_dim);
-    hidden_out_buf[hidden_idx] = fmax(accum, SCALAR_ZERO);
+    // --- 4. Final Activation and Concurrent Mask Generation ---
+    // Apply the ReLU activation function.
+    const SCALAR_TYPE activation                      = fmax(accum, SCALAR_ZERO);
+    dest_buffer_GLOBAL_hidden_activations[hidden_idx] = activation;
+
+    // Concurrently compute the derivative mask for ReLU (0 or 1). This is a fused operation that
+    // avoids a separate kernel launch, saving overhead. The `select` intrinsic is often
+    // more efficient than an if/else block.
+    dest_buffer_GLOBAL_hidden_mask[hidden_idx] = select((SCALAR_TYPE)0.0f, (SCALAR_TYPE)1.0f, activation > SCALAR_ZERO);
 }
 
 // --- Implementation: render_logits_chunk (Node 5) ---
-// Strategy: A pure 3D "map" kernel where each work-item computes one logit. It
-// is designed to be padding-aware, using the physical stride of the class
-// dimension (`padded_total_output_classes`) for all memory index calculations.
-// This ensures correct addressing into buffers that are padded for performance.
+// Strategy: A pure, 3D "map" kernel. Each work-item is assigned the task of computing
+// exactly one logit value. This embarrassingly parallel structure is highly scalable
+// and maps perfectly to the GPU's execution model. The implementation is fully
+// compliant with the modern, orthogonal chunking contract.
 __kernel void render_logits_chunk(
-    __global const SCALAR_TYPE *__restrict hidden_buf,
-    __global const SCALAR_TYPE *__restrict hidden_mask,
-    __global const SCALAR_TYPE *__restrict module_weights_buf,
-    __global const SCALAR_TYPE *__restrict module_biases_buf,
-    __global SCALAR_TYPE *__restrict full_logits_out,
-    int module_batch_chunk_index,
-    int module_param_offset,
-    int num_modules_in_chunk,
-    int class_offset,
-    int num_classes_in_chunk,
-    int total_batch_size,
-    int hidden_dim,
-    int padded_hidden_dim,
-    int total_output_classes,
-    int padded_total_output_classes) {
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_activations,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_mask,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_CONST_weights_module,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_CONST_biases_module,
+    __global SCALAR_TYPE       *dest_buffer_GLOBAL_logits,
+    uint                        src_scalar_NATURAL_batch_chunk_offset,
+    uint                        src_scalar_NATURAL_batch_chunk_count,
+    uint                        src_scalar_NATURAL_module_chunk_offset,
+    uint                        src_scalar_NATURAL_module_chunk_count,
+    uint                        src_scalar_NATURAL_class_chunk_offset,
+    uint                        src_scalar_NATURAL_class_chunk_count,
+    uint                        src_scalar_NATURAL_total_batch_count,
+    uint                        src_scalar_NATURAL_hidden_count,
+    uint                        src_scalar_NATURAL_padded_hidden_count,
+    uint                        src_scalar_NATURAL_total_output_class_count,
+    uint                        src_scalar_NATURAL_padded_total_output_class_count,
+    uint                        src_scalar_NATURAL_total_modules_count) {
 
-    // Map the 3D work-item grid to the logical (module, batch, class) space.
+    // --- 1. Work-Item to Logical Coordinate Mapping ---
+    // The 3D global work-size maps directly to the logical (module, batch, class)
+    // dimensions of the computational chunk.
     const uint module_local_idx = get_global_id(0);
-    const uint batch_idx        = get_global_id(1);
+    const uint batch_local_idx  = get_global_id(1);
     const uint class_local_idx  = get_global_id(2);
 
-    // Boundary check against the logical chunk dimensions.
-    if (module_local_idx >= num_modules_in_chunk || batch_idx >= total_batch_size || class_local_idx >= num_classes_in_chunk) {
+    // Standard boundary check to discard excess work-items from incomplete work-groups.
+    if (module_local_idx >= src_scalar_NATURAL_module_chunk_count || batch_local_idx >= src_scalar_NATURAL_batch_chunk_count || class_local_idx >= src_scalar_NATURAL_class_chunk_count) {
         return;
     }
 
-    // Establish global (module, class) coordinates for this work-item.
-    const uint module_global_idx = module_param_offset + module_local_idx;
-    const uint class_global_idx  = class_offset + class_local_idx;
+    // --- 2. Global Index Calculation ---
+    // Translate the local, chunk-relative index of this work-item into the
+    // absolute global index within the full tensor space.
+    const uint module_global_idx = src_scalar_NATURAL_module_chunk_offset + module_local_idx;
+    const uint batch_global_idx  = src_scalar_NATURAL_batch_chunk_offset + batch_local_idx;
+    const uint class_global_idx  = src_scalar_NATURAL_class_chunk_offset + class_local_idx;
 
-    // CRITICAL: Use the physical stride `padded_total_output_classes` for correct addressing.
-    const long out_idx = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes + class_global_idx;
+    // --- 3. Padding-Aware Address Calculation ---
+    // Calculate the final 1D memory address for the output logit.
+    // Casting to `long` is a forward-thinking robustness measure against integer
+    // overflow for models with extremely large tensor dimensions.
+    const long out_idx = (long)module_global_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_total_output_class_count
+                         + (long)batch_global_idx * src_scalar_NATURAL_padded_total_output_class_count + (long)class_global_idx;
 
-    // Skip computation for masked-out samples.
-    if (hidden_mask[batch_idx] < 0.5f) {
-        full_logits_out[out_idx] = SCALAR_ZERO;
-        return;
+    // Initialize the accumulator with the corresponding bias.
+    SCALAR_TYPE logit = src_buffer_GLOBAL_CONST_biases_module[(long)module_global_idx * src_scalar_NATURAL_padded_total_output_class_count + class_global_idx];
+
+    // --- 4. Sparse Dot Product ---
+    // Sum contributions over the hidden dimension to compute the dot product.
+    for (uint h = 0; h < src_scalar_NATURAL_hidden_count; ++h) {
+        // Calculate the base index for the hidden layer outputs for this batch item.
+        const long        hidden_base_idx = (long)batch_global_idx * src_scalar_NATURAL_padded_hidden_count;
+        const SCALAR_TYPE h_mask          = src_buffer_GLOBAL_hidden_mask[hidden_base_idx + h];
+
+        // This `if` check is a critical, sparsity-aware optimization. The upstream ReLU
+        // activation (in Node 4) zeroes out many hidden activations. By checking the
+        // mask first, this kernel avoids two expensive global memory reads (for the
+        // activation and weight) and a multiplication for every zeroed-out neuron.
+        if (h_mask > (SCALAR_TYPE)0.5f) {
+            const SCALAR_TYPE h_val = src_buffer_GLOBAL_hidden_activations[hidden_base_idx + h];
+
+            // The weight index calculation is complex but correctly follows row-major layout
+            // while respecting the physical padding of all dimensions.
+            const long weight_idx = (long)module_global_idx * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_total_output_class_count
+                                    + (long)h * src_scalar_NATURAL_padded_total_output_class_count + (long)class_global_idx;
+
+            const SCALAR_TYPE w_val = src_buffer_GLOBAL_CONST_weights_module[weight_idx];
+            logit += h_val * w_val;
+        }
     }
 
-    // Initialize accumulator with the bias, using the physical stride.
-    SCALAR_TYPE logit = module_biases_buf[(long)module_global_idx * padded_total_output_classes + class_global_idx];
-
-    // Compute the dot product using the physical stride for the weight lookup.
-    for (int h = 0; h < hidden_dim; h++) {
-        const SCALAR_TYPE h_val      = hidden_buf[GET_PHYSICAL_HIDDEN_IDX(batch_idx, h, padded_hidden_dim)];
-        const long        weight_idx = (long)module_global_idx * hidden_dim * padded_total_output_classes + (long)h * padded_total_output_classes + class_global_idx;
-        const SCALAR_TYPE w_val      = module_weights_buf[weight_idx];
-        logit += h_val * w_val;
-    }
-
-    full_logits_out[out_idx] = logit;
+    // Write the final computed logit to its destination.
+    dest_buffer_GLOBAL_logits[out_idx] = logit;
 }
 
-// --- Implementation: reduce_logits_for_softmax (Node 6) ---
-// Strategy: A 2D "map" kernel where each work-item (module, batch_sample) performs
-// a stable two-pass reduction over the class dimension. It is padding-aware, using
-// the physical class stride for correct memory addressing into the logit buffer.
-__kernel void reduce_logits_for_softmax(
-    __global const SCALAR_TYPE *__restrict full_logits_buf,
-    __global const SCALAR_TYPE *__restrict temps_buf,
-    __global SCALAR_TYPE *__restrict softmax_params_out,
-    int total_modules,
-    int total_batch_size,
-    int total_output_classes,
-    int padded_total_output_classes) {
+// --- Implementation: compute_probs_loss_cce_chunk (Node 6) ---
+// Strategy: A fused kernel using a 2D dispatch grid. Each work-item is a self-contained
+// reduction engine for a single (module, sample) pair. It serially computes the numerically
+// stable Softmax parameters (max_logit, sum_exp) over the entire class dimension.
+// It then fulfills its dual contract by acting as a "Partial Renderer" for its assigned
+// probability chunk and performing a direct "scatter-write" of the final loss.
+__kernel void compute_probs_loss_cce_chunk(
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_logits,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_CONST_temps,
+    __global const int         *src_buffer_GLOBAL_targets,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global SCALAR_TYPE       *dest_buffer_GLOBAL_partial_probs,
+    __global SCALAR_TYPE       *dest_buffer_GLOBAL_final_loss,
+    uint                        src_scalar_NATURAL_flat_tile_index,
+    uint                        src_scalar_NATURAL_num_class_chunks,
+    uint                        src_scalar_NATURAL_classes_per_chunk,
+    uint                        src_scalar_NATURAL_modules_per_chunk,
+    uint                        src_scalar_NATURAL_total_batch_count,
+    uint                        src_scalar_NATURAL_total_output_class_count,
+    uint                        src_scalar_NATURAL_padded_total_output_class_count,
+    uint                        src_scalar_NATURAL_total_modules_count,
+    uint                        src_scalar_NATURAL_total_tile_count) {
 
-    // Map work-item to a (module, batch) pair.
-    const uint module_idx = get_global_id(0);
-    const uint batch_idx  = get_global_id(1);
+    // --- 1. Work-Item to Logical Coordinate Mapping ---
+    // A 2D dispatch is used: each thread processes one (module, batch_idx) pair.
+    const uint module_local_idx = get_global_id(0);
+    const uint batch_idx        = get_global_id(1);
 
-    if (module_idx >= total_modules || batch_idx >= total_batch_size) {
+    if (module_local_idx >= src_scalar_NATURAL_modules_per_chunk || batch_idx >= src_scalar_NATURAL_total_batch_count) {
         return;
     }
 
-    // CRITICAL: Calculate base input index using the physical stride.
-    const long base_in_idx = (long)module_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes;
-    // Output index is unaffected by class padding as its last dimension is 2.
-    const uint base_out_idx = module_idx * total_batch_size * 2 + batch_idx * 2;
+    // --- 2. Decompose Flat Tile Index into Logical Grid Coordinates ---
+    // The host provides a flat 1D index encoding a 2D tile grid. We de-flatten it
+    // here to find the global module index for this work-item.
+    const uint module_chunk_idx  = src_scalar_NATURAL_flat_tile_index / src_scalar_NATURAL_num_class_chunks;
+    const uint module_global_idx = module_chunk_idx * src_scalar_NATURAL_modules_per_chunk + module_local_idx;
 
-    const SCALAR_TYPE temp     = temps_buf[module_idx];
-    const SCALAR_TYPE temp_inv = 1.0f / temp;
+    // --- 3. Handle Padded Samples ---
+    const long loss_out_idx = (long)module_global_idx * src_scalar_NATURAL_total_batch_count + batch_idx;
 
-    // --- Pass 1: Find max logit for numerical stability ---
-    // This is essential for the stability of the `exp` function in the next pass.
-    SCALAR_TYPE max_scaled_logit = -FLT_MAX;
-    // The loop iterates over the LOGICAL number of classes.
-    for (int c = 0; c < total_output_classes; c++) {
-        // The indexing is now correct because base_in_idx used the physical stride.
-        const SCALAR_TYPE logit = full_logits_buf[base_in_idx + c];
-        max_scaled_logit        = fmax(max_scaled_logit, logit * temp_inv);
+    if (src_buffer_GLOBAL_sample_mask[batch_idx] < (SCALAR_TYPE)0.5f) {
+        dest_buffer_GLOBAL_final_loss[loss_out_idx] = SCALAR_ZERO;
+        // Also zero out the partial probabilities this tile is responsible for. This ensures
+        // downstream gradient kernels receive correct zero inputs for padded samples.
+        const uint class_chunk_idx = src_scalar_NATURAL_flat_tile_index % src_scalar_NATURAL_num_class_chunks;
+        const long prob_tile_base_offset
+            = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk;
+
+        for (uint c_local = 0; c_local < src_scalar_NATURAL_classes_per_chunk; ++c_local) {
+            const long prob_write_idx = prob_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk
+                                        + (long)batch_idx * src_scalar_NATURAL_classes_per_chunk + c_local;
+            dest_buffer_GLOBAL_partial_probs[prob_write_idx] = SCALAR_ZERO;
+        }
+        return;
     }
 
-    // For cases where all logits are -inf (e.g., a masked sample), this prevents `max_scaled_logit`
-    // from propagating a -FLT_MAX, which could lead to NaNs in later calculations.
+    // --- 4. Fused, Numerically Stable Softmax (Internal Reduction) ---
+    // This thread performs a full two-pass reduction over the class dimension.
+    const SCALAR_TYPE temp_inv = 1.0f / src_buffer_GLOBAL_CONST_temps[module_global_idx];
+    const long        base_logits_idx
+        = (long)module_global_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_total_output_class_count + (long)batch_idx * src_scalar_NATURAL_padded_total_output_class_count;
+
+    // Pass 1: Find max for numerical stability (part of log-sum-exp trick).
+    SCALAR_TYPE max_scaled_logit = -FLT_MAX;
+    for (uint c = 0; c < src_scalar_NATURAL_total_output_class_count; ++c) {
+        max_scaled_logit = fmax(max_scaled_logit, src_buffer_GLOBAL_logits[base_logits_idx + c] * temp_inv);
+    }
     if (max_scaled_logit == -FLT_MAX) {
         max_scaled_logit = 0.0f;
     }
 
-    // --- Pass 2: Calculate sum of exponentials using the max for stability ---
+    // Pass 2: Calculate sum of exponentials.
     SCALAR_TYPE sum_exp = SCALAR_ZERO;
-    for (int c = 0; c < total_output_classes; c++) {
-        const SCALAR_TYPE logit = full_logits_buf[base_in_idx + c];
-        // The log-sum-exp trick: subtracting the max before `exp` prevents overflow to +inf
-        // and improves precision for values that would otherwise underflow to zero.
-        sum_exp += MATH_FN exp((logit * temp_inv) - max_scaled_logit);
+    for (uint c = 0; c < src_scalar_NATURAL_total_output_class_count; ++c) {
+        sum_exp += MATH_FN exp((src_buffer_GLOBAL_logits[base_logits_idx + c] * temp_inv) - max_scaled_logit);
+    }
+    const SCALAR_TYPE inv_sum_exp = (sum_exp > (SCALAR_TYPE)NUMERICAL_STABILITY_EPSILON) ? (1.0f / sum_exp) : 0.0f;
+
+    // --- 5. Partial Probability Rendering ---
+    // Now, write out only the chunk of probabilities this tile is responsible for.
+    const uint class_chunk_idx       = src_scalar_NATURAL_flat_tile_index % src_scalar_NATURAL_num_class_chunks;
+    const uint class_offset          = class_chunk_idx * src_scalar_NATURAL_classes_per_chunk;
+    const long prob_tile_base_offset = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk;
+
+    for (uint c_local = 0; c_local < src_scalar_NATURAL_classes_per_chunk; ++c_local) {
+        const uint c_global = class_offset + c_local;
+        if (c_global < src_scalar_NATURAL_total_output_class_count) {
+            const SCALAR_TYPE logit = src_buffer_GLOBAL_logits[base_logits_idx + c_global];
+            const SCALAR_TYPE prob  = MATH_FN exp((logit * temp_inv) - max_scaled_logit) * inv_sum_exp;
+
+            const long prob_write_idx = prob_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk
+                                        + (long)batch_idx * src_scalar_NATURAL_classes_per_chunk + c_local;
+            dest_buffer_GLOBAL_partial_probs[prob_write_idx] = prob;
+        }
     }
 
-    softmax_params_out[base_out_idx + 0] = max_scaled_logit;
-    softmax_params_out[base_out_idx + 1] = sum_exp;
+    // --- 6. Final Loss Calculation (Scatter-Write) ---
+    // It is critical to re-calculate the probability for the true class, as it may not
+    // have been within the partial chunk this thread wrote out. This is cheap as the
+    // expensive reduction parameters (max_logit, inv_sum_exp) are already computed.
+    const int         true_class_idx   = src_buffer_GLOBAL_targets[batch_idx];
+    const SCALAR_TYPE logit_true_class = src_buffer_GLOBAL_logits[base_logits_idx + true_class_idx];
+    const SCALAR_TYPE prob_true_class  = MATH_FN exp((logit_true_class * temp_inv) - max_scaled_logit) * inv_sum_exp;
+
+    // The argument to log is bounded by the system's epsilon.
+    dest_buffer_GLOBAL_final_loss[loss_out_idx] = -MATH_FN log(fmax(prob_true_class, (SCALAR_TYPE)NUMERICAL_STABILITY_EPSILON));
 }
 
-// --- Implementation: compute_probs_loss_cce_chunk (Node 7a - CCE Path) ---
-// Strategy: A 3D "map" kernel where each work-item computes one probability. It's
-// padding-aware, using the physical class stride for correct addressing. The
-// work-item matching the target class performs a race-free "scatter" write of
-// the final CCE loss, eliminating the need for a separate reduction.
-__kernel void compute_probs_loss_cce_chunk(
-    __global const SCALAR_TYPE *__restrict full_logits_buf,
-    __global const SCALAR_TYPE *__restrict softmax_params_buf,
-    __global const SCALAR_TYPE *__restrict temps_buf,
-    __global const int *__restrict targets_cce_buf,
-    __global const SCALAR_TYPE *__restrict sample_mask,
-    __global SCALAR_TYPE *__restrict partial_probs_out,
-    __global SCALAR_TYPE *__restrict final_loss_out,
-    int module_batch_chunk_index,
-    int module_param_offset,
-    int num_modules_in_chunk,
-    int class_offset,
-    int num_classes_in_chunk,
-    int total_batch_size,
-    int total_output_classes,
-    int padded_total_output_classes) {
-
-    // Map the 3D work-item grid to the logical (module, batch, class) space.
-    const uint module_local_idx = get_global_id(0);
-    const uint batch_idx        = get_global_id(1);
-    const uint class_local_idx  = get_global_id(2);
-
-    // Boundary check against the logical chunk dimensions.
-    if (module_local_idx >= num_modules_in_chunk || batch_idx >= total_batch_size || class_local_idx >= num_classes_in_chunk) {
-        return;
-    }
-
-    const uint module_global_idx = module_param_offset + module_local_idx;
-    const uint class_global_idx  = class_offset + class_local_idx;
-
-    // CRITICAL: Use the physical stride for correct index calculation into class-dimensioned buffers.
-    const long prob_out_idx = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes + class_global_idx;
-
-    // Skip computation for masked-out samples.
-    if (sample_mask[batch_idx] < 0.5f) {
-        partial_probs_out[prob_out_idx] = SCALAR_ZERO;
-        return;
-    }
-
-    // --- Probability Calculation (using pre-computed Softmax parameters) ---
-    const uint        params_base_idx  = module_global_idx * total_batch_size * 2 + batch_idx * 2;
-    const SCALAR_TYPE max_scaled_logit = softmax_params_buf[params_base_idx + 0]; // For stability
-    const SCALAR_TYPE sum_exp          = softmax_params_buf[params_base_idx + 1]; // Normalizer
-    const SCALAR_TYPE logit            = full_logits_buf[prob_out_idx];
-    const SCALAR_TYPE temp_inv         = 1.0f / temps_buf[module_global_idx];
-
-    SCALAR_TYPE prob = SCALAR_ZERO;
-    if (sum_exp > (SCALAR_TYPE)1e-9f) {
-        prob = MATH_FN exp((logit * temp_inv) - max_scaled_logit) / sum_exp;
-    }
-    partial_probs_out[prob_out_idx] = prob;
-
-    // --- CCE Loss Calculation (Scatter Write) ---
-    // This kernel fuses probability calculation with a non-atomic scatter-write for the loss, avoiding a separate reduction step.
-    // The single work-item matching the true class writes the loss for its sample. This is a safe, race-free operation
-    // because each (module, batch_sample) pair has exactly one true class, ensuring no two work-items write to the same address.
-    const int true_class = targets_cce_buf[batch_idx];
-    if (class_global_idx == true_class) {
-        const SCALAR_TYPE loss                         = -MATH_FN log(fmax(prob, (SCALAR_TYPE)1e-9f));
-        const uint                        loss_out_idx = module_global_idx * total_batch_size + batch_idx;
-        final_loss_out[loss_out_idx]                   = loss;
-    }
-}
-
-// --- Implementation: compute_probs_loss_bce_chunk (Node 7b - BCE Path) ---
-// Strategy: A tile-based kernel where each work-item processes one
-// (module, batch_sample) pair. It is a "Partial Renderer" for both outputs.
-// It uses the host-provided `flat_tile_index` to calculate the base write offset for
-// this tile's results, ensuring that parallel invocations write to unique,
-// non-overlapping regions of the `partial_probs_out` and `partial_loss_out`
-// collection buffers.
+// --- Implementation: compute_probs_loss_bce_chunk (Node 7) ---
+// Strategy: A 2D dispatch kernel that acts as a "Dual Partial Renderer". Each work-item
+// is responsible for a single (module, sample) pair within its assigned tile. It calculates
+// a slice of the Sigmoid probabilities and reduces the BCE loss over that same slice.
+// Both results are written to unique, non-overlapping regions of their respective
+// collection buffers, governed by the `flat_tile_index`.
 __kernel void compute_probs_loss_bce_chunk(
-    __global const SCALAR_TYPE *__restrict full_logits_buf,
-    __global const SCALAR_TYPE *__restrict temps_buf,
-    __global const SCALAR_TYPE *__restrict targets_bce_buf,
-    __global const SCALAR_TYPE *__restrict sample_mask,
-    __global SCALAR_TYPE *__restrict partial_probs_out,
-    __global SCALAR_TYPE *__restrict partial_loss_out,
-    int module_batch_chunk_index,
-    int module_param_offset,
-    int num_modules_in_chunk,
-    int class_batch_chunk_index,
-    int flat_tile_index,
-    int class_offset,
-    int num_classes_in_chunk,
-    int total_batch_size,
-    int total_output_classes,
-    int padded_total_output_classes,
-    int total_modules) {
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_logits,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_CONST_temps,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_targets,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global SCALAR_TYPE       *dest_buffer_GLOBAL_partial_probs,
+    __global SCALAR_TYPE       *dest_buffer_GLOBAL_partial_loss,
+    uint                        src_scalar_NATURAL_flat_tile_index,
+    uint                        src_scalar_NATURAL_num_class_chunks,
+    uint                        src_scalar_NATURAL_classes_per_chunk,
+    uint                        src_scalar_NATURAL_modules_per_chunk,
+    uint                        src_scalar_NATURAL_total_batch_count,
+    uint                        src_scalar_NATURAL_total_output_class_count,
+    uint                        src_scalar_NATURAL_padded_total_output_class_count,
+    uint                        src_scalar_NATURAL_total_modules_count,
+    uint                        src_scalar_NATURAL_total_tile_count) {
 
-    // Map work-item to a (module, batch) pair within the current module chunk.
+    // --- 1. Work-Item to Logical Coordinate Mapping ---
+    // A 2D dispatch is used: each thread processes one (module, batch_idx) pair.
     const uint module_local_idx = get_global_id(0);
     const uint batch_idx        = get_global_id(1);
 
-    // Boundary check against the logical work dimensions.
-    if (module_local_idx >= num_modules_in_chunk || batch_idx >= total_batch_size) {
+    if (module_local_idx >= src_scalar_NATURAL_modules_per_chunk || batch_idx >= src_scalar_NATURAL_total_batch_count) {
         return;
     }
 
-    const uint module_global_idx = module_param_offset + module_local_idx;
+    // --- 2. Decompose Flat Tile Index & Calculate Write Offsets ---
+    // De-flatten the tile index provided by the host to determine our logical grid position.
+    const uint module_chunk_idx  = src_scalar_NATURAL_flat_tile_index / src_scalar_NATURAL_num_class_chunks;
+    const uint module_global_idx = module_chunk_idx * src_scalar_NATURAL_modules_per_chunk + module_local_idx;
+    // Calculate the base write offset into the partial loss collection buffer for this specific tile.
+    const long loss_tile_base_offset = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count;
+    const long loss_write_idx        = loss_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count + batch_idx;
 
-    // --- Calculate base write offsets for this tile using the flat_tile_index ---
-    const long loss_tile_base_offset = (long)flat_tile_index * num_modules_in_chunk * total_batch_size;
-    const long prob_tile_base_offset = (long)flat_tile_index * num_modules_in_chunk * total_batch_size * num_classes_in_chunk;
+    // --- 3. Handle Padded Samples ---
+    if (src_buffer_GLOBAL_sample_mask[batch_idx] < (SCALAR_TYPE)0.5f) {
+        // For padded samples, we must zero out both outputs this tile is responsible for.
+        dest_buffer_GLOBAL_partial_loss[loss_write_idx] = SCALAR_ZERO;
 
-    const long loss_out_idx = loss_tile_base_offset + (long)module_local_idx * total_batch_size + batch_idx;
-
-    // Skip computation for masked samples.
-    if (sample_mask[batch_idx] < 0.5f) {
-        partial_loss_out[loss_out_idx] = SCALAR_ZERO;
-        for (int c_local = 0; c_local < num_classes_in_chunk; ++c_local) {
-            // Write zero to the correct slice of the partial probabilities collection buffer.
-            const long prob_out_idx         = prob_tile_base_offset + ((long)module_local_idx * total_batch_size + batch_idx) * num_classes_in_chunk + c_local;
-            partial_probs_out[prob_out_idx] = SCALAR_ZERO;
+        // Calculate the base offset for this tile's slice of the probability buffer.
+        const long prob_tile_base_offset
+            = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk;
+        for (uint c_local = 0; c_local < src_scalar_NATURAL_classes_per_chunk; ++c_local) {
+            const long prob_write_idx = prob_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk
+                                        + (long)batch_idx * src_scalar_NATURAL_classes_per_chunk + c_local;
+            dest_buffer_GLOBAL_partial_probs[prob_write_idx] = SCALAR_ZERO;
         }
         return;
     }
 
+    // --- 4. Fused Probability Calculation and Loss Reduction ---
+    // Each thread accumulates the loss contributions from its assigned chunk of classes.
     SCALAR_TYPE       partial_loss_accum = SCALAR_ZERO;
-    const SCALAR_TYPE temp_inv           = 1.0f / temps_buf[module_global_idx];
+    const SCALAR_TYPE temp_inv           = 1.0f / src_buffer_GLOBAL_CONST_temps[module_global_idx];
 
-    // Each work-item iterates through its assigned slice of classes, fusing two operations:
-    // 1. MAP: Computing and writing the Sigmoid probability for each class to its tile-local slot.
-    // 2. REDUCE: Accumulating the BCE loss contributions from each class.
-    for (int c_local = 0; c_local < num_classes_in_chunk; ++c_local) {
-        const int c_global = class_offset + c_local;
+    // Decompose the tile index again to find this tile's specific chunk of classes.
+    const uint class_chunk_idx       = src_scalar_NATURAL_flat_tile_index % src_scalar_NATURAL_num_class_chunks;
+    const uint class_offset          = class_chunk_idx * src_scalar_NATURAL_classes_per_chunk;
+    const long prob_tile_base_offset = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk;
 
-        // READ indices are unchanged; they read from full input buffers.
-        const long logit_read_idx  = (long)module_global_idx * total_batch_size * padded_total_output_classes + (long)batch_idx * padded_total_output_classes + c_global;
-        const long target_read_idx = (long)batch_idx * padded_total_output_classes + c_global;
+    // Loop over this tile's assigned slice of the class dimension.
+    for (uint c_local = 0; c_local < src_scalar_NATURAL_classes_per_chunk; ++c_local) {
+        const uint c_global = class_offset + c_local;
 
-        const SCALAR_TYPE logit = full_logits_buf[logit_read_idx];
+        // This check gracefully handles cases where the total number of classes is not
+        // a multiple of the chunk size, preventing out-of-bounds access on the last chunk.
+        if (c_global < src_scalar_NATURAL_total_output_class_count) {
+            const long base_read_idx = (long)module_global_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_total_output_class_count
+                                       + (long)batch_idx * src_scalar_NATURAL_padded_total_output_class_count + c_global;
 
-        // 1. MAP: Compute and write the Sigmoid probability.
-        const SCALAR_TYPE prob = 1.0f / (1.0f + MATH_FN exp(-logit * temp_inv));
+            // Compute Sigmoid probability.
+            const SCALAR_TYPE logit = src_buffer_GLOBAL_logits[base_read_idx];
+            const SCALAR_TYPE prob  = 1.0f / (1.0f + MATH_FN exp(-logit * temp_inv));
 
-        // --- Write to the unique slot for this tile. ---
-        const long prob_out_idx         = prob_tile_base_offset + ((long)module_local_idx * total_batch_size + batch_idx) * num_classes_in_chunk + c_local;
-        partial_probs_out[prob_out_idx] = prob;
+            // Write the probability to its unique, tile-local slot in the collection buffer.
+            const long prob_write_idx = prob_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk
+                                        + (long)batch_idx * src_scalar_NATURAL_classes_per_chunk + c_local;
+            dest_buffer_GLOBAL_partial_probs[prob_write_idx] = prob;
 
-        // 2. REDUCE: Accumulate the BCE loss.
-        const SCALAR_TYPE target_val = targets_bce_buf[target_read_idx];
-        const SCALAR_TYPE term1      = target_val * MATH_FN log(fmax(prob, 1e-9f));
-        const SCALAR_TYPE term2      = (1.0f - target_val) * MATH_FN log(fmax(1.0f - prob, 1e-9f));
-        partial_loss_accum += term1 + term2;
+            // Accumulate the BCE loss contribution from this class, the log is bounded by the system's epsilon.
+            const SCALAR_TYPE target_val = src_buffer_GLOBAL_targets[(long)batch_idx * src_scalar_NATURAL_padded_total_output_class_count + c_global];
+            const SCALAR_TYPE term1      = target_val * MATH_FN log(fmax(prob, (SCALAR_TYPE)NUMERICAL_STABILITY_EPSILON));
+            const SCALAR_TYPE term2      = (1.0f - target_val) * MATH_FN log(fmax(1.0f - prob, (SCALAR_TYPE)NUMERICAL_STABILITY_EPSILON));
+            partial_loss_accum += term1 + term2;
+        }
     }
 
-    // Write the final, negated partial loss sum to the unique slot for this tile.
-    partial_loss_out[loss_out_idx] = -partial_loss_accum;
+    // --- 5. Final Partial Loss Write ---
+    // Write the final summed partial loss for this tile to its unique collection slot.
+    // The outputs of this kernel are contractually obligated to be summed by a
+    // subsequent reduction stage to get the final loss for the sample.
+    dest_buffer_GLOBAL_partial_loss[loss_write_idx] = -partial_loss_accum;
 }
