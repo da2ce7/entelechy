@@ -46,7 +46,7 @@ class BatchProcessor:
 
         Architectural Mandate:
         The logic herein is a direct, linear expression of the computational
-        DAG defined in the `1.CONCEPT.md` document. It is responsible for
+        DAG defined in the `CONCEPT.md` document. It is responsible for
         managing the data dependencies between recipes, primarily by using
         `cl.enqueue_barrier` to create explicit synchronization points between
         the major phases of the computation.

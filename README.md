@@ -14,13 +14,14 @@ Entelechy is a system designed to allow complex machine learning architectures t
 
 At its core, Entelechy is governed by a simple but powerful idea: a strict separation of concerns that creates a federation of autonomous architectures.
 
-*   **A Constitution, Not a Dictatorship:** The framework itself is a minimalist conductor. It provides a universal "constitution" that governs how its member architectures must interact with the system, but it never dictates their internal affairs. [You can read this constitution here](./DESIGN_PHILOSOPHY.md).
+*   **A Constitution, Not a Dictatorship:** The framework itself is a minimalist conductor. It provides a universal "constitution" that governs how its member architectures must interact with the system, but it never dictates their internal affairs. [You can read this constitution here (Repository Structure: Philosophy and Specification)](./STRUCTURE.md).
 
 *   **Sovereign Architectures:** Each ML architecture is a sovereign entity. It manages its own code, its own tests, and its own scientific goals. It is free to be as simple or as complex as it needs to be, as long as it honors the federal contract.
 
 *   **The Build is a Promise:** The framework guarantees that if an experiment can be built, it can be run. By treating the compile step as a sacred validation gate, Entelechy eliminates entire classes of runtime errors, freeing the researcher to focus on science, not syntax.
 
 ## An Organism of Pure Dataflow
+[Averaging Ensembled Classifier: A Computational Organism](./architectures/averaging_ensembled_classifier/README.md)
 
 To see the power of this philosophy, consider one of its first children: a **Unified, Memory-Aware Streaming Engine** designed for complex multi-head classifiers.
 
@@ -32,7 +33,7 @@ This architecture is not merely a collection of functions; it is a living system
 
 *   Most profoundly, when faced with immense memory pressure, the architecture makes a strategic choice between speed and survival. It can **cache** intermediate results in memory for maximum performance, or it can **recompute** them on the fly to guarantee scalability, trading time for space in a beautiful act of self-preservation.
 
-This is what Entelechy makes possible: architectures that are not just powerful, but intelligent and resilient. [Explore the full design of this architecture here](./architectures/multi_head_classifier/DESIGN.md).
+This is what Entelechy makes possible: architectures that are not just powerful, but intelligent and resilient.
 
 ## Getting Started
 
