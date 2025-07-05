@@ -11,6 +11,7 @@ project('averaging_ensembled_classifier-sub', 'c', version: '0.1.0')
 py = import('python').find_installation()
 
 py_sources = files(
+  'src/arch_primitives.py',
   'src/batch_processor.py',
   'src/cl_context_manager.py',
   'src/compute_patterns.py',
@@ -23,23 +24,23 @@ py_sources = files(
   'src/kernel_signatures/phase_2_learn_C_reduction.py',
   'src/kernel_signatures/phase_2_learn_D_backprop.py',
   'src/kernel_signatures/phase_3_update.py',
-  'src/kernel_signatures/utility_signatures.py',
   'src/launcher_infra.py',
   'src/main_orchestrator.py',
   'src/memory_layout.py',
   'src/model_spec.py',
   'src/parameter_space.py',
   'src/stabilization_policy.py',
-  'src/utility_kernels.py',
   'src/workload_primitives.py',
   '__init__.py',
 )
 
 cl_kernels = files(
-  'kernels/aggregation_kernels.cl.c',
-  'kernels/backprop_kernels.cl.c',
-  'kernels/chunk_kernels.cl.c',
-  'kernels/parameter_optim.cl.c',
+  'kernels/phase_1_act.cl.c',
+  'kernels/phase_2_learn_A_production.cl.c',
+  'kernels/phase_2_learn_B_processing.cl.c',
+  'kernels/phase_2_learn_C_reduction.cl.c',
+  'kernels/phase_2_learn_D_backprop.cl.c',
+  'kernels/phase_3_update.cl.c',
 )
 
 all_sources = py_sources + cl_kernels
