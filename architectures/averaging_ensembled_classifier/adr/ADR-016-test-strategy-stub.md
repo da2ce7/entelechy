@@ -1,10 +1,10 @@
 # ADR-016: Test Strategy
 
-**Status:** STUB (NARROWED — kernel source locations and cross-backend fidelity model resolved by ADR-013; test tier structure and tooling remain open)  
+**Status:** STUB (NARROWED — kernel source locations and cross-backend fidelity model resolved by ADR-013; conditional backend enablement and build manifest resolved by ADR-014; test tier structure, tooling, and fixture strategy remain open)  
 **Date:** 2026-03-10  
 **Deciders:** —  
 **Supersedes:** —  
-**Blocked by:** ADR-014  
+**Blocked by:** —  
 **Blocks:** ADR-017
 
 ---
@@ -25,40 +25,29 @@ ADR-013 (ACCEPTED) resolves kernel source locations and establishes a **three-ti
 | **Algorithm** | `kernels.cl.h` in `kernels/` | Code review against algorithmic reference during development |
 | **Implementation** | Per-backend sources in `src/backends/<name>/kernel_sources/` | Cross-backend oracle tests (this ADR, Tier 3) |
 
-ADR-013 identifies three complementary fidelity mechanisms: *specification review*, *KernelContract interface tests*, and *cross-backend parity tests*. This stub must define how those mechanisms are realized as executable tests.
+ADR-014 (ACCEPTED) resolves conditional backend enablement and provides a generated `_build_config.py` module that declares `BACKEND_OPENCL`, `BACKEND_VULKAN`, and `BACKEND_CPU` as booleans. This module is the authoritative source for determining which backends are available at runtime and, consequently, which test tiers can execute in a given environment:
 
-The kernel inventory is now known (ADR-013 §Decision, file table): ~20 kernels across 6 phase files, with Strategy A/B variants (ADR-011) expanding the effective test matrix. Each kernel has a `KernelContract` (ADR-007) that declares its interface and a reference algorithm in `kernels.cl.h`.
+- **Tier 1** (host-side plan correctness) — always runs; no backend required.
+- **Tier 2** (per-backend kernel correctness) — runs for each backend where `_build_config.BACKEND_<NAME>` is `True`.
+- **Tier 3** (cross-backend parity) — runs when two or more backends have `True` values. ADR-014's `auto` default for `backend_vulkan` and `backend_cpu` means CI environments get the tiers their hardware supports with no manual configuration.
 
-ADR-014 (pending) determines how backends are conditionally enabled at build time, which constrains which test tiers can execute in a given environment.
+The kernel inventory is known (ADR-013 §Decision, file table): ~20 kernels across 6 phase files, with Strategy A/B variants (ADR-011) expanding the effective test matrix. Each kernel has a `KernelContract` (ADR-007) that declares its interface and a reference algorithm in `kernels.cl.h`.
 
 ---
 
 ## Decision Required
 
-### Tier 1 — Host-side plan correctness (no backend required)
+### Test framework structure
 
-Validate `ExecutionPlan` construction, node topological ordering, `KernelContract` parameter calculability proofs, `BufferContract` lifecycle (ADR-009), and `MemoryLayout` placement. These are pure Python tests with no hardware dependency.
-
-### Tier 2 — Per-backend kernel correctness (single backend required)
-
-For each enabled backend, dispatch individual kernels via `KernelBinding` against known input/output fixtures and verify numerical correctness within ADR-008 precision tolerances. The kernel sources are located per ADR-013:
-- **OpenCL:** `kernels/*.cl.c` (architecture-root, no `kernel_sources/` subdirectory)
-- **Vulkan:** `src/backends/vulkan/kernel_sources/*.comp`
-- **CPU:** `src/backends/cpu/kernel_sources/*.c`
-
-### Tier 3 — Cross-backend parity (two or more backends required)
-
-Execute identical `ExecutionPlan` instances on every enabled backend and compare outputs. ADR-013 identifies the CPU backend as a natural oracle candidate (deterministic, bit-reproducible in non-SIMD mode). Tolerances governed by ADR-008 precision configuration.
-
-### Options
-
-- **(A) Layered pytest framework.** pytest markers/fixtures for each tier; `--backend` flags control which tiers execute. Tier 1 always runs. Tier 2 runs if any backend is available. Tier 3 runs if ≥ 2 backends are available.
+- **(A) Layered pytest framework.** pytest markers/fixtures for each tier; `--backend` flags control which tiers execute. Tier 1 always runs. Tier 2 runs for each backend where `_build_config.BACKEND_<NAME>` is `True`. Tier 3 runs if ≥ 2 backends are available. Skip logic reads `_build_config` at collection time.
 
 - **(B) Parameterized test matrix.** Single test body parameterized across backends × kernels × strategies. Scales combinatorially but risks slow test suites and complex skip logic.
 
+### Parity comparison strategy
+
 - **(C) CPU reference oracle.** Designate the CPU backend (deterministic, no GPU required) as the golden reference and run all parity comparisons against it. Simplifies Tier 3 to pairwise comparisons instead of all-vs-all. **Favored direction** per ADR-013's identification of CPU as natural oracle.
 
-These are combinable — A provides the test framework structure; C defines the parity comparison strategy within Tier 3.
+Options A and C are combinable — A provides the framework structure; C defines the parity comparison strategy within Tier 3.
 
 ---
 
@@ -81,10 +70,10 @@ This yields ~22 Tier 2 test cases per backend, ~22 × (backends − 1) Tier 3 co
 
 ## Tensions
 
-- Tier 3 tests require at least two compiled backends in the CI environment, which depends on ADR-014's conditional backend enablement mechanism.
 - The Strategy A FLAG variants (ADR-011) create combinatorial pressure — each Strategy A kernel needs two test paths. Option B addresses this but may over-parameterize.
 - Precision tolerances (ADR-008) vary by kernel; Tier 3 comparisons need per-kernel tolerance tables rather than a single global epsilon.
 - Using CPU as oracle (Option C) assumes CPU correctness is established independently (Tier 2). Circular dependency risk if CPU Tier 2 fixtures are derived from CPU execution.
+- CI environments without GPU hardware can still run Tier 1 + CPU Tier 2 (ADR-014's `backend_cpu` auto-enables if a C compiler is present). Tier 3 requires at least one GPU backend, gating full parity testing to GPU-equipped CI.
 
 ---
 
@@ -95,4 +84,4 @@ This yields ~22 Tier 2 test cases per backend, ~22 × (backends − 1) Tier 3 co
 - [ADR-009: Buffer Lifecycle in the Plan Model](ADR-009-buffer-lifecycle-in-the-plan-model.md) — `BufferContract` lifecycle tested at Tier 1
 - [ADR-011: CCE/BCE Strategy Delegation](ADR-011-cce-bce-strategy-delegation.md) — Strategy A/B variants expanding test matrix
 - [ADR-013: Kernel Source Strategy](ADR-013-kernel-source-strategy.md) — three-tier specification hierarchy; kernel source locations; cross-backend fidelity model; CPU as natural oracle candidate
-- [ADR-014: Build System Integration](ADR-014-build-system-integration.md) — conditional backend enablement constraining testable configurations
+- [ADR-014: Build System Integration](ADR-014-build-system-integration.md) — `_build_config.py` manifest for enabled backend discovery; conditional backend enablement via Meson `feature` options; `auto` default enabling zero-configuration CI
