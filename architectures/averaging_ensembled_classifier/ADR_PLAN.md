@@ -10,15 +10,17 @@ Two foundational decisions (Tier 0) have been accepted:
 
 - **ADR-002: Plan Node Types & Synchronization Structure** — The execution plan is a directed acyclic graph of five typed, immutable node descriptors (`KernelDispatchNode`, `ReductionTreeNode`, `StreamingLoopNode`, `BarrierNode`, `RetrievalNode`) connected by explicit dependency edges. This is a closed taxonomy governed by the Complexity Ceiling Constraint. Full record: `adr/ADR-002-plan-node-types-and-synchronization-structure.md`.
 
-Tier 1 (plan data structure) is substantially resolved. Three of five ADRs are decided:
+Tier 1 (plan data structure) is substantially resolved. Four of five ADRs are decided:
 
 - **ADR-003: Reduction Tree Plan Representation** — The `ReductionTreePlan` is a frozen dataclass carrying the Policy tier's output as pure data: uniform fan-in, stage count, placement-dependent initial offset list, tree variant, and a pre-computed threshold schedule from the Quadratic Scaling Policy. Kernel tier selection and intermediate buffer allocation are Orchestration-tier concerns left to the renderer. Full record: `adr/ADR-003-reduction-tree-plan-representation.md`.
+
+- **ADR-004: Streaming Loop Plan Representation** — The `StreamingLoopPlan` is a frozen dataclass carrying the iteration dimension (chunk count, chunk size, total extent), a stride table describing per-chunk parameter variation as affine functions of the chunk index, scratch buffer specifications, and loop-wide constant scalars. The body is a flat sequence of `KernelDispatchNode` templates whose parameterized scalars the renderer instantiates per iteration. Both Phase III (linear batch streaming, Nodes 17→18→19) and Model A (grid-based recompute) are expressed through the same structure, with `period`/`outer_stride` fields accommodating 2D→1D flattened iteration. Per-chunk dispatch, synchronization, and scratch buffer allocation are Orchestration-tier concerns. Full record: `adr/ADR-004-streaming-loop-plan-representation.md`.
 
 - **ADR-005: Node 16 Opacity** — Resolved by ADR-001's design principle: Node 16 is a single `KernelDispatchNode` with policy parameters. Its internal multi-stage reduction is an Execution-tier concern.
 
 - **ADR-011: CCE/BCE Strategy Delegation** — Resolved by ADR-001: the plan conveys intent; the renderer conveys mechanism.
 
-These choices resolve or significantly narrow all downstream decisions. ADR-003 in particular establishes the concrete pattern for how complex plan node internals are represented — a "parametric header with pre-computed policy output" — and formally places kernel tier selection in the Orchestration tier, constraining ADR-004, ADR-006, ADR-007, ADR-009, and ADR-012. The remaining ADRs are organized into tiers reflecting the actual dependency chain and work order. Within each tier, ADRs are independent of each other and may be resolved in parallel.
+These choices resolve or significantly narrow all downstream decisions. ADR-003 in particular establishes the concrete pattern for how complex plan node internals are represented — a "parametric header with pre-computed policy output" — and formally places kernel tier selection in the Orchestration tier, constraining ADR-006, ADR-007, ADR-009, and ADR-012. ADR-004 extends this pattern to streaming loops with a stride-based parametric specification, completing the concrete vocabulary for all five plan node types' internal representations. The remaining ADRs are organized into tiers reflecting the actual dependency chain and work order. Within each tier, ADRs are independent of each other and may be resolved in parallel.
 
 **Status Key:**
 - `DECIDED` — Accepted decision, recorded in `adr/`.
@@ -44,7 +46,8 @@ The shared orchestration layer produces a backend-neutral `ExecutionPlan` data s
 │                                                         │
 │  ModelSpec, MemoryLayout, ParameterSpace, Tiling,       │
 │  StabilizationPolicy, ReductionTreePlan,                │
-│  KernelContract (validation), ExecutionPlanBuilder       │
+│  StreamingLoopPlan, KernelContract (validation),        │
+│  ExecutionPlanBuilder                                   │
 │                                                         │
 │  Produces: ExecutionPlan (backend-neutral data)         │
 └───────────────────────┬─────────────────────────────────┘
@@ -116,7 +119,8 @@ The `ReductionTreePlan` frozen dataclass carries the Policy tier's output as pur
 
 ### ADR-004: Streaming Loop Representation (Phase III)
 
-**Status:** NARROWED — Abstract loop descriptor (Option A); constrained by ADR-002's Complexity Ceiling
+**Status:** DECIDED — Stride-based parametric specification (Option B)
+**Full Record:** `adr/ADR-004-streaming-loop-plan-representation.md`
 
 **Context:**
 ADR-002 establishes `StreamingLoopNode` as one of the five canonical plan node types and imposes the Complexity Ceiling Constraint: `StreamingLoopNode.body` is a flat sequence of `KernelDispatchNode`s only — it may not contain another `StreamingLoopNode`, a `ReductionTreeNode`, a `BarrierNode`, or a `RetrievalNode`. This resolves the core Option A vs. Option B question in favor of **Option A (abstract loop descriptor)**.
@@ -129,21 +133,7 @@ CONCEPT.md's Phase III (True Streaming for `Grad_SW` / `Grad_SB`) involves a hos
 
 Option B (pre-expanded flat DAG) is eliminated: it inflates plan size linearly with chunk count, prevents Vulkan from recognizing loop structure, and loses the semantic signal that N sequences are structurally identical.
 
-**ADR-003 precedent:** ADR-003 establishes the representation pattern for complex plan node internals: a frozen dataclass carrying the Policy tier's pre-computed output as pure data, with Orchestration-tier derivations (dispatch mechanics, buffer allocation) left to the renderer. The `StreamingLoopNode`'s internal representation should follow this pattern — pre-compute per-chunk parameter deltas in the shared layer; leave per-chunk dispatch sequencing, synchronization insertion, and memory management to the renderer.
-
-**Remaining Decision:**
-The concrete representation of per-chunk parameter deltas within the `StreamingLoopNode`. The node must specify:
-- Chunk count (varies per batch, determined by host memory assessment).
-- Per-chunk parameter deltas (offsets, indices) — how scalar parameters change between iterations.
-- The body: a flat sequence of `KernelDispatchNode`s with parameterized bindings that the renderer instantiates per iteration.
-
-Following ADR-003's parametric header pattern, the key design question is: how much per-chunk data to pre-compute (Policy tier) vs. how much to leave parametrically derivable by the renderer (Orchestration tier). The threshold schedule analogy: if per-chunk offsets are non-trivial (policy-dependent), pre-compute them; if they are trivially derivable from the chunk index and a stride, leave them to the renderer.
-
-**Tensions:**
-- The chunk count varies per batch. The plan is constructed fresh each batch, but Option A keeps it compact and semantically clear.
-- Vulkan's ability to record the entire loop body into one command buffer is a key performance characteristic preserved by this approach.
-- The Model A recompute path (`RECOMPUTE_GRAD_H`) is also a streaming loop (recompute hidden_i → compute gradients → clip, iterated per tile). ADR-002 confirms this is expressed as a `StreamingLoopNode` with the same constraints.
-- Per ADR-003's analysis, the Policy/Orchestration boundary should be drawn at the point where derivation becomes trivial. Chunk offsets that are simple arithmetic progressions (base + index × stride) need not be materialized — the parameterized specification carries the stride, and the renderer computes the per-chunk values.
+**Decision:** The `StreamingLoopPlan` is a stride-based parametric specification. It carries the iteration dimension (`total_extent`, `chunk_count`, `chunk_size`), a stride table of `ParameterStride` entries describing how each scalar parameter varies as an affine function of the chunk index, scratch buffer specifications for renderer-internal transient buffers, and loop-wide constant scalars. The body is a flat sequence of `KernelDispatchNode` templates. The renderer instantiates per-chunk parameters at render time by applying `base + (chunk_index % period) * stride + (chunk_index // period) * outer_stride`. Both Phase III (linear batch) and Model A (grid-based recompute) use the same structure — the `period`/`outer_stride` fields accommodate 2D→1D flattened grid iteration. Plan size is O(1) in chunk count. Full analysis and data structure definitions in the full record.
 
 ---
 
@@ -192,6 +182,8 @@ The canonical constant set. A minimal proposal:
 
 Additionally, ADR-003's backend rendering contract requires the renderer to apply a kernel-tier crossover heuristic (register-reduce vs. local-reduce). The `HardwareProfile` need not prescribe this heuristic — it is an Orchestration-tier concern — but the profile must carry the raw hardware data (local memory size, SIMD width) from which each backend derives its own crossover threshold.
 
+**ADR-004 constraint:** The `StreamingLoopPlan`'s `IterationDimension.chunk_count` for Phase III is determined by the host memory assessment, which consumes `global_mem_bytes` from the `HardwareProfile` to decide `shared_backprop_stream_chunks`. The `HardwareProfile` must carry `global_mem_bytes` (already in the table above) to support this computation. Additionally, ADR-004's `ScratchBufferSpec` entries declare per-iteration scratch buffer sizes derived from `MemoryLayout` shapes, which in turn depend on padding computed from `simd_width` and `c_tile_size`. The `HardwareProfile` is thus a transitive input to streaming loop plan construction — not just reduction tree planning.
+
 **Tensions:**
 - The CPU backend's SIMD width is a compile-time constant. The `HardwareProfile` must accept pre-determined values without requiring a "discovery" phase.
 - `max_local_mem` is meaningless for the CPU backend. The profile must tolerate `None` or sentinel values for inapplicable constants.
@@ -220,6 +212,8 @@ How does the `KernelContract` handle parameters that exist in some backends but 
 Option A is strongly favored. The Placement Contract (CONTRACT.md Article 3.2) already defines strategies abstractly (`grid_mod_cls`, `linear_batch`). The contract specifies the *strategy and key domain*; the binding specifies *how the key is communicated*.
 
 **ADR-003 parallel:** ADR-003 establishes the concrete precedent for this jurisdictional split. The `ReductionTreePlan` carries Policy-tier output (thresholds, fan-in, offset lists) as pure data; the renderer interprets it through backend-native dispatch. The Contract/Binding split applies the same principle to individual kernel invocations — the Contract carries validation data (shapes, preconditions, placement strategy); the Binding translates it into native dispatch arguments. The pattern is consistent: shared layer produces data artifacts; backend consumes them.
+
+**ADR-004 reinforcement:** ADR-004's `StreamingLoopNode` embeds `KernelDispatchNode` templates as its `body_nodes`, and each body node carries its own `KernelContract` reference for plan-time validation. The Contract/Binding split therefore governs not only top-level `KernelDispatchNode`s but also the child nodes inside `StreamingLoopNode` bodies. At plan-construction time, the plan builder validates each body node's contract (shapes, preconditions, placement strategy) against the stride-parameterized scalar ranges. At render time, the backend's `KernelBinding` translates each per-chunk-instantiated body node into native dispatch arguments. This confirms Option A (abstract placement key) as the only viable approach: the body node contracts must reference placement strategies abstractly because the stride table's `ParameterStride.param_name` fields reference abstract parameter names, not backend-specific argument positions.
 
 **Tensions:**
 - CONTRACT.md Article 1.4.1 demands that all calculability proof terms exist in the interface. If `flat_tile_index` is abstracted away, the proof must reference the abstract placement key. This requires a CONTRACT.md amendment — specifically, adding a "Backend Binding" section to Article 3.2.3 that acknowledges the mechanism is backend-specific while the strategy is universal.
@@ -265,10 +259,10 @@ The existing `BufferHandle` token is the natural plan→renderer handoff mechani
 
 **ADR-003 constraint — two-tier buffer scope:** ADR-003 establishes a critical distinction between **plan-level buffers** and **renderer-internal buffers**:
 
-- **Plan-level buffers** are named in the plan data structure — `source_buffer` and `destination_buffer` on `ReductionTreeNode`, `buffer_bindings` on `KernelDispatchNode`s. Their lifetimes are properties of the DAG topology and belong in the shared layer.
-- **Renderer-internal buffers** are allocated by the backend during rendering and never appear in the plan. For `ReductionTreeNode`s, these include all intermediate stage buffers (ping-pong buffers between reduction stages) and uploaded offset-list buffers. For `StreamingLoopNode`s, per-chunk scratch buffers may similarly be renderer-internal.
+- **Plan-level buffers** are named in the plan data structure — `source_buffer` and `destination_buffer` on `ReductionTreeNode`, `buffer_bindings` on `KernelDispatchNode`s, and `collection_buffers` on `StreamingLoopNode`s. Their lifetimes are properties of the DAG topology and belong in the shared layer.
+- **Renderer-internal buffers** are allocated by the backend during rendering and never appear in the plan. For `ReductionTreeNode`s, these include all intermediate stage buffers (ping-pong buffers between reduction stages) and uploaded offset-list buffers. For `StreamingLoopNode`s, ADR-004 formalizes the per-iteration scratch buffers via `ScratchBufferSpec` entries in the `StreamingLoopPlan` — these declare required sizes and shapes but are explicitly renderer-internal. Their allocation, reuse across iterations, and deallocation are Orchestration-tier concerns.
 
-This distinction means the plan's buffer lifetime model (whichever option is chosen below) governs only plan-level buffers. Intermediate reduction buffers are entirely the renderer's responsibility — their allocation, reuse, and deallocation are Orchestration-tier concerns that may differ radically across backends (e.g., OpenCL allocates discrete `cl.Buffer`s per stage; Vulkan suballocates from a single `VkDeviceMemory` block; CPU may use stack allocation or a bump allocator).
+This distinction means the plan's buffer lifetime model (whichever option is chosen below) governs only plan-level buffers. Intermediate reduction buffers and streaming loop scratch buffers are entirely the renderer's responsibility — their allocation, reuse, and deallocation are Orchestration-tier concerns that may differ radically across backends (e.g., OpenCL allocates discrete `cl.Buffer`s per stage or transient scratch; Vulkan suballocates from a single `VkDeviceMemory` block; CPU may use stack allocation or a bump allocator).
 
 **Remaining Decision:**
 Does the plan prescribe buffer *reuse* for plan-level buffers (e.g., "buffer A can be freed after Node 12 and its memory reused for buffer B"), or does it leave lifetime management entirely to the renderer?
@@ -281,7 +275,8 @@ Option A is strongly favored. Plan-level buffer lifetime is a property of the DA
 
 **Tensions:**
 - Vulkan backends may further optimize by suballocating from large `VkDeviceMemory` blocks. The plan's lifetime annotations enable this without prescribing it.
-- The two-tier buffer scope means the plan's memory footprint estimate (if computed) will undercount actual device memory usage — renderer-internal intermediates are invisible to the plan. If memory budgeting is desired (e.g., for the `host_memory_assessment` chunk-count decision in `StreamingLoopNode`), the plan builder may need a renderer-supplied "overhead estimate" callback. This is a minor tension that ADR-003's rendering contract accommodates by keeping intermediate buffers derivable from the plan's tree parameters (`num_stages`, `fan_in`, `elements_per_partial`).
+- The two-tier buffer scope means the plan's memory footprint estimate (if computed) will undercount actual device memory usage — renderer-internal intermediates are invisible to the plan. If memory budgeting is desired (e.g., for the `host_memory_assessment` chunk-count decision in `StreamingLoopNode`), the plan builder may need a renderer-supplied "overhead estimate" callback. This tension is accommodated by ADR-003's rendering contract (intermediate buffers derivable from `num_stages`, `fan_in`, `elements_per_partial`) and symmetrically by ADR-004's `ScratchBufferSpec` entries (scratch buffer sizes declared explicitly in the plan, even though allocation is renderer-owned). Together, the two specifications make the complete renderer-internal memory overhead *estimable* from the plan data alone — even though the plan does not prescribe the allocation.
+- ADR-004's `collection_buffers` field on `StreamingLoopNode` explicitly names the plan-level output buffers populated across iterations (e.g., `clipped_partial_grad_shared_weights`). These buffers' lifetimes are governed by the DAG — they persist beyond the streaming loop for consumption by downstream `ReductionTreeNode`s (Node 20). Option A's lifetime annotations must correctly model this: the producing node is the `StreamingLoopNode` itself (not individual iterations), and the last consumer is the downstream reduction node.
 
 ---
 
@@ -381,9 +376,12 @@ The current `compute_patterns.py` (reduction dispatch logic) moves to `backends/
 
 **ADR-003 confirmation:** `ReductionTreePlan` (the frozen dataclass defined in ADR-003) lives in `execution_plan.py` alongside the other plan node types. The plan builder in `execution_plan.py` (or `batch_processor.py`) calls `StabilizationPolicy.plan_uniform_reduction_tree()` to resolve `(K, num_stages)`, computes the threshold schedule, and constructs a `ReductionTreePlan` — all in the shared layer. The current `_execute_reduction_pipeline` logic in `graph_recipes.py`, which interleaves plan computation with OpenCL dispatch, splits cleanly along the Policy/Orchestration boundary: the plan-computation half moves to the shared plan builder; the dispatch half moves to `backends/opencl/plan_renderer.py`. Similarly, `compute_patterns.py`'s `AggregationManager` — which currently owns both the register/local crossover heuristic and the OpenCL dispatch calls — splits into a renderer-internal component. The crossover heuristic (`max_reg_agg = 16`) stays in the OpenCL renderer as an Orchestration-tier concern.
 
+**ADR-004 confirmation:** `StreamingLoopPlan` and its constituent types (`IterationDimension`, `ParameterStride`, `ScratchBufferSpec`) live in `execution_plan.py` alongside `ReductionTreePlan` and the other plan node types. The plan builder constructs `StreamingLoopPlan` instances by consuming `MemoryLayout` shapes (for scratch buffer sizing), `TilingScheme` geometry (for stride computation), and the host memory assessment's chunk count — all shared-layer data. The current `build_shared_backprop_subgraph` function in `graph_recipes.py` (Phase III streaming, ~80 lines) splits along the same Policy/Orchestration boundary as reduction trees: the stride computation, iteration dimension resolution, and scratch buffer sizing move to the shared plan builder; the per-chunk `clEnqueueNDRange` dispatch loop, event chaining, and `acquire_transient_buffer` / `release_transient_buffer` calls move to `backends/opencl/plan_renderer.py`. Similarly, `build_streaming_module_grad_path` (~120 lines, Model A recompute) splits: the grid-to-stride-table derivation moves to the plan builder; the per-tile OpenCL dispatch loop moves to the renderer.
+
 **Tensions:**
 - The `kernel_signatures/` → `kernel_contracts/` rename reflects the Contract/Binding split (ADR-007). The shared code retains validation; the backend-specific binding code moves to each backend.
 - `main_orchestrator.py` straddles both layers. Its plan-construction logic is shared; its `pyopencl` setup code moves to the OpenCL backend.
+- ADR-004's `body_nodes` on `StreamingLoopNode` carry full `KernelDispatchNode` definitions including `KernelContract` references. These contracts must be validated at plan-construction time — but the stride-parameterized scalars take different values per iteration. The plan builder validates that the stride table is consistent with the contract's calculability proofs (e.g., `batch_chunk_offset` + `batch_chunk_count` ≤ `total_extent` for every chunk index). This is a concrete manifestation of ADR-007's abstract-placement-key approach: the contract validates the *range* of parameterized values, not any single instantiation.
 
 ---
 
@@ -496,12 +494,28 @@ Additionally, for stabilized trees:
 7. Threshold monotonicity: $T_{\text{leaf}} \geq T_{\text{leaf}-1} \geq \ldots \geq T_{\text{root}}$ (for $\lambda \geq 0$).
 8. Safety ceiling: every $T_j \leq \text{FP\_FORMAT\_MAX} / K$.
 
-These invariants can be tested exhaustively across a matrix of `(N, K, tree_variant, precision)` values without any backend or device. This is a strong validation of the three-tier model: the Policy tier's output (the `ReductionTreePlan`) is a self-contained, self-validating data artifact.
+**ADR-004 concrete test targets:** ADR-004 defines eight plan-construction invariants that become additional device-free test targets for layer 1:
+
+9. `chunk_count >= 1`.
+10. `chunk_size >= 1`.
+11. `(chunk_count - 1) * chunk_size < total_extent <= chunk_count * chunk_size` (iteration dimension consistency).
+12. `len(body) >= 1` (non-empty body).
+13. Every `ParameterStride.param_name` references a `scalar_param` in at least one body node.
+14. Every `ParameterStride.period >= 1`.
+15. For each stride: `base + ((chunk_count - 1) % period) * stride + ((chunk_count - 1) // period) * outer_stride >= 0` (no negative offsets).
+16. Every `ScratchBufferSpec.size_bytes > 0`.
+
+Additionally, round-trip validation targets:
+17. For a known `ModelSpec` + `HardwareProfile` + batch size, verify that applying the stride table for every `chunk_index` produces the same per-chunk parameters as the current `build_shared_backprop_subgraph` function.
+18. For a known `TilingScheme`, verify that the Model A stride table (with `period`/`outer_stride`) produces the same per-tile `module_chunk_offset`, `class_chunk_offset`, and `flat_tile_index` as iterating `TilingScheme.__iter__`.
+
+These invariants — combined with ADR-003's eight — can be tested exhaustively across a matrix of `(N, K, tree_variant, precision, batch_size, chunk_count, grid_shape)` values without any backend or device. This is a strong validation of the three-tier model: the Policy tier's output (the `ReductionTreePlan` and `StreamingLoopPlan`) is a self-contained, self-validating data artifact.
 
 **Tensions:**
 - FP16 results will differ between backends due to different intermediate precision handling and SIMD reduction order (floating-point associativity). Tolerances must be precision-aware and documented.
 - Plan-level tests provide fast, device-free CI coverage. This is a significant practical benefit.
 - The layer 2 (backend unit) tests for reduction tree rendering should verify that each renderer correctly derives the Orchestration-tier data: intermediate offset lists are contiguous iotas, kernel tier selection matches the backend's documented crossover heuristic, and intermediate buffer counts match `num_stages - 1` (or fewer with ping-pong reuse).
+- The layer 2 tests for streaming loop rendering should verify: scratch buffers are allocated with sizes matching `ScratchBufferSpec.size_bytes`, per-chunk parameter instantiation matches the stride formula, the last chunk correctly processes `min(chunk_size, total_extent - i * chunk_size)` items, and inter-iteration synchronization ensures scratch buffer reuse safety.
 
 ---
 
@@ -523,7 +537,7 @@ Extract backend-neutral `Protocol` types from current OpenCL code. Define `Hardw
 Remove all `pyopencl` imports from: `execution_plan.py`, `stabilization_policy.py`, `workload_primitives.py`, `model_spec.py`, `memory_layout.py`, `parameter_space.py`, `arch_primitives.py`. These modules depend only on Phase 0 abstractions and standard library types. `DiscoveredArchConstants` is replaced by `HardwareProfile`. All tests pass.
 
 **Phase 2: Plan Data Structure.**
-Define the five plan node types decided in ADR-002 (`KernelDispatchNode`, `ReductionTreeNode`, `StreamingLoopNode`, `BarrierNode`, `RetrievalNode`) as frozen dataclasses with explicit dependency edges. Define `ReductionTreePlan` internals per ADR-003 (Option C: parametric header with pre-computed threshold schedule) and `StreamingLoopNode` parameter deltas per ADR-004. Implement `ExecutionPlanBuilder` that produces a typed DAG from `ModelSpec` + `HardwareProfile` + batch parameters, with the Cache/Recompute lifecycle decision expressed as DAG topology (per ADR-002's dissolution of `DependencyProvider`).
+Define the five plan node types decided in ADR-002 (`KernelDispatchNode`, `ReductionTreeNode`, `StreamingLoopNode`, `BarrierNode`, `RetrievalNode`) as frozen dataclasses with explicit dependency edges. Define `ReductionTreePlan` internals per ADR-003 (Option C: parametric header with pre-computed threshold schedule) and `StreamingLoopPlan` internals per ADR-004 (Option B: stride-based parametric specification). Implement `ExecutionPlanBuilder` that produces a typed DAG from `ModelSpec` + `HardwareProfile` + batch parameters, with the Cache/Recompute lifecycle decision expressed as DAG topology (per ADR-002's dissolution of `DependencyProvider`).
 
 The `ReductionTreePlan` construction logic — currently scattered across `graph_recipes.py` (`_execute_reduction_pipeline`) and `stabilization_policy.py` (`plan_uniform_reduction_tree`, `get_threshold_for_generic_stage`) — is consolidated into the plan builder:
 - Call `StabilizationPolicy.plan_uniform_reduction_tree(num_partials, hardware_max_fan_in)` to resolve `(K, num_stages)`.
@@ -531,12 +545,32 @@ The `ReductionTreePlan` construction logic — currently scattered across `graph
 - Package the results into a `ReductionTreePlan` frozen dataclass alongside the placement-dependent initial offset list and tree variant.
 - Validate all six ADR-003 invariants at construction time.
 
-Write plan-level tests (ADR-016, layer 1) targeting ADR-003's eight concrete invariants. The plan builder exists alongside the current OpenCL execution path — it is not yet *used* for dispatch. All tests pass.
+The `StreamingLoopPlan` construction logic — currently embedded in `graph_recipes.py`'s `build_shared_backprop_subgraph` (Phase III) and `build_streaming_module_grad_path` (Model A) — is similarly consolidated into the plan builder:
+- Resolve the `IterationDimension` from the host memory assessment (`shared_backprop_stream_chunks`, batch size) or `TilingScheme` geometry (`grid.total_tiles`).
+- Build `KernelDispatchNode` templates for the body — Nodes 17, 18, 19 for Phase III; Nodes 4, 8, 9, 10, 11 for Model A — carrying full `KernelContract` references and non-varying `scalar_params`.
+- Compute the `ParameterStride` table from `MemoryLayout` shapes and `TilingScheme` offsets. Phase III uses simple linear strides; Model A uses `period`/`outer_stride` for 2D→1D grid iteration.
+- Declare `ScratchBufferSpec` entries for per-iteration transient buffers (sizes derived from `MemoryLayout` shapes).
+- Set `constant_scalars` for loop-wide invariants (e.g., `clipping_threshold_global`, `epsilon`).
+- Validate all eight ADR-004 invariants at construction time.
+
+The activation lifecycle decision (ADR-002's dissolution of `DependencyProvider`) is expressed structurally: the `RECOMPUTE_GRAD_H` strategy produces a Model A `StreamingLoopNode` in the plan DAG; the `CACHE` strategy produces individual `KernelDispatchNode`s without a streaming loop wrapper. This replaces the current `CacheProvider` / `RecomputeProvider` hierarchy with a topological distinction — presence or absence of a `StreamingLoopNode`.
+
+Write plan-level tests (ADR-016, layer 1) targeting ADR-003's eight concrete invariants and ADR-004's ten concrete invariants (including round-trip validation against the current `build_shared_backprop_subgraph` and `build_streaming_module_grad_path` functions). The plan builder exists alongside the current OpenCL execution path — it is not yet *used* for dispatch. All tests pass.
 
 **Phase 3: OpenCL Plan Renderer.**
 This is the critical step. Refactor `graph_recipes.py` and `compute_patterns.py` into an `OpenCLPlanRenderer` that consumes an `ExecutionPlan` and produces the same OpenCL dispatch sequence as the current code. The `BatchProcessor` switches from direct recipe calls to plan-build-then-render. The current behavior is preserved but the code path is fundamentally restructured.
 
 For `ReductionTreeNode` rendering specifically: the renderer iterates over stages, applies the OpenCL register/local crossover heuristic (currently `max_reg_agg = 16` in `AggregationManager`), generates contiguous intermediate offset lists, allocates intermediate buffers (inheriting `PingPongManager`'s current scheme), and dispatches `aggregate_register_reduce` or `aggregate_local_reduce` per stage with the pre-computed threshold from `ReductionTreePlan.threshold_schedule`. The renderer no longer computes thresholds, resolves fan-in, or determines stage count — all Policy-tier work has moved to Phase 2's plan builder.
+
+For `StreamingLoopNode` rendering specifically: the renderer replaces `build_shared_backprop_subgraph` (Phase III) and `build_streaming_module_grad_path` (Model A) with a generic streaming loop interpreter that:
+- Allocates scratch buffers per `ScratchBufferSpec` entries (replacing `BufferManager.acquire_transient_buffer`).
+- Iterates over `chunk_count`, applying the stride formula `base + (i % period) * stride + (i // period) * outer_stride` to compute per-chunk parameter values.
+- Derives the last-chunk item count from `IterationDimension` fields.
+- Dispatches the body sequence per iteration with `cl.Event` chains for intra- and inter-iteration synchronization.
+- Merges `constant_scalars` into each body node's scalar parameters.
+- Releases scratch buffers after the loop completes.
+
+The renderer no longer computes chunk offsets, stride values, or scratch buffer sizes — all Policy-tier work has moved to Phase 2's plan builder. The current per-function dispatch logic (`build_shared_backprop_subgraph`'s Python loop with manual `gsw_scratch_ref` / `gsb_scratch_ref` management; `build_streaming_module_grad_path`'s per-tile event accumulation) is replaced by a single, generic `render_streaming_loop` method parameterized by the `StreamingLoopPlan`.
 
 All existing integration tests validate the transition.
 
@@ -561,7 +595,7 @@ Implement `VulkanPlanRenderer`, including SPIR-V compilation pipeline and comman
 | 001 | 0 | **DECIDED** | Where is the abstraction boundary? | — |
 | 002 | 1 | **DECIDED** | What are the plan node types? | 001 |
 | 003 | 1 | **DECIDED** | How are reduction trees represented? | 001, 002 |
-| 004 | 1 | NARROWED | How are streaming loops represented? | 001, 002, 003¹ |
+| 004 | 1 | **DECIDED** | How are streaming loops represented? | 001, 002, 003¹ |
 | 005 | 1 | **DECIDED** | Is Node 16 opaque in the plan? | 001, 002, 003¹ |
 | 006 | 2 | NARROWED | How is the hardware profile shared? | 001, 003¹ |
 | 007 | 2 | NARROWED | How does KernelSignature split? | 001, 002, 003¹ |
@@ -576,13 +610,14 @@ Implement `VulkanPlanRenderer`, including SPIR-V compilation pipeline and comman
 | 016 | 5 | OPEN | How is cross-backend correctness tested? | 013, 014 |
 | 017 | 6 | OPEN | What is the phased migration strategy? | All |
 
-<sup>1</sup> ADR-003 *constrains* rather than *blocks* these ADRs. It establishes the representation pattern (parametric header with pre-computed policy output) and the kernel-tier-selection jurisdictional ruling that narrow their remaining design space, but they can be resolved independently. ADR-009 and ADR-012 have a hard dependency on ADR-003's two-tier buffer scope distinction and `ReductionTreePlan` placement, respectively.
+<sup>1</sup> ADR-003 *constrains* rather than *blocks* these ADRs. It establishes the representation pattern (parametric header with pre-computed policy output) and the kernel-tier-selection jurisdictional ruling that narrow their remaining design space, but they can be resolved independently. ADR-004 extends and reinforces these constraints with its stride-based parametric pattern, two-tier buffer scope confirmation (via `ScratchBufferSpec`), and body-node contract validation requirements. ADR-009 and ADR-012 have hard dependencies on ADR-003's two-tier buffer scope distinction (reinforced by ADR-004's scratch buffer specification) and on `ReductionTreePlan` / `StreamingLoopPlan` placement in `execution_plan.py`, respectively.
 
 ## References
 
 - [ADR-001 Full Record](adr/ADR-001-backend-abstraction-boundary.md)
 - [ADR-002 Full Record](adr/ADR-002-plan-node-types-and-synchronization-structure.md)
 - [ADR-003 Full Record](adr/ADR-003-reduction-tree-plan-representation.md)
+- [ADR-004 Full Record](adr/ADR-004-streaming-loop-plan-representation.md)
 - [CONCEPT.md](CONCEPT.md) — Governing architectural principles
 - [CONTRACT.md](CONTRACT.md) — Host-device interface contract
 - [CPU_BACKEND.md](CPU_BACKEND.md) — CPU backend architecture
