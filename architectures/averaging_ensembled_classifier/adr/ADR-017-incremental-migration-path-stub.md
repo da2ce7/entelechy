@@ -72,7 +72,7 @@ Options A and C are combinable (sequential phases with feature-flag coexistence 
 
 - [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution.md) — `src/shared/` + `src/backends/<name>/` directory structure defining the extraction target
 - [ADR-013: Kernel Source Strategy](ADR-013-kernel-source-strategy.md) — per-phase migration implications (§Consequences); `kernels/` dual role; per-backend `kernel_sources/` locations
-- [ADR-014: Build System Integration](ADR-014-build-system-integration-stub.md) — Meson build targets, conditional backend enablement, `kernels/` path configuration
+- [ADR-014: Build System Integration](ADR-014-build-system-integration.md) — Meson build targets, conditional backend enablement, `kernels/` path configuration
 - [ADR-015: Python ↔ Native Backend Interop](ADR-015-python-native-backend-interop-stub.md) — CPU shared library loading mechanism required by Phase 3
 - [ADR-016: Test Strategy](ADR-016-test-strategy-stub.md) — Tier 1/2/3 test structure; phase acceptance gates; CPU as oracle candidate
 - [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback (formalize first, implement second)

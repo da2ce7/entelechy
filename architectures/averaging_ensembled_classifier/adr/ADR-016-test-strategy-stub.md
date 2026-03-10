@@ -95,4 +95,4 @@ This yields ~22 Tier 2 test cases per backend, ~22 × (backends − 1) Tier 3 co
 - [ADR-009: Buffer Lifecycle in the Plan Model](ADR-009-buffer-lifecycle-in-the-plan-model.md) — `BufferContract` lifecycle tested at Tier 1
 - [ADR-011: CCE/BCE Strategy Delegation](ADR-011-cce-bce-strategy-delegation.md) — Strategy A/B variants expanding test matrix
 - [ADR-013: Kernel Source Strategy](ADR-013-kernel-source-strategy.md) — three-tier specification hierarchy; kernel source locations; cross-backend fidelity model; CPU as natural oracle candidate
-- [ADR-014: Build System Integration](ADR-014-build-system-integration-stub.md) — conditional backend enablement constraining testable configurations
+- [ADR-014: Build System Integration](ADR-014-build-system-integration.md) — conditional backend enablement constraining testable configurations

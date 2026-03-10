@@ -45,5 +45,5 @@ ADR-014 (pending) determines how the CPU shared library is built and what ABI it
 
 - [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution.md) — backend isolation boundary; `PlanRenderer` as FFI abstraction point
 - [ADR-013: Kernel Source Strategy](ADR-013-kernel-source-strategy.md) — CPU kernel source layout in `src/backends/cpu/kernel_sources/`; `task_*` function signature convention; `cpu_kernels.h` ABI surface
-- [ADR-014: Build System Integration](ADR-014-build-system-integration-stub.md) — shared library build output and ABI contract
+- [ADR-014: Build System Integration](ADR-014-build-system-integration.md) — shared library build output and ABI contract
 - [ADR-001: Backend Abstraction Boundary](ADR-001-backend-abstraction-boundary.md) — `PlanRenderer` interface
