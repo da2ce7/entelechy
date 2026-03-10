@@ -1,106 +1,80 @@
 # ADR-017: Incremental Migration Path
 
-**Status:** STUB (OPEN)  
+**Status:** STUB (NARROWED — kernel source locations, directory layout, and per-phase source creation sequence resolved by ADR-013; phase ordering, rollback gates, and feature-flag strategy remain open)  
 **Date:** 2026-03-10  
 **Deciders:** —  
 **Supersedes:** —  
-**Blocked by:** All preceding ADRs  
+**Blocked by:** ADR-014, ADR-015, ADR-016  
 **Blocks:** —
 
 ---
 
 ## Context
 
-The refactoring must proceed incrementally while keeping the existing OpenCL backend operational at every intermediate commit. This ADR defines the phased migration strategy.
+The multi-backend refactoring replaces a monolithic OpenCL-only implementation with the layered architecture described by ADRs 001–013. This ADR defines the incremental migration sequence: the order in which components are extracted, backends are introduced, and the legacy code path is retired.
+
+ADR-013 (ACCEPTED) resolves kernel source locations and provides concrete per-phase migration implications (ADR-013 §Consequences → Migration implications), reproduced here as constraints:
+
+- **Phase 0 (Foundation):** `kernels/` stays in place, unchanged. `kernels.cl.h` is formally designated as the algorithmic specification. No file moves.
+- **Phase 2 (OpenCL Renderer):** The OpenCL backend loads sources from architecture-root `kernels/` directly. ADR-014 provides the path as a build constant.
+- **Phase 3 (CPU Backend):** `src/backends/cpu/kernel_sources/` is created with C implementations developed against `kernels.cl.h` as algorithmic reference. `cpu_simd.h` and `cpu_kernels.h` written per CPU_BACKEND.md. Tier 2 + Tier 3 tests (ADR-016) validate.
+- **Phase 4 (Vulkan Backend):** `src/backends/vulkan/kernel_sources/` is created with GLSL compute shaders. `common.glsl` provides shared declarations. Meson compiles `*.comp` → `*.spv`. Tier 3 parity tests validate against OpenCL + CPU.
+
+ADR-014 (pending) determines the Meson build system structure that gates backend enablement. ADR-015 (pending) determines how the CPU shared library is loaded at runtime. ADR-016 (pending) determines the test tiers executed at each phase gate.
 
 ---
 
 ## Decision Required
 
-A 6-phase plan is proposed. The phases are ordered by the ADR dependency graph — each phase resolves one or more ADRs and produces a testable intermediate state.
+### Phase structure
 
-### Phase 0: Foundation (No behavioral change)
-- Extract `HardwareProfile` frozen dataclass from current OpenCL device queries (ADR-006).
-- Replace `PrecisionContext` ABC hierarchy with `PrecisionConfig` frozen dataclass (ADR-008): dissolve `Float32Context`/`Float16Context`/`Float32ModelSpec`/`Float16ModelSpec` etc.; `ModelSpec` composes `PrecisionConfig` as a field; `make_precision_config()` factory provides safe construction.
-- Extract `KernelContract` from existing `KernelSignature` classes (ADR-007, shared half).
-- Extract `ProblemTypeStrategy` → `KernelContract` mapping (ADR-011): ensure `CceStrategy` and `BceStrategy` produce the correct `KernelContract` instances — Strategy B contracts (distinct `kernel_name`) for Nodes 6/7 and Strategy A contracts (shared `kernel_name` + `FLAG_problem_type`) for Nodes 8/9/10. This extraction is mechanical — the existing `get_loss_signature()` / `get_module_grad_signature()` factories already implement the correct logic; the change is to produce `KernelContract` frozen dataclasses instead of `KernelSignature` objects.
-- All existing tests pass unchanged — the OpenCL backend still uses its current code paths, with a thin adapter mapping the new `PrecisionConfig` to the legacy `-D SCALAR_TYPE=...` build flags.
+Six phases are envisioned. ADR-013 constrains Phases 0, 2, 3, and 4. The remaining open decisions are:
 
-### Phase 1: Plan Model (New shared layer, unused)
-- Implement plan node types (ADR-002): `KernelDispatchNode`, `ReductionTreeNode`, `StreamingLoopNode`, `BarrierNode`, `RetrievalNode` (with `logical_shape` field per ADR-010).
-- Implement `RetrievalFuture` Protocol in the shared layer (ADR-010) — `shared/retrieval_future.py`.
-- Implement plan builder: `HardwareProfile` + `ModelSpec` (composing `PrecisionConfig`) → immutable plan DAG.
-  - The plan builder uses `ProblemTypeStrategy` (ADR-011) to drive CCE/BCE divergence: for each module, it queries the strategy to select the loss kernel's `kernel_name` (Strategy B) or the gradient kernels' FLAG value (Strategy A), and to determine whether the BCE loss reduction sub-tree is included in Node 14's inputs.
-- Implement `BufferHandle` plan-level tokens and `BufferDescriptor` lifecycle annotations (ADR-009).
-- Add Tier 1 shared-layer tests for plan construction, contract validation, buffer lifecycle invariants (ADR-016 targets 19–26), `RetrievalNode` logical-shape derivation, and CCE/BCE strategy delegation correctness (ADR-016 targets 35–42).
-- The OpenCL backend is **not yet wired** to the plan model — it still uses the old code path.
+| Phase | ADR-013 constrained? | Open decisions |
+| :--- | :--- | :--- |
+| **0 — Foundation** | Yes (no file moves, `kernels.cl.h` designation) | Rollback strategy; feature flag for legacy/new code paths |
+| **1 — Shared layer extraction** | No | Extraction order for `src/shared/` modules; backward-compatibility shims |
+| **2 — OpenCL Renderer** | Yes (direct `kernels/` reference) | `PlanRenderer` interface freeze gate; legacy path deprecation timeline |
+| **3 — CPU Backend** | Yes (source layout, `cpu_kernels.h`, Tier 2+3 tests) | CPU Tier 2 fixture generation; CI hardware requirements |
+| **4 — Vulkan Backend** | Yes (source layout, SPIR-V compilation, Tier 3) | Vulkan SDK version pinning; CI GPU requirements |
+| **5 — Legacy retirement** | No | Cutover criteria; deprecation warnings; removal timeline |
 
-### Phase 2: OpenCL Renderer (Dual code path)
-- Implement OpenCL `PlanRenderer`: consumes plan DAG, produces dispatch sequences. `render()` returns `Dict[str, RetrievalFuture]`.
-- Implement `_OpenCLRetrievalFuture` (ADR-010) — absorbs `HostView`'s functionality: pre-allocated numpy host buffer, `cl.enqueue_copy`, `cl.Event` completion, and padding-stripping via numpy slice in `.result()`. The `.release()` method signals that the host has consumed the data and the renderer may reclaim the host-side allocation and underlying `BATCH_OUTPUT` device buffer.
-- Implement OpenCL `KernelBinding`s (ADR-007, backend half) — including the OpenCL-specific `numpy_dtype` → `{SCALAR_TYPE, SCALAR_IS_HALF}` mapping (ADR-008's backend type-mapping contract). For Strategy A kernels (Nodes 8/9/10), the OpenCL binding passes `src_scalar_FLAG_problem_type` as a positional scalar argument per ADR-011 §Backend rendering responsibilities.
-- Implement reduction tree rendering (ADR-003) and streaming loop rendering (ADR-004).
-- Wire the new renderer alongside the old code path, selectable by flag.
-- Add Tier 2 per-backend tests for OpenCL renderer, including `RetrievalFuture` Protocol conformance (ADR-016 targets 27–34).
-- **Validation gate:** New renderer produces bit-identical results to old code path for all existing test cases — including both CCE and BCE module configurations.
+### Options
 
-### Phase 3: CPU Backend (Second backend)
-- Implement CPU `PlanRenderer` with C kernel implementations (ADR-013, ADR-015).
-  - For Strategy B kernels (Nodes 6/7): separate C source implementations — `compute_probs_loss_cce_chunk_cpu()` and `compute_probs_loss_bce_chunk_cpu()`.
-  - For Strategy A kernels (Nodes 8/9/10): the CPU binding may pass the FLAG as a C function parameter (branching internally) or dispatch to separate functions — this is a binding-internal decision per ADR-011.
-- Implement `_CPURetrievalFuture` (ADR-010) — zero-copy, zero-wait: `.wait()` is a no-op; `.result()` returns a numpy view over the compute buffer sliced to `logical_shape`; `.release()` drops the reference.
-- Implement CPU precision type-mapping (`numpy_dtype` → `float`/`_Float16` or emulated) and `UnsupportedPrecisionError` for hardware without FP16 SIMD (ADR-008).
-- Build system integration for CPU backend (ADR-014).
-- Add Tier 2 tests for CPU backend, including CPU-specific zero-copy verification (ADR-016 target 33).
-- Add Tier 3 cross-backend tests: OpenCL vs. CPU within tolerance (ADR-016).
-- **Validation gate:** Cross-backend oracle tests pass for both CCE and BCE configurations.
+- **(A) Strict sequential gating.** Each phase must pass a defined acceptance gate (Tier 1–3 tests from ADR-016) before the next phase begins. Slower but lower risk.
 
-### Phase 4: Old Code Path Removal
-- Remove the old (non-plan-based) OpenCL code path.
-- Complete module factoring (ADR-012): physical directory split into `shared/` and `backends/`. The `ProblemTypeStrategy` hierarchy moves to `shared/problem_type_strategy.py`. Kernel contracts (including the Strategy B CCE/BCE loss contracts and Strategy A gradient contracts) move to `shared/kernel_contracts/`.
-- Dissolve remaining Services layer code — `arch_primitives.py` (old `PrecisionContext` host), `cl_context_manager.py`, `compute_patterns.py`, `launcher_infra.py` (including `HostView`, now fully replaced by `_OpenCLRetrievalFuture`).
-- All tests run through the plan-based renderer.
+- **(B) Overlapping phases.** Phases 3 and 4 (CPU + Vulkan) proceed in parallel once Phase 2 is stable. Faster but requires careful coordination of shared-layer changes.
 
-### Phase 5: Vulkan Backend (Third backend)
-- Implement Vulkan `PlanRenderer`.
-- Implement `_VulkanRetrievalFuture` (ADR-010) — wraps `VkFence` + pre-allocated staging buffer. `.wait()` calls `vkWaitForFences`. `.result()` constructs a numpy array from the mapped staging pointer and slices to `logical_shape`. `.release()` marks the staging buffer as reclaimable.
-- GLSL compute shaders + SPIR-V compilation (ADR-013, ADR-014).
-  - For Strategy B kernels (Nodes 6/7): separate GLSL shader modules for CCE and BCE loss. The Vulkan renderer selects the pre-compiled pipeline variant by `kernel_name`.
-  - For Strategy A kernels (Nodes 8/9/10): the Vulkan binding delivers `FLAG_problem_type` as a specialization constant at pipeline creation time or as a push constant at dispatch time (ADR-011 §Backend rendering responsibilities).
-- Implement Vulkan precision type-mapping (`numpy_dtype` → GLSL `float`/`float16_t`, specialization constants).
-- Extend Tier 2 and Tier 3 tests for Vulkan.
-- **Validation gate:** Three-way cross-backend oracle tests pass for both CCE and BCE configurations.
+- **(C) Feature-flag coexistence.** Legacy and new code paths coexist behind runtime feature flags throughout all phases. Enables gradual rollout per-user/per-environment but increases code maintenance burden.
+
+Options A and C are combinable (sequential phases with feature-flag coexistence within each phase).
 
 ---
 
 ## Risk Assessment
 
-| Risk | Mitigation |
-| :--- | :---------- |
-| Phase 2 dual code path divergence | Bit-identical validation gate; old path removed in Phase 4 |
-| CPU floating-point divergence (no local memory, different rounding) | Per-precision tolerance model in test strategy (ADR-016) |
-| CPU FP16 unsupported on target hardware | `UnsupportedPrecisionError` at discovery time (ADR-008); tests skip gracefully |
-| Vulkan SDK availability in CI | Tier 3 tests optional; Tier 2 uses mock or software Vulkan (SwiftShader) |
-| Migration stalls mid-phase | Each phase is independently valuable; Phase 2 alone improves testability |
-| `release()` lifecycle bugs (memory leak or use-after-free) | Tier 2 tests include Protocol conformance and lifecycle verification (ADR-016 targets 27–34); defensive `__del__` fallback considered |
-| CCE/BCE strategy misapplication during extraction | Phase 0 validates existing test coverage for both CCE and BCE paths; Phase 1 adds Tier 1 tests for strategy delegation (ADR-016 targets 35–42) before any behavioral change |
+- **Partial migration stall.** If Phase 2 (OpenCL Renderer) destabilizes the existing training loop, the legacy path must remain available. Feature flags (Option C) mitigate this.
+- **Cross-phase specification drift.** A kernel algorithm change during Phase 3 or 4 must propagate to `kernels.cl.h` first (CONCEPT.md §1 Architectural Elegance Feedback), then to all in-progress backend implementations.
+- **Build system bootstrapping.** ADR-014 must be resolved before Phase 2 can begin — the OpenCL backend needs the `kernels/` path as a build constant.
+- **Test infrastructure dependency.** ADR-016's Tier 3 tests must be operational before Phase 3 can be accepted — CPU correctness is validated by parity against OpenCL.
 
 ---
 
 ## Tensions
 
-- The phases are ordered by the ADR dependency graph, but some work within a phase can be parallelized (e.g., Phase 0's extractions are independent).
-- Phase 2's "dual code path" period must be kept short to avoid maintenance burden. The validation gate provides a clear criterion for Phase 4.
-- Phase 5 (Vulkan) may be deferred indefinitely if the CPU backend satisfies the multi-backend validation goal. The architecture must not assume Vulkan will be implemented.
-- ADR-010's `release()` lifecycle introduces a new correctness concern per phase: each backend's `RetrievalFuture` must correctly retain `BATCH_OUTPUT` memory until `release()`. This must be verified in each phase's Tier 2 tests before proceeding.
-- ADR-011's mixed strategy must be correctly extracted in Phase 0 and wired into the plan builder in Phase 1 before any backend rendering occurs. The mechanical nature of the extraction (existing `ProblemTypeStrategy` factories already implement the correct logic) minimizes risk, but test coverage for both CCE and BCE configurations is a prerequisite for Phase 2's validation gate.
+- Phase 0 is largely formalization (designating `kernels.cl.h`, no file moves per ADR-013), but it establishes the foundational invariants that later phases depend on. Rushing Phase 0 risks under-specifying the `kernels/` directory's dual role.
+- Phases 3 and 4 have independent source trees (ADR-013: `src/backends/cpu/kernel_sources/` and `src/backends/vulkan/kernel_sources/`) and could theoretically proceed in parallel (Option B), but Tier 3 tests for Vulkan would benefit from CPU as oracle (ADR-016 Option C), creating a soft dependency.
+- The OpenCL backend's lack of a `kernel_sources/` subdirectory (ADR-013 — it references `kernels/` directly) simplifies Phase 2 but means Phase 2 and Phase 0 are tightly coupled — any reorganization of `kernels/` during Phase 0 immediately affects the OpenCL backend.
 
 ---
 
 ## References
 
-- All preceding ADRs — this ADR synthesizes the migration order from the full dependency graph
-- [ADR-001: Backend Abstraction Boundary](ADR-001-backend-abstraction-boundary.md) — foundational constraint for all phases
-- [ADR-008: Precision Configuration](ADR-008-precision-configuration.md) — `PrecisionConfig` frozen dataclass; backend type-mapping contract; `UnsupportedPrecisionError`
-- [ADR-010: D2H Transfer & Phase Sync Points](ADR-010-d2h-transfer-and-phase-sync-points.md) — `RetrievalFuture` Protocol; `HostView` dissolution; per-backend implementation; `release()` lifecycle
-- [ADR-011: CCE/BCE Strategy Delegation](ADR-011-cce-bce-strategy-delegation.md) — mixed Strategy B / Strategy A; `ProblemTypeStrategy` hierarchy; backend rendering responsibilities for FLAG delivery
+- [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution.md) — `src/shared/` + `src/backends/<name>/` directory structure defining the extraction target
+- [ADR-013: Kernel Source Strategy](ADR-013-kernel-source-strategy.md) — per-phase migration implications (§Consequences); `kernels/` dual role; per-backend `kernel_sources/` locations
+- [ADR-014: Build System Integration](ADR-014-build-system-integration-stub.md) — Meson build targets, conditional backend enablement, `kernels/` path configuration
+- [ADR-015: Python ↔ Native Backend Interop](ADR-015-python-native-backend-interop-stub.md) — CPU shared library loading mechanism required by Phase 3
+- [ADR-016: Test Strategy](ADR-016-test-strategy-stub.md) — Tier 1/2/3 test structure; phase acceptance gates; CPU as oracle candidate
+- [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback (formalize first, implement second)
+- [CPU_BACKEND.md](../CPU_BACKEND.md) — CPU kernel source specifications referenced by Phase 3
+- [VULKAN_BACKEND.md](../VULKAN_BACKEND.md) — Vulkan shader specifications referenced by Phase 4
