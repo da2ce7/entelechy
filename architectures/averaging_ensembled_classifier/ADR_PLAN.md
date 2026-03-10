@@ -4,9 +4,13 @@
 
 This document catalogues the Architecture Decision Records (ADRs) required for refactoring the `averaging_ensembled_classifier` from its current OpenCL-only implementation to a multi-backend architecture supporting OpenCL, Vulkan, and CPU execution.
 
-The foundational decision—**ADR-001: Backend Abstraction Boundary**—has been accepted. The system will abstract at the DAG/Phase level: a shared orchestration layer produces a backend-neutral execution plan expressed as a data structure, and each backend receives this plan and renders it using its native execution model. The full decision record is in `adr/ADR-001-backend-abstraction-boundary.md`.
+Two foundational decisions have been accepted:
 
-This choice resolves or significantly narrows many downstream decisions. The remaining ADRs are organized into tiers reflecting the actual dependency chain and work order. Within each tier, ADRs are independent of each other and may be resolved in parallel.
+- **ADR-001: Backend Abstraction Boundary** — The system abstracts at the DAG/Phase level: a shared orchestration layer produces a backend-neutral execution plan expressed as a data structure, and each backend receives this plan and renders it using its native execution model. Full record: `adr/ADR-001-backend-abstraction-boundary.md`.
+
+- **ADR-002: Plan Node Types & Synchronization Structure** — The execution plan is a directed acyclic graph of five typed, immutable node descriptors (`KernelDispatchNode`, `ReductionTreeNode`, `StreamingLoopNode`, `BarrierNode`, `RetrievalNode`) connected by explicit dependency edges. This is a closed taxonomy governed by the Complexity Ceiling Constraint. Full record: `adr/ADR-002-plan-node-types-and-synchronization-structure.md`.
+
+These choices resolve or significantly narrow all downstream decisions. The remaining ADRs are organized into tiers reflecting the actual dependency chain and work order. Within each tier, ADRs are independent of each other and may be resolved in parallel.
 
 **Status Key:**
 - `DECIDED` — Accepted decision, recorded in `adr/`.
@@ -64,44 +68,40 @@ These ADRs define what the execution plan must be capable of expressing. They ar
 **Status:** DECIDED — Option B (Typed node hierarchy with explicit dependency edges)
 **Full Record:** `adr/ADR-002-plan-node-types-and-synchronization-structure.md`
 
-**Context:**
-ADR-001 eliminates event objects from the shared layer. The plan must instead express:
-1. **Dependency edges** between nodes (which node's output feeds which node's input).
-2. **Named synchronization points**: `inference_event` (Act→Host), `final_batch_event` (Learn→Host), the Item Synchronization Point (Node 13), and the Batch Synchronization Point (Node 22).
-3. **Concurrency opportunities**: which nodes may execute in parallel (e.g., Nodes 8, 9, 10 within a tile).
+The execution plan is a directed acyclic graph of typed, immutable node descriptors connected by explicit dependency edges (`depends_on: FrozenSet[str]`). Three options were considered: (A) a flat, homogeneous node list with a `kind` discriminator, (B) a typed node hierarchy with explicit dependency edges, and (C) a two-level phase-descriptor model. Option A was eliminated for forfeiting static type safety. Option C was eliminated because the architecture's dependency structure crosses phase boundaries in non-trivial ways and named synchronization points (Node 13, Node 22) are intra-phase constructs, not phase boundaries.
 
-Each backend maps this structure to its native sync model. OpenCL inserts `wait_for` event lists. Vulkan inserts `vkCmdPipelineBarrier` commands at recording time. CPU executes nodes sequentially (sync is free).
+**Closed node type taxonomy:**
 
-**Remaining Decision:**
-What is the concrete taxonomy of plan node types? A minimal set:
+| Node Type              | Semantics                                                                                           | CONCEPT.md Correspondence                                      |
+| :--------------------- | :-------------------------------------------------------------------------------------------------- | :------------------------------------------------------------- |
+| `KernelDispatchNode`   | A single logical kernel invocation with buffer bindings, scalar parameters, tile decomposition, placement strategy, and embedded `KernelContract`. Dispatch granularity is a rendering concern — `tile_count=N` does not prescribe N dispatches vs. one dispatch. | Nodes 4, 5, 6, 7, 8, 9, 10, 11, 13, 16, 17, 18, 19, 21, 24, 25 |
+| `ReductionTreeNode`    | A multi-stage reduction tree rendered atomically by the backend. Internal structure (stage plans) defined in ADR-003. | Nodes 14, 15, 20                                               |
+| `StreamingLoopNode`    | A parametric loop over a chunk-indexed sub-DAG body. Body is a flat sequence of `KernelDispatchNode`s only (Complexity Ceiling). Design defined in ADR-004. | Phase III streaming (Nodes 17→18→19); Model A recompute path   |
+| `BarrierNode`          | A named synchronization point that joins multiple upstream edges. Pure sequencing — no dispatch payload. | Node 13 (Item Sync), Node 22 (Batch Sync)                     |
+| `RetrievalNode`        | A host-accessible result extraction point. Signals a named event. Retrieval mechanism is a backend concern (ADR-010). | Node 23 (`inference_event`), `final_batch_event`               |
 
-| Node Type                | Semantics                                                                                          |
-| :----------------------- | :------------------------------------------------------------------------------------------------- |
-| `KernelDispatchNode`     | A single logical kernel invocation with tile count, buffer bindings, and scalar parameters.        |
-| `ReductionTreeNode`      | A multi-stage reduction tree (stages, fan-ins, offset lists, per-stage thresholds). See ADR-003.   |
-| `StreamingLoopNode`      | A parametric loop over a sub-DAG. See ADR-004.                                                     |
-| `BarrierNode`            | A named synchronization point (Node 13, Node 22).                                                  |
-| `RetrievalNode`          | A host-accessible result extraction point (`inference_event`, `final_batch_event`).                |
+**Complexity Ceiling Constraint:** This is a **closed taxonomy**. No additional node types may be introduced without a formal ADR. The plan does not support conditional branches, dynamic dispatch, or nested loops. Per CONCEPT.md §1 (Architectural Elegance Feedback): when an optimization requires a construct beyond this vocabulary, implementation is suspended, the pattern is formalized, and a new node type is introduced through a revised ADR.
 
-**Complexity Ceiling Constraint:** The plan is a **static, fully-typed DAG of the above node types**. It does not support conditional branches, dynamic dispatch, or nested loops beyond the single `StreamingLoopNode` primitive. If a future optimization requires constructs beyond this vocabulary, CONCEPT.md §1 (Architectural Elegance Feedback) mandates formalizing that construct as a new node type — not stretching the existing vocabulary.
+**Key design decisions:**
 
-**Tensions:**
-- The plan must carry enough information for CONTRACT.md Article 1.4a pre-dispatch validation to remain in the shared layer. Each `KernelDispatchNode` must include the validated `KernelContract` data (shapes, preconditions) — not just a kernel name.
-- Vulkan's single-dispatch-for-N-tiles model means a `KernelDispatchNode` with `tile_count=N` is rendered as one `vkCmdDispatch(N,1,1)`, while OpenCL renders it as N `clEnqueueNDRange` calls. The node must not prescribe the dispatch granularity.
+- **Concurrency from structure.** The DAG's dependency edges are the complete and sufficient specification of concurrency constraints. Nodes with no dependency relationship may execute in parallel. No separate concurrency annotation is needed.
+- **Contract embedding.** Each `KernelDispatchNode` carries a `contract: KernelContract` reference (ADR-007). Validation occurs once at plan-construction time (CONTRACT.md Article 1.4a). The renderer receives a pre-validated plan.
+- **Activation lifecycle as topology.** The Cache vs. Recompute decision (CONCEPT.md §5) is expressed structurally in the plan DAG — presence or absence of recompute `StreamingLoopNode`s — not as executable `DependencyProvider` objects. The current `CacheProvider` / `RecomputeProvider` / `ComputeOnceProvider` / `StagedComputationProvider` hierarchy is dissolved; the plan builder absorbs this logic.
+- **Named synchronization fidelity.** The CONCEPT.md synchronization points are directly represented as typed nodes with canonical `node_id` values: `"item_sync_barrier"` (Node 13), `"batch_sync_barrier"` (Node 22), `"inference_retrieval"` (`inference_event`), `"final_batch_retrieval"` (`final_batch_event`).
 
 ---
 
 ### ADR-003: Reduction Tree Plan Representation
 
-**Status:** NARROWED — Shared `ReductionTreePlan` embedded in the execution plan
+**Status:** NARROWED — Shared `ReductionTreePlan` as the internal structure of `ReductionTreeNode`
 
 **Context:**
-The Recursive Clip-Aggregation Engine (Nodes 14, 15, 20) is the canonical example of why ADR-001 chose the plan-level boundary. The tree's mathematical structure — stage count, fan-in `K`, offset lists, Quadratic Scaling Policy thresholds (`T_j = T_algorithmic + λ·j²`) — is identical across all backends. Only the dispatch mechanics differ.
+ADR-002 establishes `ReductionTreeNode` as one of the five canonical plan node types. The Recursive Clip-Aggregation Engine (Nodes 14, 15, 20) is represented as a single typed node rendered atomically by the backend — its stages are not individual plan nodes. The tree's mathematical structure — stage count, fan-in `K`, offset lists, Quadratic Scaling Policy thresholds (`T_j = T_algorithmic + λ·j²`) — is identical across all backends. Only the dispatch mechanics differ.
 
 ADR-001 directly resolves this as a shared `ReductionTreePlan` embedded in the execution plan. The `StabilizationPolicy` module and offset-list construction remain in the shared layer. Each backend's renderer interprets the tree natively.
 
 **Remaining Decision:**
-The `ReductionTreePlan` must specify, per stage:
+The `ReductionTreePlan` (the internal data of a `ReductionTreeNode`) must specify, per stage:
 - Fan-in count and kernel tier selection (`aggregate_register_reduce` vs. `aggregate_local_reduce`).
 - Offset list (integer array of memory displacements).
 - Whether a `clip_intermediate_grad` step follows the aggregation (gradient paths) or not (diagnostic paths).
@@ -118,40 +118,39 @@ The renderer is responsible for: uploading offset lists, allocating intermediate
 
 ### ADR-004: Streaming Loop Representation (Phase III)
 
-**Status:** OPEN
+**Status:** NARROWED — Abstract loop descriptor (Option A); constrained by ADR-002's Complexity Ceiling
 
 **Context:**
+ADR-002 establishes `StreamingLoopNode` as one of the five canonical plan node types and imposes the Complexity Ceiling Constraint: `StreamingLoopNode.body` is a flat sequence of `KernelDispatchNode`s only — it may not contain another `StreamingLoopNode`, a `ReductionTreeNode`, a `BarrierNode`, or a `RetrievalNode`. This resolves the core Option A vs. Option B question in favor of **Option A (abstract loop descriptor)**.
+
 CONCEPT.md's Phase III (True Streaming for `Grad_SW` / `Grad_SB`) involves a host-side loop that iterates over chunks, dispatching a per-chunk kernel sequence (Nodes 17→18→19). The backends handle this loop radically differently:
 
 - **OpenCL:** Host Python loop; per-chunk `clEnqueueNDRange` calls with event chains.
 - **Vulkan:** Loop at *recording time*; per-chunk `vkCmdPushConstants` + `vkCmdDispatch` + `vkCmdPipelineBarrier`, baked into the command buffer.
 - **CPU:** Host loop; per-chunk `pool_dispatch_and_wait`.
 
-**Decision Required:**
-How does the plan express the streaming loop?
+Option B (pre-expanded flat DAG) is eliminated: it inflates plan size linearly with chunk count, prevents Vulkan from recognizing loop structure, and loses the semantic signal that N sequences are structurally identical.
 
-- **(A) Abstract loop descriptor.** The plan carries a `StreamingLoopNode` with: chunk count, per-chunk parameter deltas (offsets, indices), and the sub-DAG body (a small sequence of `KernelDispatchNode`s). Each backend renders the loop natively — Vulkan records N iterations into one command buffer; OpenCL iterates in Python; CPU iterates with `pool_dispatch_and_wait`.
-
-- **(B) Pre-expanded flat DAG.** The plan builder unrolls the loop into N concrete node sequences at plan-construction time. Simpler plan vocabulary, but: inflates plan size linearly with chunk count; prevents Vulkan from recognizing loop structure for potential batch optimization; loses the semantic signal that these N sequences are structurally identical.
+**Remaining Decision:**
+The concrete representation of per-chunk parameter deltas within the `StreamingLoopNode`. The node must specify:
+- Chunk count (varies per batch, determined by host memory assessment).
+- Per-chunk parameter deltas (offsets, indices) — how scalar parameters change between iterations.
+- The body: a flat sequence of `KernelDispatchNode`s with parameterized bindings that the renderer instantiates per iteration.
 
 **Tensions:**
-- Option A demands the `StreamingLoopNode` be the **only** loop primitive — if it nests or generalizes, the plan risks becoming an IR. The constraint must be explicit: `StreamingLoopNode.body` is a flat sequence of `KernelDispatchNode`s, never containing another `StreamingLoopNode`.
-- The chunk count varies per batch (determined by host memory assessment). Under both options the plan is constructed fresh each batch, but Option A keeps the plan compact and semantically clear.
-- Vulkan's ability to record the entire loop body is a key performance characteristic that Option B would forfeit.
+- The chunk count varies per batch. The plan is constructed fresh each batch, but Option A keeps it compact and semantically clear.
+- Vulkan's ability to record the entire loop body into one command buffer is a key performance characteristic preserved by this approach.
+- The Model A recompute path (`RECOMPUTE_GRAD_H`) is also a streaming loop (recompute hidden_i → compute gradients → clip, iterated per tile). ADR-002 confirms this is expressed as a `StreamingLoopNode` with the same constraints.
 
 ---
 
 ### ADR-005: Node 16 Opacity in the Plan
 
-**Status:** NARROWED — Backend-owned; plan treats Node 16 as opaque
+**Status:** DECIDED — Resolved by ADR-001 design principle; confirmed by ADR-002 taxonomy
 
-**Context:**
-CONCEPT.md designates Node 16 (`stabilize_and_reduce_grad_hidden_activations`) as a Specialized Kernel with internal multi-stage reduction. Its internal structure — fan-in calculation from `get_local_size(0)`, per-stage threshold synthesis — is inherently hardware-specific.
+CONCEPT.md designates Node 16 (`stabilize_and_reduce_grad_hidden_activations`) as a Specialized Kernel with internal multi-stage reduction. ADR-001's design principle ("plan boundary stops at the kernel's public interface") resolves this: the plan specifies Node 16 as a single `KernelDispatchNode` — confirmed as a first-class node type by ADR-002 — with policy parameters (`T_algorithmic`, `λ`, `policy_max_k`, `fp_max`) in its `scalar_params` dict. The kernel contract (in `kernels.cl.h`) specifies the internal algorithm in its `Behavioral Invariants`; this is a device-side concern, not a plan-level concern.
 
-ADR-001's design principle ("plan boundary stops at the kernel's public interface") directly resolves this. The plan specifies Node 16 as a single `KernelDispatchNode` with policy parameters (`T_algorithmic`, `λ`, `policy_max_k`, `fp_max`). The kernel contract (in `kernels.cl.h`) already specifies the internal algorithm in its `Behavioral Invariants` — this is a device-side concern, not a plan-level concern.
-
-**Remaining Decision:**
-None — this is resolved. The policy parameters are computed by the shared `StabilizationPolicy` module and embedded in the plan node's scalar parameter set. Each backend passes them to its native Node 16 implementation.
+The policy parameters are computed by the shared `StabilizationPolicy` module and embedded in the plan node's scalar parameter set. Each backend passes them to its native Node 16 implementation. No remaining decision.
 
 ---
 
@@ -246,7 +245,9 @@ These ADRs define the contract that every backend must satisfy. They depend on t
 **Status:** NARROWED — `BufferHandle` as universal plan-level token; backend allocates
 
 **Context:**
-The plan references buffers by logical name (e.g., `hidden_activations`, `partial_grad_weights_module`). Plan construction never allocates — it declares "this node produces buffer X with shape Y and padding Z." The backend's `PlanRenderer` maps logical buffer names to physical allocations.
+The plan references buffers by logical name via `buffer_bindings: Dict[str, str]` in each `KernelDispatchNode` (ADR-002). Plan construction never allocates — it declares "this node produces buffer X with shape Y and padding Z." The backend's `PlanRenderer` maps logical buffer names to physical allocations.
+
+ADR-002 further resolves the activation lifecycle dimension: the Cache vs. Recompute decision is expressed structurally in the plan DAG — presence or absence of recompute `StreamingLoopNode`s — not as executable `DependencyProvider` objects. The `CacheProvider` / `RecomputeProvider` / `ComputeOnceProvider` / `StagedComputationProvider` hierarchy is dissolved. This means buffer lifetimes are fully determined by the DAG topology at plan-construction time.
 
 The existing `BufferHandle` token is the natural plan→renderer handoff mechanism. The plan builder assigns handles; the renderer allocates backing memory.
 
@@ -257,10 +258,9 @@ Does the plan prescribe buffer *reuse* (e.g., "buffer A can be freed after Node 
 
 - **(B) Renderer owns lifetimes.** The plan declares buffers but not their lifetimes. Each renderer analyzes the plan to determine reuse opportunities. Risk: duplicated analysis logic across backends.
 
-Option A is favored. Buffer lifetime is a property of the DAG, not the dispatch model. The shared layer should compute it once.
+Option A is strongly favored. Buffer lifetime is a property of the DAG, not the dispatch model. The shared layer should compute it once. ADR-002's explicit dependency edges make lifetime computation straightforward: a buffer's lifetime extends from its producing node to the last node in `depends_on` chains that references it.
 
 **Tensions:**
-- The activation lifecycle decision (Cache vs. Recompute, CONCEPT.md §5) affects buffer lifetimes and must be reflected in the plan. This is already a plan-construction concern.
 - Vulkan backends may further optimize by suballocating from large `VkDeviceMemory` blocks. The plan's lifetime annotations enable this without prescribing it.
 
 ---
@@ -270,7 +270,7 @@ Option A is favored. Buffer lifetime is a property of the DAG, not the dispatch 
 **Status:** OPEN
 
 **Context:**
-The plan's `RetrievalNode` describes a point where results become host-accessible. The renderer must return something to the shared orchestrator that represents "this data is ready." The backends diverge:
+ADR-002 establishes `RetrievalNode` as one of the five canonical plan node types, with canonical instances `"inference_retrieval"` (`inference_event`) and `"final_batch_retrieval"` (`final_batch_event`). The `RetrievalNode` specifies the source buffer, expected shape, and the named event it signals — but the mechanism by which the renderer communicates host-side availability is left to this ADR. The backends diverge:
 
 - **OpenCL:** `cl.enqueue_copy` → numpy array, signaled via `cl.Event`.
 - **Vulkan:** `vkCmdCopyBuffer` to staging → `vkWaitForFences` → `memcpy` from mapped pointer.
@@ -292,18 +292,14 @@ What does the renderer return for retrieval points?
 
 ### ADR-011: CCE/BCE Strategy Delegation
 
-**Status:** NARROWED — Backend-local decision
+**Status:** DECIDED — Resolved by ADR-001; confirmed by ADR-002 node design
 
-**Context:**
-CONCEPT.md §3 explicitly permits both Strategy A (single kernel with runtime flag) and Strategy B (separate kernels) for CCE/BCE divergence. The existing `ProblemTypeStrategy` in `execution_plan.py` already abstracts this.
+CONCEPT.md §3 explicitly permits both Strategy A (single kernel with runtime flag) and Strategy B (separate kernels) for CCE/BCE divergence. Under the plan model, the `KernelDispatchNode` for Nodes 6/7 (ADR-002) carries the `problem_type` in its `scalar_params` or via distinct `kernel_identity` values. The backend decides the dispatch mechanism:
+- Single kernel with a runtime flag (OpenCL's current approach).
+- Pre-compiled pipeline variants via specialization constants (Vulkan).
+- Separate C functions (CPU).
 
-Under the plan model, the plan node for Nodes 6/7 carries a `problem_type` enum (`CCE` or `BCE`). The backend decides whether to:
-- Dispatch a single kernel with a runtime flag (OpenCL's current approach).
-- Select from pre-compiled pipeline variants via specialization constants (Vulkan).
-- Call separate C functions (CPU).
-
-**Remaining Decision:**
-None — this is resolved. The plan conveys intent (`problem_type`), the renderer conveys mechanism.
+The plan conveys intent; the renderer conveys mechanism. No remaining decision.
 
 ---
 
@@ -489,7 +485,7 @@ Extract backend-neutral `Protocol` types from current OpenCL code. Define `Hardw
 Remove all `pyopencl` imports from: `execution_plan.py`, `stabilization_policy.py`, `workload_primitives.py`, `model_spec.py`, `memory_layout.py`, `parameter_space.py`, `arch_primitives.py`. These modules depend only on Phase 0 abstractions and standard library types. `DiscoveredArchConstants` is replaced by `HardwareProfile`. All tests pass.
 
 **Phase 2: Plan Data Structure.**
-Define the plan node types (ADR-002), `ReductionTreePlan` (ADR-003), and `StreamingLoopNode` (ADR-004). Implement `ExecutionPlanBuilder` that produces a plan from `ModelSpec` + `HardwareProfile` + batch parameters. Write plan-level tests (ADR-016, layer 1). The plan builder exists alongside the current OpenCL execution path — it is not yet *used* for dispatch. All tests pass.
+Define the five plan node types decided in ADR-002 (`KernelDispatchNode`, `ReductionTreeNode`, `StreamingLoopNode`, `BarrierNode`, `RetrievalNode`) as frozen dataclasses with explicit dependency edges. Define `ReductionTreePlan` internals (ADR-003) and `StreamingLoopNode` parameter deltas (ADR-004). Implement `ExecutionPlanBuilder` that produces a typed DAG from `ModelSpec` + `HardwareProfile` + batch parameters, with the Cache/Recompute lifecycle decision expressed as DAG topology (per ADR-002's dissolution of `DependencyProvider`). Write plan-level tests (ADR-016, layer 1). The plan builder exists alongside the current OpenCL execution path — it is not yet *used* for dispatch. All tests pass.
 
 **Phase 3: OpenCL Plan Renderer.**
 This is the critical step. Refactor `graph_recipes.py` and `compute_patterns.py` into an `OpenCLPlanRenderer` that consumes an `ExecutionPlan` and produces the same OpenCL dispatch sequence as the current code. The `BatchProcessor` switches from direct recipe calls to plan-build-then-render. The current behavior is preserved but the code path is fundamentally restructured. All existing integration tests validate the transition.
@@ -514,15 +510,15 @@ Implement `VulkanPlanRenderer`, including SPIR-V compilation pipeline and comman
 |:----|:-----|:-------|:--------------|:-----------|
 | 001 | 0 | **DECIDED** | Where is the abstraction boundary? | — |
 | 002 | 1 | **DECIDED** | What are the plan node types? | 001 |
-| 003 | 1 | NARROWED | How are reduction trees represented? | 001 |
-| 004 | 1 | OPEN | How are streaming loops represented? | 001 |
-| 005 | 1 | NARROWED | Is Node 16 opaque in the plan? | 001 |
+| 003 | 1 | NARROWED | How are reduction trees represented? | 001, 002 |
+| 004 | 1 | NARROWED | How are streaming loops represented? | 001, 002 |
+| 005 | 1 | **DECIDED** | Is Node 16 opaque in the plan? | 001, 002 |
 | 006 | 2 | NARROWED | How is the hardware profile shared? | 001 |
-| 007 | 2 | NARROWED | How does KernelSignature split? | 001 |
+| 007 | 2 | NARROWED | How does KernelSignature split? | 001, 002 |
 | 008 | 2 | NARROWED | How does precision configuration flow? | 006 |
 | 009 | 3 | NARROWED | How are buffers referenced in the plan? | 002 |
 | 010 | 3 | OPEN | What does the renderer return for D2H? | 002, 009 |
-| 011 | 3 | NARROWED | Is CCE/BCE strategy backend-local? | 007 |
+| 011 | 3 | **DECIDED** | Is CCE/BCE strategy backend-local? | 007, 002 |
 | 012 | 4 | NARROWED | How are modules physically organized? | 007, 009 |
 | 013 | 4 | OPEN | How are kernel sources organized? | 007 |
 | 014 | 4 | OPEN | How does the build system accommodate backends? | 012 |
@@ -533,6 +529,7 @@ Implement `VulkanPlanRenderer`, including SPIR-V compilation pipeline and comman
 ## References
 
 - [ADR-001 Full Record](adr/ADR-001-backend-abstraction-boundary.md)
+- [ADR-002 Full Record](adr/ADR-002-plan-node-types-and-synchronization-structure.md)
 - [CONCEPT.md](CONCEPT.md) — Governing architectural principles
 - [CONTRACT.md](CONTRACT.md) — Host-device interface contract
 - [CPU_BACKEND.md](CPU_BACKEND.md) — CPU backend architecture
