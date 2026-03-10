@@ -87,7 +87,7 @@ Two design questions must be resolved:
 
 7. **`pyproject.toml` integration.** The Meson build must produce artifacts that `meson-python` can package correctly for `pip install`. Optional backend dependencies (Vulkan SDK, C compiler) must be expressible as optional build requirements.
 
-8. **ADR-015 (Python ↔ Native Interop, pending).** The CPU backend's shared library must export a stable C ABI that the FFI layer can load. The build system defines the library name, symbol visibility, and installation path that ADR-015's interop mechanism depends on.
+8. **ADR-015 (Python ↔ Native Interop, ACCEPTED).** The CPU backend's shared library must export a stable C ABI that the FFI layer can load. The build system defines the library name, symbol visibility, and installation path that ADR-015's ctypes interop mechanism depends on.
 
 9. **ADR-016 (Test Strategy, pending).** Conditional backend enablement determines which test tiers can execute. The build system must produce a discoverable manifest of enabled backends so the test framework can skip unavailable tiers.
 
@@ -615,7 +615,7 @@ The architecture's `pyproject.toml` is extended with optional dependency groups 
 ```toml
 [project.optional-dependencies]
 vulkan = ["vulkan-python>=0.2.0"]
-cpu = []  # No additional Python deps — FFI is stdlib ctypes or cffi (ADR-015)
+cpu = []  # No additional Python deps — FFI is stdlib ctypes (ADR-015)
 dev = [
     "pytest",
     "pytest-benchmark",
@@ -734,7 +734,7 @@ Per ADR-017's phasing:
 - [ADR-001: Backend Abstraction Boundary](ADR-001-backend-abstraction-boundary.md) — plan-as-data-structure principle; backend isolation; `PlanRenderer` interface
 - [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution.md) — `src/shared/` + `src/backends/<name>/` directory structure; pure Python shared layer; per-backend compilation requirements
 - [ADR-013: Kernel Source Strategy](ADR-013-kernel-source-strategy.md) — kernel source locations (`kernels/`, `src/backends/vulkan/kernel_sources/`, `src/backends/cpu/kernel_sources/`); OpenCL cross-boundary reference; SPIR-V at build time; `task_<kernel_name>` C ABI
-- [ADR-015: Python ↔ Native Backend Interop](ADR-015-python-native-backend-interop-stub.md) — CPU shared library loading mechanism; C ABI surface consumed by FFI layer
+- [ADR-015: Python ↔ Native Backend Interop](ADR-015-python-native-backend-interop.md) — CPU shared library loading mechanism; C ABI surface consumed by FFI layer; ctypes as CPU backend FFI
 - [ADR-016: Test Strategy](ADR-016-test-strategy-stub.md) — Tier 1/2/3 test structure; conditional test execution based on enabled backends
 - [ADR-017: Incremental Migration Path](ADR-017-incremental-migration-path-stub.md) — per-phase build system evolution
 - [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback (formalize build abstractions, don't hack around them)

@@ -1,88 +1,106 @@
 # ADR-017: Incremental Migration Path
 
-**Status:** STUB (NARROWED — kernel source locations, directory layout, and per-phase source creation sequence resolved by ADR-013; build system structure, conditional enablement, and per-phase build evolution resolved by ADR-014; phase ordering, rollback gates, and feature-flag strategy remain open)  
+**Status:** STUB (NARROWED — backend abstraction boundary resolved by ADR-001; kernel source locations resolved by ADR-013; build system integration resolved by ADR-014; CPU FFI mechanism resolved by ADR-015; phase ordering, rollback gates, and feature-flag strategy remain open)  
 **Date:** 2026-03-10  
 **Deciders:** —  
 **Supersedes:** —  
-**Blocked by:** ADR-015, ADR-016  
+**Blocked by:** ADR-016  
 **Blocks:** —
 
 ---
 
 ## Context
 
-The multi-backend refactoring replaces a monolithic OpenCL-only implementation with the layered architecture described by ADRs 001–014. This ADR defines the incremental migration sequence: the order in which components are extracted, backends are introduced, and the legacy code path is retired.
+The averaging ensembled classifier architecture is being migrated from a monolithic Python+PyOpenCL implementation to a multi-backend, formally-specified system. The migration must be incremental — existing PyOpenCL functionality must remain operational at each step, with new infrastructure (memory layout, execution plan, CPU backend, Vulkan backend) layered in behind feature gates.
 
-ADR-013 (ACCEPTED) resolves kernel source locations and provides concrete per-phase migration implications (ADR-013 §Consequences → Migration implications):
+The resolved ADRs establish the technical constraints for each migration phase:
 
-- **Phase 0 (Foundation):** `kernels/` stays in place, unchanged. `kernels.cl.h` is formally designated as the algorithmic specification. No file moves.
-- **Phase 2 (OpenCL Renderer):** The OpenCL backend loads sources from architecture-root `kernels/` directly.
-- **Phase 3 (CPU Backend):** `src/backends/cpu/kernel_sources/` is created with C implementations developed against `kernels.cl.h` as algorithmic reference. `cpu_simd.h` and `cpu_kernels.h` written per CPU_BACKEND.md. Tier 2 + Tier 3 tests (ADR-016) validate.
-- **Phase 4 (Vulkan Backend):** `src/backends/vulkan/kernel_sources/` is created with GLSL compute shaders. `common.glsl` provides shared declarations. Meson compiles `*.comp` → `*.spv`. Tier 3 parity tests validate against OpenCL + CPU.
+| ADR | Key constraint on migration |
+| :--- | :--- |
+| ADR-001 | Backend abstraction boundary — backends expose a uniform dispatch interface behind the plan model |
+| ADR-007 | `KernelContract`/`KernelBinding` split — host-side validation distinct from per-backend compilation |
+| ADR-009 | `BufferContract` lifecycle — all buffer allocations, transfers, and releases are plan-controlled |
+| ADR-012 | Module factoring — services dissolution into stateless plan primitives |
+| ADR-013 | Kernel source strategy — `kernels.cl.h` as shared spec; per-backend source directories under `src/backends/` |
+| ADR-014 | Build system — Meson with `meson-python`; `_build_config.py` manifest; `feature` options with `auto` default; conditional `subdir()` delegation |
+| ADR-015 | CPU FFI — ctypes with struct layout verification; `_ffi_types.py` for struct definitions; dispatch table mapping `kernel_name` → `(task_fn_ptr, args_struct_class)`; `_verify_layouts()` at library load |
 
-ADR-014 (ACCEPTED) resolves the build system evolution per phase:
+ADR-016 (STUB) will resolve the test strategy. Until ADR-016 is decided, the rollback gate criteria for each migration phase cannot be fully specified — rollback gates depend on which test tiers pass and what constitutes a phase-completion signal.
 
-- **Phase 0:** Create `meson.options` with `backend_vulkan` and `backend_cpu` options. Create `src/_build_config.py.in` template. Refactor `meson.build` to `subdir()` delegation. Create skeleton `meson.build` files in `src/shared/`, `src/backends/opencl/`.
-- **Phase 2:** OpenCL backend's `meson.build` installs kernel binding Python files. `install_data` for `kernels/` already in top-level `meson.build`. `_build_config.py` reflects `BACKEND_OPENCL = True`.
-- **Phase 3:** Create `src/backends/cpu/meson.build` with `shared_library('cpu_kernels', ...)`. `_build_config.py` gains `BACKEND_CPU = True`. Tier 2 + Tier 3 tests compare CPU vs. OpenCL.
-- **Phase 4:** Create `src/backends/vulkan/meson.build` with `custom_target` SPIR-V compilation. `_build_config.py` gains `BACKEND_VULKAN = True`. Tier 3 tests compare Vulkan vs. OpenCL/CPU.
+---
 
-ADR-014's `auto` default for backend options means each phase's build artifacts are automatically picked up when their source files and dependencies exist — no manual option toggling required during migration.
+## Phase Structure (tentative)
 
-ADR-015 (pending) determines how the CPU shared library is loaded at runtime. ADR-016 (pending) determines the test tiers executed at each phase gate.
+The migration is organized into six phases. Each phase introduces a specific capability and has a rollback gate (to be formalized after ADR-016).
+
+| Phase | Deliverable | ADR constraints | Open decisions |
+| :--- | :--- | :--- | :--- |
+| **1** | Host-side plan model (`ExecutionPlan`, `MemoryLayout`, `KernelContract`) | ADR-001, ADR-007, ADR-009, ADR-012 | Rollback gate criteria (ADR-016) |
+| **2** | PyOpenCL backend adapter — existing kernels wrapped in plan-model dispatch | ADR-001, ADR-013 | Degree of refactoring vs. thin wrapper |
+| **3** | CPU backend — native C library + ctypes FFI | ADR-013, ADR-014, ADR-015 | Rollback gate criteria (ADR-016) |
+| **4** | Test harness — Tier 1/2/3 test suites operational | ADR-016 | **Blocked on ADR-016** |
+| **5** | Vulkan backend — GLSL compute shaders + vulkan-python dispatch | ADR-001, ADR-013, ADR-014 | Vulkan descriptor set strategy; rollback gate criteria |
+| **6** | Legacy PyOpenCL removal — unified dispatch through plan model only | All | Cross-backend parity threshold for legacy removal |
+
+### Phase 3 detail (informed by ADR-015)
+
+Phase 3 is the first phase that introduces compiled native code and an FFI boundary. ADR-015's decisions define the concrete deliverables:
+
+- **`libcpu_backend.so`** compiled via Meson `shared_library()` (ADR-014)
+- **`_ffi_types.py`** — ctypes `Structure` subclasses for each kernel's argument struct, generated or hand-maintained to mirror the C headers
+- **Layout verification** — `_verify_layouts()` callable invoked at `cdll.LoadLibrary` time; asserts Python-side struct `sizeof` matches C-side `get_struct_size_*` return values
+- **Dispatch table** — `dict[str, tuple[ctypes.CFUNCTYPE, type[ctypes.Structure]]]` mapping kernel names to their C entry points and argument types
+- **Thread pool** — `pool_create` / `pool_destroy` lifecycle managed by the CPU backend adapter; `pool_dispatch_and_wait` as the single blocking dispatch primitive
+
+Phase 3 completion gate requires, at minimum, that layout verification passes and a representative subset of kernels produce numerically correct results when dispatched through the ctypes FFI. The formal gate criteria depend on ADR-016's test tier definitions.
 
 ---
 
 ## Decision Required
 
-### Phase structure
+### Phase sequencing strategy
 
-Six phases are envisioned. ADR-013 constrains Phases 0, 2, 3, and 4. ADR-014 constrains the build system evolution within each phase. The remaining open decisions are:
+- **(A) Strict sequential.** Each phase must fully complete and pass its rollback gate before the next begins. Simplest to reason about; slowest to deliver. No partial overlap.
 
-| Phase | Constrained by | Open decisions |
-| :--- | :--- | :--- |
-| **0 — Foundation** | ADR-013 (no file moves), ADR-014 (`meson.options`, `subdir()` refactor, `_build_config.py.in`) | Rollback strategy; feature flag for legacy/new code paths |
-| **1 — Shared layer extraction** | ADR-012 (target structure) | Extraction order for `src/shared/` modules; backward-compatibility shims |
-| **2 — OpenCL Renderer** | ADR-013 (direct `kernels/` ref), ADR-014 (kernel `install_data`, `_build_config`) | `PlanRenderer` interface freeze gate; legacy path deprecation timeline |
-| **3 — CPU Backend** | ADR-013 (source layout), ADR-014 (`shared_library`, ISA flags) | CPU Tier 2 fixture generation; FFI mechanism (ADR-015); CI hardware requirements |
-| **4 — Vulkan Backend** | ADR-013 (GLSL layout), ADR-014 (`custom_target` SPIR-V) | Vulkan SDK version pinning; CI GPU requirements |
-| **5 — Legacy retirement** | — | Cutover criteria; deprecation warnings; removal timeline |
+- **(B) Overlapping phases with dependency ordering.** Phases may overlap where their deliverables are independent. E.g., Phase 3 (CPU backend) and Phase 5 (Vulkan backend) could proceed in parallel once Phase 2 is stable. Phase 4 (test harness) can begin as soon as ADR-016 is decided, potentially overlapping with Phase 3.
 
-### Options
+- **(C) Feature-flag gated.** All phases proceed in parallel behind `_build_config.py` feature flags (ADR-014). Each backend is independently toggleable. Integration testing gates promotion of each feature flag from `auto` to `enabled`. **Favored direction** — ADR-014's `auto`/`enabled`/`disabled` feature options already provide the gating mechanism; this option leverages existing infrastructure.
 
-- **(A) Strict sequential gating.** Each phase must pass a defined acceptance gate (Tier 1–3 tests from ADR-016) before the next phase begins. Slower but lower risk.
+### Rollback gate formalization
 
-- **(B) Overlapping phases.** Phases 3 and 4 (CPU + Vulkan) proceed in parallel once Phase 2 is stable. Faster but requires careful coordination of shared-layer changes. ADR-014's independent `subdir()` per backend supports this — the CPU and Vulkan `meson.build` files do not interact.
+- **(D) Tier-based gates.** Each phase's rollback gate is defined in terms of ADR-016's test tiers: Phase 1 requires Tier 1 green; Phase 3 requires Tier 1 + CPU Tier 2 green; Phase 5 requires Tier 1 + Vulkan Tier 2 green; Phase 6 requires Tier 3 parity green across all enabled backends. **Blocked on ADR-016.**
 
-- **(C) Feature-flag coexistence.** Legacy and new code paths coexist behind runtime feature flags throughout all phases. Enables gradual rollout per-user/per-environment but increases code maintenance burden.
-
-Options A and C are combinable (sequential phases with feature-flag coexistence within each phase).
+- **(E) Metric-based gates.** In addition to tier-based gates, define quantitative thresholds (e.g., maximum allowable precision deviation per kernel, performance regression bounds). **Blocked on ADR-016 and ADR-008 tolerance tables.**
 
 ---
 
 ## Risk Assessment
 
-- **Partial migration stall.** If Phase 2 (OpenCL Renderer) destabilizes the existing training loop, the legacy path must remain available. Feature flags (Option C) mitigate this.
-- **Cross-phase specification drift.** A kernel algorithm change during Phase 3 or 4 must propagate to `kernels.cl.h` first (CONCEPT.md §1 Architectural Elegance Feedback), then to all in-progress backend implementations.
-- **Test infrastructure dependency.** ADR-016's Tier 3 tests must be operational before Phase 3 can be accepted — CPU correctness is validated by parity against OpenCL. ADR-014's `_build_config.py` provides the test framework with the enabled-backend manifest needed for skip/run logic.
+| Risk | Likelihood | Impact | Mitigation |
+| :--- | :--- | :--- | :--- |
+| Phase 3 FFI struct drift during development | Medium | High — silent corruption | Layout verification (ADR-015) catches size-level drift at load time; Tier 2 catches field reorderings behaviorally |
+| Phase 5 Vulkan descriptor set complexity delays | Medium | Medium — Vulkan backend delayed | Phase 5 independent of Phases 3/4 under Option B/C |
+| ADR-016 delayed — rollback gates undefined | Low | High — phases proceed without formal gates | Informal gates (manual numerical spot-checks) until ADR-016 is decided |
+| Legacy PyOpenCL removal (Phase 6) reveals undocumented behavior | Medium | High — correctness regression | Tier 3 parity tests must cover full kernel inventory before Phase 6 |
 
 ---
 
 ## Tensions
 
-- Phase 0 is largely formalization (designating `kernels.cl.h` per ADR-013, creating `meson.options` and `_build_config.py.in` per ADR-014), but it establishes the foundational invariants that later phases depend on. Rushing Phase 0 risks under-specifying the `kernels/` directory's dual role.
-- Phases 3 and 4 have independent source trees (ADR-013) and independent `meson.build` files (ADR-014), supporting Option B (overlapping phases). However, Tier 3 tests for Vulkan would benefit from CPU as oracle (ADR-016 favored direction), creating a soft dependency of Phase 4 on Phase 3.
-- The OpenCL backend's lack of a `kernel_sources/` subdirectory (ADR-013 — it references `kernels/` directly) simplifies Phase 2 but means Phase 2 and Phase 0 are tightly coupled — any reorganization of `kernels/` during Phase 0 immediately affects the OpenCL backend.
+- Option A (strict sequential) provides the strongest correctness guarantees but is incompatible with parallel development across backends. Option C is operationally efficient but requires robust per-backend isolation — ADR-014's feature flags provide this.
+- Phase 4 (test harness) is gated on ADR-016, but Phase 3 needs at minimum informal test coverage to validate the FFI layer. ADR-015's layout verification provides a mechanical pre-test gate, reducing the risk of entering Phase 3 without formal Tier 2 tests.
+- Phase 6 (legacy removal) is the highest-risk phase. The cross-backend parity threshold depends on ADR-008 precision tolerances and ADR-016's Tier 3 definitions — both must be fully resolved before Phase 6 can be gated.
+- The `auto` default for `backend_cpu` and `backend_vulkan` (ADR-014) means CI machines may non-deterministically gain or lose backends if their toolchains change. This interacts with rollback gate definitions — a phase that was "green" may become "yellow" if a backend disappears from the build manifest.
 
 ---
 
 ## References
 
-- [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution.md) — `src/shared/` + `src/backends/<name>/` directory structure defining the extraction target
-- [ADR-013: Kernel Source Strategy](ADR-013-kernel-source-strategy.md) — per-phase migration implications (§Consequences); `kernels/` dual role; per-backend `kernel_sources/` locations
-- [ADR-014: Build System Integration](ADR-014-build-system-integration.md) — per-phase build system evolution; `meson.options`; `subdir()` delegation; `_build_config.py` manifest; `shared_library` for CPU; `custom_target` for Vulkan SPIR-V
-- [ADR-015: Python ↔ Native Backend Interop](ADR-015-python-native-backend-interop-stub.md) — CPU shared library loading mechanism required by Phase 3
-- [ADR-016: Test Strategy](ADR-016-test-strategy-stub.md) — Tier 1/2/3 test structure; phase acceptance gates; CPU as oracle candidate
-- [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback (formalize first, implement second)
-- [CPU_BACKEND.md](../CPU_BACKEND.md) — CPU kernel source specifications referenced by Phase 3
-- [VULKAN_BACKEND.md](../VULKAN_BACKEND.md) — Vulkan shader specifications referenced by Phase 4
+- [ADR-001: Backend Abstraction Boundary](ADR-001-backend-abstraction-boundary.md) — uniform dispatch interface behind the plan model
+- [ADR-007: KernelSignature Contract/Binding Split](ADR-007-kernel-signature-contract-binding-split.md) — host-side validation distinct from per-backend compilation
+- [ADR-009: Buffer Lifecycle in the Plan Model](ADR-009-buffer-lifecycle-in-the-plan-model.md) — plan-controlled buffer allocations, transfers, releases
+- [ADR-012: Module Factoring and Services Dissolution](ADR-012-module-factoring-and-services-dissolution.md) — stateless plan primitives replacing service objects
+- [ADR-013: Kernel Source Strategy](ADR-013-kernel-source-strategy.md) — shared spec in `kernels.cl.h`; per-backend source directories; cross-backend fidelity model
+- [ADR-014: Build System Integration](ADR-014-build-system-integration.md) — Meson with `meson-python`; `_build_config.py` manifest; `feature` options with `auto` default; conditional `subdir()` delegation
+- [ADR-015: Python ↔ Native Backend Interop](ADR-015-python-native-backend-interop.md) — ctypes FFI for CPU backend; struct layout verification; `_ffi_types.py`; dispatch table; thread pool lifecycle
+- [ADR-016: Test Strategy](ADR-016-test-strategy-stub.md) — (STUB) test tier definitions; rollback gate criteria dependency
