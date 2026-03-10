@@ -568,7 +568,7 @@ Per ADR-017's phasing:
 - [ADR-011: CCE/BCE Strategy Delegation](ADR-011-cce-bce-strategy-delegation.md) — Strategy B (Nodes 6/7, separate kernel names) and Strategy A (Nodes 8/9/10, FLAG parameter); per-backend rendering responsibilities
 - [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution.md) — `src/shared/` + `src/backends/<name>/` directory structure; kernel source placement deferred to this ADR
 - [ADR-014: Build System Integration](ADR-014-build-system-integration.md) — SPIR-V compilation targets, C shared library compilation, OpenCL kernel source path configuration
-- [ADR-016: Test Strategy](ADR-016-test-strategy-stub.md) — Tier 3 cross-backend parity tests as behavioral fidelity verification
+- [ADR-016: Test Strategy](ADR-016-test-strategy.md) — Tier 3 cross-backend parity tests as behavioral fidelity verification
 - [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback (formalize first, implement second); §3 Modular Dumb Kernels
 - [CONTRACT.md](../CONTRACT.md) — Article 1.4 Collaborative Interface Verifiability; Article 5 Architectural Constants; Article 6 Mandatory Build-Time Symbols
 - [VULKAN_BACKEND.md](../VULKAN_BACKEND.md) — GLSL shader structure, specialization constants, push constants, descriptor set strategy

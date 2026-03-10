@@ -774,7 +774,7 @@ Per ADR-017's phasing:
 - [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution.md) — backend isolation boundary; `src/backends/cpu/` module inventory; `PlanRenderer` as FFI abstraction point
 - [ADR-013: Kernel Source Strategy](ADR-013-kernel-source-strategy.md) — CPU kernel source layout in `src/backends/cpu/kernel_sources/`; `task_*` function signature convention; `cpu_kernels.h` ABI surface; three-tier specification hierarchy
 - [ADR-014: Build System Integration](ADR-014-build-system-integration.md) — `libcpu_kernels.so` build output; hidden visibility + `CPU_KERNELS_EXPORT`; `importlib.resources` discovery; installation path; `cpu = []` dependency declaration; single-ISA strategy with multi-ISA extension path
-- [ADR-016: Test Strategy](ADR-016-test-strategy-stub.md) — Tier 2 per-backend kernel tests catch FFI marshalling errors; Tier 3 cross-backend parity tests validate end-to-end correctness
+- [ADR-016: Test Strategy](ADR-016-test-strategy.md) — Tier 2 per-backend kernel tests catch FFI marshalling errors; Tier 3 cross-backend parity tests validate end-to-end correctness
 - [ADR-017: Incremental Migration Path](ADR-017-incremental-migration-path-stub.md) — Phase 3 (CPU Backend) requires the FFI mechanism decided here
 - [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback (proportional complexity; formalize when pressure arises)
 - [CONTRACT.md](../CONTRACT.md) — Article 6 Mandatory Build-Time Symbols; Article 1.4 Collaborative Interface Verifiability
