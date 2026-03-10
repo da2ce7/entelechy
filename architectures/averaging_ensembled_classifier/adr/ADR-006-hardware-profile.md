@@ -398,6 +398,6 @@ The following constants are deliberately excluded from `HardwareProfile`:
 - [ADR-003: Reduction Tree Plan Representation](ADR-003-reduction-tree-plan-representation.md) — `hardware_max_fan_in` requirement; kernel-tier crossover as Orchestration-tier concern
 - [ADR-004: Streaming Loop Plan Representation](ADR-004-streaming-loop-plan-representation.md) — `global_mem_bytes` for chunk count; padding inputs for scratch buffer sizing
 - [ADR-005: Node 16 Opacity](ADR-005-node-16-opacity-in-the-plan.md) — `policy_max_k` synthesis from hardware profile data
-- [ADR-008: Precision Configuration](ADR-008-precision-configuration-stub.md) — decoupled precision context; interaction with hardware capabilities
+- [ADR-008: Precision Configuration](ADR-008-precision-configuration.md) — decoupled precision context; interaction with hardware capabilities
 - [CPU_BACKEND.md](../CPU_BACKEND.md) — SIMD compile-time detection, cache line constants, threading model
 - [VULKAN_BACKEND.md](../VULKAN_BACKEND.md) — subgroup size discovery, specialization constants, memory queries
