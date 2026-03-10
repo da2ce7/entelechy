@@ -4,13 +4,21 @@
 
 This document catalogues the Architecture Decision Records (ADRs) required for refactoring the `averaging_ensembled_classifier` from its current OpenCL-only implementation to a multi-backend architecture supporting OpenCL, Vulkan, and CPU execution.
 
-Two foundational decisions have been accepted:
+Two foundational decisions (Tier 0) have been accepted:
 
-- **ADR-001: Backend Abstraction Boundary** — The system abstracts at the DAG/Phase level: a shared orchestration layer produces a backend-neutral execution plan expressed as a data structure, and each backend receives this plan and renders it using its native execution model. Full record: `adr/ADR-001-backend-abstraction-boundary.md`.
+- **ADR-001: Backend Abstraction Boundary** — The system abstracts at the DAG/Phase level: a shared orchestration layer produces a backend-neutral execution plan expressed as a data structure, and each backend receives this plan and renders it using its native execution model. A three-tier jurisdictional model (Policy / Orchestration / Execution) governs decision flow. Full record: `adr/ADR-001-backend-abstraction-boundary.md`.
 
 - **ADR-002: Plan Node Types & Synchronization Structure** — The execution plan is a directed acyclic graph of five typed, immutable node descriptors (`KernelDispatchNode`, `ReductionTreeNode`, `StreamingLoopNode`, `BarrierNode`, `RetrievalNode`) connected by explicit dependency edges. This is a closed taxonomy governed by the Complexity Ceiling Constraint. Full record: `adr/ADR-002-plan-node-types-and-synchronization-structure.md`.
 
-These choices resolve or significantly narrow all downstream decisions. The remaining ADRs are organized into tiers reflecting the actual dependency chain and work order. Within each tier, ADRs are independent of each other and may be resolved in parallel.
+Tier 1 (plan data structure) is substantially resolved. Three of five ADRs are decided:
+
+- **ADR-003: Reduction Tree Plan Representation** — The `ReductionTreePlan` is a frozen dataclass carrying the Policy tier's output as pure data: uniform fan-in, stage count, placement-dependent initial offset list, tree variant, and a pre-computed threshold schedule from the Quadratic Scaling Policy. Kernel tier selection and intermediate buffer allocation are Orchestration-tier concerns left to the renderer. Full record: `adr/ADR-003-reduction-tree-plan-representation.md`.
+
+- **ADR-005: Node 16 Opacity** — Resolved by ADR-001's design principle: Node 16 is a single `KernelDispatchNode` with policy parameters. Its internal multi-stage reduction is an Execution-tier concern.
+
+- **ADR-011: CCE/BCE Strategy Delegation** — Resolved by ADR-001: the plan conveys intent; the renderer conveys mechanism.
+
+These choices resolve or significantly narrow all downstream decisions. ADR-003 in particular establishes the concrete pattern for how complex plan node internals are represented — a "parametric header with pre-computed policy output" — and formally places kernel tier selection in the Orchestration tier, constraining ADR-004, ADR-006, ADR-007, ADR-009, and ADR-012. The remaining ADRs are organized into tiers reflecting the actual dependency chain and work order. Within each tier, ADRs are independent of each other and may be resolved in parallel.
 
 **Status Key:**
 - `DECIDED` — Accepted decision, recorded in `adr/`.
@@ -57,6 +65,8 @@ The shared orchestration layer produces a backend-neutral `ExecutionPlan` data s
 
 **Design principle:** The plan boundary stops at each kernel's public interface. Plan nodes describe kernel identity, logical buffer bindings, tile decomposition, dependency edges, and policy parameters. Internal kernel algorithms (e.g., Node 16's multi-stage reduction) are never expressed in the plan.
 
+A three-tier jurisdictional model, observed in the existing OpenCL code and formalized in the full ADR record, governs how decisions flow through the system: the **Policy** tier (shared layer) determines *what* to compute under *what constraints*; the **Orchestration** tier (backend renderer) determines *how* to sequence and dispatch; the **Execution** tier (kernel) performs the computation itself. The plan boundary separates Policy from Orchestration. The kernel contract boundary (CONTRACT.md) separates Orchestration from Execution. These tiers redistribute depending on the node type — e.g., Node 16 collapses Orchestration into Execution because its pre-gathered input eliminates inter-stage host logistics.
+
 ---
 
 ## Tier 1: The Plan Data Structure
@@ -93,26 +103,14 @@ The execution plan is a directed acyclic graph of typed, immutable node descript
 
 ### ADR-003: Reduction Tree Plan Representation
 
-**Status:** NARROWED — Shared `ReductionTreePlan` as the internal structure of `ReductionTreeNode`
+**Status:** DECIDED — Option C (Parametric header with pre-computed threshold schedule)
+**Full Record:** `adr/ADR-003-reduction-tree-plan-representation.md`
 
-**Context:**
 ADR-002 establishes `ReductionTreeNode` as one of the five canonical plan node types. The Recursive Clip-Aggregation Engine (Nodes 14, 15, 20) is represented as a single typed node rendered atomically by the backend — its stages are not individual plan nodes. The tree's mathematical structure — stage count, fan-in `K`, offset lists, Quadratic Scaling Policy thresholds (`T_j = T_algorithmic + λ·j²`) — is identical across all backends. Only the dispatch mechanics differ.
 
-ADR-001 directly resolves this as a shared `ReductionTreePlan` embedded in the execution plan. The `StabilizationPolicy` module and offset-list construction remain in the shared layer. Each backend's renderer interprets the tree natively.
+Three options were considered: (A) fully materialized per-stage descriptor arrays, (B) compact parametric specification with a live policy object, and (C) parametric header with pre-computed threshold schedule. Option A was eliminated for prescribing kernel tier selection — an Orchestration-tier concern (ADR-001 §Three-tier jurisdictional model) that differs per backend. Option B was eliminated for embedding a live `StabilizationPolicy` object in the plan, violating the plan-as-data-structure boundary.
 
-**Remaining Decision:**
-The `ReductionTreePlan` (the internal data of a `ReductionTreeNode`) must specify, per stage:
-- Fan-in count and kernel tier selection (`aggregate_register_reduce` vs. `aggregate_local_reduce`).
-- Offset list (integer array of memory displacements).
-- Whether a `clip_intermediate_grad` step follows the aggregation (gradient paths) or not (diagnostic paths).
-- The computed threshold `T_j` for the clip step.
-- Intermediate buffer sizing.
-
-The renderer is responsible for: uploading offset lists, allocating intermediate buffers, dispatching the kernels, and inserting synchronization between stages.
-
-**Tensions:**
-- The offset lists are pure integer arrays. The shared layer computes them; the backend uploads them in its native way (OpenCL: `cl.enqueue_copy` to a `cl.Buffer`; Vulkan: mapped staging buffer; CPU: direct pointer).
-- For diagnostic reductions (Node 14), no clipping occurs — the plan must express "sum-only" vs. "sum-then-clip" per stage.
+The `ReductionTreePlan` frozen dataclass carries the Policy tier's output as pure data: uniform fan-in `K`, stage count, the placement-dependent initial offset list, tree variant (`"diagnostic"` or `"stabilized"`), and a pre-computed threshold schedule (tuple of per-stage `T_j` floats, or all-`None` for diagnostic trees). The Orchestration tier (backend renderer) derives trivially derivable per-stage data at render time: contiguous intermediate offset lists, kernel tier selection (hardware-specific crossover heuristic), intermediate buffer allocation, and inter-stage synchronization.
 
 ---
 
@@ -131,26 +129,33 @@ CONCEPT.md's Phase III (True Streaming for `Grad_SW` / `Grad_SB`) involves a hos
 
 Option B (pre-expanded flat DAG) is eliminated: it inflates plan size linearly with chunk count, prevents Vulkan from recognizing loop structure, and loses the semantic signal that N sequences are structurally identical.
 
+**ADR-003 precedent:** ADR-003 establishes the representation pattern for complex plan node internals: a frozen dataclass carrying the Policy tier's pre-computed output as pure data, with Orchestration-tier derivations (dispatch mechanics, buffer allocation) left to the renderer. The `StreamingLoopNode`'s internal representation should follow this pattern — pre-compute per-chunk parameter deltas in the shared layer; leave per-chunk dispatch sequencing, synchronization insertion, and memory management to the renderer.
+
 **Remaining Decision:**
 The concrete representation of per-chunk parameter deltas within the `StreamingLoopNode`. The node must specify:
 - Chunk count (varies per batch, determined by host memory assessment).
 - Per-chunk parameter deltas (offsets, indices) — how scalar parameters change between iterations.
 - The body: a flat sequence of `KernelDispatchNode`s with parameterized bindings that the renderer instantiates per iteration.
 
+Following ADR-003's parametric header pattern, the key design question is: how much per-chunk data to pre-compute (Policy tier) vs. how much to leave parametrically derivable by the renderer (Orchestration tier). The threshold schedule analogy: if per-chunk offsets are non-trivial (policy-dependent), pre-compute them; if they are trivially derivable from the chunk index and a stride, leave them to the renderer.
+
 **Tensions:**
 - The chunk count varies per batch. The plan is constructed fresh each batch, but Option A keeps it compact and semantically clear.
 - Vulkan's ability to record the entire loop body into one command buffer is a key performance characteristic preserved by this approach.
 - The Model A recompute path (`RECOMPUTE_GRAD_H`) is also a streaming loop (recompute hidden_i → compute gradients → clip, iterated per tile). ADR-002 confirms this is expressed as a `StreamingLoopNode` with the same constraints.
+- Per ADR-003's analysis, the Policy/Orchestration boundary should be drawn at the point where derivation becomes trivial. Chunk offsets that are simple arithmetic progressions (base + index × stride) need not be materialized — the parameterized specification carries the stride, and the renderer computes the per-chunk values.
 
 ---
 
 ### ADR-005: Node 16 Opacity in the Plan
 
-**Status:** DECIDED — Resolved by ADR-001 design principle; confirmed by ADR-002 taxonomy
+**Status:** DECIDED — Resolved by ADR-001 design principle; confirmed by ADR-002 taxonomy; reinforced by ADR-003
 
-CONCEPT.md designates Node 16 (`stabilize_and_reduce_grad_hidden_activations`) as a Specialized Kernel with internal multi-stage reduction. ADR-001's design principle ("plan boundary stops at the kernel's public interface") resolves this: the plan specifies Node 16 as a single `KernelDispatchNode` — confirmed as a first-class node type by ADR-002 — with policy parameters (`T_algorithmic`, `λ`, `policy_max_k`, `fp_max`) in its `scalar_params` dict. The kernel contract (in `kernels.cl.h`) specifies the internal algorithm in its `Behavioral Invariants`; this is a device-side concern, not a plan-level concern.
+CONCEPT.md designates Node 16 (`stabilize_and_reduce_grad_hidden_activations`) as a Specialized Kernel with internal multi-stage reduction. ADR-001's three-tier jurisdictional model explains this as a tier collapse: the Orchestration tier collapses into the Execution tier because Node 13 guarantees contiguous input, eliminating the inter-stage logistics that otherwise require host participation. The shared layer still sets policy (`T_algorithmic`, `λ`, `policy_max_k`, `fp_max` as scalar parameters in the Policy tier), but the kernel internally manages its own reduction.
 
-The policy parameters are computed by the shared `StabilizationPolicy` module and embedded in the plan node's scalar parameter set. Each backend passes them to its native Node 16 implementation. No remaining decision.
+ADR-003 reinforces this decision by formally placing kernel tier selection (the register-vs-local crossover heuristic) in the Orchestration tier. Node 16's internal kernel tier decisions are even further removed — they belong to the Execution tier. The contrast is instructive: `ReductionTreeNode`s (Nodes 14, 15, 20) expose their tree structure to the Orchestration tier via `ReductionTreePlan`, while Node 16 hides its entirely behind a single `KernelDispatchNode` interface. Both approaches respect the plan boundary — the difference is where the Orchestration/Execution boundary falls, determined by whether the host must participate in inter-stage logistics.
+
+The plan specifies Node 16 as a single `KernelDispatchNode` — confirmed as a first-class node type by ADR-002 — with policy parameters in its `scalar_params` dict. The kernel contract (in `kernels.cl.h`) specifies the internal algorithm in its `Behavioral Invariants`; this is an Execution-tier concern, not a plan-level concern. No remaining decision.
 
 ---
 
@@ -183,9 +188,14 @@ The canonical constant set. A minimal proposal:
 
 `ParameterSpace`, `MemoryLayout`, `StabilizationPolicy`, and the plan builder consume this dataclass. These modules require zero backend-specific changes once `DiscoveredArchConstants` is replaced.
 
+**ADR-003 constraint:** `StabilizationPolicy.plan_uniform_reduction_tree()` requires a `hardware_max_fan_in` parameter — the maximum fan-in the device can safely execute in a single aggregation dispatch. This is derived from `max_work_group_size` (for GPU backends, where the aggregation kernel's work-group size scales with fan-in) or from a CPU-specific limit (e.g., L1 cache capacity divided by partial element size). The `HardwareProfile` must either supply this constant directly or carry sufficient data for `StabilizationPolicy` to derive it. The current OpenCL code derives it as `policy_max_k` in `stabilization_policy.py` from `DiscoveredArchConstants.simd_width` and related fields. This derivation should remain in the shared layer, consuming `HardwareProfile` properties.
+
+Additionally, ADR-003's backend rendering contract requires the renderer to apply a kernel-tier crossover heuristic (register-reduce vs. local-reduce). The `HardwareProfile` need not prescribe this heuristic — it is an Orchestration-tier concern — but the profile must carry the raw hardware data (local memory size, SIMD width) from which each backend derives its own crossover threshold.
+
 **Tensions:**
 - The CPU backend's SIMD width is a compile-time constant. The `HardwareProfile` must accept pre-determined values without requiring a "discovery" phase.
 - `max_local_mem` is meaningless for the CPU backend. The profile must tolerate `None` or sentinel values for inapplicable constants.
+- The `hardware_max_fan_in` derivation is Policy-tier logic (it feeds directly into the tree plan). It should live in `StabilizationPolicy`, not in any backend, even though its inputs come from backend-supplied hardware data.
 
 ---
 
@@ -208,6 +218,8 @@ How does the `KernelContract` handle parameters that exist in some backends but 
 - **(B) Superset parameter list with backend annotations.** The contract lists all parameters including `flat_tile_index`, annotated as `[OpenCL-only]`. Risks: pollutes the shared contract with backend concerns; must be extended for every new backend.
 
 Option A is strongly favored. The Placement Contract (CONTRACT.md Article 3.2) already defines strategies abstractly (`grid_mod_cls`, `linear_batch`). The contract specifies the *strategy and key domain*; the binding specifies *how the key is communicated*.
+
+**ADR-003 parallel:** ADR-003 establishes the concrete precedent for this jurisdictional split. The `ReductionTreePlan` carries Policy-tier output (thresholds, fan-in, offset lists) as pure data; the renderer interprets it through backend-native dispatch. The Contract/Binding split applies the same principle to individual kernel invocations — the Contract carries validation data (shapes, preconditions, placement strategy); the Binding translates it into native dispatch arguments. The pattern is consistent: shared layer produces data artifacts; backend consumes them.
 
 **Tensions:**
 - CONTRACT.md Article 1.4.1 demands that all calculability proof terms exist in the interface. If `flat_tile_index` is abstracted away, the proof must reference the abstract placement key. This requires a CONTRACT.md amendment — specifically, adding a "Backend Binding" section to Article 3.2.3 that acknowledges the mechanism is backend-specific while the strategy is universal.
@@ -251,17 +263,25 @@ ADR-002 further resolves the activation lifecycle dimension: the Cache vs. Recom
 
 The existing `BufferHandle` token is the natural plan→renderer handoff mechanism. The plan builder assigns handles; the renderer allocates backing memory.
 
+**ADR-003 constraint — two-tier buffer scope:** ADR-003 establishes a critical distinction between **plan-level buffers** and **renderer-internal buffers**:
+
+- **Plan-level buffers** are named in the plan data structure — `source_buffer` and `destination_buffer` on `ReductionTreeNode`, `buffer_bindings` on `KernelDispatchNode`s. Their lifetimes are properties of the DAG topology and belong in the shared layer.
+- **Renderer-internal buffers** are allocated by the backend during rendering and never appear in the plan. For `ReductionTreeNode`s, these include all intermediate stage buffers (ping-pong buffers between reduction stages) and uploaded offset-list buffers. For `StreamingLoopNode`s, per-chunk scratch buffers may similarly be renderer-internal.
+
+This distinction means the plan's buffer lifetime model (whichever option is chosen below) governs only plan-level buffers. Intermediate reduction buffers are entirely the renderer's responsibility — their allocation, reuse, and deallocation are Orchestration-tier concerns that may differ radically across backends (e.g., OpenCL allocates discrete `cl.Buffer`s per stage; Vulkan suballocates from a single `VkDeviceMemory` block; CPU may use stack allocation or a bump allocator).
+
 **Remaining Decision:**
-Does the plan prescribe buffer *reuse* (e.g., "buffer A can be freed after Node 12 and its memory reused for buffer B"), or does it leave lifetime management entirely to the renderer?
+Does the plan prescribe buffer *reuse* for plan-level buffers (e.g., "buffer A can be freed after Node 12 and its memory reused for buffer B"), or does it leave lifetime management entirely to the renderer?
 
-- **(A) Plan prescribes lifetimes.** The plan annotates each buffer with its producing node and last-consuming node. The renderer uses this information to optimize memory reuse. This is the more principled approach — the shared layer has full DAG visibility and can compute optimal lifetimes.
+- **(A) Plan prescribes lifetimes.** The plan annotates each plan-level buffer with its producing node and last-consuming node. The renderer uses this information to optimize memory reuse. This is the more principled approach — the shared layer has full DAG visibility and can compute optimal lifetimes. The renderer further manages its own internal buffers without plan guidance.
 
-- **(B) Renderer owns lifetimes.** The plan declares buffers but not their lifetimes. Each renderer analyzes the plan to determine reuse opportunities. Risk: duplicated analysis logic across backends.
+- **(B) Renderer owns lifetimes.** The plan declares buffers but not their lifetimes. Each renderer analyzes the plan to determine reuse opportunities. Risk: duplicated analysis logic across backends for plan-level buffers.
 
-Option A is strongly favored. Buffer lifetime is a property of the DAG, not the dispatch model. The shared layer should compute it once. ADR-002's explicit dependency edges make lifetime computation straightforward: a buffer's lifetime extends from its producing node to the last node in `depends_on` chains that references it.
+Option A is strongly favored. Plan-level buffer lifetime is a property of the DAG, not the dispatch model. The shared layer should compute it once. ADR-002's explicit dependency edges make lifetime computation straightforward: a buffer's lifetime extends from its producing node to the last node in `depends_on` chains that references it. Renderer-internal buffers (ADR-003's intermediate stage buffers, offset-list uploads, etc.) remain outside this scope.
 
 **Tensions:**
 - Vulkan backends may further optimize by suballocating from large `VkDeviceMemory` blocks. The plan's lifetime annotations enable this without prescribing it.
+- The two-tier buffer scope means the plan's memory footprint estimate (if computed) will undercount actual device memory usage — renderer-internal intermediates are invisible to the plan. If memory budgeting is desired (e.g., for the `host_memory_assessment` chunk-count decision in `StreamingLoopNode`), the plan builder may need a renderer-supplied "overhead estimate" callback. This is a minor tension that ADR-003's rendering contract accommodates by keeping intermediate buffers derivable from the plan's tree parameters (`num_stages`, `fan_in`, `elements_per_partial`).
 
 ---
 
@@ -358,6 +378,8 @@ The current `launcher_infra.py` splits into:
 - `HostView` → stays shared (it's a plan-level retrieval artifact).
 
 The current `compute_patterns.py` (reduction dispatch logic) moves to `backends/opencl/plan_renderer.py`.
+
+**ADR-003 confirmation:** `ReductionTreePlan` (the frozen dataclass defined in ADR-003) lives in `execution_plan.py` alongside the other plan node types. The plan builder in `execution_plan.py` (or `batch_processor.py`) calls `StabilizationPolicy.plan_uniform_reduction_tree()` to resolve `(K, num_stages)`, computes the threshold schedule, and constructs a `ReductionTreePlan` — all in the shared layer. The current `_execute_reduction_pipeline` logic in `graph_recipes.py`, which interleaves plan computation with OpenCL dispatch, splits cleanly along the Policy/Orchestration boundary: the plan-computation half moves to the shared plan builder; the dispatch half moves to `backends/opencl/plan_renderer.py`. Similarly, `compute_patterns.py`'s `AggregationManager` — which currently owns both the register/local crossover heuristic and the OpenCL dispatch calls — splits into a renderer-internal component. The crossover heuristic (`max_reg_agg = 16`) stays in the OpenCL renderer as an Orchestration-tier concern.
 
 **Tensions:**
 - The `kernel_signatures/` → `kernel_contracts/` rename reflects the Contract/Binding split (ADR-007). The shared code retains validation; the backend-specific binding code moves to each backend.
@@ -461,9 +483,25 @@ How is correctness validated across backends?
 
 Option A is favored. Plan-level testing is a unique advantage of the plan model and should be exploited. Integration tests (A.3) subsume the parameterized approach (B). The oracle model (C) can be layered on top.
 
+**ADR-003 concrete test targets:** ADR-003 defines six plan-construction invariants that become concrete, device-free test targets for layer 1:
+
+1. `num_partials > 1` (N=1 is handled as a direct copy, never a `ReductionTreeNode`).
+2. `fan_in >= 2`.
+3. `fan_in ** num_stages >= num_partials` (stage count consistency).
+4. `len(initial_offset_list) == num_partials`.
+5. `len(threshold_schedule) == num_stages`.
+6. `tree_variant == "diagnostic"` iff all `threshold_schedule` entries are `None`; `"stabilized"` iff all are `float`.
+
+Additionally, for stabilized trees:
+7. Threshold monotonicity: $T_{\text{leaf}} \geq T_{\text{leaf}-1} \geq \ldots \geq T_{\text{root}}$ (for $\lambda \geq 0$).
+8. Safety ceiling: every $T_j \leq \text{FP\_FORMAT\_MAX} / K$.
+
+These invariants can be tested exhaustively across a matrix of `(N, K, tree_variant, precision)` values without any backend or device. This is a strong validation of the three-tier model: the Policy tier's output (the `ReductionTreePlan`) is a self-contained, self-validating data artifact.
+
 **Tensions:**
 - FP16 results will differ between backends due to different intermediate precision handling and SIMD reduction order (floating-point associativity). Tolerances must be precision-aware and documented.
 - Plan-level tests provide fast, device-free CI coverage. This is a significant practical benefit.
+- The layer 2 (backend unit) tests for reduction tree rendering should verify that each renderer correctly derives the Orchestration-tier data: intermediate offset lists are contiguous iotas, kernel tier selection matches the backend's documented crossover heuristic, and intermediate buffer counts match `num_stages - 1` (or fewer with ping-pong reuse).
 
 ---
 
@@ -485,10 +523,22 @@ Extract backend-neutral `Protocol` types from current OpenCL code. Define `Hardw
 Remove all `pyopencl` imports from: `execution_plan.py`, `stabilization_policy.py`, `workload_primitives.py`, `model_spec.py`, `memory_layout.py`, `parameter_space.py`, `arch_primitives.py`. These modules depend only on Phase 0 abstractions and standard library types. `DiscoveredArchConstants` is replaced by `HardwareProfile`. All tests pass.
 
 **Phase 2: Plan Data Structure.**
-Define the five plan node types decided in ADR-002 (`KernelDispatchNode`, `ReductionTreeNode`, `StreamingLoopNode`, `BarrierNode`, `RetrievalNode`) as frozen dataclasses with explicit dependency edges. Define `ReductionTreePlan` internals (ADR-003) and `StreamingLoopNode` parameter deltas (ADR-004). Implement `ExecutionPlanBuilder` that produces a typed DAG from `ModelSpec` + `HardwareProfile` + batch parameters, with the Cache/Recompute lifecycle decision expressed as DAG topology (per ADR-002's dissolution of `DependencyProvider`). Write plan-level tests (ADR-016, layer 1). The plan builder exists alongside the current OpenCL execution path — it is not yet *used* for dispatch. All tests pass.
+Define the five plan node types decided in ADR-002 (`KernelDispatchNode`, `ReductionTreeNode`, `StreamingLoopNode`, `BarrierNode`, `RetrievalNode`) as frozen dataclasses with explicit dependency edges. Define `ReductionTreePlan` internals per ADR-003 (Option C: parametric header with pre-computed threshold schedule) and `StreamingLoopNode` parameter deltas per ADR-004. Implement `ExecutionPlanBuilder` that produces a typed DAG from `ModelSpec` + `HardwareProfile` + batch parameters, with the Cache/Recompute lifecycle decision expressed as DAG topology (per ADR-002's dissolution of `DependencyProvider`).
+
+The `ReductionTreePlan` construction logic — currently scattered across `graph_recipes.py` (`_execute_reduction_pipeline`) and `stabilization_policy.py` (`plan_uniform_reduction_tree`, `get_threshold_for_generic_stage`) — is consolidated into the plan builder:
+- Call `StabilizationPolicy.plan_uniform_reduction_tree(num_partials, hardware_max_fan_in)` to resolve `(K, num_stages)`.
+- Compute the threshold schedule by iterating `get_threshold_for_generic_stage(stage_j=j, runtime_fan_in_k=K)` for each stage.
+- Package the results into a `ReductionTreePlan` frozen dataclass alongside the placement-dependent initial offset list and tree variant.
+- Validate all six ADR-003 invariants at construction time.
+
+Write plan-level tests (ADR-016, layer 1) targeting ADR-003's eight concrete invariants. The plan builder exists alongside the current OpenCL execution path — it is not yet *used* for dispatch. All tests pass.
 
 **Phase 3: OpenCL Plan Renderer.**
-This is the critical step. Refactor `graph_recipes.py` and `compute_patterns.py` into an `OpenCLPlanRenderer` that consumes an `ExecutionPlan` and produces the same OpenCL dispatch sequence as the current code. The `BatchProcessor` switches from direct recipe calls to plan-build-then-render. The current behavior is preserved but the code path is fundamentally restructured. All existing integration tests validate the transition.
+This is the critical step. Refactor `graph_recipes.py` and `compute_patterns.py` into an `OpenCLPlanRenderer` that consumes an `ExecutionPlan` and produces the same OpenCL dispatch sequence as the current code. The `BatchProcessor` switches from direct recipe calls to plan-build-then-render. The current behavior is preserved but the code path is fundamentally restructured.
+
+For `ReductionTreeNode` rendering specifically: the renderer iterates over stages, applies the OpenCL register/local crossover heuristic (currently `max_reg_agg = 16` in `AggregationManager`), generates contiguous intermediate offset lists, allocates intermediate buffers (inheriting `PingPongManager`'s current scheme), and dispatches `aggregate_register_reduce` or `aggregate_local_reduce` per stage with the pre-computed threshold from `ReductionTreePlan.threshold_schedule`. The renderer no longer computes thresholds, resolves fan-in, or determines stage count — all Policy-tier work has moved to Phase 2's plan builder.
+
+All existing integration tests validate the transition.
 
 **Phase 4: CPU Backend.**
 Implement `CPUPlanRenderer` against the established plan interface. Write cross-backend integration tests (ADR-016, layer 3). Validate with scenario tests.
@@ -510,26 +560,29 @@ Implement `VulkanPlanRenderer`, including SPIR-V compilation pipeline and comman
 |:----|:-----|:-------|:--------------|:-----------|
 | 001 | 0 | **DECIDED** | Where is the abstraction boundary? | — |
 | 002 | 1 | **DECIDED** | What are the plan node types? | 001 |
-| 003 | 1 | NARROWED | How are reduction trees represented? | 001, 002 |
-| 004 | 1 | NARROWED | How are streaming loops represented? | 001, 002 |
-| 005 | 1 | **DECIDED** | Is Node 16 opaque in the plan? | 001, 002 |
-| 006 | 2 | NARROWED | How is the hardware profile shared? | 001 |
-| 007 | 2 | NARROWED | How does KernelSignature split? | 001, 002 |
+| 003 | 1 | **DECIDED** | How are reduction trees represented? | 001, 002 |
+| 004 | 1 | NARROWED | How are streaming loops represented? | 001, 002, 003¹ |
+| 005 | 1 | **DECIDED** | Is Node 16 opaque in the plan? | 001, 002, 003¹ |
+| 006 | 2 | NARROWED | How is the hardware profile shared? | 001, 003¹ |
+| 007 | 2 | NARROWED | How does KernelSignature split? | 001, 002, 003¹ |
 | 008 | 2 | NARROWED | How does precision configuration flow? | 006 |
-| 009 | 3 | NARROWED | How are buffers referenced in the plan? | 002 |
+| 009 | 3 | NARROWED | How are buffers referenced in the plan? | 002, 003 |
 | 010 | 3 | OPEN | What does the renderer return for D2H? | 002, 009 |
 | 011 | 3 | **DECIDED** | Is CCE/BCE strategy backend-local? | 007, 002 |
-| 012 | 4 | NARROWED | How are modules physically organized? | 007, 009 |
+| 012 | 4 | NARROWED | How are modules physically organized? | 003, 007, 009 |
 | 013 | 4 | OPEN | How are kernel sources organized? | 007 |
 | 014 | 4 | OPEN | How does the build system accommodate backends? | 012 |
 | 015 | 4 | OPEN | What is the Python↔native interop? | 012, 014 |
 | 016 | 5 | OPEN | How is cross-backend correctness tested? | 013, 014 |
 | 017 | 6 | OPEN | What is the phased migration strategy? | All |
 
+<sup>1</sup> ADR-003 *constrains* rather than *blocks* these ADRs. It establishes the representation pattern (parametric header with pre-computed policy output) and the kernel-tier-selection jurisdictional ruling that narrow their remaining design space, but they can be resolved independently. ADR-009 and ADR-012 have a hard dependency on ADR-003's two-tier buffer scope distinction and `ReductionTreePlan` placement, respectively.
+
 ## References
 
 - [ADR-001 Full Record](adr/ADR-001-backend-abstraction-boundary.md)
 - [ADR-002 Full Record](adr/ADR-002-plan-node-types-and-synchronization-structure.md)
+- [ADR-003 Full Record](adr/ADR-003-reduction-tree-plan-representation.md)
 - [CONCEPT.md](CONCEPT.md) — Governing architectural principles
 - [CONTRACT.md](CONTRACT.md) — Host-device interface contract
 - [CPU_BACKEND.md](CPU_BACKEND.md) — CPU backend architecture

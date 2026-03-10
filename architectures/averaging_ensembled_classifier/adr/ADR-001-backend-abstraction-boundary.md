@@ -175,6 +175,28 @@ The system is split into two layers with a plan data structure at the interface:
 └─────────────────────────────────────────────────────────┘
 ```
 
+### Three-tier jurisdictional model
+
+The two-layer boundary above governs *where code lives*. Examining the existing OpenCL implementation reveals a finer-grained pattern in how decisions actually flow through the system — three tiers of jurisdiction that distribute differently depending on the computation:
+
+| Tier | Decides | Illustrative ownership (OpenCL) |
+| :--- | :------ | :------------------------------ |
+| **Policy** | *What* to compute and *under what constraints*. | `StabilizationPolicy` resolves fan-in `K`, stage counts, threshold schedules. `ParameterSpace` determines tile decompositions. `ExecutionPlan` selects activation lifecycle. |
+| **Orchestration** | *How* to sequence and dispatch the computation. | `graph_recipes.py` loops over reduction stages, selects register vs. local kernel tier (`max_reg_agg = 16`), manages ping-pong buffers, uploads offset lists via `cl.enqueue_copy`, chains `cl.Event`s between stages. |
+| **Execution** | *The computation itself*. | `aggregate_register_reduce` / `aggregate_local_reduce` kernels sum partials. `clip_intermediate_grad` clips. `stabilize_and_reduce_grad_hidden_activations` (Node 16) runs its own internal `log_K(M)` reduction. |
+
+The two-layer boundary (shared / backend) maps cleanly to this: the Policy tier is always shared; the Orchestration and Execution tiers are always backend-side. But the *distribution* of work across the three tiers varies by node type — the existing OpenCL code already demonstrates this:
+
+**Host-orchestrated reduction trees (Nodes 14, 15, 20).** All three tiers have distinct actors. `StabilizationPolicy` computes the threshold schedule and `K` (Policy). `_execute_reduction_pipeline` in `graph_recipes.py` drives the stage loop — selecting kernel tier, allocating intermediate buffers, uploading offset lists, threading `cl.Event` chains (Orchestration). The `aggregate_*` and `clip_intermediate_grad` kernels execute individual stages (Execution).
+
+**Specialized kernels (Node 16).** The Orchestration tier collapses into the Execution tier. `StabilizationPolicy` still computes `policy_max_k`, and the plan still carries `T_algorithmic`, `λ`, and `fp_max` as scalar parameters (Policy). But the kernel itself manages its internal multi-stage reduction — selecting its own fan-in, running its own `log_K(M)` loop, inserting its own synchronization. The host's role reduces to a single `KernelExecutor.launch()` call. This collapse is possible because Node 13 (`gather_and_permute_grad_h`) guarantees contiguous input, eliminating the inter-stage logistics — scattered offset lists, intermediate buffer allocation — that otherwise require host participation.
+
+**Simple kernel dispatches (Nodes 4–11, 17–19, 21, 24, 25).** The Orchestration tier is minimal. `graph_recipes.py` issues a single `KernelExecutor.launch()` with the appropriate event dependencies. Policy determines the parameters; execution is a single kernel invocation.
+
+This observed pattern is significant for the abstraction boundary because it reveals that **the Policy tier is the only tier that is invariant across all node types and all backends**. In every case — whether the host drives a multi-stage loop, a kernel manages its own internal reduction, or a simple dispatch occurs — the shared layer is responsible for setting the constraints. The Orchestration and Execution tiers redistribute freely depending on the node's structure and the backend's native capabilities.
+
+The plan boundary (this ADR) therefore separates Policy from Orchestration. The kernel contract boundary (CONTRACT.md) separates Orchestration from Execution. When a future backend discovers an optimization that shifts work between these latter two tiers — e.g., a Vulkan backend fusing adjacent sum-and-clip stages into a single command buffer segment, or a CPU backend inlining the stage loop — CONCEPT.md §1 (Architectural Elegance Feedback) applies: if the shift creates tension with the plan vocabulary, it is formalized as a plan-level primitive, not hidden inside the renderer.
+
 ### What crosses the boundary
 
 The execution plan carries:

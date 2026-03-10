@@ -33,7 +33,7 @@ From the CONCEPT.md DAG and the `BatchProcessor`'s current execution flow, the p
 
 1. **Kernel dispatch nodes** — individual kernel invocations with their logical buffer bindings, tile decomposition, and scalar parameters. These are the fundamental units of work (Nodes 4–11, 13, 16–19, 21, 24, 25).
 
-2. **Reduction tree structures** — multi-stage `log_K(N)` reduction trees with per-stage fan-in, kernel tier selection, offset lists, and optional clip steps. These correspond to the Recursive Clip-Aggregation Engine (Nodes 14, 15, 20). See ADR-003.
+2. **Reduction tree structures** — multi-stage `log_K(N)` reduction trees with fan-in, offset lists, per-stage thresholds, and optional clip steps. Kernel tier selection is an Orchestration-tier concern (ADR-001 §Three-tier jurisdictional model) resolved by the renderer, not the plan. These correspond to the Recursive Clip-Aggregation Engine (Nodes 14, 15, 20). See ADR-003.
 
 3. **Streaming loop structures** — parametric loops over a chunk-indexed sub-DAG. Phase III's streaming backpropagation (Nodes 17→18→19, iterated per chunk) and the Model A recompute path (Nodes 4→5→6/7→8→9→10→11, iterated per tile under `RECOMPUTE_GRAD_H`). See ADR-004.
 
@@ -133,8 +133,8 @@ The execution plan is a directed acyclic graph of typed, immutable node descript
 
 | Node Type              | Semantics                                                                                           | CONCEPT.md Correspondence                                      |
 | :--------------------- | :-------------------------------------------------------------------------------------------------- | :------------------------------------------------------------- |
-| `KernelDispatchNode`   | A single logical kernel invocation with buffer bindings, scalar parameters, tile decomposition, and placement strategy. | Nodes 4, 5, 6, 7, 8, 9, 10, 11, 13, 16, 17, 18, 19, 21, 24, 25 |
-| `ReductionTreeNode`    | A multi-stage reduction tree (stages, fan-ins, offset lists, per-stage thresholds, kernel tier selection). Rendered as a sub-DAG by the backend. | Nodes 14, 15, 20                                               |
+| `KernelDispatchNode`   | A single logical kernel invocation with buffer bindings, scalar parameters, tile decomposition, and placement strategy. Node 16 appears here despite its internal multi-stage reduction because ADR-001's plan boundary stops at the kernel's public interface — the Orchestration and Execution tiers collapse into a single kernel dispatch (see ADR-001 §Three-tier jurisdictional model, ADR-005). | Nodes 4, 5, 6, 7, 8, 9, 10, 11, 13, 16, 17, 18, 19, 21, 24, 25 |
+| `ReductionTreeNode`    | A multi-stage reduction tree (fan-in, offset lists, per-stage thresholds). Rendered atomically by the backend, which selects kernel tiers and manages intermediate buffers. Internal structure defined in ADR-003. | Nodes 14, 15, 20                                               |
 | `StreamingLoopNode`    | A parametric loop over a chunk-indexed sub-DAG body. Specifies chunk count, per-chunk parameter deltas, and the flat body sequence. | Phase III streaming (Nodes 17→18→19); Model A recompute path   |
 | `BarrierNode`          | A named synchronization point that joins multiple upstream dependency edges. Carries no kernel dispatch — it is a pure sequencing construct. | Node 13 (Item Sync), Node 22 (Batch Sync)                     |
 | `RetrievalNode`        | A host-accessible result extraction point. Specifies the source buffer, expected shape, and the named event it signals. | Node 23 (`inference_event`), `final_batch_event`               |
@@ -204,7 +204,9 @@ This satisfies CONTRACT.md Article 1.4a (Host Proof Obligation): all validation 
 
 ### ReductionTreeNode design principles
 
-The `ReductionTreeNode` encapsulates the full Recursive Clip-Aggregation Engine for one parameter flow. Its internal structure — stage count, per-stage fan-in, offset lists, kernel tier selection, optional clip steps, and Quadratic Scaling Policy thresholds — is defined in ADR-003.
+The `ReductionTreeNode` encapsulates the full Recursive Clip-Aggregation Engine for one parameter flow. Its internal structure — stage count, per-stage fan-in, offset lists, optional clip steps, and Quadratic Scaling Policy thresholds — is defined in ADR-003.
+
+The `ReductionTreeNode` is the canonical example of how the three-tier jurisdictional model (ADR-001 §Three-tier jurisdictional model) distributes across all three tiers with distinct actors. In the existing OpenCL code, `StabilizationPolicy` computes the threshold schedule and fan-in (Policy); `_execute_reduction_pipeline` in `graph_recipes.py` drives the stage loop, selects kernel tier, and manages intermediate buffers (Orchestration); `aggregate_*` and `clip_intermediate_grad` kernels execute individual stages (Execution). The `ReductionTreePlan` (ADR-003) is the data structure that carries the Policy tier's output across the plan boundary to the Orchestration tier.
 
 The plan carries the reduction tree as a single, typed node rather than expanding it into individual `KernelDispatchNode`s because:
 
@@ -235,7 +237,7 @@ The `DataLifecyclePolicy` and its `DependencyProvider` subclasses (`CacheProvide
 
 - **Inspectable dependency structure.** The plan's dependency edges are a first-class data structure that can be topologically sorted, visualized, validated against CONCEPT.md invariants, and compared across backends — all without executing anything.
 - **Static type safety.** Each node type enforces its own field invariants. A `BarrierNode` cannot accidentally carry kernel dispatch parameters. A `RetrievalNode` cannot be missing its source buffer specification.
-- **Backend rendering freedom.** The typed DAG with explicit edges gives each renderer complete freedom in its execution strategy. OpenCL builds event chains. Vulkan records a command buffer in topological order with pipeline barriers at dependency edges. CPU executes a topological sort. No renderer is constrained by another's execution model.
+- **Backend rendering freedom.** The typed DAG with explicit edges gives each renderer complete freedom in its execution strategy — the Orchestration and Execution tiers (ADR-001 §Three-tier jurisdictional model) are entirely backend-owned. OpenCL builds event chains. Vulkan records a command buffer in topological order with pipeline barriers at dependency edges. CPU executes a topological sort. No renderer is constrained by another's execution model.
 - **Single validation pass.** Contract validation occurs once at plan-construction time (CONTRACT.md Article 1.4a). The renderer receives a pre-validated plan and proceeds directly to dispatch.
 - **Concurrency from structure.** The DAG's dependency edges are the complete and sufficient specification of concurrency constraints. No separate concurrency annotation layer is needed.
 - **Named synchronization fidelity.** The CONCEPT.md synchronization points (Item Sync, Batch Sync, `inference_event`, `final_batch_event`) are directly represented as typed nodes with specific `node_id` values, preserving their architectural significance.
@@ -259,7 +261,7 @@ Per ADR-017 (Incremental Migration Path), this decision affects Phase 2:
 
 ## References
 
-- [ADR-001: Backend Abstraction Boundary](ADR-001-backend-abstraction-boundary.md) — foundational decision on plan-level abstraction
+- [ADR-001: Backend Abstraction Boundary](ADR-001-backend-abstraction-boundary.md) — foundational decision on plan-level abstraction; three-tier jurisdictional model (Policy / Orchestration / Execution)
 - [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback, §4 Asynchronous Host Interaction, §5 Unified Execution Model, DAG diagram
 - [CONTRACT.md](../CONTRACT.md) — Article 1.1 Jurisdictional Separation, Article 1.4 Collaborative Interface Verifiability, Article 3.2 Placement Contract
 - [ADR_PLAN.md](../ADR_PLAN.md) — ADR-002 problem statement and narrowing analysis
