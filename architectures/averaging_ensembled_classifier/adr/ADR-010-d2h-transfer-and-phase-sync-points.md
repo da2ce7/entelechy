@@ -712,9 +712,9 @@ class ExecutionPlan:
 
 ### Migration implications
 
-Per ADR-002's migration path and ADR-012's proposed structure:
+Per ADR-002's migration path and ADR-012's structure:
 
-1. **Define the Protocol** (`RetrievalFuture`) in the shared layer (e.g., `shared/retrieval_future.py`). Define the `RetrievalNode` frozen dataclass alongside the other node types in `shared/plan_types.py`. These are additive definitions — no existing code is modified.
+1. **Define the Protocol** (`RetrievalFuture`) in the shared layer (`shared/retrieval_future.py`). Define the `RetrievalNode` frozen dataclass alongside the other node types in `shared/plan_types.py`. These are additive definitions — no existing code is modified.
 
 2. **Add `logical_shape` to `RetrievalNode`.** The plan builder computes the logical (unpadded) shape from `MemoryLayout` and stores it on the `RetrievalNode`. The `padded_shape` remains on the `BufferDescriptor` (ADR-009). The renderer uses both.
 
@@ -741,7 +741,7 @@ Per ADR-002's migration path and ADR-012's proposed structure:
 - [ADR-002: Plan Node Types & Synchronization Structure](ADR-002-plan-node-types-and-synchronization-structure.md) — `RetrievalNode` definition; named synchronization points (`inference_event`, `final_batch_event`); renderer signals host-side availability
 - [ADR-009: Buffer Lifecycle in the Plan Model](ADR-009-buffer-lifecycle-in-the-plan-model.md) — `BufferDescriptor` with `BATCH_OUTPUT` role; `last_consumer` semantics; `BufferHandle` as shared-layer token; backend rendering contract
 - [ADR-008: Precision Configuration](ADR-008-precision-configuration.md) — `PrecisionConfig.numpy_dtype` governs the dtype of the returned numpy array
-- [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution-stub.md) — proposed `shared/` directory structure where `RetrievalFuture` and `RetrievalNode` live
+- [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution.md) — `shared/` directory structure where `RetrievalFuture` and `RetrievalNode` live
 - [CONCEPT.md](../CONCEPT.md) — §4 Asynchronous Host Interaction (`inference_event`, `final_batch_event`); §5 Unified Execution Model (Sequential vs. Event-Triggered); §2 Primacy of Memory Strategy (CPU zero-copy)
 - [CONTRACT.md](../CONTRACT.md) — Article 1.4 Collaborative Interface Verifiability (pre-dispatch validation in the shared layer)
 - [VULKAN_BACKEND.md](../VULKAN_BACKEND.md) — Command buffer strategy (Act/Learn split); staging buffer allocation (`VMA_ALLOCATION_CREATE_MAPPED_BIT`); `VkFence` for host synchronization

@@ -454,7 +454,7 @@ The sum of plan-level + estimated renderer-internal gives the shared layer a rel
 
 Per ADR-002's migration path:
 
-1. **Define the data structures** (`BufferRole`, `BufferHandle`, `BufferDescriptor`) as frozen types in the shared layer (e.g., `shared/buffer_handles.py` per ADR-012's proposed structure). The `BufferHandle` type is extracted from `launcher_infra.py` into the shared layer, removing its OpenCL dependency. No existing code is modified at this step.
+1. **Define the data structures** (`BufferRole`, `BufferHandle`, `BufferDescriptor`) as frozen types in the shared layer (`shared/buffer_lifecycle.py` per ADR-012). The `BufferHandle` type is extracted from `launcher_infra.py` into the shared layer, removing its OpenCL dependency. No existing code is modified at this step.
 
 2. **Add buffer namespace construction** to the `ExecutionPlanBuilder`: for each plan being built, enumerate all buffer names from the DAG nodes, resolve shapes from `ParameterSpace.get_all_memory_layouts()`, classify roles, compute producing nodes and consumer sets from `buffer_bindings` and kernel contract flow prefixes, and determine `last_consumer` via topological analysis. The resulting `Tuple[BufferDescriptor, ...]` is stored on the `ExecutionPlan`.
 

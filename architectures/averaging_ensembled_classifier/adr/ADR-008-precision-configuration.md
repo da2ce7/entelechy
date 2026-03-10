@@ -429,7 +429,7 @@ This is a backend-level concern, not a shared-layer concern. The shared layer's 
 - [ADR-001: Backend Abstraction Boundary](ADR-001-backend-abstraction-boundary.md) — plan-as-data-structure; shared layer produces backend-neutral data; three-tier jurisdictional model
 - [ADR-006: Hardware Profile](ADR-006-hardware-profile.md) — `HardwareProfile` as standalone frozen dataclass; precision-decoupled; `simd_width` is precision-dependent but profile is not precision-typed; plan builder receives hardware profile and precision as separate inputs
 - [ADR-007: KernelSignature Contract/Binding Split](ADR-007-kernel-signature-contract-binding-split.md) — local memory size formulas are symbolic to avoid coupling to precision configuration; `scalar_bytes` derived at bind time
-- [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution-stub.md) — `precision_context.py` in `shared/` directory; `PrecisionContext` refactored per this ADR
+- [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution.md) — `shared/precision_config.py` directory placement; `PrecisionContext` dissolved per this ADR
 - [CONTRACT.md](../CONTRACT.md) — Article 6 mandates `SCALAR_TYPE`, `SCALAR_IS_HALF`, `NUMERICAL_STABILITY_EPSILON` as build-time symbols
 - [CONCEPT.md](../CONCEPT.md) — §3.4 safety ceiling calculation using `FP_FORMAT_MAX`
 - [CPU_BACKEND.md](../CPU_BACKEND.md) — compile-time ISA detection; FP16 may be unsupported
