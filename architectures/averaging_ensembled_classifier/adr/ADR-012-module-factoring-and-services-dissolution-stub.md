@@ -53,10 +53,13 @@ src/
 │   ├── plan_types.py                # Node dataclasses from ADR-002 (incl. RetrievalNode)
 │   ├── buffer_lifecycle.py          # ADR-009 — BufferHandle, BufferRole, BufferDescriptor
 │   ├── retrieval_future.py          # ADR-010 — RetrievalFuture Protocol
+│   ├── problem_type_strategy.py     # ADR-011 — ProblemTypeStrategy ABC, CceStrategy, BceStrategy
 │   ├── kernel_contracts/            # ADR-007 — KernelContract frozen dataclasses
 │   │   ├── __init__.py              # Exports KernelContractBlock registry
-│   │   ├── phase_1_act.py
-│   │   ├── phase_2_learn_A_production.py
+│   │   ├── phase_1_act.py           # Node 4, 5; Node 6 (CCE) and Node 7 (BCE) as
+│   │   │                            #   separate contracts per ADR-011 Strategy B
+│   │   ├── phase_2_learn_A_production.py  # Nodes 8, 9, 10 — unified contracts with
+│   │   │                            #   ScalarParamSpec(FLAG_problem_type) per ADR-011 Strategy A
 │   │   ├── ...
 │   │   └── phase_3_update.py
 │   └── workload_primitives.py       # TilingScheme, WorkTile, GatherPrimitive (pure math)
@@ -91,7 +94,15 @@ src/
 └── orchestrator.py                   # Top-level assembly
 ```
 
-The `shared/kernel_contracts/` directory maps one-to-one with `KernelContract` frozen dataclasses (ADR-007). Each file constructs `KernelContract` instances with `BufferParamSpec`, `ScalarParamSpec`, `LocalMemorySpec`, and `PlacementContract` entries per the decided schema. Each `backends/<name>/kernel_bindings/` directory contains the corresponding `KernelBinding` implementations that translate validated contracts to native dispatch format.
+The `shared/kernel_contracts/` directory maps one-to-one with `KernelContract` frozen dataclasses (ADR-007). Each file constructs `KernelContract` instances with `BufferParamSpec`, `ScalarParamSpec`, `LocalMemorySpec`, and `PlacementContract` entries per the decided schema.
+
+**ADR-011 impact on kernel contract organization:** The mixed CCE/BCE strategy (ADR-011) manifests in two ways within `shared/kernel_contracts/`:
+- **Strategy B (Nodes 6/7):** `phase_1_act.py` exports two distinct `KernelContract` instances: `compute_probs_loss_cce_chunk_contract` and `compute_probs_loss_bce_chunk_contract`. Each has its own self-consistent parameter manifest (different `kernel_name`, different targets buffer type, different loss output topology).
+- **Strategy A (Nodes 8/9/10):** `phase_2_learn_A_production.py` exports one `KernelContract` per kernel (e.g., `calculate_module_param_grads_chunk_contract`), each including a `ScalarParamSpec` for `src_scalar_FLAG_problem_type`. The targets buffer's conditional specification is documented in the contract's `validation_preconditions`.
+
+The `shared/problem_type_strategy.py` module houses the `ProblemTypeStrategy` ABC, `CceStrategy`, and `BceStrategy`. The plan builder queries this strategy to select the correct `kernel_name` for Nodes 6/7 (Strategy B) and the correct FLAG value for Nodes 8/9/10 (Strategy A). The strategy also determines the DAG topology — `BceStrategy` includes the loss reduction sub-tree in Node 14's inputs; `CceStrategy` omits it.
+
+Each `backends/<name>/kernel_bindings/` directory contains the corresponding `KernelBinding` implementations that translate validated contracts to native dispatch format. For Strategy A kernels, the OpenCL binding passes the FLAG as a positional scalar, the Vulkan binding delivers it as a specialization constant or push constant, and the CPU binding passes it as a C function parameter (ADR-011 §Backend rendering responsibilities).
 
 Each `backends/<name>/buffer_allocator.py` consumes the plan's `Tuple[BufferDescriptor, ...]` (ADR-009) — allocating physical memory from `size_bytes`, building the `BufferHandle` → physical map, and optionally using `role`, `producing_node`, and `last_consumer` annotations to optimize memory reuse.
 
@@ -115,6 +126,8 @@ Each `backends/<name>/retrieval.py` implements the `RetrievalFuture` Protocol (A
 
 **ADR-010 (ACCEPTED):** The `RetrievalFuture` Protocol is a shared-layer type → `shared/retrieval_future.py`. Each backend implements the Protocol in `backends/<name>/retrieval.py`. The renderer's `render()` method returns `Dict[str, RetrievalFuture]` — one future per `RetrievalNode` in the plan. The existing `HostView` class is dissolved: its host-buffer allocation and padding-stripping logic are absorbed by the OpenCL backend's `_OpenCLRetrievalFuture`. The shared-layer import of `HostView` is replaced by the `RetrievalFuture` Protocol. The `release()` lifecycle method bridges ADR-009's `last_consumer` semantics — the renderer retains `BATCH_OUTPUT` physical memory until the host signals consumption complete.
 
+**ADR-011 (ACCEPTED):** CCE/BCE strategy delegation uses a mixed approach: Strategy B (separate `kernel_name`) for Nodes 6/7, Strategy A (`FLAG_problem_type` scalar) for Nodes 8/9/10. The `ProblemTypeStrategy` hierarchy (`CceStrategy`, `BceStrategy`) lives in `shared/problem_type_strategy.py` and drives the plan builder's kernel selection and DAG topology decisions. Each backend's kernel bindings handle the FLAG delivery mechanism natively. See §ADR-011 impact above for directory structure implications.
+
 ---
 
 ## Tensions
@@ -132,3 +145,4 @@ Each `backends/<name>/retrieval.py` implements the `RetrievalFuture` Protocol (A
 - [ADR-008: Precision Configuration](ADR-008-precision-configuration.md)
 - [ADR-009: Buffer Lifecycle in the Plan Model](ADR-009-buffer-lifecycle-in-the-plan-model.md)
 - [ADR-010: D2H Transfer & Phase Sync Points](ADR-010-d2h-transfer-and-phase-sync-points.md)
+- [ADR-011: CCE/BCE Strategy Delegation](ADR-011-cce-bce-strategy-delegation.md)
