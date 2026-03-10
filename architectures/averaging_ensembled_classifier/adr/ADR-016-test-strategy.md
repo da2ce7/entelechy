@@ -576,7 +576,7 @@ This decision enables formal gate definitions for ADR-017's migration phases:
 - [ADR-013: Kernel Source Strategy](ADR-013-kernel-source-strategy.md) — three-tier specification hierarchy; kernel inventory; CPU as natural oracle candidate; cross-backend fidelity assurance model
 - [ADR-014: Build System Integration](ADR-014-build-system-integration.md) — `_build_config.py` manifest; conditional backend enablement; `auto` defaults for CI self-configuration
 - [ADR-015: Python ↔ Native Backend Interop](ADR-015-python-native-backend-interop.md) — ctypes FFI with `_verify_layouts()` pre-gate; Tier 2 as behavioral FFI verification; CPU dispatch inspectability
-- [ADR-017: Incremental Migration Path](ADR-017-incremental-migration-path-stub.md) — migration phase rollback gates defined by tier outcomes
+- [ADR-017: Incremental Migration Path](ADR-017-incremental-migration-path.md) — migration phase rollback gates defined by tier outcomes
 - [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback; §3 Modular Dumb Kernels; §3.4 Safety ceiling calculations; §5 Unified Execution Model
 - [CONTRACT.md](../CONTRACT.md) — Article 1.4 Collaborative Interface Verifiability; Article 3.2 Placement Contract; Article 5 Architectural Constants
 - [CPU_BACKEND.md](../CPU_BACKEND.md) — deterministic single-threaded-per-task execution model; `pool_dispatch_and_wait` dispatch

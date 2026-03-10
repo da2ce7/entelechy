@@ -250,7 +250,7 @@ The renderer is free to:
 
 ### Migration implications
 
-Per ADR-020 (Incremental Migration Path), this decision validates the proposed phasing:
+Per ADR-017 (Incremental Migration Path), this decision validates the proposed phasing:
 
 1. **Phase 0:** Extract backend-neutral `Protocol` types from current OpenCL code. No behavioural change.
 2. **Phase 1:** Purify the shared layer—remove all `pyopencl` imports from `execution_plan.py`, `stabilization_policy.py`, `workload_primitives.py`, `model_spec.py`, `memory_layout.py`, `parameter_space.py`.

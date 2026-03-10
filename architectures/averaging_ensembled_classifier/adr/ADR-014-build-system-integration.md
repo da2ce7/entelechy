@@ -736,7 +736,7 @@ Per ADR-017's phasing:
 - [ADR-013: Kernel Source Strategy](ADR-013-kernel-source-strategy.md) — kernel source locations (`kernels/`, `src/backends/vulkan/kernel_sources/`, `src/backends/cpu/kernel_sources/`); OpenCL cross-boundary reference; SPIR-V at build time; `task_<kernel_name>` C ABI
 - [ADR-015: Python ↔ Native Backend Interop](ADR-015-python-native-backend-interop.md) — CPU shared library loading mechanism; C ABI surface consumed by FFI layer; ctypes as CPU backend FFI
 - [ADR-016: Test Strategy](ADR-016-test-strategy.md) — Tier 1/2/3 test structure; conditional test execution based on enabled backends
-- [ADR-017: Incremental Migration Path](ADR-017-incremental-migration-path-stub.md) — per-phase build system evolution
+- [ADR-017: Incremental Migration Path](ADR-017-incremental-migration-path.md) — per-phase build system evolution
 - [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback (formalize build abstractions, don't hack around them)
 - [CONTRACT.md](../CONTRACT.md) — Article 6 Mandatory Build-Time Symbols (`SCALAR_TYPE`, `SIMD_WIDTH`, `C_TILE_SIZE`, `NUMERICAL_STABILITY_EPSILON`)
 - [STRUCTURE.md](../../STRUCTURE.md) — §2 Architectural Autonomy; §3 Declarative Interaction; §4 Build-Time System Guarantees
