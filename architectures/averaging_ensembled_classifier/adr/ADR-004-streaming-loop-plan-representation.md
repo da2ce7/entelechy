@@ -557,5 +557,5 @@ Per ADR-002's migration path:
 - [CONCEPT.md](../CONCEPT.md) — §2 Model A (Accumulate via Recompute) and Model B (True Streaming); §5 Host Orchestrator & Execution Policies (chunk definition, activation lifecycle); §1 Architectural Elegance Feedback
 - [CONTRACT.md](../CONTRACT.md) — Article 1.4 Collaborative Interface Verifiability; Article 3.2 Placement Contract (`linear_batch`, `grid_mod_cls` strategies)
 - [ADR_PLAN.md](../ADR_PLAN.md) — ADR-004 problem statement and narrowing analysis
-- [ADR-009: Buffer Lifecycle in the Plan Model](ADR-009-buffer-lifecycle-in-the-plan-model.md) — plan-level vs. renderer-internal buffer scope (pending)
+- [ADR-009: Buffer Lifecycle in the Plan Model](ADR-009-buffer-lifecycle-in-the-plan-model.md) — plan-level buffer lifetime annotations; two-tier buffer scope formalization
 - [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution.md) — physical placement of `StreamingLoopPlan` in `execution_plan.py` (pending)

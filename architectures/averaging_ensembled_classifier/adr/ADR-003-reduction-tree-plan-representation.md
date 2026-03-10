@@ -375,4 +375,4 @@ Per ADR-002's migration path:
 - [CONCEPT.md](../CONCEPT.md) — §2 Recursive Tiered Aggregation Engine; §3 Gradient Stabilization (Quadratic Scaling Policy, safety clamping); §1 Architectural Elegance Feedback
 - [CONTRACT.md](../CONTRACT.md) — Article 1.4 Collaborative Interface Verifiability; Group 5 Parallel Processing & Reduction Primitives; `offset_list` Indirection Contract
 - [ADR_PLAN.md](../ADR_PLAN.md) — ADR-003 problem statement and narrowing analysis
-- [ADR-009: Buffer Lifecycle in the Plan Model](ADR-009-buffer-lifecycle-in-the-plan-model.md) — intermediate buffer lifetime implications (pending)
+- [ADR-009: Buffer Lifecycle in the Plan Model](ADR-009-buffer-lifecycle-in-the-plan-model.md) — plan-level buffer lifetime annotations; two-tier buffer scope formalization

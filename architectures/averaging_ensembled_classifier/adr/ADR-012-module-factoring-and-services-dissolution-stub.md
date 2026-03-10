@@ -19,7 +19,7 @@ The current `src/` directory is a flat namespace where shared-layer logic, backe
 The existing Services layer (`cl_context_manager.py`, `compute_patterns.py`, `launcher_infra.py`) is dissolved:
 - **Context management** → backend-specific (each backend's renderer creates and owns its execution context).
 - **Hardware discovery** → backend-specific. ADR-006 (ACCEPTED) establishes `HardwareProfile` as a shared-layer frozen dataclass; each backend *constructs* it from its native discovery mechanism.
-- **Precision-to-native mapping** → backend-specific. ADR-008 (ACCEPTED) establishes `PrecisionConfig` as a shared-layer frozen dataclass carrying `numpy_dtype`, `fp_format_max`, and `epsilon`; each backend maps `numpy_dtype` to its native type system (`float`/`half` for OpenCL, `float`/`float16_t` for Vulkan GLSL, `float`/`_Float16` for CPU C) at render time.
+- **Precision-to-native mapping** → backend-specific. ADR-008 (ACCEPTED) establishes `PrecisionConfig` as a shared-layer frozen dataclass carrying `numpy_dtype`, `fp_format_max`, and `epsilon`; each backend maps `numpy_dtype` to its native type system at render time.
 - **Compute patterns** → split between shared (tiling, padding helpers as pure math) and backend-specific (dispatch pattern translation).
 - **Launcher infrastructure** → shared orchestration layer that calls the selected backend's renderer.
 
@@ -51,13 +51,14 @@ src/
 │   ├── hardware_profile.py          # ADR-006 — HardwareProfile frozen dataclass only
 │   ├── plan_builder.py              # Consumes above, produces plan DAG
 │   ├── plan_types.py                # Node dataclasses from ADR-002
+│   ├── buffer_lifecycle.py          # ADR-009 — BufferHandle, BufferRole, BufferDescriptor
 │   ├── kernel_contracts/            # ADR-007 — KernelContract frozen dataclasses
 │   │   ├── __init__.py              # Exports KernelContractBlock registry
 │   │   ├── phase_1_act.py
 │   │   ├── phase_2_learn_A_production.py
 │   │   ├── ...
 │   │   └── phase_3_update.py
-│   └── buffer_handles.py            # ADR-009 — BufferHandle definitions
+│   └── workload_primitives.py       # TilingScheme, WorkTile, GatherPrimitive (pure math)
 ├── backends/
 │   ├── __init__.py
 │   ├── opencl/
@@ -66,25 +67,29 @@ src/
 │   │   ├── context.py               # cl.Context + queue management
 │   │   ├── discovery.py             # Populates HardwareProfile from cl.device_info
 │   │   ├── type_mapping.py          # Maps PrecisionConfig.numpy_dtype → OpenCL types
-│   │   ├── kernel_bindings/         # ADR-007 — OpenCL KernelBinding implementations
-│   │   │   ├── __init__.py
-│   │   │   ├── phase_1_act.py       # Injects flat_tile_index, marshals cl.Buffer args
-│   │   │   └── ...
-│   │   └── buffer_allocator.py
+│   │   ├── buffer_allocator.py      # Allocates cl.Buffer from BufferDescriptor; reuse via lifetime intervals
+│   │   └── kernel_bindings/         # ADR-007 — OpenCL KernelBinding implementations
+│   │       ├── __init__.py
+│   │       ├── phase_1_act.py       # Injects flat_tile_index, marshals cl.Buffer args
+│   │       └── ...
 │   ├── vulkan/
 │   │   ├── discovery.py             # Populates HardwareProfile from VkPhysicalDevice
 │   │   ├── type_mapping.py          # Maps PrecisionConfig.numpy_dtype → Vulkan/GLSL types
+│   │   ├── buffer_allocator.py      # Suballocates from VkDeviceMemory using lifetime intervals
 │   │   ├── kernel_bindings/         # Push constants + descriptor sets
 │   │   └── ...
 │   └── cpu/
 │       ├── discovery.py             # Populates HardwareProfile from ISA flags + OS queries
 │       ├── type_mapping.py          # Maps PrecisionConfig.numpy_dtype → C types
+│       ├── buffer_allocator.py      # malloc / arena allocation from BufferDescriptor
 │       ├── kernel_bindings/         # C function arg struct marshalling
 │       └── ...
 └── orchestrator.py                   # Top-level assembly
 ```
 
 The `shared/kernel_contracts/` directory maps one-to-one with `KernelContract` frozen dataclasses (ADR-007). Each file constructs `KernelContract` instances with `BufferParamSpec`, `ScalarParamSpec`, `LocalMemorySpec`, and `PlacementContract` entries per the decided schema. Each `backends/<name>/kernel_bindings/` directory contains the corresponding `KernelBinding` implementations that translate validated contracts to native dispatch format.
+
+Each `backends/<name>/buffer_allocator.py` consumes the plan's `Tuple[BufferDescriptor, ...]` (ADR-009) — allocating physical memory from `size_bytes`, building the `BufferHandle` → physical map, and optionally using `role`, `producing_node`, and `last_consumer` annotations to optimize memory reuse.
 
 ---
 
@@ -98,9 +103,9 @@ The `shared/kernel_contracts/` directory maps one-to-one with `KernelContract` f
 
 **ADR-007 (ACCEPTED):** The `KernelContract` / `KernelBinding` split maps directly to `shared/kernel_contracts/` and `backends/<name>/kernel_bindings/`. `KernelContract` is a frozen dataclass carrying `BufferParamSpec`, `ScalarParamSpec`, `LocalMemorySpec`, and `PlacementContract` entries. `KernelBinding` is Orchestration-tier code that accepts a validated `KernelContract` and translates it to native dispatch format. The existing `kernel_signatures/` sub-package dissolves: each signature becomes a `KernelContract` (shared) + one `KernelBinding` per backend.
 
-**ADR-008 (ACCEPTED):** `PrecisionConfig` is a shared-layer frozen dataclass (`shared/precision_config.py`) carrying `numpy_dtype`, `fp_format_max`, and `epsilon`. The `PrecisionContext` ABC, `Float32Context`, `Float16Context`, and all precision-specific subclass variants (`Float32ModelSpec`, `Float16ModelSpec`, `Float32DiscoveredArchConstants`, etc.) are eliminated. `ModelSpec` composes `PrecisionConfig` as a field instead of inheriting from `PrecisionContext`. Each backend maps `PrecisionConfig.numpy_dtype` to its native type vocabulary at render time — this mapping lives in `backends/<name>/type_mapping.py`, not in the shared layer. The `arch_primitives.py` module that hosted the old hierarchy is dissolved; its remaining non-precision utilities (e.g., `c_tile_extent`) move to `shared/`.
+**ADR-008 (ACCEPTED):** `PrecisionConfig` is a shared-layer frozen dataclass (`shared/precision_config.py`) carrying `numpy_dtype`, `fp_format_max`, and `epsilon`. The `PrecisionContext` ABC and all precision-specific subclass variants are eliminated. `ModelSpec` composes `PrecisionConfig` as a field instead of inheriting from `PrecisionContext`. Each backend maps `PrecisionConfig.numpy_dtype` to its native type vocabulary at render time in `backends/<name>/type_mapping.py`. The `arch_primitives.py` module that hosted the old hierarchy is dissolved; its remaining non-precision utilities (e.g., `c_tile_extent`) move to `shared/`.
 
-**ADR-009:** `BufferHandle` is shared. Physical allocation is backend-specific.
+**ADR-009 (ACCEPTED):** `BufferHandle`, `BufferRole`, and `BufferDescriptor` are shared-layer frozen types → `shared/buffer_lifecycle.py`. The plan builder constructs a `Tuple[BufferDescriptor, ...]` carrying per-buffer shape, size, role, and lifetime annotations (`producing_node`, `consumers`, `last_consumer`). Physical allocation is entirely backend-specific: each `backends/<name>/buffer_allocator.py` iterates over the descriptor tuple, allocates native memory, and builds the `BufferHandle` → physical map. Vulkan uses lifetime intervals for suballocation packing; OpenCL allocates discrete `cl.Buffer`s; CPU uses `malloc` or arena allocation. The two-tier buffer scope (plan-level vs. renderer-internal) is formalized — renderer-internal buffers (reduction intermediates, scratch buffers) are allocated by the renderer without plan-level descriptors.
 
 ---
 
@@ -117,4 +122,4 @@ The `shared/kernel_contracts/` directory maps one-to-one with `KernelContract` f
 - [ADR-006: Hardware Profile](ADR-006-hardware-profile.md)
 - [ADR-007: KernelSignature Contract/Binding Split](ADR-007-kernel-signature-contract-binding-split.md)
 - [ADR-008: Precision Configuration](ADR-008-precision-configuration.md)
-- [ADR-009: Buffer Lifecycle](ADR-009-buffer-lifecycle-in-the-plan-model-stub.md)
+- [ADR-009: Buffer Lifecycle in the Plan Model](ADR-009-buffer-lifecycle-in-the-plan-model.md)
