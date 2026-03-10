@@ -175,9 +175,9 @@ class TestGatherAndPermuteGradHiddenActivations:
             total_modules_count=np.uint32(MODULES),
             hidden_count=np.uint32(HIDDEN_NATURAL),
             total_batch_count=np.uint32(BATCH),
-            num_module_chunks_count=np.uint32(NUM_MODULE_CHUNKS),
-            modules_per_chunk_count=np.uint32(MODULES_PER_CHUNK),
-            num_class_chunks_count=np.uint32(NUM_CLASS_CHUNKS),
+            num_module_chunks=np.uint32(NUM_MODULE_CHUNKS),
+            modules_per_chunk=np.uint32(MODULES_PER_CHUNK),
+            num_class_chunks=np.uint32(NUM_CLASS_CHUNKS),
         )
 
     def test_kernel_name(self, sig):
@@ -216,7 +216,7 @@ class TestGatherAndPermuteGradHiddenActivations:
                 hidden_count=np.uint32(HIDDEN_NATURAL),
                 total_batch_count=np.uint32(BATCH),
                 # Intentionally wrong: 2 * 2 = 4 != TILES (1)
-                num_module_chunks_count=np.uint32(2),
-                modules_per_chunk_count=np.uint32(MODULES_PER_CHUNK),
-                num_class_chunks_count=np.uint32(2),
+                num_module_chunks=np.uint32(2),
+                modules_per_chunk=np.uint32(MODULES_PER_CHUNK),
+                num_class_chunks=np.uint32(2),
             )

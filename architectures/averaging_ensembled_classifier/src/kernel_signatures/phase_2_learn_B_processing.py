@@ -232,9 +232,9 @@ class GatherAndPermuteGradHiddenActivationsSignature(KernelSignature):
     total_modules_count: np.uint32
     hidden_count: np.uint32
     total_batch_count: np.uint32
-    num_module_chunks_count: np.uint32
-    modules_per_chunk_count: np.uint32
-    num_class_chunks_count: np.uint32
+    num_module_chunks: np.uint32
+    modules_per_chunk: np.uint32
+    num_class_chunks: np.uint32
 
     padded_hidden_count: np.uint32 = field(init=False)
     padded_total_modules_count: np.uint32 = field(init=False)
@@ -253,13 +253,13 @@ class GatherAndPermuteGradHiddenActivationsSignature(KernelSignature):
         # --- Contractual Verification (Host-Side Assurance) ---
         # This block is the system's guarantee that the host's strategy is
         # physically realizable in the memory it has allocated.
-        assert self.total_tile_count == self.num_module_chunks_count * self.num_class_chunks_count, (
+        assert self.total_tile_count == self.num_module_chunks * self.num_class_chunks, (
             f"Host plan inconsistency: total_tiles ({self.total_tile_count}) does not match "
-            f"num_module_chunks ({self.num_module_chunks_count}) * num_class_chunks ({self.num_class_chunks_count})."
+            f"num_module_chunks ({self.num_module_chunks}) * num_class_chunks ({self.num_class_chunks})."
         )
-        assert aos_shape[1] == self.modules_per_chunk_count, (
+        assert aos_shape[1] == self.modules_per_chunk, (
             f"Buffer spec mismatch: Clipped partials buffer expects {aos_shape[1]} modules per chunk, "
-            f"but plan requires {self.modules_per_chunk_count}."
+            f"but plan requires {self.modules_per_chunk}."
         )
         assert aos_shape[2] == self.total_batch_count, (
             f"Buffer spec mismatch: Clipped partials buffer expects batch size {aos_shape[2]}, "
@@ -291,8 +291,8 @@ class GatherAndPermuteGradHiddenActivationsSignature(KernelSignature):
             self.padded_hidden_count,
             self.total_modules_count,
             self.padded_total_modules_count,
-            self.num_module_chunks_count,
-            self.modules_per_chunk_count,
-            self.num_class_chunks_count,
+            self.num_module_chunks,
+            self.modules_per_chunk,
+            self.num_class_chunks,
             self.total_tile_count,
         ]

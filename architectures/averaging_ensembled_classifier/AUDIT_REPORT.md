@@ -18,10 +18,10 @@
 | B3    | Cross-Doc Inaccuracy  | Incomplete Kernel List        | Resolved |
 | B4    | Cross-Doc Inaccuracy  | Missing DAG Edge              | Resolved |
 | B5    | Cross-Doc Inaccuracy  | Incorrect DAG Edges           | Resolved |
-| C1    | Naming Inconsistency  | Spurious `_count` Suffixes    | Open   |
-| D1    | Editorial             | List Numbering Artifact       | Open   |
-| D2    | Editorial             | Unexplained Node Gap          | Open   |
-| E1    | Informational         | Stale Policy Name Reference   | Open   |
+| C1    | Naming Inconsistency  | Spurious `_count` Suffixes    | Resolved |
+| D1    | Editorial             | List Numbering Artifact       | Resolved |
+| D2    | Editorial             | Unexplained Node Gap          | Resolved |
+| E1    | Informational         | Stale Policy Name Reference   | Resolved |
 
 ---
 

@@ -150,9 +150,9 @@ __kernel void gather_and_permute_grad_hidden_activations(
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_total_modules_count,
     uint src_scalar_NATURAL_padded_total_modules_count,
-    uint src_scalar_NATURAL_num_module_chunks_count,
-    uint src_scalar_NATURAL_modules_per_chunk_count,
-    uint src_scalar_NATURAL_num_class_chunks_count,
+    uint src_scalar_NATURAL_num_module_chunks,
+    uint src_scalar_NATURAL_modules_per_chunk,
+    uint src_scalar_NATURAL_num_class_chunks,
     uint src_scalar_NATURAL_total_tile_count) {
 
     // --- 1. Work-Item to Destination Coordinate Mapping ---
@@ -179,19 +179,19 @@ __kernel void gather_and_permute_grad_hidden_activations(
     const uint h_idx     = bh_flat_idx % src_scalar_NATURAL_padded_hidden_count;
 
     // From the global module index, find the specific chunk and local index within it.
-    const uint module_chunk_idx = module_global_idx / src_scalar_NATURAL_modules_per_chunk_count;
-    const uint module_local_idx = module_global_idx % src_scalar_NATURAL_modules_per_chunk_count;
+    const uint module_chunk_idx = module_global_idx / src_scalar_NATURAL_modules_per_chunk;
+    const uint module_local_idx = module_global_idx % src_scalar_NATURAL_modules_per_chunk;
 
     // Loop through all class chunks to gather and sum partial results.
-    for (uint class_chunk_idx = 0; class_chunk_idx < src_scalar_NATURAL_num_class_chunks_count; ++class_chunk_idx) {
+    for (uint class_chunk_idx = 0; class_chunk_idx < src_scalar_NATURAL_num_class_chunks; ++class_chunk_idx) {
         // Reconstruct the flat_tile_index that contains the partial data we need.
-        const uint flat_tile_idx = module_chunk_idx * src_scalar_NATURAL_num_class_chunks_count + class_chunk_idx;
+        const uint flat_tile_idx = module_chunk_idx * src_scalar_NATURAL_num_class_chunks + class_chunk_idx;
 
         if (flat_tile_idx < src_scalar_NATURAL_total_tile_count) {
             // --- 3. Complex Source Address Calculation ---
             // This is the core of the gather logic: calculating the precise 1D address within the
             // monolithic source buffer for the desired partial result.
-            const long tile_size        = (long)src_scalar_NATURAL_modules_per_chunk_count * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count;
+            const long tile_size        = (long)src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count;
             const long tile_base_offset = (long)flat_tile_idx * tile_size;
 
             const long local_offset = (long)module_local_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count +

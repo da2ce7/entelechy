@@ -86,17 +86,17 @@ This indirection-based model is a cornerstone of the **Primacy of Memory Strateg
 
 This architecture acknowledges degrees for Gradient Clipping, defined as Vector-Wise Scaling. The methods differ only in the **scope of their L2 norm calculation**. They are neutral tools; their purpose is determined by the context in which they are applied.
 
-3.  **`Full-Group-Wise Clipping`**
+1.  **`Full-Group-Wise Clipping`**
 
     - **Mechanism:** This method operates on the principle of **"gather and regulate."** It treats the full group of gradients as a single, atomic vector. It computes one L2 norm over the entire pre-summed group and applies a single scaling factor, perfectly preserving the relative magnitudes of all vectors _within_ the group.
     - **Key Property:** Requires a full, synchronizing reduction of the group before it can be applied, making it architecturally expensive.
 
-4.  **`Partial-Group-Wise Clipping`**
+2.  **`Partial-Group-Wise Clipping`**
 
     - **Mechanism:** This method operates on the principle of **"assemble and scale."** It treats a practical sub-group of gradients as a single, partial vector. It computes one L2 norm over the pre-summed group and applies a single localized scaling factor, preserving the local-relative magnitudes of all vectors _within_ a sub-group.
     - **Key Property:** Requires a local barrier, synchronizing reduction of the sub-group before it can be applied, relatively cheap.
 
-5.  **`Component-Wise Clipping`**
+3.  **`Component-Wise Clipping`**
     - **Mechanism:** This method operates on the principle of **"divide and conquer."** It treats a logical group of gradients as a collection of independent components (tiles/chunks). It computes a local L2 norm for each component and applies a scaling factor to that component alone, preserving only the component's internal gradient direction.
     - **Key Property:** Massively parallel and efficient, requiring no cross-component synchronization, but alters the relative magnitudes _between_ components.
 
@@ -176,7 +176,7 @@ The host logic serves as a sophisticated orchestrator, responsible for resource 
 1.  **Memory Assessment & Chunk Definition:** The orchestrator determines an optimal chunking strategy, defining `num_module_chunks`, `num_batch_chunks`, and `num_class_chunks` to balance compute and memory demands.
 2.  **Activation Lifecycle & Streaming:** ... It selects between a Cache or Recompute strategy and manages **two distinct backpropagation streaming models** based on data path requirements:
 
-- **Model A: Accumulate via Recompute (For `Grad_H` and `Grad_Mod*`):** Used when a downstream kernel requires a global synchronization point (e.g., Node 12 permutation). The host allocates a monolithic partials buffer and populates it iteratively by:
+- **Model A: Accumulate via Recompute (For `Grad_H` and `Grad_Mod*`):** Used when a downstream kernel requires a global synchronization point (e.g., Node 13 permutation). The host allocates a monolithic partials buffer and populates it iteratively by:
   1. Recomputing a single `hidden_i` chunk.
   2. Calling the gradient kernel to process that chunk and write its result.
   3. Discarding the `hidden_i` chunk.
@@ -461,6 +461,7 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
   - **Clarification of Clipping Strategy:** This kernel's behavior constitutes a **`Group-Wise` clip at the tile level**, preserving the internal directionality of the tile's total gradient. This is part of a broader system strategy that is **`Component-Wise` at the inter-tile level** (i.e., each tile is clipped independently of other tiles in the batch).
   - **Strategic Role:** By preserving the tile's gradient direction as a single unit, this operation is critical for stability. For the `Grad_H` vector, it serves as **Phase I (Safety) of a two-stage stabilization strategy**. It guarantees all raw partials are brought into a finite numerical range before their respective reductions, preventing `NaN`/`Inf` propagation. Consumes `PARTIAL_*` gradient buffers and produces `Clipped_PARTIAL_*` buffers.
 
+- **(12)** _Reserved — retired. Its permutation functionality was subsumed by Node 13._
 - **(13) `gather_and_permute_grad_h`**: **[Specialized Kernel]** Gathers and permutes the clipped `Grad_H` partials.
   - **Contract:** Reads from the `Clipped_PARTIALS_Grad_H_AoS` collection and writes to a single `Permuted_Grad_H_SoA` buffer. This is a mandatory step before Node (16) and serves as the canonical **Item Synchronization Point**.
 - **The Recursive Clip-Aggregation Engine:** **[Architectural Concept, not a single kernel]**

@@ -499,9 +499,9 @@ def build_final_grad_h_reduction_path(
         total_modules_count=np.uint32(spec.num_modules),
         hidden_count=np.uint32(spec.hidden_dim),
         total_batch_count=np.uint32(plan.effective_batch_size),
-        num_module_chunks_count=np.uint32(plan.grid.num_module_chunks),
-        modules_per_chunk_count=np.uint32(plan.grid.get_tile(0, 0).modules_per_chunk),
-        num_class_chunks_count=np.uint32(plan.grid.num_class_chunks),
+        num_module_chunks=np.uint32(plan.grid.num_module_chunks),
+        modules_per_chunk=np.uint32(plan.grid.get_tile(0, 0).modules_per_chunk),
+        num_class_chunks=np.uint32(plan.grid.num_class_chunks),
     )
     permute_evt = ex.launch(q, permute_sig, wait_for=wait_for)
 

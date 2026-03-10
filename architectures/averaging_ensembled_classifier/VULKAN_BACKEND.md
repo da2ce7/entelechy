@@ -1125,9 +1125,9 @@ typedef struct {
     uint32_t padded_hidden_count;
     uint32_t total_modules_count;
     uint32_t padded_total_modules_count;
-    uint32_t num_module_chunks_count;
-    uint32_t modules_per_chunk_count;
-    uint32_t num_class_chunks_count;
+    uint32_t num_module_chunks;
+    uint32_t modules_per_chunk;
+    uint32_t num_class_chunks;
     uint32_t total_tile_count;
 } GatherPermutePush;
 

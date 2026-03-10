@@ -61,7 +61,8 @@ These ADRs define what the execution plan must be capable of expressing. They ar
 
 ### ADR-002: Plan Node Types & Synchronization Structure
 
-**Status:** NARROWED — Dependency edges in plan; no event objects in shared layer
+**Status:** DECIDED — Option B (Typed node hierarchy with explicit dependency edges)
+**Full Record:** `adr/ADR-002-plan-node-types-and-synchronization-structure.md`
 
 **Context:**
 ADR-001 eliminates event objects from the shared layer. The plan must instead express:
@@ -512,7 +513,7 @@ Implement `VulkanPlanRenderer`, including SPIR-V compilation pipeline and comman
 | ADR | Tier | Status | Core Question | Blocked By |
 |:----|:-----|:-------|:--------------|:-----------|
 | 001 | 0 | **DECIDED** | Where is the abstraction boundary? | — |
-| 002 | 1 | NARROWED | What are the plan node types? | 001 |
+| 002 | 1 | **DECIDED** | What are the plan node types? | 001 |
 | 003 | 1 | NARROWED | How are reduction trees represented? | 001 |
 | 004 | 1 | OPEN | How are streaming loops represented? | 001 |
 | 005 | 1 | NARROWED | Is Node 16 opaque in the plan? | 001 |

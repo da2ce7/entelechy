@@ -714,9 +714,9 @@ class TestBenchGatherAndPermute:
             total_modules_count=np.uint32(spec.num_modules),
             hidden_count=np.uint32(spec.hidden_dim),
             total_batch_count=np.uint32(batch_size),
-            num_module_chunks_count=np.uint32(_grid.num_module_chunks),
-            modules_per_chunk_count=np.uint32(max_mods_per_tile),
-            num_class_chunks_count=np.uint32(_grid.num_class_chunks),
+            num_module_chunks=np.uint32(_grid.num_module_chunks),
+            modules_per_chunk=np.uint32(max_mods_per_tile),
+            num_class_chunks=np.uint32(_grid.num_class_chunks),
         )
 
         def _dispatch():

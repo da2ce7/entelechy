@@ -860,10 +860,10 @@ __kernel void clip_partial_gradients(
 __kernel void gather_and_permute_grad_hidden_activations(
     /**
      * @param src_buffer_GLOBAL_clipped_partial_grad_hidden_activations_aos The full collection of *clipped* partial upstream gradients, produced by Node 11.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
-     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_tile_count * src_scalar_NATURAL_modules_per_chunk_count * src_scalar_NATURAL_total_batch_count *
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_tile_count * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count *
      * src_scalar_NATURAL_padded_hidden_count * sizeof(SCALAR_TYPE)] bytes. [2] [ARCHITECTURAL SYNCHRONIZATION POINT] The consumer (this kernel) requires a monolithic input fully populated by its
      * preceding dependency, Node (11).
      */
@@ -884,9 +884,9 @@ __kernel void gather_and_permute_grad_hidden_activations(
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_total_modules_count,
     uint src_scalar_NATURAL_padded_total_modules_count,
-    uint src_scalar_NATURAL_num_module_chunks_count,
-    uint src_scalar_NATURAL_modules_per_chunk_count,
-    uint src_scalar_NATURAL_num_class_chunks_count,
+    uint src_scalar_NATURAL_num_module_chunks,
+    uint src_scalar_NATURAL_modules_per_chunk,
+    uint src_scalar_NATURAL_num_class_chunks,
     uint src_scalar_NATURAL_total_tile_count);
 
 // --- Phase 14, 15 & 20: Aggregation Engine ---
@@ -1015,7 +1015,7 @@ __kernel void clip_intermediate_grad(
 
     /**
      * @param src_scalar_REAL_clipping_threshold_t_j The clipping threshold for this specific reduction stage `j`.
-     *        - Calculability Proof: [Host-side calculation based on the active stabilization policy (e.g., Normalized Log-Space Quadratic Scaling)]
+     *        - Calculability Proof: [Host-side calculation based on the active stabilization policy (e.g., Quadratic Scaling Policy)]
      *        - Validation Preconditions: The value must be a positive real number.
      */
     SCALAR_TYPE src_scalar_REAL_clipping_threshold_t_j,
