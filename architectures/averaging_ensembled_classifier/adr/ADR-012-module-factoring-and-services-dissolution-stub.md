@@ -4,7 +4,7 @@
 **Date:** 2026-03-10  
 **Deciders:** —  
 **Supersedes:** —  
-**Blocked by:** ADR-003, ADR-007, ADR-009  
+**Blocked by:** ADR-009  
 **Blocks:** ADR-013, ADR-014, ADR-015
 
 ---
@@ -18,7 +18,7 @@ The current `src/` directory is a flat namespace where shared-layer logic, backe
 
 The existing Services layer (`cl_context_manager.py`, `compute_patterns.py`, `launcher_infra.py`) is dissolved:
 - **Context management** → backend-specific (each backend's renderer creates and owns its execution context).
-- **Hardware discovery** → backend-specific. ADR-006 (ACCEPTED) establishes that `HardwareProfile` is a shared-layer frozen dataclass, but each backend *constructs* it from its native discovery mechanism. `DiscoveredArchConstants` in `cl_context_manager.py` is replaced: the five-field `HardwareProfile` (`simd_width`, `cache_line_bytes`, `max_reduce_fan_in`, `max_local_mem_bytes`, `global_mem_bytes`) moves to `shared/hardware_profile.py`; the OpenCL discovery code that populates it moves to `backends/opencl/`.
+- **Hardware discovery** → backend-specific. ADR-006 (ACCEPTED) establishes `HardwareProfile` as a shared-layer frozen dataclass; each backend *constructs* it from its native discovery mechanism.
 - **Compute patterns** → split between shared (tiling, padding helpers as pure math) and backend-specific (dispatch pattern translation).
 - **Launcher infrastructure** → shared orchestration layer that calls the selected backend's renderer.
 
@@ -50,13 +50,13 @@ src/
 │   ├── hardware_profile.py          # ADR-006 — frozen dataclass only
 │   ├── plan_builder.py              # Consumes above, produces plan DAG
 │   ├── plan_types.py                # Node dataclasses from ADR-002
-│   ├── kernel_contracts/            # ADR-007 shared contracts
-│   │   ├── __init__.py
+│   ├── kernel_contracts/            # ADR-007 — KernelContract frozen dataclasses
+│   │   ├── __init__.py              # Exports KernelContractBlock registry
 │   │   ├── phase_1_act.py
 │   │   ├── phase_2_learn_A_production.py
 │   │   ├── ...
 │   │   └── phase_3_update.py
-│   └── buffer_handles.py            # ADR-009 BufferHandle definitions
+│   └── buffer_handles.py            # ADR-009 — BufferHandle definitions
 ├── backends/
 │   ├── __init__.py
 │   ├── opencl/
@@ -64,30 +64,35 @@ src/
 │   │   ├── renderer.py              # OpenCL PlanRenderer
 │   │   ├── context.py               # cl.Context + queue management
 │   │   ├── discovery.py             # Populates HardwareProfile from cl.device_info
-│   │   ├── kernel_bindings/         # ADR-007 OpenCL bindings
+│   │   ├── kernel_bindings/         # ADR-007 — OpenCL KernelBinding implementations
+│   │   │   ├── __init__.py
+│   │   │   ├── phase_1_act.py       # Injects flat_tile_index, marshals cl.Buffer args
+│   │   │   └── ...
 │   │   └── buffer_allocator.py
 │   ├── vulkan/
 │   │   ├── discovery.py             # Populates HardwareProfile from VkPhysicalDevice
+│   │   ├── kernel_bindings/         # Push constants + descriptor sets
 │   │   └── ...
 │   └── cpu/
-│       ├── discovery.py             # Populates HardwareProfile from compiled ISA flags + OS queries
+│       ├── discovery.py             # Populates HardwareProfile from ISA flags + OS queries
+│       ├── kernel_bindings/         # C function arg struct marshalling
 │       └── ...
 └── orchestrator.py                   # Top-level assembly
 ```
 
-Each `backends/<name>/discovery.py` is responsible for constructing a `HardwareProfile` for the target precision, satisfying the `max_reduce_fan_in >= 2` invariant and the hardware-fidelity contract documented in ADR-006 §`max_reduce_fan_in` derivation contract.
+The `shared/kernel_contracts/` directory maps one-to-one with `KernelContract` frozen dataclasses (ADR-007). Each file constructs `KernelContract` instances with `BufferParamSpec`, `ScalarParamSpec`, `LocalMemorySpec`, and `PlacementContract` entries per the decided schema. Each `backends/<name>/kernel_bindings/` directory contains the corresponding `KernelBinding` implementations that translate validated contracts to native dispatch format.
 
 ---
 
 ## Upstream Confirmations
 
-**ADR-003:** `ReductionTreePlan` is a shared-layer dataclass → lives in `shared/plan_types.py`. The *rendering* of the reduction tree (ping-pong dispatch, offset-list upload) is backend-specific → lives in `backends/<name>/renderer.py`.
+**ADR-003 (ACCEPTED):** `ReductionTreePlan` is a shared-layer dataclass → `shared/plan_types.py`. Rendering (ping-pong dispatch, offset-list upload) is backend-specific → `backends/<name>/renderer.py`.
 
-**ADR-004:** `StreamingLoopNode` similarly lives in shared plan types. The streaming loop *execution* (iteration dispatch, scratch buffer allocation) is backend-specific.
+**ADR-004 (ACCEPTED):** `StreamingLoopNode` lives in shared plan types. Streaming loop execution is backend-specific.
 
-**ADR-006:** `HardwareProfile` is a shared-layer *type* (`shared/hardware_profile.py`) but its *construction* is backend-specific (`backends/<name>/discovery.py`). The current `DiscoveredArchConstants` + `PrecisionContext` inheritance hierarchy is dissolved: `HardwareProfile` has no `PrecisionContext` parent; `PrecisionContext` is refactored separately per ADR-008.
+**ADR-006 (ACCEPTED):** `HardwareProfile` is a shared-layer type (`shared/hardware_profile.py`); its construction is backend-specific (`backends/<name>/discovery.py`). The current `DiscoveredArchConstants` + `PrecisionContext` inheritance hierarchy is dissolved: `HardwareProfile` has no `PrecisionContext` parent; `PrecisionContext` is refactored separately per ADR-008.
 
-**ADR-007:** The `KernelContract` / `KernelBinding` split maps directly to `shared/kernel_contracts/` and `backends/<name>/kernel_bindings/`.
+**ADR-007 (ACCEPTED):** The `KernelContract` / `KernelBinding` split maps directly to `shared/kernel_contracts/` and `backends/<name>/kernel_bindings/`. `KernelContract` is a frozen dataclass carrying `BufferParamSpec`, `ScalarParamSpec`, `LocalMemorySpec`, and `PlacementContract` entries. `KernelBinding` is Orchestration-tier code that accepts a validated `KernelContract` and translates it to native dispatch format. The existing `kernel_signatures/` sub-package dissolves: each signature becomes a `KernelContract` (shared) + one `KernelBinding` per backend.
 
 **ADR-009:** `BufferHandle` is shared. Physical allocation is backend-specific.
 
@@ -96,7 +101,6 @@ Each `backends/<name>/discovery.py` is responsible for constructing a `HardwareP
 ## Tensions
 
 - Utility code that is *currently* shared but may evolve backend-specific variants (e.g., `arch_primitives.py` with `c_tile_extent`) needs a clear home. Proposed: `shared/` for the abstract primitive; backends import and specialize.
-- The `kernel_signatures/` sub-package needs to be split during migration. Each signature becomes a Contract (shared) + one Binding per backend.
 
 ---
 
@@ -105,6 +109,6 @@ Each `backends/<name>/discovery.py` is responsible for constructing a `HardwareP
 - [ADR-003: Reduction Tree Plan Representation](ADR-003-reduction-tree-plan-representation.md)
 - [ADR-004: Streaming Loop Plan Representation](ADR-004-streaming-loop-plan-representation.md)
 - [ADR-006: Hardware Profile](ADR-006-hardware-profile.md)
-- [ADR-007: KernelSignature Contract/Binding Split](ADR-007-kernel-signature-contract-binding-split-stub.md)
+- [ADR-007: KernelSignature Contract/Binding Split](ADR-007-kernel-signature-contract-binding-split.md)
 - [ADR-008: Precision Configuration](ADR-008-precision-configuration-stub.md)
 - [ADR-009: Buffer Lifecycle](ADR-009-buffer-lifecycle-in-the-plan-model-stub.md)
