@@ -557,8 +557,16 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
     b_shape, _ = bm.get_spec(bm.get_handle_by_name("shared_biases"))
     gsw_chunk_shape = (w_shape[0], w_shape[1])
     gsb_chunk_shape = (b_shape[0],)
-    gsw_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gsw_chunk_shape) * spec.SCALAR_NP_TYPE().itemsize))
-    gsb_scratch_ref = bm.acquire_transient_buffer(int(np.prod(gsb_chunk_shape) * spec.SCALAR_NP_TYPE().itemsize))
+    gsw_scratch_ref = bm.acquire_transient_buffer(
+        int(np.prod(gsw_chunk_shape) * spec.SCALAR_NP_TYPE().itemsize),
+        shape=gsw_chunk_shape,
+        dtype=spec.SCALAR_NP_TYPE,
+    )
+    gsb_scratch_ref = bm.acquire_transient_buffer(
+        int(np.prod(gsb_chunk_shape) * spec.SCALAR_NP_TYPE().itemsize),
+        shape=gsb_chunk_shape,
+        dtype=spec.SCALAR_NP_TYPE,
+    )
 
     try:
         # Main streaming loop over batch chunks.
@@ -571,6 +579,10 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
                 continue
 
             # Nodes 17 & 18: Compute raw partials into SCRATCH buffers.
+            # WHY: batch_chunk_index=0 because the kernel uses it to compute a
+            # write offset into its output buffer. Since the output is a per-chunk
+            # SCRATCH buffer (not the full collection), the offset must be zero.
+            # The clip kernel (Node 19) handles the placement into the collection.
             gsw_sig = BackpropSharedWeightsChunkSignature(
                 _buffer_mgr=bm,
                 _arch_consts=arch_consts,
@@ -581,7 +593,7 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
                 partial_gsw_out_ref=gsw_scratch_ref,
                 batch_chunk_offset=np.uint32(batch_offset),
                 batch_chunk_count=np.uint32(items_in_chunk),
-                batch_chunk_index=np.uint32(i),
+                batch_chunk_index=np.uint32(0),
                 num_batch_chunks_count=np.uint32(num_batch_chunks),
             )
             gsw_evt = ex.launch(q, gsw_sig, wait_for=deps_for_all_chunks)
@@ -594,7 +606,7 @@ def build_shared_backprop_subgraph(svs: Services, plan: ExecutionPlan, deps: Lis
                 partial_gsb_out_ref=gsb_scratch_ref,
                 batch_chunk_offset=np.uint32(batch_offset),
                 batch_chunk_count=np.uint32(items_in_chunk),
-                batch_chunk_index=np.uint32(i),
+                batch_chunk_index=np.uint32(0),
                 num_batch_chunks_count=np.uint32(num_batch_chunks),
             )
             gsb_evt = ex.launch(q, gsb_sig, wait_for=deps_for_all_chunks)

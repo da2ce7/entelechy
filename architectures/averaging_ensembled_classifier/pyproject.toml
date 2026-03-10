@@ -30,6 +30,7 @@ dependencies = ["numpy", "pyopencl", "scikit-learn"]
 # but are not needed in a pure production runtime environment.
 dev = [
     "pytest",
+    "pytest-benchmark",
     "black",
     "isort",
     "flake8",

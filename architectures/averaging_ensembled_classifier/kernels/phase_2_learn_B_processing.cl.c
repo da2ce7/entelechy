@@ -31,6 +31,7 @@ __kernel void clip_partial_gradients(
     uint                        src_scalar_NATURAL_modules_per_chunk,
     uint                        src_scalar_NATURAL_total_batch_count,
     uint                        src_scalar_NATURAL_padded_hidden_count,
+    uint                        src_scalar_NATURAL_padded_total_output_class_count,
     uint                        src_scalar_NATURAL_total_tile_count) {
 
     const uint lid   = get_local_id(0);
@@ -39,8 +40,10 @@ __kernel void clip_partial_gradients(
 
     // --- 1. Calculate Per-Buffer Element Counts and Base Offsets for the Current Tile ---
     // This section defines the size of each segment of our "virtual vector".
-    const uint n_weights      = src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_classes_per_chunk;
-    const uint n_biases       = src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_classes_per_chunk;
+    // WHY: Weights and biases use the PADDED class dimension to match the parameter layout,
+    // ensuring the flat element ordering is identical to summed_grad / Adam update buffers.
+    const uint n_weights      = src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_total_output_class_count;
+    const uint n_biases       = src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_padded_total_output_class_count;
     const uint n_temps        = src_scalar_NATURAL_modules_per_chunk;
     const uint n_hidden       = src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count;
     const uint total_elements = n_weights + n_biases + n_temps + n_hidden;

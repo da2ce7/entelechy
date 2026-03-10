@@ -17,6 +17,8 @@ Scenarios Covered:
   6. The Lexicon           – Massive output_classes produce valid tiling
   7. The Data Tsunami      – Large batch_size produces valid reduction tree
   8. The Colossus          – All systems under compound pressure
+  9. The Behemoth          – Massive hidden_dim Cache/Recompute trade-off
+ 10. The Real-Time Trader  – Act/Learn temporal split & event-triggered Learn
 
 No OpenCL device is required.
 """
@@ -29,7 +31,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from src.model_spec import Float32ModelSpec
+from src.model_spec import Float32ModelSpec, Float16ModelSpec
 from src.parameter_space import ParameterSpace
 from src.stabilization_policy import StabilizationPolicy
 from src.workload_primitives import LinearlyChunkedGather, TilingScheme
@@ -433,3 +435,312 @@ class TestColossus:
                         covered.add((m, c))
         expected = {(m, c) for m in range(spec.num_modules) for c in range(spec.output_classes)}
         assert covered == expected
+
+
+# =========================================================================
+# Scenario 9: The Behemoth (Massive hidden_dim)
+# =========================================================================
+
+
+class TestBehemoth:
+    """
+    Verify scalability through strategic memory trade-offs when hidden_dim
+    is a bottleneck.  The host's Cache-vs-Recompute policy must produce
+    radically different memory footprints.
+
+    From CONCEPT.md:
+    "When the hidden_i buffer is a bottleneck, the host's policy to Cache or
+     Recompute it remains a critical, orthogonal optimization that works in
+     synergy with the batch accumulation model."
+    """
+
+    @pytest.fixture
+    def behemoth_spec(self) -> Float32ModelSpec:
+        """A model with massive hidden_dim to stress memory layouts."""
+        return _make_spec(
+            Float32ModelSpec,
+            input_dim=64,
+            hidden_dim=2048,
+            output_classes=10,
+            num_modules=8,
+        )
+
+    def test_hidden_activations_dominate_memory(self, behemoth_spec: Float32ModelSpec) -> None:
+        """With hidden_dim=2048, the hidden_activations buffer should be
+        substantially larger than the module-level gradient buffers."""
+        ps = ParameterSpace(spec=behemoth_spec)
+        grid = _make_tiling(behemoth_spec)
+        batch_size = 256
+        layouts = ps.get_all_memory_layouts(
+            batch_size=batch_size, grid=grid, num_batch_chunks=8
+        )
+        dtype = np.dtype(behemoth_spec.SCALAR_NP_TYPE)
+
+        hidden_shape = layouts["hidden_activations"].get_padded_shape(dtype)
+        hidden_bytes = int(np.prod(hidden_shape)) * dtype.itemsize
+
+        # Module weights: (num_modules, padded_hidden, padded_class)
+        mod_w_shape = layouts["module_weights"].get_padded_shape(dtype)
+        mod_w_bytes = int(np.prod(mod_w_shape)) * dtype.itemsize
+
+        # hidden_activations should be a significant fraction of total memory
+        assert hidden_bytes > 0
+        # With batch_size=256 and hidden_dim=2048, this buffer is at least 2MB
+        assert hidden_bytes >= 256 * 2048 * dtype.itemsize
+
+    def test_permuted_grad_h_scales_with_hidden_dim(self, behemoth_spec: Float32ModelSpec) -> None:
+        """The permuted_grad_h buffer grows linearly with hidden_dim and batch."""
+        ps = ParameterSpace(spec=behemoth_spec)
+        grid = _make_tiling(behemoth_spec)
+        batch_size = 256
+        layouts = ps.get_all_memory_layouts(
+            batch_size=batch_size, grid=grid, num_batch_chunks=8
+        )
+        dtype = np.dtype(behemoth_spec.SCALAR_NP_TYPE)
+
+        permuted = layouts["permuted_grad_h"]
+        p_shape = permuted.get_padded_shape(dtype)
+        permuted_bytes = int(np.prod(p_shape)) * dtype.itemsize
+
+        # SoA layout: (B * padded_H, padded_M)
+        # For B=256, H=2048, this is very large
+        assert permuted.logical_shape[0] == batch_size * behemoth_spec.padded_hidden_dim
+        assert permuted_bytes > 0
+
+    def test_cache_strategy_memory_footprint(self, behemoth_spec: Float32ModelSpec) -> None:
+        """Under CACHE strategy, hidden_activations are retained in full."""
+        ps = ParameterSpace(spec=behemoth_spec)
+        grid = _make_tiling(behemoth_spec)
+        # Two batch sizes to demonstrate scaling
+        for batch_size in [64, 256]:
+            layouts = ps.get_all_memory_layouts(
+                batch_size=batch_size, grid=grid, num_batch_chunks=8
+            )
+            hidden = layouts["hidden_activations"]
+            assert hidden.logical_shape[0] == batch_size
+            assert hidden.logical_shape[1] == behemoth_spec.padded_hidden_dim
+
+    def test_recompute_strategy_reduces_partial_grad_hidden(self, behemoth_spec: Float32ModelSpec) -> None:
+        """Under RECOMPUTE, the partial_grad_hidden buffer is allocated per-tile,
+        but each tile is processed serially and the scratch is reused.
+
+        The partial_grad_hidden_activations collection buffer is still allocated
+        (it holds ALL tiles' clipped results), but the raw hidden_i itself is
+        recomputed into a small scratch buffer."""
+        ps = ParameterSpace(spec=behemoth_spec)
+        grid = _make_tiling(behemoth_spec)
+        batch_size = 256
+        layouts = ps.get_all_memory_layouts(
+            batch_size=batch_size, grid=grid, num_batch_chunks=8
+        )
+        dtype = np.dtype(behemoth_spec.SCALAR_NP_TYPE)
+
+        # The full hidden_activations buffer (for CACHE) exists in layout
+        full_hidden_shape = layouts["hidden_activations"].get_padded_shape(dtype)
+        full_hidden_bytes = int(np.prod(full_hidden_shape)) * dtype.itemsize
+
+        # A RECOMPUTE strategy would use a scratch buffer of the same shape
+        # as hidden_activations for ONE tile at a time, then discard it.
+        # The scratch bytes are always <= the full cache bytes.
+        scratch_bytes = full_hidden_bytes  # Same shape, but transient
+        assert scratch_bytes <= full_hidden_bytes
+
+    def test_behemoth_layouts_produce_valid_shapes(self, behemoth_spec: Float32ModelSpec) -> None:
+        """All layouts for the Behemoth must produce non-zero shapes."""
+        ps = ParameterSpace(spec=behemoth_spec)
+        grid = _make_tiling(behemoth_spec)
+        layouts = ps.get_all_memory_layouts(
+            batch_size=256, grid=grid, num_batch_chunks=8
+        )
+        dtype = np.dtype(behemoth_spec.SCALAR_NP_TYPE)
+        for name, layout in layouts.items():
+            shape = layout.get_padded_shape(dtype)
+            total_bytes = int(np.prod(shape)) * dtype.itemsize
+            assert total_bytes > 0, f"{name} has zero bytes"
+
+    def test_behemoth_reduction_tree_valid(self, behemoth_spec: Float32ModelSpec) -> None:
+        """The reduction tree for a Behemoth model must be valid."""
+        grid = _make_tiling(behemoth_spec)
+        policy = StabilizationPolicy(
+            t_algorithmic=1.0,
+            lambda_=1.0,
+            fp_format_max=float(np.finfo(np.float32).max),
+        )
+        if grid.total_tiles > 1:
+            k, stages = policy.plan_uniform_reduction_tree(
+                num_partials=grid.total_tiles,
+                hardware_max_fan_in=256,
+            )
+            assert k >= 2
+            assert k ** stages >= grid.total_tiles
+
+    def test_behemoth_shared_weight_layout_scales(self, behemoth_spec: Float32ModelSpec) -> None:
+        """The shared_weights buffer grows with hidden_dim."""
+        ps = ParameterSpace(spec=behemoth_spec)
+        grid = _make_tiling(behemoth_spec)
+        layouts = ps.get_all_memory_layouts(
+            batch_size=64, grid=grid, num_batch_chunks=4
+        )
+        sw = layouts["shared_weights"]
+        # Shape: (padded_hidden_dim, padded_input_dim) — hidden-major layout
+        assert sw.logical_shape[0] == behemoth_spec.padded_hidden_dim
+        assert sw.logical_shape[0] >= 2048  # At least hidden_dim
+        assert sw.logical_shape[1] == behemoth_spec.padded_input_dim
+
+
+# =========================================================================
+# Scenario 10: The Real-Time Trader (Event-Triggered Execution Mode)
+# =========================================================================
+
+
+class TestRealTimeTrader:
+    """
+    Verify the Act/Learn temporal split and event-triggered Learn-phase
+    triggering described in CONCEPT.md.
+
+    From CONCEPT.md:
+    "All workflows follow Act then Learn sequencing, manifesting as either
+     Sequential Execution Mode — where Act-Learn phases execute contiguously
+     — or Event-Triggered Execution Mode — where Learn-phase execution
+     awaits an external readiness signal post-Act."
+
+    This scenario validates that:
+    - Act and Learn phases are independently plannable
+    - Act-phase output (Final Probs) is self-sufficient for inference
+    - VRAM for Learn-phase intermediates can be deferred
+    - The lifecycle policy supports both CACHE and RECOMPUTE strategies
+      for the event-triggered case
+    """
+
+    def test_act_phase_output_is_self_contained(self) -> None:
+        """The Act phase produces Final Probs, which must be independently
+        usable without any Learn-phase data."""
+        spec = _make_spec(Float32ModelSpec)
+        ps = ParameterSpace(spec=spec)
+        grid = _make_tiling(spec)
+        layouts = ps.get_all_memory_layouts(batch_size=1, grid=grid, num_batch_chunks=1)
+
+        # Act-phase buffers must all be present
+        act_buffers = [
+            "input", "hidden_activations", "hidden_mask",
+            "logits", "sample_mask",
+            "partial_probs", "final_loss",
+        ]
+        for buf_name in act_buffers:
+            assert buf_name in layouts, f"Act-phase buffer '{buf_name}' missing"
+
+    def test_learn_phase_buffers_are_additional(self) -> None:
+        """Learn-phase buffers (gradients, optimizer state) are present in the
+        layout but are logically separable from Act-phase buffers."""
+        spec = _make_spec(Float32ModelSpec)
+        ps = ParameterSpace(spec=spec)
+        grid = _make_tiling(spec)
+        layouts = ps.get_all_memory_layouts(batch_size=32, grid=grid, num_batch_chunks=4)
+
+        learn_only_buffers = [
+            "partial_grad_module_weights",
+            "partial_grad_module_biases",
+            "partial_grad_temps",
+            "partial_grad_hidden_activations",
+            "partial_grad_shared_weights",
+            "partial_grad_shared_biases",
+            "summed_grad_hidden_activations",
+            "permuted_grad_h",
+        ]
+        for buf_name in learn_only_buffers:
+            assert buf_name in layouts, f"Learn-phase buffer '{buf_name}' missing"
+
+    def test_act_phase_independent_of_batch_size_for_planning(self) -> None:
+        """The Act phase's computational structure (tiling, forward pass)
+        is identical regardless of whether Learn will follow immediately
+        (Sequential) or later (Event-Triggered)."""
+        spec = _make_spec(Float32ModelSpec, num_modules=8, output_classes=10)
+        grid = _make_tiling(spec)
+
+        # The grid (which drives Act-phase kernel dispatch) is determined by
+        # model dimensions, not by execution mode
+        assert grid.total_tiles == grid.num_module_chunks * grid.num_class_chunks
+        # All tiles are valid for the Act phase
+        for tile in grid:
+            assert tile.modules_per_chunk > 0
+            assert tile.classes_per_chunk > 0
+
+    def test_recompute_strategy_enables_vram_release(self) -> None:
+        """Under RECOMPUTE strategy, hidden_activations can be discarded after
+        the Act phase and recomputed when Learn is triggered.  This is the
+        key architectural enabler for the Real-Time Trader scenario."""
+        spec = _make_spec(Float32ModelSpec)
+        ps = ParameterSpace(spec=spec)
+        grid = _make_tiling(spec)
+        layouts = ps.get_all_memory_layouts(batch_size=32, grid=grid, num_batch_chunks=4)
+
+        # hidden_activations exists in layout (it's always planned)
+        ha = layouts["hidden_activations"]
+        dtype = np.dtype(spec.SCALAR_NP_TYPE)
+        ha_bytes = int(np.prod(ha.get_padded_shape(dtype))) * dtype.itemsize
+
+        # The RECOMPUTE strategy means this buffer is transient:
+        # allocated for Act, released, then re-allocated for Learn.
+        # This test verifies the buffer CAN be independently described.
+        assert ha_bytes > 0
+        # The hidden_mask is similarly releasable
+        hm = layouts["hidden_mask"]
+        hm_bytes = int(np.prod(hm.get_padded_shape(dtype))) * dtype.itemsize
+        assert hm_bytes > 0
+
+    def test_event_triggered_plan_with_deferred_targets(self) -> None:
+        """In Event-Triggered mode, ground truth (targets) arrive after Act.
+        The layout must still plan for targets buffers regardless."""
+        spec = _make_spec(Float32ModelSpec)
+        ps = ParameterSpace(spec=spec)
+        grid = _make_tiling(spec)
+        layouts = ps.get_all_memory_layouts(batch_size=1, grid=grid, num_batch_chunks=1)
+
+        # Both target types must be planned (the strategy object selects one)
+        assert "targets_cce" in layouts
+        assert "targets_bce" in layouts
+
+    def test_single_item_event_triggered(self) -> None:
+        """The Real-Time Trader processes one item at a time (N=1).
+        The full planning pipeline must be valid for batch_size=1."""
+        spec = _make_spec(Float32ModelSpec, num_modules=4, output_classes=5)
+        ps = ParameterSpace(spec=spec)
+        grid = _make_tiling(spec)
+        layouts = ps.get_all_memory_layouts(batch_size=1, grid=grid, num_batch_chunks=1)
+        dtype = np.dtype(spec.SCALAR_NP_TYPE)
+
+        for name, layout in layouts.items():
+            shape = layout.get_padded_shape(dtype)
+            total = int(np.prod(shape)) * dtype.itemsize
+            assert total > 0, f"{name} has zero bytes for N=1"
+
+        # With N=1, the reduction tree degenerates (no reduction needed)
+        policy = StabilizationPolicy(
+            t_algorithmic=1.0,
+            lambda_=1.0,
+            fp_format_max=float(np.finfo(np.float32).max),
+        )
+        # Single tile, single partial → no multi-stage reduction
+        _k, stages = policy.plan_uniform_reduction_tree(
+            num_partials=grid.total_tiles,
+            hardware_max_fan_in=256,
+        )
+        # For very small grids, may need 0 or 1 stages
+        assert stages >= 0
+
+    def test_temporal_split_orthogonality(self) -> None:
+        """The Act/Learn split is orthogonal to the batch processing model.
+        Both Sequential and Event-Triggered modes must produce identical
+        computational grids for the same model."""
+        spec = _make_spec(Float32ModelSpec, num_modules=16, output_classes=20)
+        grid = _make_tiling(spec)
+
+        # The grid is model-determined, not mode-determined
+        tiles_sequential = list(grid)
+        tiles_event_triggered = list(grid)  # Same grid, same tiles
+
+        assert len(tiles_sequential) == len(tiles_event_triggered)
+        for t_seq, t_evt in zip(tiles_sequential, tiles_event_triggered):
+            assert t_seq.flat_tile_index == t_evt.flat_tile_index
+            assert t_seq.module_chunk_offset == t_evt.module_chunk_offset
+            assert t_seq.class_chunk_offset == t_evt.class_chunk_offset

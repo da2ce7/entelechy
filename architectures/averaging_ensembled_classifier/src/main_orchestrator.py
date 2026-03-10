@@ -46,11 +46,13 @@ from .execution_plan import (
     DataLifecyclePolicy,
     DependencyProvider,
     CacheProvider,
+    ComputeOnceProvider,
     StagedComputationProvider,
     ProblemTypeStrategy,
     CceStrategy,
     BceStrategy,
 )
+from .kernel_signatures import ForwardPassSignature
 from .launcher_infra import Services, BufferManager, KernelExecutor, BufferHandle
 from .compute_patterns import ReductionPlan
 from .workload_primitives import TilingScheme
@@ -137,6 +139,63 @@ class TrainingOrchestrator:
         for name, layout in all_layouts.items():
             bm.create_named_buffer(name, layout, spec.SCALAR_NP_TYPE)
 
+        # --- Zero-initialize ALL buffers ---
+        # WHY: OpenCL's clCreateBuffer with CL_MEM_READ_WRITE does NOT
+        # guarantee zero-initialized memory.  Buffers may contain arbitrary
+        # leftover GPU data.  This is critical for Adam optimizer state
+        # (m1, m2 must start at zero), bias buffers, and any accumulation
+        # buffer.  We zero everything, then selectively overwrite the
+        # buffers that require non-zero starting values below.
+        q = self.compute_env.cl_bundle.queue
+        for name in all_layouts:
+            ref = bm.get_handle_by_name(name)
+            buf_shape, buf_dtype = bm.get_spec(ref)
+            zeros = np.zeros(buf_shape, dtype=buf_dtype)
+            cl.enqueue_copy(q, bm.get_cl_buffer(ref), zeros)
+
+        # --- Initialize buffers that require non-zero starting values ---
+        rng = np.random.default_rng(42)
+
+        # WHY: Every sample is "active" in full-batch training. The mask must
+        # be all-ones so that loss/gradient kernels process every sample.
+        sample_mask = np.ones(batch_size, dtype=spec.SCALAR_NP_TYPE)
+        cl.enqueue_copy(q, bm.get_cl_buffer("sample_mask"), sample_mask)
+
+        # WHY: Temperatures control the sharpness of the softmax per module.
+        # An initial value of 1.0 gives a standard softmax; zero would cause
+        # division-by-zero in the kernel.
+        temps = np.ones(spec.num_modules, dtype=spec.SCALAR_NP_TYPE)
+        cl.enqueue_copy(q, bm.get_cl_buffer("temperatures"), temps)
+
+        # WHY: Learnable weight matrices require non-zero initialization so
+        # that the model breaks symmetry and gradient flow is non-trivial.
+        # We use Xavier (Glorot) uniform initialization scaled to the logical
+        # dimensions, writing into the full padded buffer shape so that
+        # padding elements remain zero and do not affect computation.
+
+        # Shared layer: shape (padded_hidden_dim, padded_input_dim)
+        # WHY: The forward_pass kernel reads W[h, i] = flat[h * padded_input + i],
+        # so the numpy array with shape (padded_hidden, padded_input) stores
+        # arr[h, i] at flat[h * padded_input + i] — matching the kernel exactly.
+        sw_shape, _ = bm.get_spec(bm.get_handle_by_name("shared_weights"))
+        limit_sw = np.sqrt(6.0 / (spec.input_dim + spec.hidden_dim))
+        sw_init = np.zeros(sw_shape, dtype=spec.SCALAR_NP_TYPE)
+        sw_init[:spec.hidden_dim, :spec.input_dim] = rng.uniform(
+            -limit_sw, limit_sw, (spec.hidden_dim, spec.input_dim)
+        ).astype(spec.SCALAR_NP_TYPE)
+        cl.enqueue_copy(q, bm.get_cl_buffer("shared_weights"), sw_init)
+
+        # Module layer: shape (num_modules, padded_hidden_dim, padded_class_dim)
+        mw_shape, _ = bm.get_spec(bm.get_handle_by_name("module_weights"))
+        limit_mw = np.sqrt(6.0 / (spec.hidden_dim + spec.output_classes))
+        mw_init = np.zeros(mw_shape, dtype=spec.SCALAR_NP_TYPE)
+        mw_init[:, :spec.hidden_dim, :spec.output_classes] = rng.uniform(
+            -limit_mw, limit_mw, (spec.num_modules, spec.hidden_dim, spec.output_classes)
+        ).astype(spec.SCALAR_NP_TYPE)
+        cl.enqueue_copy(q, bm.get_cl_buffer("module_weights"), mw_init)
+
+        q.finish()
+
     def _create_execution_plan(self, batch_size: int) -> ExecutionPlan:
         """Authors the complete, immutable execution strategy for one batch."""
         svs, spec, h_params = self.services, self.model_spec, self.hyperparams
@@ -186,8 +245,29 @@ class TrainingOrchestrator:
         # Here, the high-level adaptation strategy is translated into a concrete
         # `DependencyProvider` for the `hidden_activations` themselves.
         if self.adaptation_strategy == "CACHE":
-            h_ref, h_ready_evt = recipes.execute_forward_pass(svs, batch_size, deps=[])
-            policy_providers["hidden_activations"] = CacheProvider(handle=h_ref, ready_event=h_ready_evt)
+            # WHY: ComputeOnceProvider instead of CacheProvider. The forward pass
+            # must execute AFTER data is uploaded to the input buffer (which happens
+            # during BatchProcessor.run). Pre-executing at plan-creation time would
+            # read uninitialised input data, producing all-zero hidden activations.
+            # ComputeOnceProvider defers the launch until the first resolve() call
+            # (which is made by BatchProcessor with data-upload events in wait_for),
+            # then caches the result for subsequent consumers.
+            fwd_sig = ForwardPassSignature(
+                _buffer_mgr=svs.bm,
+                _arch_consts=svs.arch_consts,
+                in_ref=svs.bm.get_handle_by_name("input"),
+                mask_ref=svs.bm.get_handle_by_name("sample_mask"),
+                w_ref=svs.bm.get_handle_by_name("shared_weights"),
+                b_ref=svs.bm.get_handle_by_name("shared_biases"),
+                h_out_ref=svs.bm.get_handle_by_name("hidden_activations"),
+                h_mask_out_ref=svs.bm.get_handle_by_name("hidden_mask"),
+                batch_chunk_offset=np.uint32(0),
+                batch_chunk_count=np.uint32(batch_size),
+            )
+            policy_providers["hidden_activations"] = ComputeOnceProvider(
+                signature=fwd_sig,
+                output_handle=svs.bm.get_handle_by_name("hidden_activations"),
+            )
         elif self.adaptation_strategy == "RECOMPUTE_GRAD_H":
             # Architecturally correct: no provider is defined. `hidden_activations`
             # becomes a transient internal artifact of the recipe.
@@ -221,9 +301,14 @@ class TrainingOrchestrator:
 
         return plan
 
-    def train(self, X_train: np.ndarray, y_train: np.ndarray):
-        """The main training loop, demonstrating the Plan -> Execute pattern."""
+    def train(self, X_train: np.ndarray, y_train: np.ndarray) -> np.ndarray:
+        """The main training loop, demonstrating the Plan -> Execute pattern.
+
+        Returns the final epoch's class-probability matrix (batch_size × output_classes)
+        after all learning events have completed.
+        """
         batch_size = X_train.shape[0]
+        final_probs: np.ndarray = np.empty(0)
 
         for epoch in range(self.hyperparams.epochs):
             print(f"\n--- Epoch {epoch + 1}/{self.hyperparams.epochs}, Step {self.global_step} ---")
@@ -239,8 +324,12 @@ class TrainingOrchestrator:
 
             # Blocks for learning to complete before the next step.
             learn_event.wait()
+            infer_event.wait()
+            final_probs = probs_view.get()
             print(f"--- Step {self.global_step} Complete. ---")
             self.global_step += 1
+
+        return final_probs
 
 
 if __name__ == "__main__":

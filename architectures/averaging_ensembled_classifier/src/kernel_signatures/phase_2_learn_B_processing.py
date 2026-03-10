@@ -92,6 +92,7 @@ class _ClipTiledModuleGradsBase(KernelSignature):
 
     # --- Derived Fields ---
     padded_hidden_count: np.uint32 = field(init=False)
+    padded_class_count: np.uint32 = field(init=False)
     total_batch_count: np.uint32 = field(init=False)
     total_tile_count: np.uint32 = field(init=False)
 
@@ -99,9 +100,11 @@ class _ClipTiledModuleGradsBase(KernelSignature):
         """Derives physical dimensions from the injected memory context."""
         super().__post_init__()
         grad_h_shape, _ = self._buffer_mgr.get_spec(self.handles.grad_hidden_activations_aos)
+        grad_w_shape, _ = self._buffer_mgr.get_spec(self.handles.grad_weights_module)
         object.__setattr__(self, "total_tile_count", np.uint32(grad_h_shape[0]))
         object.__setattr__(self, "total_batch_count", np.uint32(grad_h_shape[2]))
         object.__setattr__(self, "padded_hidden_count", np.uint32(grad_h_shape[3]))
+        object.__setattr__(self, "padded_class_count", np.uint32(grad_w_shape[3]))
 
     @property
     def kernel_name(self) -> str:
@@ -116,8 +119,8 @@ class _ClipTiledModuleGradsBase(KernelSignature):
         """
         work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         total_elements_in_tile = (
-            (self.padded_hidden_count * self.tile.classes_per_chunk)  # weights
-            + self.tile.classes_per_chunk  # biases
+            (self.padded_hidden_count * self.padded_class_count)  # weights
+            + self.padded_class_count  # biases
             + 1  # temps
             + self.padded_hidden_count  # hidden_activations
         ) * self.tile.modules_per_chunk
@@ -158,6 +161,7 @@ class ClipPartialGradientsGlobalNormSignature(_ClipTiledModuleGradsBase):
             np.uint32(self.tile.modules_per_chunk),
             self.total_batch_count,
             self.padded_hidden_count,
+            self.padded_class_count,
             self.total_tile_count,
         ]
 
@@ -194,6 +198,7 @@ class ClipPartialGradientsPerItemNormSignature(_ClipTiledModuleGradsBase):
             np.uint32(self.tile.modules_per_chunk),
             self.total_batch_count,
             self.padded_hidden_count,
+            self.padded_class_count,
             self.total_tile_count,
         ]
 

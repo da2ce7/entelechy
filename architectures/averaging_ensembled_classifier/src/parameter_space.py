@@ -128,11 +128,12 @@ class ParameterSpace:
         # source of truth for calculating padded dimensions. This section reads
         # those values directly to construct layouts, ensuring consistency.
 
-        # LOGIC CORRECTED: The `shared_weights` matrix shape must be based on
-        # the *logical* input dimension, as the computational kernel loops over
-        # these features. Padding is only applied to the hidden dimension to
-        # satisfy SIMD alignment requirements within the kernel's inner loop.
-        layouts["shared_weights"] = MemoryLayout((spec.input_dim, spec.padded_hidden_dim))
+        # WHY: The forward_pass kernel reads weights in SIMD-major layout as
+        # W[h_block, feature] = flat[h_block * padded_input * SIMD + feature * SIMD + lane].
+        # For SIMD=1 this is flat[h * padded_input + i], i.e. (hidden, padded_input).
+        # The buffer must provide padded_hidden * padded_input elements in this
+        # (hidden-major, padded-input) physical layout.
+        layouts["shared_weights"] = MemoryLayout((spec.padded_hidden_dim, spec.padded_input_dim))
         layouts["shared_biases"] = MemoryLayout((spec.padded_hidden_dim,))
         layouts["module_weights"] = MemoryLayout(
             (spec.num_modules, spec.padded_hidden_dim, spec.padded_class_dim)
@@ -168,18 +169,20 @@ class ParameterSpace:
         max_cls_per_tile = (spec.output_classes + grid.num_class_chunks - 1) // grid.num_class_chunks
 
         layouts["partial_grad_module_weights"] = MemoryLayout(
-            (grid.total_tiles, max_mods_per_tile, spec.padded_hidden_dim, max_cls_per_tile)
+            (grid.total_tiles, max_mods_per_tile, spec.padded_hidden_dim, spec.padded_class_dim)
         )
-        layouts["partial_grad_module_biases"] = MemoryLayout((grid.total_tiles, max_mods_per_tile, max_cls_per_tile))
+        layouts["partial_grad_module_biases"] = MemoryLayout((grid.total_tiles, max_mods_per_tile, spec.padded_class_dim))
         layouts["partial_grad_temps"] = MemoryLayout((grid.total_tiles, max_mods_per_tile))
         layouts["partial_grad_hidden_activations"] = MemoryLayout(
             (grid.total_tiles, max_mods_per_tile, batch_size, spec.padded_hidden_dim)
         )
 
-        # LOGIC CORRECTED: The partial gradient for shared weights must match the
-        # logical shape of the weights (`input_dim`), not the padded data buffer.
+        # WHY: The backprop_shared_weights_chunk kernel (after the transpose fix)
+        # writes gradients as flat[j * padded_input + i], matching the weight
+        # buffer's (hidden, padded_input) flat layout. Each chunk produces
+        # padded_hidden * padded_input elements.
         layouts["partial_grad_shared_weights"] = MemoryLayout(
-            (num_batch_chunks, spec.input_dim, spec.padded_hidden_dim)
+            (num_batch_chunks, spec.padded_hidden_dim, spec.padded_input_dim)
         )
         layouts["partial_grad_shared_biases"] = MemoryLayout((num_batch_chunks, spec.padded_hidden_dim))
 
@@ -188,13 +191,18 @@ class ParameterSpace:
         # enforces the contract that their shapes must be identical.
         for name in list(layouts.keys()):
             if "partial_grad" in name:
-                layouts[name.replace("partial", "clipped")] = layouts[name]
+                layouts[name.replace("partial_grad", "clipped_partial_grad")] = layouts[name]
 
         # --- Layouts for Diagnostic & Specialized Buffers ---
         layouts["partial_probs"] = MemoryLayout((grid.total_tiles, max_mods_per_tile, batch_size, max_cls_per_tile))
         layouts["partial_loss"] = MemoryLayout((grid.total_tiles, max_mods_per_tile, batch_size))
         # This buffer is for the direct-write CCE loss; BCE reduction uses a transient buffer.
         layouts["final_loss"] = MemoryLayout((spec.num_modules, batch_size))
+        # WHY: `final_probs` is the destination of the tile-wise probability
+        # reduction (Node 14). Its shape is one partial's worth: the tile
+        # dimension has been summed away, leaving per-module, per-sample,
+        # per-class probabilities.
+        layouts["final_probs"] = MemoryLayout((max_mods_per_tile, batch_size, max_cls_per_tile))
 
         # Specialized Intermediates
         # WHY: These layouts are dictated entirely by the kernels that consume them.

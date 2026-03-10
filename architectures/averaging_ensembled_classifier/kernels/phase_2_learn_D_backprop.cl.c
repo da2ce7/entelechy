@@ -79,9 +79,13 @@ __kernel void backprop_shared_weights_chunk(
 
     // The leader thread writes the final, reduced partial gradient for this chunk
     // to its unique slot in the collection buffer, fulfilling the placement contract.
+    // WHY: The write uses (hidden-major, input) order — j_idx * padded_input + i_idx —
+    // matching the forward_pass kernel's SIMD-major weight layout (h * padded_input + i).
+    // This ensures the flat gradient layout is element-wise compatible with the weight
+    // buffer, so the Adam update applies each gradient to the correct weight.
     if (lid == 0) {
         const long chunk_base_offset                                   = (long)src_scalar_NATURAL_batch_chunk_index * src_scalar_NATURAL_padded_input_count * src_scalar_NATURAL_padded_hidden_count;
-        const long grad_w_out_idx                                      = chunk_base_offset + (long)i_idx * src_scalar_NATURAL_padded_hidden_count + j_idx;
+        const long grad_w_out_idx                                      = chunk_base_offset + (long)j_idx * src_scalar_NATURAL_padded_input_count + i_idx;
         dest_buffer_GLOBAL_partial_grad_weights_shared[grad_w_out_idx] = update_buffer_LOCAL_reduction_tile[0];
     }
 }

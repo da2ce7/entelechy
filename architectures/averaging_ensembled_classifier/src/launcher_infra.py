@@ -83,7 +83,7 @@ class HostView:
         self.real_shape = real_shape
         self.host_data = np.empty(self.padded_shape, dtype=self.dtype)
 
-    def enqueue_read(self, queue: cl.CommandQueue, cl_buffer: cl.Buffer, wait_for=None) -> cl.Event:
+    def enqueue_read(self, queue: cl.CommandQueue, cl_buffer: cl.Buffer, wait_for: Optional[List[cl.Event]] = None) -> cl.Event:
         """Enqueues a non-blocking copy from device buffer to this host view's memory."""
         return cl.enqueue_copy(queue, self.host_data, cl_buffer, wait_for=wait_for or [])
 
@@ -132,10 +132,22 @@ class BufferManager:
         self._handle_to_spec[handle] = (padded_shape, dtype)
         return handle
 
-    def acquire_transient_buffer(self, size_bytes: int) -> BufferHandle:
-        """Acquires a temporary, unnamed buffer of a specified byte size."""
+    def acquire_transient_buffer(
+        self,
+        size_bytes: int,
+        shape: Optional[Tuple[int, ...]] = None,
+        dtype: Optional[Type[np.floating]] = None,
+    ) -> BufferHandle:
+        """Acquires a temporary, unnamed buffer of a specified byte size.
+
+        When *shape* and *dtype* are provided, the buffer becomes queryable
+        via :meth:`get_spec`, which allows kernel signatures to derive
+        element counts from the scratch buffer's logical shape.
+        """
         handle = self._get_new_handle()
         self._handle_to_buffer[handle] = cl.Buffer(self._context, cl.mem_flags.READ_WRITE, size=max(4, size_bytes))
+        if shape is not None and dtype is not None:
+            self._handle_to_spec[handle] = (shape, dtype)
         return handle
 
     def release_transient_buffer(self, handle: BufferHandle) -> None:

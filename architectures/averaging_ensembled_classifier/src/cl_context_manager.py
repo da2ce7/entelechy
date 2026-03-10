@@ -249,7 +249,12 @@ class OpenCLContextManager:
         options.append(f"-D C_TILE_SIZE={arch_consts.optimal_square_tile_dim}")
         options.append(f"-D LOCAL_MEM_BANK_PADDING=1")
         if isinstance(arch_consts, Float16DiscoveredArchConstants):
+            options.append("-D SCALAR_IS_HALF=1")
+            options.append("-D NUMERICAL_STABILITY_EPSILON=9.77e-04h")
             options.extend(["-cl-fp32-correctly-rounded-divide-sqrt", "-D cl_khr_fp16"])
+        else:
+            options.append("-D SCALAR_IS_HALF=0")
+            options.append("-D NUMERICAL_STABILITY_EPSILON=1e-7f")
         return options
 
     def _handle_build_error(self, e: cl.Error):

@@ -113,6 +113,38 @@ class RecomputeProvider(DependencyProvider):
 
 
 @dataclass(frozen=True)
+class ComputeOnceProvider(DependencyProvider):
+    """The 'deferred cache' strategy: launches a kernel on first resolve, caches subsequent calls.
+
+    Architectural Mandate:
+    This provider solves a critical temporal ordering problem: a kernel whose
+    result must be cached for multiple consumers (like `CacheProvider`), but
+    whose execution must be deferred until runtime dependencies (e.g., data
+    uploads) are satisfied—something `CacheProvider` cannot guarantee because
+    it pre-executes at plan-creation time.
+
+    On the first call to `resolve()`, the kernel is launched with the caller's
+    `wait_for` events, and the resulting event is cached. All subsequent calls
+    return the cached handle and event, ignoring their `wait_for` arguments
+    (which is safe because subsequent callers always depend on the first
+    caller's event transitively).
+    """
+
+    signature: KernelSignature
+    output_handle: BufferHandle
+    # Mutable cache slot in a frozen dataclass, accessed via object.__setattr__.
+    _cached_event: Optional[cl.Event] = field(default=None, init=False, repr=False, compare=False, hash=False)
+
+    def resolve(
+        self, queue: cl.CommandQueue, ex: KernelExecutor, wait_for: List[cl.Event]
+    ) -> Tuple[BufferHandle, cl.Event]:
+        if self._cached_event is None:
+            event = ex.launch(queue, self.signature, wait_for=wait_for)
+            object.__setattr__(self, "_cached_event", event)
+        return self.output_handle, self._cached_event
+
+
+@dataclass(frozen=True)
 class StagedComputationProvider(DependencyProvider):
     """A generic, powerful provider for complex, multi-kernel dependency chains."""
 
@@ -195,6 +227,8 @@ class CceStrategy(ProblemTypeStrategy):
         return "targets_cce"
 
     def get_loss_signature(self, **kwargs) -> "ComputeProbsLossCceChunkSignature":
+        # CCE uses `loss_out_ref`; discard the BCE-specific `partial_loss_out_ref`.
+        kwargs.pop("partial_loss_out_ref", None)
         return ComputeProbsLossCceChunkSignature(**kwargs, target_ref=self.targets_cce_ref)
 
     def get_module_grad_signature(self, **kwargs) -> "CalculateModuleParamGradsCceSignature":
@@ -218,6 +252,8 @@ class BceStrategy(ProblemTypeStrategy):
         return "targets_bce"
 
     def get_loss_signature(self, **kwargs) -> "ComputeProbsLossBceChunkSignature":
+        # BCE uses `partial_loss_out_ref`; discard the CCE-specific `loss_out_ref`.
+        kwargs.pop("loss_out_ref", None)
         return ComputeProbsLossBceChunkSignature(**kwargs, target_ref=self.targets_bce_ref)
 
     def get_module_grad_signature(self, **kwargs) -> "CalculateModuleParamGradsBceSignature":

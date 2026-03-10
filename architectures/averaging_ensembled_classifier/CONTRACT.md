@@ -1,4 +1,4 @@
-### **System Contract: Host-Device Kernel Interface (Revision 6)**
+### **System Contract: Host-Device Kernel Interface (Revision 7)**
 
 #### **Preamble**
 
@@ -50,9 +50,9 @@ A buffer identifier shall be constructed as:
 
 **2.1.1. Memory Scope Token Definitions**
 
-- **`GLOBAL_`**: Standard read/write `__global` device memory.
+- **`GLOBAL_`**: Standard `__global` device memory for pipeline data. Buffers in this scope represent transient, per-dispatch data flowing through the computational DAG (inputs, activations, masks, partials, intermediates). They may carry the `const` qualifier in the C declaration when used as a read-only source.
 - **`LOCAL_`**: Work-group exclusive `__local` memory.
-- **`GLOBAL_CONST_`**: Read-only `__global` device memory (qualified as `__global const`).
+- **`GLOBAL_CONST_`**: Read-only `__global` device memory holding persistent model state (learnable parameters: weights, biases, temperatures) that is invariant for the duration of a kernel dispatch.
 - **`DEVICE_CONST_`**: The hardware-specific, read-only `__constant` address space.
 
 **2.2. Scalar Name Grammar**
@@ -156,6 +156,8 @@ This article defines symbols that must be provided by the host build environment
 - `SCALAR_TYPE`: Defines the primary floating-point type (e.g., `float`, `half`).
 - `SIMD_WIDTH`: Defines the target SIMD vector width (e.g., `8`, `16`).
 - `C_TILE_SIZE`: Defines the block/tile dimension for tiled algorithms.
+- `SCALAR_IS_HALF`: Integer flag (`0` or `1`) indicating whether `SCALAR_TYPE` is `half`. Required because the C preprocessor cannot perform type-name comparison.
+- `NUMERICAL_STABILITY_EPSILON`: The minimum epsilon value used for numerical stability guards (e.g., division-by-zero prevention). Its value is precision-dependent and must be consistent with `SCALAR_TYPE`.
 
 ### **Article 7: Canonical Interface Instantiation**
 
@@ -320,11 +322,10 @@ _Generic terms for special cases._
 | Prefix | `partial_` | Denotes an intermediate, un-aggregated result requiring further reduction.                                                                                               |
 | Prefix | `leaf_`    | Denotes a raw, un-aggregated result at the entry point of a reduction process. It is the most granular form of a `partial_` result.                                      |
 | Prefix | `clipped_` | Denotes a buffer whose elements have undergone a norm-clipping transformation. This is a transitional state, typically applied to `partial_` gradients before reduction. |
-| Prefix | `final_`   | Denotes a fully reduced, final result.                                                                                                                                   |
+| Prefix | `final_`   | Denotes a fully processed, normalized result ready for consumption by a final state-modifying kernel (e.g., optimizer).                                                  |
 | Prefix | `in_`      | Pertaining to a source buffer.                                                                                                                                           |
 | Prefix | `out_`     | Pertaining to a destination buffer.                                                                                                                                      |
 | Prefix | `summed_`  | Denotes a buffer whose elements are the result of a batch-wide reduction (summation) of `partial_` or `clipped_` precursor elements.                                     |
-| Prefix | `final_`   | Denotes a fully processed, normalized result ready for consumption by a final state-modifying kernel (e.g., optimizer).                                                  |
 | Suffix | `_index`   | A logical, ordinal position within a sequence or grid.                                                                                                                   |
 | Suffix | `_offset`  | A physical displacement for direct memory address calculation.                                                                                                           |
 | Suffix | `_count`   | The number of elements to process, relative to a corresponding `_offset`.                                                                                                |
@@ -369,3 +370,12 @@ The following terms are contractually forbidden and must be refactored if found 
 | `elements` | Redundant with `_count`. | Standardize on the canonical `_count` suffix. |
 | `_leading_dim` | Ambiguous library-specific term. | `stride` |
 | `cce`/`bce` | Problem-specific type in name. | Use generic terms (`loss`, `targets`); type is handled by a `FLAG` param. |
+
+**Exception: Architecturally-Mandated Kernel Bifurcation.**
+When CONCEPT.md Principle 3(B) requires separate kernels due to incompatible type signatures, memory layouts, or downstream DAG topologies, those kernels may use otherwise-forbidden terms to distinguish the variant. This exception applies only when:
+
+1. The kernel pair cannot share a unified interface (differing buffer types, shapes, or DAG edges).
+2. The distinction is documented in the kernel's `@kernel_contract` block with an explicit reference to Principle 3(B).
+3. No `FLAG` parameter could eliminate the interface divergence without producing a "smart kernel" with complex internal branching over incompatible memory patterns.
+
+**Current applicants:** `compute_probs_loss_cce_chunk` (Node 6), `compute_probs_loss_bce_chunk` (Node 7).

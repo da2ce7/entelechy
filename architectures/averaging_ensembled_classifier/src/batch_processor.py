@@ -54,7 +54,22 @@ class BatchProcessor:
         q, bm, ex = self.svs.q, self.svs.bm, self.svs.ex
 
         # --- Phase 1: Initial Data Uploads & Async Dependency Calculation ---
-        upload_x_evt = cl.enqueue_copy(q, bm.get_cl_buffer("input"), X_batch)
+        # WHY: The GPU "input" buffer has shape (batch_size, padded_input_dim),
+        # but the host array X_batch has shape (batch_size, input_dim) where
+        # input_dim <= padded_input_dim.  A raw enqueue_copy of the unpadded
+        # array would pack samples contiguously in flat memory, misaligning
+        # rows relative to the padded stride the kernel expects.  We must
+        # expand to padded width so that each row occupies exactly
+        # padded_input_dim elements, with zeros in the padding columns.
+        padded_input_dim = self.svs.model_spec.padded_input_dim
+        if X_batch.shape[1] < padded_input_dim:
+            padded_X = np.zeros(
+                (X_batch.shape[0], padded_input_dim), dtype=X_batch.dtype
+            )
+            padded_X[:, :X_batch.shape[1]] = X_batch
+        else:
+            padded_X = X_batch
+        upload_x_evt = cl.enqueue_copy(q, bm.get_cl_buffer("input"), padded_X)
         targets_buffer_name = self.plan.problem_type.required_targets_buffer_name
         upload_y_evt = cl.enqueue_copy(q, bm.get_cl_buffer(targets_buffer_name), y_batch)
 

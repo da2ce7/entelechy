@@ -105,8 +105,8 @@ __kernel void calculate_module_param_grads_chunk(
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         if (lid == 0) {
-            const long bias_tile_base_offset                       = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_classes_per_chunk;
-            const long out_idx                                     = bias_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_classes_per_chunk + class_local_idx;
+            const long bias_tile_base_offset                       = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_padded_total_output_class_count;
+            const long out_idx                                     = bias_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_padded_total_output_class_count + class_global_idx;
             dest_buffer_GLOBAL_partial_grad_biases_module[out_idx] = update_buffer_LOCAL_reduction_tile[0];
         }
     }
@@ -120,9 +120,9 @@ __kernel void calculate_module_param_grads_chunk(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     if (lid == 0) {
-        const long weight_tile_base_offset = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_hidden_count * src_scalar_NATURAL_classes_per_chunk;
-        const long out_idx                 = weight_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_hidden_count * src_scalar_NATURAL_classes_per_chunk
-                             + (long)h_idx * src_scalar_NATURAL_classes_per_chunk + class_local_idx;
+        const long weight_tile_base_offset = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_total_output_class_count;
+        const long out_idx                 = weight_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_total_output_class_count
+                             + (long)h_idx * src_scalar_NATURAL_padded_total_output_class_count + class_global_idx;
         dest_buffer_GLOBAL_partial_grad_weights_module[out_idx] = update_buffer_LOCAL_reduction_tile[0];
     }
 }

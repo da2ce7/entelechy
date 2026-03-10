@@ -265,8 +265,9 @@ graph TD
         subgraph ActProcess["Act Process (Forward Pass & Loss)"]
             style ActProcess phase_box
             K4["(4) forward_pass"]:::kernel --> hidden_i["Hidden Activations 'i'"]:::data
+            K4 --> hidden_mask["Hidden Mask 'i'"]:::data
             P_Shared & P_Module & SampleMask --> K4
-            hidden_i --> K5["(5) render_logits_chunk"]:::kernel
+            hidden_i & hidden_mask --> K5["(5) render_logits_chunk"]:::kernel
             P_Module & P_Temps --> K5
             K5 --> Full_Logits["Full Logits Buffer"]:::full_intermediate
             subgraph LossPath["Loss Path (CCE/BCE)"]
@@ -340,10 +341,9 @@ graph TD
                 style PhaseIII phase_box
                 subgraph StreamingLoop["Streaming Backprop Loop (Chunk 'i')"]
                     style StreamingLoop streaming_loop
-                    Input_i["Recomputed Input 'i'"]:::data --- K17["(17) backprop_shared_weights"]:::kernel
-                    Input_i --- K18["(18) backprop_shared_biases"]:::kernel
-                    P_Shared & hidden_i --> K17
-                    hidden_i --> K18
+                    Input_i["Recomputed Input 'i'"]:::data --> K17["(17) backprop_shared_weights"]:::kernel
+                    hidden_i --> K17
+                    hidden_i --> K18["(18) backprop_shared_biases"]:::kernel
                     Summed_Grad_H -. "slice" .-> K17 & K18
                     K17 --> PARTIALS_Grad_SW["PARTIAL Grad_SW 'i'"]:::partial_data
                     K18 --> PARTIALS_Grad_SB["PARTIAL Grad_SB 'i'"]:::partial_data
@@ -417,7 +417,7 @@ This architecture defines two distinct and fundamental types of synchronization 
 
 #### **The Placement Contract**
 
-All kernels designated as "Partial Renderers" must accept a unique `flat_tile_index` integer parameter from the host. This index is used to calculate the write offset within their designated output buffer, ensuring each partial result is placed in its correct, discrete slot. This contract applies to kernels: **(7), (8), (9), (10), (17), (18)**.
+All kernels designated as "Partial Renderers" must accept a unique `flat_tile_index` integer parameter from the host. This index is used to calculate the write offset within their designated output buffer, ensuring each partial result is placed in its correct, discrete slot. This contract applies to kernels: **(6), (7), (8), (9), (10), (11), (17), (18)**.
 
 ---
 
@@ -489,7 +489,7 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
     2.  **Performance:** It is optimized for the contiguous data block guaranteed by the **`(13) Item Synchronization Point`**, avoiding the latency and overhead of a host-driven recursive engine.
     3.  **Architectural Coherence:** It resolves the logical conflict of applying a scatter-gather primitive to a pre-gathered, contiguous buffer.
 - **(17) `backprop_shared_weights_chunk`**: Computes partial gradients for shared weights.
-  - **Contract:** Consumes a slice of the `Summed_Grad_H` and a **chunk** of recomputed `hidden_i`. Adheres to the Placement Contract.
+  - **Contract:** Consumes `Input_i`, a slice of the `Summed_Grad_H`, and a **chunk** of recomputed `hidden_i`. Adheres to the Placement Contract.
   - **Lifecycle Note:** The `PARTIAL_Grad_SW_i` buffer produced by this kernel **must** be processed by **Node (19)** before being aggregated by Node (20).
 - **(18) `backprop_shared_biases_chunk`**: Computes partial gradients for shared biases.
   - **Contract:** Consumes a slice of the `Summed_Grad_H` and a **chunk** of recomputed `hidden_i`. Adheres to the Placement Contract.

@@ -175,10 +175,10 @@ class TestParameterSpaceLayouts:
                         dtype
                     ), f"Shape mismatch: {key} vs {clipped_key}"
 
-    def test_shared_weights_shape_uses_logical_input_dim(
+    def test_shared_weights_shape_uses_padded_hidden_major_layout(
         self, fp32_iris_spec: Float32ModelSpec, iris_param_space: ParameterSpace
     ) -> None:
-        """Contract: shared_weights first dim is logical input_dim, not padded."""
+        """Contract: shared_weights is (padded_hidden_dim, padded_input_dim) — hidden-major."""
         grid = _make_tiling(fp32_iris_spec)
         layouts = iris_param_space.get_all_memory_layouts(
             batch_size=150,
@@ -186,7 +186,8 @@ class TestParameterSpaceLayouts:
             num_batch_chunks=4,
         )
         sw_shape = layouts["shared_weights"].logical_shape
-        assert sw_shape[0] == fp32_iris_spec.input_dim
+        assert sw_shape[0] == fp32_iris_spec.padded_hidden_dim
+        assert sw_shape[1] == fp32_iris_spec.padded_input_dim
 
     def test_partial_grad_shared_weights_first_dim_equals_num_batch_chunks(
         self, fp32_iris_spec: Float32ModelSpec, iris_param_space: ParameterSpace

@@ -31,8 +31,17 @@
 #error "OpenCL 1.2 or newer is required. Please use a compatible device/driver."
 #endif
 
-// Enable FP16 extension if using half precision
-#if SCALAR_TYPE == half
+// Enable FP16 extension if using half precision.
+// WHY: The C preprocessor #if directive only evaluates integer constant
+// expressions.  Type-name tokens like ``float`` and ``half`` are not
+// integers — they silently evaluate to 0, making ``#if float == half``
+// always true.  We therefore rely on the host-injected integer flag
+// ``SCALAR_IS_HALF`` (0 or 1) which the build system is contractually
+// obligated to provide.
+#ifndef SCALAR_IS_HALF
+#error "System Contract Violation: SCALAR_IS_HALF must be defined by the host build system."
+#endif
+#if SCALAR_IS_HALF
 #if !defined(cl_khr_fp16)
 #error "FP16 extension (cl_khr_fp16) required for half precision but not supported by device"
 #endif
@@ -310,6 +319,8 @@ __kernel void render_logits_chunk(
  *        - Behavioral Invariants: "The implementation is a fused, indivisible unit for numerically stable Softmax calculation."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Partial Renderer for probabilities output."
+ *        - Kernel Bifurcation: "CONCEPT.md Principle 3(B) — separate kernel required due to incompatible type signatures,
+ *          memory layouts, and DAG topology vs. Node 7 (BCE path). CONTRACT §7.0 Exception applies."
  */
 __kernel void compute_probs_loss_cce_chunk(
     /**
@@ -388,6 +399,8 @@ __kernel void compute_probs_loss_cce_chunk(
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Dual Partial Renderer. Uses flat_tile_index for both probability and loss outputs."
+ *        - Kernel Bifurcation: "CONCEPT.md Principle 3(B) — separate kernel required due to incompatible type signatures,
+ *          memory layouts, and DAG topology vs. Node 6 (CCE path). CONTRACT §7.0 Exception applies."
  */
 __kernel void compute_probs_loss_bce_chunk(
     /**
@@ -830,6 +843,7 @@ __kernel void clip_partial_gradients(
     uint src_scalar_NATURAL_modules_per_chunk,
     uint src_scalar_NATURAL_total_batch_count,
     uint src_scalar_NATURAL_padded_hidden_count,
+    uint src_scalar_NATURAL_padded_total_output_class_count,
     uint src_scalar_NATURAL_total_tile_count);
 
 // --- Phase 13: Data Layout Transformation & Permutation ---
@@ -1222,14 +1236,14 @@ __kernel void backprop_shared_biases_chunk(
     __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_activations,
 
     /**
-     * @param src_buffer_GLOBAL_final_grad_hidden_activations The final, consolidated upstream gradient from Node 16.
+     * @param src_buffer_GLOBAL_summed_grad_hidden_activations The final, consolidated upstream gradient from Node 16.
      *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_total_element_count)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_final_grad_hidden_total_element_count]
      *        - Validation Preconditions: The logical shape assumed by this kernel must match the physical size of the provided buffer, as proven by: (src_scalar_NATURAL_total_batch_count *
      * src_scalar_NATURAL_padded_hidden_count) == src_scalar_NATURAL_final_grad_hidden_total_element_count.
      */
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_final_grad_hidden_activations,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_summed_grad_hidden_activations,
 
     /**
      * @param src_buffer_GLOBAL_sample_mask A tensor defining the validity (1) or padding (0) status of samples.
@@ -1401,7 +1415,7 @@ __kernel void normalize_gradients(
  */
 __kernel void adam_update(
     /**
-     * @param src_buffer_GLOBAL_final_grad The buffer containing the final, normalized, batch-averaged gradients from Node 20.
+     * @param src_buffer_GLOBAL_final_grad The buffer containing the final, normalized, batch-averaged gradients from Node 21.
      *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
      *        - Padding Contract: {Type: NONE}
      *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]

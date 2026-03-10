@@ -84,12 +84,19 @@ class _CalculateModuleParamGradsBase(KernelSignature):
         return "calculate_module_param_grads_chunk"
 
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
+        # WHY: The kernel uses get_group_id() for gradient component mapping
+        # (module, hidden, class) and get_local_id(0)/get_local_size(0) for
+        # batch reduction within each work-group. The global_size in dim 0
+        # must be modules_per_chunk * work_group_size_0 so that there are
+        # exactly modules_per_chunk work-groups in that dimension. Dims 1 & 2
+        # have local_size = 1, giving one work-group per hidden/class index.
         global_size = (
-            self.tile.modules_per_chunk,
+            self.tile.modules_per_chunk * self.work_group_size_0,
             int(self.hidden_count),
             self.tile.classes_per_chunk,
         )
-        return global_size, None
+        local_size = (self.work_group_size_0, 1, 1)
+        return global_size, local_size
 
 
 @dataclass(frozen=True)
