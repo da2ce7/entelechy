@@ -1,0 +1,10 @@
+# meson.options — Build feature options for averaging_ensembled_classifier
+
+option('aec_backend_vulkan', type: 'feature', value: 'auto',
+       description: 'Build Vulkan SPIR-V compute shaders (requires glslc)')
+
+option('aec_backend_cpu', type: 'feature', value: 'auto',
+       description: 'Build CPU SIMD kernel shared library')
+
+option('aec_cpu_isa_flags', type: 'array', value: [],
+       description: 'C compiler ISA flags for CPU backend (e.g., [\'-mavx2\']. Empty = -march=native)')

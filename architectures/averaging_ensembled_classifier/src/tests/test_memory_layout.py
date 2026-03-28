@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.memory_layout import MemoryLayout, PaddingStrategy, PaddingType, _pad_to_multiple
+from src.shared.memory_layout import MemoryLayout, PaddingStrategy, PaddingType, _pad_to_multiple
 
 
 class TestPadToMultiple:

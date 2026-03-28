@@ -21,10 +21,10 @@ num_heads, and massive output_classes.
 import numpy as np
 import pytest
 
-from src.memory_layout import MemoryLayout, PaddingStrategy, PaddingType
-from src.model_spec import Float16ModelSpec, Float32ModelSpec, ModelSpec
-from src.parameter_space import ParameterSpace
-from src.workload_primitives import TilingScheme
+from src.shared.memory_layout import MemoryLayout, PaddingStrategy, PaddingType
+from src.shared.model_spec import Float16ModelSpec, Float32ModelSpec, ModelSpec
+from src.shared.parameter_space import ParameterSpace
+from src.shared.workload_primitives import TilingScheme
 
 # =========================================================================
 # Helper: build a TilingScheme consistent with the orchestrator's logic

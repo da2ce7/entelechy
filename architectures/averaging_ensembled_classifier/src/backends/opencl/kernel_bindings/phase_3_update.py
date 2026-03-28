@@ -31,7 +31,7 @@ import pyopencl as cl
 
 # --- Foundational Primitives & Core Infrastructure ---
 from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
-from ..cl_context_manager import DiscoveredArchConstants
+from ..context import DiscoveredArchConstants
 
 
 # =========================================================================

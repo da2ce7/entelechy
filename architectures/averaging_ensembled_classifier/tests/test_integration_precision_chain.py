@@ -28,9 +28,9 @@ import numpy as np
 import pytest
 
 from src.arch_primitives import Float16Context, Float32Context
-from src.model_spec import Float16ModelSpec, Float32ModelSpec, ModelSpec
-from src.parameter_space import ParameterSpace
-from src.workload_primitives import TilingScheme
+from src.shared.model_spec import Float16ModelSpec, Float32ModelSpec, ModelSpec
+from src.shared.parameter_space import ParameterSpace
+from src.shared.workload_primitives import TilingScheme
 
 # =========================================================================
 # Helpers

@@ -27,13 +27,13 @@ import pyopencl as cl
 
 # --- Foundational Primitives (The Vocabulary of Work) ---
 # These are the low-level, stateless descriptors of the workload.
-from ..workload_primitives import WorkTile
+from ....shared.workload_primitives import WorkTile
 
 # --- Core Infrastructure (The Tools of the Artisan) ---
 # These are the foundational components upon which all signatures are built.
 from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
-from ..memory_layout import _pad_to_multiple
-from ..cl_context_manager import DiscoveredArchConstants
+from ....shared.memory_layout import _pad_to_multiple
+from ..context import DiscoveredArchConstants
 
 
 @dataclass(frozen=True)

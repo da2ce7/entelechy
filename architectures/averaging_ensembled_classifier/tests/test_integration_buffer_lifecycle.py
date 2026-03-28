@@ -26,19 +26,19 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from src.memory_layout import MemoryLayout
+from src.shared.memory_layout import MemoryLayout
 
 # Provide Pylance with the real types for static analysis.
 if TYPE_CHECKING:
     import pyopencl as cl
 
-    from src.launcher_infra import BufferHandle, BufferManager, HostView, PingPongManager
+    from src.backends.opencl.launcher_infra import BufferHandle, BufferManager, HostView, PingPongManager
 
 # Conditional OpenCL imports — launcher_infra requires pyopencl
 try:
     import pyopencl as cl  # noqa: F811
 
-    from src.launcher_infra import BufferHandle, BufferManager, HostView, PingPongManager  # noqa: F811
+    from src.backends.opencl.launcher_infra import BufferHandle, BufferManager, HostView, PingPongManager  # noqa: F811
 
     _has_cl = True
 except ImportError:

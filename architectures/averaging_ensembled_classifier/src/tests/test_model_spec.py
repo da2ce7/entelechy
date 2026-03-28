@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.model_spec import Float32ModelSpec, Float16ModelSpec, ModelSpec
+from src.shared.model_spec import Float32ModelSpec, Float16ModelSpec, ModelSpec
 
 
 class TestPaddingCalculations:

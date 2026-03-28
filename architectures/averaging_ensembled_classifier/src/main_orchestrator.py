@@ -31,8 +31,8 @@ from sklearn.utils import Bunch
 # --- Foundational Architectural Primitives ---
 # WHY: The Orchestrator's primary function is to compose these primitive "nouns"
 # into a coherent, executable "sentence" (the ExecutionPlan).
-from .model_spec import ModelSpec, Float32ModelSpec, Float16ModelSpec
-from .cl_context_manager import (
+from .shared.model_spec import ModelSpec, Float32ModelSpec, Float16ModelSpec
+from .backends.opencl.context import (
     OpenCLContextManager,
     ComputeEnvironment,
     Float32ComputeEnvironment,
@@ -40,25 +40,27 @@ from .cl_context_manager import (
     Float32Context,
     Float16Context,
 )
-from .parameter_space import ParameterSpace
-from .execution_plan import (
+from .shared.parameter_space import ParameterSpace
+from .backends.opencl.execution_plan import (
     ExecutionPlan,
     DataLifecyclePolicy,
     DependencyProvider,
     CacheProvider,
     ComputeOnceProvider,
     StagedComputationProvider,
+)
+from .shared.problem_type_strategy import (
     ProblemTypeStrategy,
     CceStrategy,
     BceStrategy,
 )
-from .kernel_signatures import ForwardPassSignature
-from .launcher_infra import Services, BufferManager, KernelExecutor, BufferHandle
-from .compute_patterns import ReductionPlan
-from .workload_primitives import TilingScheme
-from .stabilization_policy import StabilizationPolicy
-from .batch_processor import BatchProcessor
-from . import graph_recipes as recipes
+from .backends.opencl.kernel_bindings import ForwardPassSignature
+from .backends.opencl.launcher_infra import Services, BufferManager, KernelExecutor, BufferHandle
+from .backends.opencl.compute_patterns import ReductionPlan
+from .shared.workload_primitives import TilingScheme
+from .shared.stabilization_policy import StabilizationPolicy
+from .backends.opencl.batch_processor import BatchProcessor
+from .backends.opencl import graph_recipes as recipes
 
 
 @dataclass(frozen=True)

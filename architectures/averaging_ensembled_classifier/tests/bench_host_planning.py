@@ -21,11 +21,11 @@ import math
 import numpy as np
 import pytest
 
-from src.model_spec import Float32ModelSpec, Float16ModelSpec, ModelSpec
-from src.parameter_space import ParameterSpace
-from src.stabilization_policy import StabilizationPolicy
-from src.memory_layout import MemoryLayout, PaddingStrategy, PaddingType
-from src.workload_primitives import (
+from src.shared.model_spec import Float32ModelSpec, Float16ModelSpec, ModelSpec
+from src.shared.parameter_space import ParameterSpace
+from src.shared.stabilization_policy import StabilizationPolicy
+from src.shared.memory_layout import MemoryLayout, PaddingStrategy, PaddingType
+from src.shared.workload_primitives import (
     ContiguousGather,
     LinearlyChunkedGather,
     TiledGather,

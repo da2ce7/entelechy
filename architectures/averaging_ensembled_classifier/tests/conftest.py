@@ -60,10 +60,10 @@ if "src" not in sys.modules:
 # ---------------------------------------------------------------------------
 # Architecture imports (host-side only – no device needed)
 # ---------------------------------------------------------------------------
-from src.model_spec import Float16ModelSpec, Float32ModelSpec  # noqa: E402
-from src.parameter_space import ParameterSpace  # noqa: E402
-from src.stabilization_policy import StabilizationPolicy  # noqa: E402
-from src.workload_primitives import TilingScheme  # noqa: E402
+from src.shared.model_spec import Float16ModelSpec, Float32ModelSpec  # noqa: E402
+from src.shared.parameter_space import ParameterSpace  # noqa: E402
+from src.shared.stabilization_policy import StabilizationPolicy  # noqa: E402
+from src.shared.workload_primitives import TilingScheme  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Pytest markers

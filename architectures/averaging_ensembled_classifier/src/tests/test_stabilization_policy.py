@@ -14,7 +14,7 @@ import math
 import numpy as np
 import pytest
 
-from src.stabilization_policy import StabilizationPolicy
+from src.shared.stabilization_policy import StabilizationPolicy
 
 
 @pytest.fixture

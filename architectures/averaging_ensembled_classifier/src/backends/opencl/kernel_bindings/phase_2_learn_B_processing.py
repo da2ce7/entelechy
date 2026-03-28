@@ -31,10 +31,10 @@ import numpy as np
 import pyopencl as cl
 
 # --- Foundational Primitives & Core Infrastructure ---
-from ..workload_primitives import WorkTile
+from ....shared.workload_primitives import WorkTile
 from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
-from ..memory_layout import _pad_to_multiple
-from ..cl_context_manager import DiscoveredArchConstants
+from ....shared.memory_layout import _pad_to_multiple
+from ..context import DiscoveredArchConstants
 
 
 # =========================================================================

@@ -51,14 +51,14 @@ if TYPE_CHECKING:
 from sklearn.datasets import load_iris
 from sklearn.utils import Bunch as _Bunch
 
-from src.cl_context_manager import (
+from src.backends.opencl.context import (
     OpenCLContextManager,
     Float32ComputeEnvironment,
     Float16ComputeEnvironment,
 )
 from src.arch_primitives import Float32Context
-from src.model_spec import Float32ModelSpec
-from src.parameter_space import ParameterSpace
+from src.shared.model_spec import Float32ModelSpec
+from src.shared.parameter_space import ParameterSpace
 from src.main_orchestrator import (
     TrainingOrchestrator,
     TrainingHyperparams,

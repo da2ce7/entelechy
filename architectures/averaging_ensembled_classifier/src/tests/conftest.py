@@ -21,10 +21,10 @@ if "src" not in sys.modules:
     _pkg.__package__ = "src"
     sys.modules["src"] = _pkg
 
-from src.model_spec import Float32ModelSpec, Float16ModelSpec
-from src.parameter_space import ParameterSpace
-from src.workload_primitives import TilingScheme
-from src.stabilization_policy import StabilizationPolicy
+from src.shared.model_spec import Float32ModelSpec, Float16ModelSpec
+from src.shared.parameter_space import ParameterSpace
+from src.shared.workload_primitives import TilingScheme
+from src.shared.stabilization_policy import StabilizationPolicy
 
 
 # ── Canonical small model (Iris-like) ──

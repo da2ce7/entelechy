@@ -19,8 +19,8 @@ No OpenCL device is required.
 import numpy as np
 import pytest
 
-from src.model_spec import Float32ModelSpec
-from src.workload_primitives import (
+from src.shared.model_spec import Float32ModelSpec
+from src.shared.workload_primitives import (
     ContiguousGather,
     GatherPrimitive,
     LinearlyChunkedGather,

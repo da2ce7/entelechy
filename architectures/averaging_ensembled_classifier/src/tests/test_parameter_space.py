@@ -16,9 +16,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.model_spec import Float32ModelSpec, Float16ModelSpec
-from src.parameter_space import ParameterSpace, ParameterFlowConfig
-from src.workload_primitives import TilingScheme
+from src.shared.model_spec import Float32ModelSpec, Float16ModelSpec
+from src.shared.parameter_space import ParameterSpace, ParameterFlowConfig
+from src.shared.workload_primitives import TilingScheme
 
 
 # =========================================================================

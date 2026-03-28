@@ -18,13 +18,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.workload_primitives import (
+from src.shared.workload_primitives import (
     TilingScheme,
     TiledGather,
     LinearlyChunkedGather,
     ContiguousGather,
 )
-from src.stabilization_policy import StabilizationPolicy
+from src.shared.stabilization_policy import StabilizationPolicy
 
 
 # =========================================================================
@@ -270,7 +270,7 @@ class TestEppConsistency:
 
     @pytest.fixture
     def iris_layouts(self, iris_spec):
-        from src.parameter_space import ParameterSpace
+        from src.shared.parameter_space import ParameterSpace
         ps = ParameterSpace(spec=iris_spec)
         grid = TilingScheme(
             num_module_chunks=1, num_class_chunks=1,
@@ -365,8 +365,8 @@ class TestUpdateSubgraphFlowFiltering:
     """
 
     def test_non_specialized_flows_have_expected_names(self):
-        from src.parameter_space import ParameterSpace
-        from src.model_spec import Float32ModelSpec
+        from src.shared.parameter_space import ParameterSpace
+        from src.shared.model_spec import Float32ModelSpec
 
         spec = Float32ModelSpec(
             input_dim=4, hidden_dim=32, output_classes=3,
@@ -388,8 +388,8 @@ class TestUpdateSubgraphFlowFiltering:
         Both iterate the same param_space object, so the keys MUST match.
         This verifies that the name used as dict key is the same as flow.name.
         """
-        from src.parameter_space import ParameterSpace
-        from src.model_spec import Float32ModelSpec
+        from src.shared.parameter_space import ParameterSpace
+        from src.shared.model_spec import Float32ModelSpec
 
         spec = Float32ModelSpec(
             input_dim=4, hidden_dim=32, output_classes=3,

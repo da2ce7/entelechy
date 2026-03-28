@@ -36,10 +36,10 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from src.model_spec import Float32ModelSpec
-from src.parameter_space import ParameterSpace
-from src.stabilization_policy import StabilizationPolicy
-from src.workload_primitives import (
+from src.shared.model_spec import Float32ModelSpec
+from src.shared.parameter_space import ParameterSpace
+from src.shared.stabilization_policy import StabilizationPolicy
+from src.shared.workload_primitives import (
     LinearlyChunkedGather,
     TiledGather,
     TilingScheme,
@@ -47,8 +47,8 @@ from src.workload_primitives import (
 
 # These modules require pyopencl at import time — gate them.
 if TYPE_CHECKING:
-    from src.compute_patterns import ReductionPlan
-    from src.execution_plan import (
+    from src.backends.opencl.compute_patterns import ReductionPlan
+    from src.backends.opencl.execution_plan import (
         BceStrategy,
         CacheProvider,
         CceStrategy,
@@ -57,11 +57,11 @@ if TYPE_CHECKING:
         ExecutionPlan,
         ProblemTypeStrategy,
     )
-    from src.launcher_infra import BufferHandle
+    from src.backends.opencl.launcher_infra import BufferHandle
 
 try:
-    from src.compute_patterns import ReductionPlan  # noqa: F811
-    from src.execution_plan import (  # noqa: F811
+    from src.backends.opencl.compute_patterns import ReductionPlan  # noqa: F811
+    from src.backends.opencl.execution_plan import (  # noqa: F811
         BceStrategy,
         CacheProvider,
         CceStrategy,
@@ -70,7 +70,7 @@ try:
         ExecutionPlan,
         ProblemTypeStrategy,
     )
-    from src.launcher_infra import BufferHandle  # noqa: F811
+    from src.backends.opencl.launcher_infra import BufferHandle  # noqa: F811
 
     _has_cl = True
 except ImportError:

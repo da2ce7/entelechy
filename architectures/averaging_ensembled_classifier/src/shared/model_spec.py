@@ -21,7 +21,7 @@ import abc
 from dataclasses import dataclass, field
 import numpy as np
 
-from .arch_primitives import PrecisionContext, Float32Context, Float16Context
+from ..arch_primitives import PrecisionContext, Float32Context, Float16Context
 
 @dataclass(frozen=True)
 class ModelSpec(PrecisionContext, abc.ABC):

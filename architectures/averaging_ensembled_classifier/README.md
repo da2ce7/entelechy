@@ -87,5 +87,6 @@ This architecture was forged in a crucible of deliberate constraint: to target *
 This document provides the spirit of the architecture. To understand its flesh and bone, its laws and its logic, you must consult the canonical sources:
 
 *   **The Philosophical Blueprint:** For the unabridged design philosophy, data contracts, validation scenarios, and the full computational graph, see [1: `CONCEPT.md`](./CONCEPT.md).
-*   **The Book of Law:** For the inviolable Host-Device interface, parameter naming conventions, and memory layout contracts, see [2: `CONTRACT.md`](./CONTRACT.md).
+*   **The Implementation Blueprint:** For concrete data structures, module layout, build system, multi-backend design, test strategy, and the phase-gated migration plan, see [2: `DESIGN.md`](./DESIGN.md).
+*   **The Book of Law:** For the inviolable Host-Device interface, parameter naming conventions, and memory layout contracts, see [3: `CONTRACT.md`](./CONTRACT.md).
 *   **The Kernel Declarations:** For the ground-truth C-level function signatures that are the final authority for all kernel launches, see [`kernels/kernels.cl.h`](./kernels/kernels.cl.h).

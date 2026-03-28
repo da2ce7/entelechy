@@ -31,10 +31,10 @@ from typing import Any
 import numpy as np
 import pytest
 
-from src.model_spec import Float32ModelSpec, Float16ModelSpec
-from src.parameter_space import ParameterSpace
-from src.stabilization_policy import StabilizationPolicy
-from src.workload_primitives import LinearlyChunkedGather, TilingScheme
+from src.shared.model_spec import Float32ModelSpec, Float16ModelSpec
+from src.shared.parameter_space import ParameterSpace
+from src.shared.stabilization_policy import StabilizationPolicy
+from src.shared.workload_primitives import LinearlyChunkedGather, TilingScheme
 
 # =========================================================================
 # Helpers

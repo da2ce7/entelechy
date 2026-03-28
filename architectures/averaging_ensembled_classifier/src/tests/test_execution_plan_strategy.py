@@ -16,8 +16,8 @@ from typing import List, Tuple, Optional
 import numpy as np
 import pytest
 
-from src.execution_plan import CceStrategy, BceStrategy
-from src.launcher_infra import BufferHandle, KernelSignature
+from src.backends.opencl.execution_plan import CceStrategy, BceStrategy
+from src.backends.opencl.launcher_infra import BufferHandle, KernelSignature
 
 
 # ── Fake BufferHandle factory ──

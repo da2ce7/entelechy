@@ -57,20 +57,20 @@ import pytest
 if TYPE_CHECKING:
     import pyopencl as cl
 
-    from src.cl_context_manager import (
+    from src.backends.opencl.context import (
         OpenCLContextManager,
         Float32ComputeEnvironment,
         Float32DiscoveredArchConstants,
     )
     from src.arch_primitives import Float32Context
-    from src.model_spec import Float32ModelSpec
-    from src.parameter_space import ParameterSpace
-    from src.workload_primitives import TilingScheme
-    from src.launcher_infra import (
+    from src.shared.model_spec import Float32ModelSpec
+    from src.shared.parameter_space import ParameterSpace
+    from src.shared.workload_primitives import TilingScheme
+    from src.backends.opencl.launcher_infra import (
         BufferManager,
         KernelExecutor,
     )
-    from src.kernel_signatures import (
+    from src.backends.opencl.kernel_bindings import (
         ForwardPassSignature,
         RenderLogitsChunkSignature,
         ComputeProbsLossCceChunkSignature,
@@ -87,7 +87,7 @@ if TYPE_CHECKING:
         SharedGradientHandles,
         ClipSharedGradientsChunkSignature,
     )
-    from src.compute_patterns import AggregationManager
+    from src.backends.opencl.compute_patterns import AggregationManager
 
 # ---------------------------------------------------------------------------
 # Conditional OpenCL imports — the entire module is skipped when absent.
@@ -112,20 +112,20 @@ pytestmark = pytest.mark.skipif(
 )
 
 if _has_opencl and _has_opencl_device:
-    from src.cl_context_manager import (  # noqa: F811
+    from src.backends.opencl.context import (  # noqa: F811
         OpenCLContextManager,
         Float32ComputeEnvironment,
         Float32DiscoveredArchConstants,
     )
     from src.arch_primitives import Float32Context  # noqa: F811
-    from src.model_spec import Float32ModelSpec  # noqa: F811
-    from src.parameter_space import ParameterSpace  # noqa: F811
-    from src.workload_primitives import TilingScheme  # noqa: F811
-    from src.launcher_infra import (  # noqa: F811
+    from src.shared.model_spec import Float32ModelSpec  # noqa: F811
+    from src.shared.parameter_space import ParameterSpace  # noqa: F811
+    from src.shared.workload_primitives import TilingScheme  # noqa: F811
+    from src.backends.opencl.launcher_infra import (  # noqa: F811
         BufferManager,
         KernelExecutor,
     )
-    from src.kernel_signatures import (  # noqa: F811
+    from src.backends.opencl.kernel_bindings import (  # noqa: F811
         ForwardPassSignature,
         RenderLogitsChunkSignature,
         ComputeProbsLossCceChunkSignature,
@@ -142,7 +142,7 @@ if _has_opencl and _has_opencl_device:
         SharedGradientHandles,
         ClipSharedGradientsChunkSignature,
     )
-    from src.compute_patterns import AggregationManager  # noqa: F811
+    from src.backends.opencl.compute_patterns import AggregationManager  # noqa: F811
 
 
 # =========================================================================

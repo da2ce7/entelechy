@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.workload_primitives import (
+from src.shared.workload_primitives import (
     TilingScheme,
     WorkTile,
     TiledGather,
@@ -22,7 +22,7 @@ from src.workload_primitives import (
     ContiguousGather,
     SCALAR_UINT_TYPE,
 )
-from src.model_spec import Float32ModelSpec
+from src.shared.model_spec import Float32ModelSpec
 
 
 # =========================================================================

@@ -27,18 +27,18 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from src.model_spec import Float32ModelSpec as Float32ModelSpec  # noqa: F401 (used by conftest fixtures)
-from src.parameter_space import ParameterSpace  # noqa: F401 (used by conftest fixtures)
-from src.stabilization_policy import StabilizationPolicy
-from src.workload_primitives import TilingScheme
+from src.shared.model_spec import Float32ModelSpec as Float32ModelSpec  # noqa: F401 (used by conftest fixtures)
+from src.shared.parameter_space import ParameterSpace  # noqa: F401 (used by conftest fixtures)
+from src.shared.stabilization_policy import StabilizationPolicy
+from src.shared.workload_primitives import TilingScheme
 
 # These modules require pyopencl at import time — gate them.
 # The TYPE_CHECKING block provides Pylance with the real types for static
 # analysis, while the runtime try/except handles the case where pyopencl
 # is absent (the entire module is skipped via pytestmark below).
 if TYPE_CHECKING:
-    from src.compute_patterns import ReductionPlan
-    from src.execution_plan import (
+    from src.backends.opencl.compute_patterns import ReductionPlan
+    from src.backends.opencl.execution_plan import (
         BceStrategy,
         CacheProvider,
         CceStrategy,
@@ -48,11 +48,11 @@ if TYPE_CHECKING:
         ProblemTypeStrategy,
         StagedComputationProvider,
     )
-    from src.launcher_infra import BufferHandle
+    from src.backends.opencl.launcher_infra import BufferHandle
 
 try:
-    from src.compute_patterns import ReductionPlan  # noqa: F811
-    from src.execution_plan import (  # noqa: F811
+    from src.backends.opencl.compute_patterns import ReductionPlan  # noqa: F811
+    from src.backends.opencl.execution_plan import (  # noqa: F811
         BceStrategy,
         CacheProvider,
         CceStrategy,
@@ -62,7 +62,7 @@ try:
         ProblemTypeStrategy,
         StagedComputationProvider,
     )
-    from src.launcher_infra import BufferHandle  # noqa: F811
+    from src.backends.opencl.launcher_infra import BufferHandle  # noqa: F811
 
     _has_cl = True
 except ImportError:

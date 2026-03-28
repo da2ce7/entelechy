@@ -22,11 +22,11 @@ from typing import Dict, Tuple
 import numpy as np
 import pytest
 
-from src.model_spec import Float32ModelSpec
-from src.parameter_space import ParameterSpace, ParameterFlowConfig
-from src.memory_layout import MemoryLayout
-from src.workload_primitives import TilingScheme
-from src.execution_plan import CceStrategy, BceStrategy
+from src.shared.model_spec import Float32ModelSpec
+from src.shared.parameter_space import ParameterSpace, ParameterFlowConfig
+from src.shared.memory_layout import MemoryLayout
+from src.shared.workload_primitives import TilingScheme
+from src.backends.opencl.execution_plan import CceStrategy, BceStrategy
 
 
 # =========================================================================

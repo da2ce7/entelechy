@@ -28,9 +28,9 @@ import numpy as np
 import pyopencl as cl
 
 # --- Foundational Primitives & Core Infrastructure ---
-from ..workload_primitives import WorkTile
+from ....shared.workload_primitives import WorkTile
 from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
-from ..cl_context_manager import DiscoveredArchConstants
+from ..context import DiscoveredArchConstants
 
 
 # =========================================================================

@@ -1,4 +1,12 @@
 // kernels.cl.h
+//
+// --- ADR-013 Designation ---
+// This file is the algorithmic specification document for the
+// averaging_ensembled_classifier architecture.  Its @kernel_contract
+// blocks and @param annotations constitute the authoritative,
+// language-neutral reference that all backend implementations
+// (OpenCL, Vulkan SPIR-V, CPU SIMD) must implement against.
+// See: adr/ADR-013-kernel-source-strategy.md
 
 #ifndef KERNELS_CL_H
 #define KERNELS_CL_H

@@ -59,10 +59,10 @@ import math
 import numpy as np
 import pytest
 
-from src.launcher_infra import BufferHandle, KernelSignature
-from src.model_spec import Float32ModelSpec
-from src.parameter_space import ParameterSpace
-from src.workload_primitives import TilingScheme, WorkTile
+from src.backends.opencl.launcher_infra import BufferHandle, KernelSignature
+from src.shared.model_spec import Float32ModelSpec
+from src.shared.parameter_space import ParameterSpace
+from src.shared.workload_primitives import TilingScheme, WorkTile
 
 
 # ── Shared helpers ──
@@ -103,7 +103,7 @@ class TestComputeOnceProvider:
     @staticmethod
     def _make_provider():
         """Build a ComputeOnceProvider with a mock signature."""
-        from src.execution_plan import ComputeOnceProvider
+        from src.backends.opencl.execution_plan import ComputeOnceProvider
 
         mock_sig = MagicMock(spec=KernelSignature)
         handle = _h(42)
@@ -164,7 +164,7 @@ class TestComputeOnceProvider:
 
     def test_frozen_dataclass_allows_cache_mutation(self) -> None:
         """The internal _cached_event must be mutable despite the frozen dataclass."""
-        from src.execution_plan import ComputeOnceProvider
+        from src.backends.opencl.execution_plan import ComputeOnceProvider
 
         provider = ComputeOnceProvider(signature=MagicMock(), output_handle=_h(0))
         # Before resolve, cache is empty.
@@ -180,7 +180,7 @@ class TestComputeOnceProvider:
     def test_cache_provider_ignores_wait_for(self) -> None:
         """CacheProvider must ignore its wait_for — this means it cannot solve
         the timing bug because its event was created before data upload."""
-        from src.execution_plan import CacheProvider
+        from src.backends.opencl.execution_plan import CacheProvider
 
         handle = _h(10)
         stale_event = MagicMock()
@@ -241,7 +241,7 @@ class TestNode8DispatchGrid:
         batch_size: int = 150,
         total_tiles: int = 1,
     ):
-        from src.kernel_signatures.phase_2_learn_A_production import (
+        from src.backends.opencl.kernel_bindings.phase_2_learn_A_production import (
             CalculateModuleParamGradsCceSignature,
         )
 
@@ -545,7 +545,7 @@ class TestNode10DispatchGrid:
 
     @staticmethod
     def _make_temp_signature(modules_per_chunk: int = 8, wg_size: int = 256):
-        from src.kernel_signatures.phase_2_learn_A_production import (
+        from src.backends.opencl.kernel_bindings.phase_2_learn_A_production import (
             CalculateChunkTempGradientsCceSignature,
         )
 
@@ -732,7 +732,7 @@ class TestBackpropGradientLayoutAlignment:
         batch_size: int = 150,
         num_chunks: int = 4,
     ):
-        from src.kernel_signatures.phase_2_learn_D_backprop import (
+        from src.backends.opencl.kernel_bindings.phase_2_learn_D_backprop import (
             BackpropSharedWeightsChunkSignature,
         )
         input_ref = _h(0)
@@ -842,7 +842,7 @@ class TestBatchChunkIndexContract:
 
     @staticmethod
     def _make_backprop_sw_sig(batch_chunk_index: int, padded_input: int = 16, padded_hidden: int = 32):
-        from src.kernel_signatures.phase_2_learn_D_backprop import (
+        from src.backends.opencl.kernel_bindings.phase_2_learn_D_backprop import (
             BackpropSharedWeightsChunkSignature,
         )
         input_ref, h_ref, grad_h_ref = _h(0), _h(1), _h(2)
@@ -891,7 +891,7 @@ class TestBatchChunkIndexContract:
         source of execute_streaming_shared_backprop to confirm the fix.
         """
         import inspect
-        from src.graph_recipes import build_shared_backprop_subgraph
+        from src.backends.opencl.graph_recipes import build_shared_backprop_subgraph
         source = inspect.getsource(build_shared_backprop_subgraph)
         # The fixed code must pass batch_chunk_index=np.uint32(0) for BOTH
         # the weight and bias backprop signatures.
@@ -953,7 +953,7 @@ class TestInputDataPadding:
         confirm the padding logic is present.
         """
         import inspect
-        from src.batch_processor import BatchProcessor
+        from src.backends.opencl.batch_processor import BatchProcessor
         source = inspect.getsource(BatchProcessor.run)
         # Must reference padded_input_dim and create a padded array
         assert "padded_input_dim" in source, (

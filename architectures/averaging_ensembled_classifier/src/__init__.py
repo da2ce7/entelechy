@@ -24,13 +24,13 @@ interface for the consumer.
 from .main_orchestrator import TrainingOrchestrator, TrainingHyperparams, StabilizationConfig
 
 # The primitive that defines the model's static, logical shape.
-from .model_spec import ModelSpec
+from .shared.model_spec import ModelSpec
 
 # The manifest that defines the model's learnable parameter space.
-from .parameter_space import ParameterSpace
+from .shared.parameter_space import ParameterSpace
 
 # The object that implements the system's gradient stabilization policy.
-from .stabilization_policy import StabilizationPolicy
+from .shared.stabilization_policy import StabilizationPolicy
 
 
 # --- Public API Contract (`__all__`) ---

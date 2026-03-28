@@ -367,19 +367,19 @@ Top-level `meson.build` with `subdir()` delegation to per-backend `meson.build` 
 project('averaging_ensembled_classifier-sub', 'c', version: '0.1.0')
 py = import('python').find_installation()
 
-backend_vulkan_opt = get_option('backend_vulkan')
-backend_cpu_opt    = get_option('backend_cpu')
-glslc = find_program('glslc', required: backend_vulkan_opt)
+backend_vulkan = get_option('aec_backend_vulkan')
+backend_cpu    = get_option('aec_backend_cpu')
+glslc = find_program('glslc', required: backend_vulkan)
 
 subdir('src/shared')                          # Pure Python install
 subdir('src/backends/opencl')                 # Always enabled — runtime compilation only
 subdir('kernels')                             # Install OpenCL kernel sources as package data
 
-if backend_vulkan_opt.allowed() and glslc.found()
+if backend_vulkan.allowed() and glslc.found()
   subdir('src/backends/vulkan')               # SPIR-V compilation
 endif
 
-if backend_cpu_opt.allowed()
+if backend_cpu.allowed()
   subdir('src/backends/cpu')                  # C shared library
 endif
 ```
@@ -388,13 +388,15 @@ endif
 
 ```meson
 # meson.options
-option('backend_vulkan', type: 'feature', value: 'auto',
+option('aec_backend_vulkan', type: 'feature', value: 'auto',
        description: 'Build Vulkan SPIR-V compute shaders (requires glslc)')
-option('backend_cpu', type: 'feature', value: 'auto',
+option('aec_backend_cpu', type: 'feature', value: 'auto',
        description: 'Build CPU SIMD kernel shared library')
-option('cpu_isa_flags', type: 'array', value: [],
-       description: 'C compiler ISA flags (e.g., [\'-mavx2\']. Empty = -march=native)')
+option('aec_cpu_isa_flags', type: 'array', value: [],
+       description: 'C compiler ISA flags (e.g., [\'\-mavx2\']. Empty = -march=native)')
 ```
+
+Option names use the `aec_` prefix to namespace them within the Meson subproject.
 
 **Feature flag semantics:** `auto` (default) probes for dependencies and enables if available; `enabled` makes the backend mandatory; `disabled` skips unconditionally. OpenCL is always enabled (no build-time compilation).
 
@@ -482,21 +484,21 @@ All phases proceed in parallel behind `_build_config.py` feature flags. Each pha
 
 ### 11.2 Phase Structure
 
-| Phase | Objective | Rollback Gate |
-| :--- | :--- | :--- |
-| **0: Foundation** | Create directory structure; move modules to `src/shared/` + `src/backends/opencl/`; create `meson.options` and `_build_config.py` template | All existing tests green |
-| **1: Plan Model** | Implement shared-layer plan data structures (node types, buffer lifecycle, reduction/streaming plans, retrieval protocol); write Tier 1 tests | Tier 1 green |
-| **2: OpenCL Adapter** | Wrap existing PyOpenCL dispatch in `PlanRenderer` interface; write OpenCL Tier 2 tests | Tier 1 + OpenCL Tier 2 green |
-| **3: CPU Backend** | Implement C kernel library, ctypes FFI, `CPUPlanRenderer`; write CPU Tier 2 tests | Tier 1 + CPU Tier 2 green |
-| **4: Test Harness** | Full Tier 1/2/3 framework, fixtures, tolerance tables, oracle logic; can begin immediately | All enabled tiers green |
-| **5: Vulkan Backend** | GLSL shaders, SPIR-V compilation, vulkan-python `PlanRenderer`; write Vulkan Tier 2 tests | Tier 1 + Vulkan Tier 2 + Tier 3 parity green |
-| **User-Facing API** | `WorkTicket`, `LearnHandle`, `Engine`; parallel with Phase 4 | Tier 1 (ticket) + integration green |
-| **6: Legacy Removal** | Delete dissolved modules; system operates exclusively through plan-model dispatch | Tier 3 parity green, all backends, FP32 + FP16 |
+| Phase | Objective | Rollback Gate | Status |
+| :--- | :--- | :--- | :--- |
+| **0: Foundation** | Create directory structure; move modules to `src/shared/` + `src/backends/opencl/`; create `meson.options` and `_build_config.py` template | All existing tests green | **Complete** |
+| **1: Plan Model** | Implement shared-layer plan data structures (node types, buffer lifecycle, reduction/streaming plans, retrieval protocol); write Tier 1 tests | Tier 1 green | Not started |
+| **2: OpenCL Adapter** | Wrap existing PyOpenCL dispatch in `PlanRenderer` interface; write OpenCL Tier 2 tests | Tier 1 + OpenCL Tier 2 green | Not started |
+| **3: CPU Backend** | Implement C kernel library, ctypes FFI, `CPUPlanRenderer`; write CPU Tier 2 tests | Tier 1 + CPU Tier 2 green | Not started |
+| **4: Test Harness** | Full Tier 1/2/3 framework, fixtures, tolerance tables, oracle logic; can begin immediately | All enabled tiers green | Not started |
+| **5: Vulkan Backend** | GLSL shaders, SPIR-V compilation, vulkan-python `PlanRenderer`; write Vulkan Tier 2 tests | Tier 1 + Vulkan Tier 2 + Tier 3 parity green | Not started |
+| **User-Facing API** | `WorkTicket`, `LearnHandle`, `Engine`; parallel with Phase 4 | Tier 1 (ticket) + integration green | Not started |
+| **6: Legacy Removal** | Delete dissolved modules; system operates exclusively through plan-model dispatch | Tier 3 parity green, all backends, FP32 + FP16 | Not started |
 
 ### 11.3 Phase Dependency Graph
 
 ```
-Phase 0 (Foundation)
+Phase 0 (Foundation) ────────── ✅ Complete (407 tests green)
   │
   ▼
 Phase 1 (Plan Model) ──────── Tier 1 gate
