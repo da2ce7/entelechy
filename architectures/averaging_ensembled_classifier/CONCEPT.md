@@ -1,4 +1,4 @@
-## **Architectural Concept: A Unified, Memory-Aware Streaming Classification Engine (Revision 7)**
+## **Architectural Concept: A Unified, Memory-Aware Streaming Classification Engine (Revision 8)**
 
 ### **Guiding Principles**
 
@@ -34,9 +34,9 @@ Kernels are simple, single-purpose modules. The architecture avoids complex bran
 > - **(A) Single Kernel with Host-Injected Flag:** A unified kernel uses a `FLAG__` scalar to toggle paths, provided the divergence is manageable.
 > - **(B) Separate Kernels:** Distinct kernels are expected when divergence is complex or imposes conflicting memory patterns.
 
-#### 4. **Trust the Driver**
+#### 4. **Backend-Neutral Plan Model**
 
-Simple kernels are composed into a logical Directed Acyclic Graph (DAG). The architecture trusts the OpenCL driver to handle low-level optimizations like kernel fusion. The number of nodes in the DAG is a non-goal, emphasizing adaptability over rigid structure.
+Simple kernels are composed into a logical Directed Acyclic Graph (DAG) expressed as an immutable, backend-neutral execution plan—a data structure, not executable code. Each target backend (OpenCL, Vulkan, CPU) receives this plan and renders it using its native execution model. The architecture trusts each backend's rendering tier to handle low-level optimizations within its jurisdiction. The number of nodes in the plan is a non-goal, emphasizing adaptability over rigid structure.
 
 #### 5. **Unified Execution Model**
 
@@ -46,13 +46,14 @@ All workflows follow Act (forward pass) then Learn (backpropagation) sequencing,
 
 The system observes a strict tripartite authority structure to prevent circular dependencies and ensure traceable design decisions:
 
-- **1. Conceptual (This Document):** Sovereign authority defining **what** must be achieved and **why**. Contains all principles, component definitions, and validation scenarios.
+- **1. Conceptual (This Document):** Sovereign authority defining **what** must be achieved and **why**. Contains all principles, component definitions, and validation scenarios. Structural decisions that realize these mandates are recorded in the ADR chain (ADR-001 through ADR-018); once accepted, an ADR's decision is binding on all downstream layers.
 
   - _Example Mandate:_ "Optimizer implementations must avoid precision erosion across unbounded training steps"
+  - _Example ADR:_ ADR-002 establishes the five-node plan type taxonomy as the closed vocabulary for the execution plan
 
-- **2. Contractual (Kernel Headers):** Binding authority formalizing **interface requirements**. Translates conceptual mandates into human/machine-verifiable API contracts.
+- **2. Contractual (Kernel Headers & Contracts):** Binding authority formalizing **interface requirements**. Translates conceptual mandates into human/machine-verifiable API contracts, expressed as `KernelContract` frozen dataclasses and the `CONTRACT.md` articles.
 
-  - _Example Enforcement:_ `adam_update` kernel requires `src_scalar_REAL_beta1_pow_t` parameter
+  - _Example Enforcement:_ `adam_update` kernel's `KernelContract` requires `src_scalar_REAL_beta1_pow_t` parameter
 
 - **3. Design (Implementations):** Subordinate authority implementing **how** to fulfill superior layers. Never influences higher layers.
   - _Example Execution:_ Host computes `beta1**t` using FP64 regardless of `SCALAR_TYPE`
@@ -162,52 +163,129 @@ A Host Orchestrator could be configured to implement a true **`Group-Wise`** cli
 
 #### **4. Asynchronous Host Interaction**
 
-The processing of each item within a training batch spans two event-delimited phases:
+The processing of each batch spans two event-delimited phases whose temporal relationship is controlled by the user:
 
-- **Act Phase**: Concludes when complete, aggregated forward-pass results (`Final Probs`) for that item become available on the host, signaled by the `inference_event`.
-- **Learn Phase**: Triggered by the host when ground truth for that item is ready, concluding when all device-side computations for the entire training batch complete, signaled by the `final_batch_event`.
+- **Act Phase**: Concludes when complete, aggregated forward-pass results (`Final Probs`) become available on the host, signaled by the `inference_event`. Results are delivered through a `RetrievalFuture`—a Protocol with `.wait()`, `.result()`, and `.release()` methods that adapts to each backend's native observation mechanism (zero-copy pointer access for CPU, async D2H transfer completion for GPU backends).
+- **Learn Phase**: Triggered by the host when ground truth is ready, concluding when all device-side computations for the training batch complete, signaled by the `final_batch_event`. Device-side intermediate buffers are not retained between phases; the Learn plan recomputes any required activations, trading negligible redundant computation for immediate VRAM release and elimination of stale-activation risk.
 
-#### **5. The Host Orchestrator & Execution Policies**
+The user-facing expression of this temporal split is the **WorkTicket**—a stateful object whose lifecycle mirrors the Act/Learn separation:
+
+| Ticket State | Transition | Synchronization Point |
+| :--- | :--- | :--- |
+| `PENDING` | `engine.submit(x_data)` | — |
+| `ACT_COMPLETE` | `ticket.get_prediction()` | `inference_event` |
+| `RESOLVED` | `ticket.resolve(y_data)` | — |
+| `CONSUMED` | `learn_handle.wait()` | `final_batch_event` |
+
+This model natively expresses both **Sequential Execution Mode** (resolve immediately after submit) and **Event-Triggered Execution Mode** (inspect prediction, defer resolution until ground truth arrives) through identical syntax, with no mode flag or conditional branching.
+
+#### **5. The Three-Tier Jurisdictional Model**
+
+The system's computational jurisdiction is partitioned into three tiers that correspond to naturally separable concerns:
+
+- **Policy Tier (Shared Layer):** Produces the backend-neutral execution plan. All non-trivial shared computation—plan construction, contract validation, reduction tree planning, buffer lifecycle annotation, threshold scheduling, tiling, activation lifecycle decisions—occurs here. The Policy tier is the sole tier invariant across all backends and all node types.
+
+- **Orchestration Tier (Per-Backend Rendering):** Receives the execution plan and renders it using the backend's native dispatch model. OpenCL enqueues per-tile `clEnqueueNDRange` calls with event chains. Vulkan records a command buffer with `vkCmdDispatch` and `vkCmdPipelineBarrier`. CPU calls `pool_dispatch_and_wait` per node. Kernel tier selection for reduction trees (register-reduce vs. local-reduce), buffer allocation via native allocators, and synchronization primitive management are Orchestration-tier concerns.
+
+- **Execution Tier (Kernel Internals):** The algorithm inside a compiled kernel. Governed by the kernel contract's Behavioral Invariants specification, never prescribed by the plan or the rendering layer. Node 16's internal multi-stage reduction exemplifies the Orchestration/Execution tier collapse: when the upstream Item Synchronization Point (Node 13) guarantees contiguous input, the host-driven inter-stage logistics that necessitate Orchestration-tier participation for Nodes 14/15/20 are eliminated, and the kernel manages its own reduction internally.
+
+This model provides a formal criterion for where new functionality belongs: if a computation must produce identical results across backends, it is a Policy concern and belongs in the shared plan. If it adapts to backend-specific capabilities, it is an Orchestration concern. If it is internal to a kernel's algorithm, it is an Execution concern.
+
+#### **6. The Backend-Neutral Execution Plan**
+
+The execution plan is a directed acyclic graph of typed, immutable node descriptors connected by explicit dependency edges. It replaces the implicit `cl.Event` chains of the monolithic implementation with a first-class, inspectable data structure.
+
+The plan's node vocabulary is a **closed taxonomy** of five types:
+
+| Node Type | Semantics |
+| :--- | :--- |
+| `KernelDispatchNode` | A single logical kernel invocation with buffer bindings, scalar parameters, tile decomposition, and placement strategy. |
+| `ReductionTreeNode` | A multi-stage `log_K(N)` reduction tree, carrying fan-in, pre-computed threshold schedule, and initial offset lists. Rendered atomically by the backend, which selects kernel tiers and manages intermediate buffers. |
+| `StreamingLoopNode` | A parametric loop over a chunk-indexed body of `KernelDispatchNode`s. Specifies chunk count and per-chunk parameter strides; the backend instantiates per-chunk parameter values from base + index × stride. |
+| `BarrierNode` | A named synchronization point that joins upstream dependency edges. Carries no dispatch payload—it is a pure sequencing construct. |
+| `RetrievalNode` | A host-accessible result extraction point, specifying the source buffer, expected shape, and the named event it signals. |
+
+No additional node types may be introduced without a formal architectural decision. Per Principle §1 (Architectural Elegance Feedback): when an optimization requires a construct beyond this vocabulary, implementation is suspended and the pattern is formalized as a new first-class node type.
+
+The plan's dependency edges are the concurrency specification. Nodes with no dependency relationship may execute in parallel; the backend is free to exploit this. No explicit concurrency annotations are required. A `KernelDispatchNode` with `tile_count=N` specifies logical parallelism—not dispatch granularity. Whether N tiles become N `clEnqueueNDRange` calls, one `vkCmdDispatch(N,1,1)`, or N thread-pool tasks is a backend rendering concern.
+
+#### **7. The Kernel Contract Model**
+
+Each kernel's interface is formalized as two complementary artifacts:
+
+- **`KernelContract` (Shared Layer):** A frozen, backend-neutral dataclass carrying the kernel's complete interface specification—parameter names, types, shapes, padding contracts, placement strategies, and validation preconditions. The Policy tier uses this for pre-dispatch validation at plan-construction time. A plan is only valid if every `KernelDispatchNode`'s buffer bindings and scalar parameters satisfy its associated `KernelContract`.
+
+- **`KernelBinding` (Per-Backend):** A backend-specific dispatch adapter that translates abstract placement keys and buffer references into native dispatch arguments. Tile index delivery—host-provided `flat_tile_index` scalar (OpenCL), `gl_WorkGroupID.x` (Vulkan), or `task_index` parameter (CPU)—is a binding concern, not a contract concern.
+
+This split ensures that interface validation is shared (no duplication across backends) while dispatch mechanics remain backend-native (no lowest-common-denominator abstraction).
+
+#### **8. The Buffer Lifecycle**
+
+Every device-side buffer in the execution plan is described by a `BufferDescriptor` carrying:
+
+- **`producing_node`**: The unique node that writes the buffer.
+- **`consumers`**: The set of nodes that read the buffer.
+- **`last_consumer`**: The final reader, after which the buffer may be freed.
+- **`role`**: One of four lifecycle roles—`MODEL_STATE` (persists across batches), `BATCH_INPUT` (uploaded per batch), `BATCH_INTERMEDIATE` (temporary computation product), or `BATCH_OUTPUT` (returned to the host).
+
+Buffer lifetimes are plan-prescribed: the Policy tier annotates each buffer's lifetime interval, and the Orchestration tier manages allocation and deallocation according to these annotations. Each plan's buffer namespace is fully self-contained—no buffer persists across plan boundaries, enabling immediate VRAM release after each plan completes.
+
+#### **9. Multi-Backend Architecture**
+
+The system supports three compute backends:
+
+- **OpenCL (PyOpenCL):** Runtime-compiled kernels from the architecture's `kernels/` directory. Per-tile imperative dispatch with `cl.Event` synchronization. The original and reference backend.
+- **Vulkan (vulkan-python):** GLSL compute shaders compiled to SPIR-V at build time. Single-dispatch parallelism (`vkCmdDispatch(N,1,1)`) with pipeline barriers recorded into command buffers.
+- **CPU (ctypes):** Native C implementations compiled to a shared library. Deterministic, single-threaded-per-task execution via `pool_dispatch_and_wait`. Struct layout verification at library load time prevents silent FFI corruption.
+
+All backends implement from the same algorithmic specification (`kernels.cl.h`), which serves as the language-neutral reference for every kernel's mathematical operation. Per-backend source files reside in `src/backends/<name>/kernel_sources/`, with the shared orchestration layer in `src/shared/`. This physical isolation ensures that changes to one backend cannot affect another.
+
+The build system (Meson with `meson-python`) conditionally enables each backend via `feature` options (`backend_opencl`, `backend_vulkan`, `backend_cpu`) with `auto` as the default—each backend is available when its toolchain is detected, absent otherwise, requiring no manual configuration. A generated `_build_config.py` module declares each backend's availability as a boolean, serving as the single authoritative source for runtime capability queries and test-tier skip logic.
+
+The test strategy reflects this multi-backend structure through three tiers: **Tier 1** validates Policy-tier correctness (plan construction, contract validation) with no backend required; **Tier 2** validates per-backend kernel correctness against analytical/numpy reference fixtures; **Tier 3** validates cross-backend parity using the CPU backend as a deterministic reference oracle.
+
+#### **10. The User-Facing API Surface**
+
+The user-facing API expresses the architecture's Act/Learn temporal split through a `WorkTicket` lifecycle:
+
+```python
+# Sequential Execution Mode (pre-labeled batch)
+result = engine.train_batch(X_train, y_train)
+
+# Event-Triggered Execution Mode (temporal split)
+ticket = engine.submit(x_data)         # returns immediately; Act plan dispatched
+probs = ticket.get_prediction()        # blocks until Act completes
+# ... time passes ...
+learn_handle = ticket.resolve(y_data)  # returns immediately; Learn plan dispatched
+learn_handle.wait()                    # blocks until Learn completes
+```
+
+Design decisions:
+
+- **Future-based concurrency:** `submit()` and `resolve()` return immediately; the user decides when to block. No `asyncio` dependency. Compatible with synchronous scripts, Jupyter notebooks, and non-async frameworks.
+- **Explicit batch submission:** One `submit()` produces one ticket representing one batch. The engine is stateless between ticket lifecycles.
+- **Recompute (no cross-plan sharing):** The Learn plan recomputes the forward pass from the stored input data reference. No device buffers persist across plan boundaries. The ticket holds only host-side state—its arbitrary lifetime in `ACT_COMPLETE` carries zero VRAM cost.
+- **Ephemeral data:** Each submission is a one-shot event. For multi-epoch training, the user resubmits the data each epoch, retaining full control over the training loop.
+
+#### **11. The Host Orchestrator & Execution Policies**
 
 **"All operations are spreadable except for the final gradient collect operation."**
 
-The host logic serves as a sophisticated orchestrator, responsible for resource management and DAG construction. For each training batch, it performs strategic assessments to optimize execution:
+The Policy tier's plan construction logic serves as a sophisticated orchestrator, responsible for resource assessment and plan-graph assembly. For each training batch, it performs strategic assessments that shape the execution plan:
 
-1.  **Memory Assessment & Chunk Definition:** The orchestrator determines an optimal chunking strategy, defining `num_module_chunks`, `num_batch_chunks`, and `num_class_chunks` to balance compute and memory demands.
-2.  **Activation Lifecycle & Streaming:** ... It selects between a Cache or Recompute strategy and manages **two distinct backpropagation streaming models** based on data path requirements:
+1.  **Memory Assessment & Chunk Definition:** The orchestrator determines an optimal chunking strategy, defining `num_module_chunks`, `num_batch_chunks`, and `num_class_chunks` to balance compute and memory demands. These decisions manifest as tile counts on `KernelDispatchNode`s and chunk counts on `StreamingLoopNode`s. The device's capabilities are described by a `HardwareProfile` carrying `max_reduce_fan_in`, `simd_width`, `cache_line_bytes`, and `global_mem_bytes`—named for its plan-construction role, not its hardware origin.
+2.  **Activation Lifecycle & Streaming:** It selects between a Cache or Recompute strategy and manages **two distinct backpropagation streaming models**, expressed as plan-level structural choices:
 
-- **Model A: Accumulate via Recompute (For `Grad_H` and `Grad_Mod*`):** Used when a downstream kernel requires a global synchronization point (e.g., Node 13 permutation). The host allocates a monolithic partials buffer and populates it iteratively by:
-  1. Recomputing a single `hidden_i` chunk.
-  2. Calling the gradient kernel to process that chunk and write its result.
-  3. Discarding the `hidden_i` chunk.
-     This maintains a minimal memory footprint at the cost of a host-side loop.
-- **Model B: True Streaming (For `Grad_SW` & `Grad_SB`):** Used for data paths without global dependencies. The host recomputes a `hidden_i` chunk and passes it, along with the corresponding slice of `Summed_Grad_H`, to a gradient kernel. The kernel's raw partial output is immediately processed by the clipping primitive, and the resulting clipped partial is then fed into the reduction engine.
+- **Model A: Accumulate via Recompute (For `Grad_H` and `Grad_Mod*`):** Expressed as a `StreamingLoopNode` whose body recomputes `hidden_i` chunks and writes tile-indexed partials into a collection buffer for subsequent reduction. It maintains a minimal memory footprint at the cost of a parametric loop.
+- **Model B: True Streaming (For `Grad_SW` & `Grad_SB`):** Expressed as a `StreamingLoopNode` (Nodes 17→18→19) that recomputes inputs, computes partial gradients, clips them immediately, and feeds the clipped partials into the reduction engine—all within a single parametric loop.
 
-The Orchestrator's ability to dynamically select and safely execute these complex streaming models is fundamentally underpinned by the system's **`Axiom of Interface Verifiability` (Contract Article 1.4)**. Because each kernel's interface is a closed logical system, and its `Calculability Proof` must be self-contained, the host possesses all the information required to plan these data flows without any implicit or hidden knowledge, guaranteeing correctness.
+3.  **SIMD-Aware Weight Layout:** Transforms shared layer weights into a SIMD-friendly "Struct of Arrays" (SoA) layout before the Act phase.
+4.  **Reduction Planning & Rendering:** Analyzes problem size and device capabilities (via `HardwareProfile`) to select an optimal Reduction Batch Size (`K`), rendering the full `log_K(N)` reduction tree as `ReductionTreeNode`s with pre-computed threshold schedules and initial offset lists.
+5.  **Indirection List Construction:** For each reduction stage, constructs the `offset_list` buffer pointing to scattered partials, fulfilling the **Indirection Contract**.
+6.  **Partial Result Placement & Indexing:** Provides each tile-parallel kernel invocation with a unique placement key via abstract placement strategies (e.g., `grid_mod_cls`, `linear_batch`), guaranteeing non-overlapping writes. The mechanism by which each tile resolves its index—host scalar, hardware intrinsic, or task parameter—is a `KernelBinding` concern.
+7.  **Phase Staging & Optimizer State Management:** Governs phase intervals through named synchronization points (`BarrierNode`s and `RetrievalNode`s). For the Adam optimizer, the host computes `beta1**t` and `beta2**t` bias correction terms in high precision (FP64) and passes the final values to the update kernel, avoiding on-device precision loss. Precision is uniformly configured through a `PrecisionConfig` frozen dataclass carrying `numpy_dtype`, `fp_format_max`, and `epsilon`.
 
-#### **6. SIMD-Aware Weight Layout:**
-
-The orchestrator transforms shared layer weights into a SIMD-friendly "Struct of Arrays" (SoA) layout before enqueuing kernel (4).
-
-#### **7. DAG Construction & Parallel Dispatch:**
-
-The orchestrator constructs the multi-phase computational graph, enqueuing kernels according to the selected mode and chunking strategy.
-
-#### **8. Reduction Planning & Rendering:**
-
-The orchestrator acts as a **Reduction Planner**, analyzing problem size and VRAM to set an optimal **Reduction Batch Size (`K`)**. It renders the full `log_K(N)` reduction tree, managing intermediate buffer lifecycles.
-
-#### **9. Indirection List Construction:**
-
-For each reduction stage, the orchestrator constructs and enqueues an `offset_list` buffer. This list contains the memory offsets pointing to the scattered partials that a given `aggregate_*` kernel is responsible for reducing.
-
-#### **10. Partial Result Placement & Indexing:**
-
-When dispatching `N` parallel kernels, the orchestrator provides each invocation with a unique **Placement Index** (`flat_tile_index`), guaranteeing that all `N` partials are written without data loss or race conditions.
-
-#### **11. Phase Staging & Optimizer State Management:**
-
-The orchestrator governs phase intervals through event-based sequencing. For the Adam optimizer, the host is responsible for computing the `beta1**t` and `beta2**t` bias correction terms for the current training batch in high precision (e.g., `double`) and passing the final numerical values to the update kernel, avoiding on-device precision loss and underflow during long training runs.
+The Orchestrator's ability to construct valid execution plans for these complex streaming and reduction patterns is fundamentally underpinned by the **`Axiom of Interface Verifiability` (Contract Article 1.4)**. Because each kernel's `KernelContract` is a closed logical system with a self-contained `Calculability Proof`, the Policy tier possesses all information required to plan data flows without implicit or hidden knowledge, guaranteeing correctness.
 
 ---
 
@@ -237,12 +315,11 @@ graph TD
     classDef streaming_loop fill:#e3f2fd,stroke:#1e88e5,stroke-width:2px,stroke-dasharray: 8 4;
 
     %% === HOST ORCHESTRATION LAYER ===
-    subgraph HostStateMachine["Host-Side Execution State Machine"]
+    subgraph HostStateMachine["WorkTicket Lifecycle"]
         style HostStateMachine host_sm
-        HSM_Dispatch["Dispatch Batch"]:::host_state --> HSM_Await_Inference["Await Inference"]:::host_state
-        HSM_Await_Inference --> HSM_Trigger_Learn["Trigger Learn"]:::host_state
-        HSM_Trigger_Learn --> HSM_Await_Batch["Await Batch"]:::host_state
-        HSM_Await_Batch --> HSM_Cycle_Complete["Cycle Complete"]:::host_state
+        HSM_Dispatch["submit(x)<br/>PENDING"]:::host_state --> HSM_Await_Inference["get_prediction()<br/>ACT_COMPLETE"]:::host_state
+        HSM_Await_Inference --> HSM_Trigger_Learn["resolve(y)<br/>RESOLVED"]:::host_state
+        HSM_Trigger_Learn --> HSM_Await_Batch["wait()<br/>CONSUMED"]:::host_state
     end
 
     %% === GLOBAL PARAMETERS (HOST-STAGED PRECONDITIONS) ===
@@ -404,16 +481,22 @@ graph TD
 
 ### **Kernel & Synchronization Contracts**
 
+Each kernel described below is formalized as a `KernelContract` frozen dataclass (§7) in the shared layer, validatable at plan-construction time without requiring any backend. Per-backend `KernelBinding` implementations translate these contracts into native dispatch arguments. The algorithmic reference for all kernels is `kernels.cl.h`, serving as the language-neutral specification from which each backend's kernel sources are independently implemented.
+
+The CCE/BCE strategy divergence (CONCEPT.md §3, Principle "Modular, Dumb Kernels") is resolved through a mixed delegation model: **Strategy B** (separate kernels) for structurally divergent operations (Nodes 6 and 7, which have genuinely different interfaces and algorithms), and **Strategy A** (host-injected `FLAG__` scalar) for parametrically divergent operations (Nodes 8, 9, and 10, which share the same interface but toggle an internal branch).
+
 #### **Fundamental Synchronization Barriers**
 
-This architecture defines two distinct and fundamental types of synchronization points, which are properties of the computational graph itself, independent of the host's scheduling logic (e.g., "Epochs" or "Tickets").
+This architecture defines two distinct and fundamental types of synchronization points, which are properties of the computational graph itself, independent of the host's scheduling logic (e.g., "Epochs" or "Tickets"). In the execution plan (§6), these manifest as `BarrierNode`s (pure sequencing constructs) and `RetrievalNode`s (host-observable completion points).
 
 - **Item Synchronization Point:** A barrier that resolves a data dependency _within the execution of a single learning item_. It ensures that all necessary partial results for that one item are available before a subsequent algorithmic step can proceed. Its purpose is to enforce the correctness of the core algorithm (e.g., backpropagation).
 
-  - **Canonical Example:** Node **(13) `gather_and_permute_grad_h`**.
+  - **Canonical Example:** Node **(13) `gather_and_permute_grad_h`** — represented as a `KernelDispatchNode` whose completion gates the Item Synchronization `BarrierNode`.
 
 - **Batch Synchronization Point:** A barrier that resolves a data dependency _between multiple independent learning items_ that constitute a single logical batch. It ensures that the parallel-processed, fully-reduced, and normalized gradients for all items are ready before the final, collective state-update step is performed. Its purpose is to enforce the correctness of the parallel training paradigm (e.g., mini-batch gradient descent).
-  - **Canonical Example:** Node **(22) Batch Synchronization Point**.
+  - **Canonical Example:** Node **(22) Batch Synchronization Point** — represented as a `BarrierNode` that gates all `adam_update` dispatches.
+
+The two host-visible synchronization events are represented as `RetrievalNode`s: `inference_event` (signaled after diagnostic aggregation, enabling host observation of `Final Probs`) and `final_batch_event` (signaled after all parameter updates complete).
 
 #### **The Placement Contract**
 
@@ -517,14 +600,30 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
 - **Scenario: The Iris Case (Sequential Execution Mode Validation)**
 
   - **Description:** A classic supervised learning task using the Iris dataset, where a small training batch of pre-labeled flower measurements is processed.
-  - **Validation Focus:** Measures the end-to-end latency, ensuring the overhead of the full `clipping -> reduction -> normalization -> update` pipeline is minimal for small batches and doesn't hinder high-throughput, low-latency use cases.
-  - **Key Insight:** Proves the **graceful degradation** of the parallel machinery. The Act/Learn split and batch-wide processing model are not costly abstractions on small problems but a foundational primitive that scales from `N=1` to `N=Infinity`. The `N=1` case is now handled with a direct, efficient driver-level copy, further validating the system's focus on optimal performance at all scales.
+  - **API Expression:**
+    ```python
+    engine = Engine(model_spec, hyperparams)
+    for epoch in range(num_epochs):
+        result = engine.train_batch(X_train, y_train)
+    print(result.predictions)
+    ```
+  - **Validation Focus:** Measures the end-to-end latency, ensuring the overhead of the full `clipping -> reduction -> normalization -> update` pipeline is minimal for small batches and doesn't hinder high-throughput, low-latency use cases. Under 5-line ceremony threshold for the common case.
+  - **Key Insight:** Proves the **graceful degradation** of the parallel machinery. The Act/Learn split and batch-wide processing model are not costly abstractions on small problems but a foundational primitive that scales from `N=1` to `N=Infinity`.
 
 - **Scenario: The Real-Time Trader (Event-Triggered Execution Mode Validation)**
 
   - **Description:** A high-frequency trading system where the system must make instant predictions (`Act` phase) and the `Learn` phase is triggered later when trade outcomes (labels) arrive.
-  - **Validation Focus:** Assesses the system's ability to release VRAM after the `Act` phase and efficiently recompute intermediates for the `Learn` phase.
-  - **Key Insight:** Demonstrates the architecture's strength in real-time, event-driven scenarios. This is unaffected by the `Learn` phase's internal mechanics, proving the **orthogonality of the Act/Learn temporal split** from the batch processing model.
+  - **API Expression:**
+    ```python
+    ticket = engine.submit(market_snapshot)        # returns immediately; Act plan dispatched
+    prediction = ticket.get_prediction()           # blocks until Act completes
+    execute_trade(prediction)
+    # ... seconds to minutes pass ...
+    learn_handle = ticket.resolve(actual_outcome)  # returns immediately; Learn plan dispatched
+    learn_handle.wait()                            # blocks until Learn completes
+    ```
+  - **Validation Focus:** Assesses the system's ability to release VRAM after the `Act` phase (all device buffers freed when `get_prediction()` returns) and efficiently recompute intermediates for the `Learn` phase. The ticket captures `market_snapshot` at submit time—even if the original array is overwritten, the system-enforced Act→Learn association guarantees correctness.
+  - **Key Insight:** Demonstrates the architecture's strength in real-time, event-driven scenarios. The temporal split between Act and Learn is a first-class concept, not a special mode. The ticket holds only host-side state; its arbitrary lifetime in `ACT_COMPLETE` carries zero VRAM cost.
 
 - **Scenario: The Marathon (Massive `epochs`)**
 
@@ -556,7 +655,14 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
 
 - **Scenario: The Data Tsunami (Massive `batch_size`)**
 
-  - **Insight:** This is the canonical test of the full parallel learning model. It validates that the host correctly processes a large training batch (`N` items) by:
+  - **API Expression:**
+    ```python
+    ticket = engine.submit(X_massive)              # returns immediately; Act plan dispatched
+    probs = ticket.get_prediction()                # blocks until Act completes; (N × C) matrix
+    learn_handle = ticket.resolve(y_massive)       # returns immediately; Learn plan dispatched
+    learn_handle.wait()                            # reduction tree handles log_K(N) aggregation
+    ```
+  - **Insight:** This is the canonical test of the full parallel learning model. One ticket, one Act plan, one Learn plan—no per-item overhead. The plan's `ReductionTreeNode` handles the aggregation. It validates that the host correctly processes a large training batch (`N` items) by:
     1.  Rendering `N` parallel gradient computation tasks.
     2.  Correctly inserting the **`(11) clip_partial_gradients`** step for each item's tiled module gradients.
     3.  Knowing the write locations of all `N` partials via the **Placement Contract**.
@@ -566,7 +672,7 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
     7.  Enforcing the strict **`(22) Batch Synchronization Point`**, ensuring the **`(24) adam_update`** kernel only runs _after_ all preceding steps are complete.
 
 - **Scenario: The Colossus (Holistic Stress Test)**
-  - **Insight:** Tests the synergy of all scaling strategies under extreme, compound memory pressure. This proves the orchestrator's robustness by forcing it to compose a single, valid execution graph that correctly handles:
+  - **Insight:** Tests the synergy of all scaling strategies under extreme, compound memory pressure. This proves the orchestrator's robustness by forcing it to compose a single, valid execution plan that correctly handles:
     1.  Per-item gradient clipping for the module path (`Node 11`).
     2.  Per-chunk gradient clipping for the shared path (`Node 19`).
     3.  The **Item Synchronization Point** (`Node 13`) for the `Grad_H` calculation.
@@ -574,3 +680,8 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
     5.  The **Recursive Reduction Engine** applied over multiple, independent data paths.
     6.  The **dual streaming models** for recomputing inputs on demand.
         This demonstrates that the system's sophisticated, multi-stage processing and two-tier synchronization model is not just theoretical but robust in practice.
+
+- **Scenario: The Cross-Backend Arbiter (Multi-Backend Parity Validation)**
+  - **Description:** The same `ExecutionPlan` (Iris-scale, both CCE and BCE configurations) is rendered and executed on all enabled backends. Per-kernel outputs and end-to-end results (`Final Probs`, updated parameters) are compared across backends within per-kernel tolerance bounds derived from `PrecisionConfig`.
+  - **Validation Focus:** Confirms that the three-tier jurisdictional model holds: the Policy tier produces one plan, and every backend's Orchestration + Execution tiers produce numerically equivalent results. The CPU backend serves as the deterministic reference oracle, with its correctness independently established by Tier 2 analytical/numpy fixtures.
+  - **Key Insight:** Proves the **behavioral equivalence** of structurally different rendering paths. OpenCL's per-tile imperative dispatch, Vulkan's single-dispatch command buffer recording, and CPU's synchronous pool dispatch converge to the same mathematical outcome. This is the definitive validation that the backend abstraction boundary (§5) and the execution plan model (§6) faithfully preserve the algorithm's semantics across all execution paradigms.
