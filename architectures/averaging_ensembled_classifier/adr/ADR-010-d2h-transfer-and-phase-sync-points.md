@@ -464,7 +464,7 @@ When the renderer encounters a `RetrievalNode` during plan rendering, it perform
    - **CPU:** No transfer. The compute buffer is already host-accessible.
 
 4. **Construct the `RetrievalFuture`.** Wrap the backend-native completion state in an object satisfying the `RetrievalFuture` protocol:
-   - **OpenCL:** `_OpenCLRetrievalFuture(node_id, event, host_arr, logical_shape)`.
+   - **OpenCL:** `OpenCLRetrievalFuture(node_id, event, host_arr, logical_shape)`.
    - **Vulkan:** `_VulkanRetrievalFuture(node_id, fence, staging_ptr, padded_shape, logical_shape, dtype)`.
    - **CPU:** `_CPURetrievalFuture(node_id, compute_buffer_ptr, logical_shape, dtype)`.
 
@@ -494,7 +494,7 @@ The following illustrates how each backend wraps its native mechanism. These are
 #### OpenCL
 
 ```python
-class _OpenCLRetrievalFuture:
+class OpenCLRetrievalFuture:
     """OpenCL implementation of RetrievalFuture."""
 
     def __init__(
@@ -660,10 +660,10 @@ batch_future.release()
 
 ### Relationship to `HostView`
 
-The existing `HostView` class in `launcher_infra.py` is functionally equivalent to `_OpenCLRetrievalFuture` — it pre-allocates a numpy host buffer, enqueues a non-blocking copy with `cl.Event`, and provides `get()` to slice to the logical shape. Under this ADR:
+The existing `HostView` class in `launcher_infra.py` is functionally equivalent to `OpenCLRetrievalFuture` — it pre-allocates a numpy host buffer, enqueues a non-blocking copy with `cl.Event`, and provides `get()` to slice to the logical shape. Under this ADR:
 
 - `HostView` is **not renamed or preserved** in the shared layer. It is an OpenCL-specific implementation detail.
-- The OpenCL renderer's `_OpenCLRetrievalFuture` absorbs `HostView`'s functionality: host buffer allocation, `enqueue_copy`, and `get()`-style slicing.
+- The OpenCL renderer's `OpenCLRetrievalFuture` absorbs `HostView`'s functionality: host buffer allocation, `enqueue_copy`, and `get()`-style slicing.
 - The shared layer's `HostView` import is replaced by the `RetrievalFuture` Protocol. The host orchestrator depends only on the Protocol.
 
 ### Relationship to the `ExecutionPlan`
@@ -718,7 +718,7 @@ Per ADR-002's migration path and ADR-012's structure:
 
 2. **Add `logical_shape` to `RetrievalNode`.** The plan builder computes the logical (unpadded) shape from `MemoryLayout` and stores it on the `RetrievalNode`. The `padded_shape` remains on the `BufferDescriptor` (ADR-009). The renderer uses both.
 
-3. **OpenCL renderer** (Phase 3 of ADR-001 migration) implements `_OpenCLRetrievalFuture`, absorbing `HostView`'s functionality. The renderer's `render()` method returns `Dict[str, RetrievalFuture]`. The host orchestrator replaces `HostView` usage with the Protocol.
+3. **OpenCL renderer** (Phase 3 of ADR-001 migration) implements `OpenCLRetrievalFuture`, absorbing `HostView`'s functionality. The renderer's `render()` method returns `Dict[str, RetrievalFuture]`. The host orchestrator replaces `HostView` usage with the Protocol.
 
 4. **CPU renderer** (Phase 4) implements `_CPURetrievalFuture` as a zero-cost wrapper. The synchronous execution model means the future is already-resolved at construction time.
 
@@ -731,7 +731,7 @@ Per ADR-002's migration path and ADR-012's structure:
    - `release()` can be called after `result()` without error.
    - For the CPU backend: `wait()` returns immediately; `result()` is a view (no copy).
 
-7. **`HostView` deprecation.** Once the OpenCL renderer implements `_OpenCLRetrievalFuture`, the `HostView` class in `launcher_infra.py` becomes the renderer's internal concern — it may be kept as a private helper or dissolved entirely. The shared-layer import of `HostView` is removed.
+7. **`HostView` deprecation.** Once the OpenCL renderer implements `OpenCLRetrievalFuture`, the `HostView` class in `launcher_infra.py` becomes the renderer's internal concern — it may be kept as a private helper or dissolved entirely. The shared-layer import of `HostView` is removed.
 
 ---
 

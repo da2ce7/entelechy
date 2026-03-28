@@ -233,7 +233,7 @@ The migration is organized into seven phases (Phase 0 through Phase 6). Phases 0
 
 **Deliverables:**
 - Implement OpenCL `PlanRenderer` → `src/backends/opencl/renderer.py` (ADR-001).
-- Implement `_OpenCLRetrievalFuture` → `src/backends/opencl/retrieval.py` (ADR-010).
+- Implement `OpenCLRetrievalFuture` → `src/backends/opencl/retrieval.py` (ADR-010).
 - Implement OpenCL `KernelBinding`s → `src/backends/opencl/kernel_bindings/` (ADR-007).
 - Implement OpenCL buffer allocator, discovery, type mapping, context → `src/backends/opencl/` (ADR-012).
 - Configure OpenCL backend to load source files from `kernels/` (ADR-013).

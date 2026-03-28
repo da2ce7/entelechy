@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.shared.memory_layout import MemoryLayout, PaddingStrategy, PaddingType, _pad_to_multiple
+from src.shared.memory_layout import MemoryLayout, PaddingStrategy, PaddingType, pad_to_multiple
 
 
 class TestPadToMultiple:
@@ -22,13 +22,13 @@ class TestPadToMultiple:
         (33, 16, 48),
     ])
     def test_correct(self, dim, mult, expected) -> None:
-        assert _pad_to_multiple(dim, mult) == expected
+        assert pad_to_multiple(dim, mult) == expected
 
     def test_zero_multiple_returns_original(self) -> None:
-        assert _pad_to_multiple(10, 0) == 10
+        assert pad_to_multiple(10, 0) == 10
 
     def test_none_multiple_returns_original(self) -> None:
-        assert _pad_to_multiple(10, None) == 10  # type: ignore[arg-type]
+        assert pad_to_multiple(10, None) == 10  # type: ignore[arg-type]
 
 
 class TestMemoryLayout:

@@ -33,7 +33,7 @@ import pyopencl as cl
 # --- Foundational Primitives & Core Infrastructure ---
 from ....shared.workload_primitives import WorkTile
 from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
-from ....shared.memory_layout import _pad_to_multiple
+from ....shared.memory_layout import pad_to_multiple
 from ..context import DiscoveredArchConstants
 
 
@@ -124,7 +124,7 @@ class _ClipTiledModuleGradsBase(KernelSignature):
             + 1  # temps
             + self.padded_hidden_count  # hidden_activations
         ) * self.tile.modules_per_chunk
-        global_size = (_pad_to_multiple(int(total_elements_in_tile), work_group_size),)
+        global_size = (pad_to_multiple(int(total_elements_in_tile), work_group_size),)
         local_size = (work_group_size,)
         return global_size, local_size
 

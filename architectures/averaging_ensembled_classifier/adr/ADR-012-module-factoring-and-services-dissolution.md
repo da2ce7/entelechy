@@ -47,7 +47,7 @@ Three modules constitute an informal "Services layer" that bundles backend-speci
 - **`Services`** — a frozen dataclass aggregating `cl.CommandQueue`, `BufferManager`, and `KernelExecutor`. This is a convenience bundle of OpenCL-specific infrastructure. It dissolves entirely — each backend owns its own service aggregation.
 - **`BufferHandle`** — a backend-neutral opaque token. ADR-009 (ACCEPTED) extracts it into the shared layer as a frozen dataclass with an integer `id` field.
 - **`BufferManager`** — coupled to `cl.Context` and `cl.Buffer`. It manages named buffer allocation (`create_named_buffer`), transient buffer pooling (`acquire_transient_buffer` / `release_transient_buffer`), and buffer handle resolution (`get_cl_buffer`). Under ADR-009, plan-level buffer allocation becomes a backend rendering concern. Each backend implements its own buffer allocator.
-- **`HostView`** — couples `cl.enqueue_copy`, `cl.Event`, and numpy padding-stripping. ADR-010 (ACCEPTED) replaces it with the `RetrievalFuture` Protocol. The OpenCL backend's `_OpenCLRetrievalFuture` absorbs `HostView`'s functionality. The shared-layer import of `HostView` is eliminated.
+- **`HostView`** — couples `cl.enqueue_copy`, `cl.Event`, and numpy padding-stripping. ADR-010 (ACCEPTED) replaces it with the `RetrievalFuture` Protocol. The OpenCL backend's `OpenCLRetrievalFuture` absorbs `HostView`'s functionality. The shared-layer import of `HostView` is eliminated.
 
 ### Additional module dissolution
 
@@ -369,7 +369,7 @@ src/
 │   │   ├── discovery.py             # Populates HardwareProfile from cl.device_info
 │   │   ├── type_mapping.py          # Maps PrecisionConfig.numpy_dtype → OpenCL types
 │   │   ├── buffer_allocator.py      # Allocates cl.Buffer from BufferDescriptor; reuse via lifetime intervals
-│   │   ├── retrieval.py             # _OpenCLRetrievalFuture (absorbs HostView functionality)
+│   │   ├── retrieval.py             # OpenCLRetrievalFuture (absorbs HostView functionality)
 │   │   └── kernel_bindings/         # ADR-007 — OpenCL KernelBinding implementations
 │   │       ├── __init__.py
 │   │       ├── phase_1_act.py       # Injects flat_tile_index, marshals cl.Buffer args
@@ -462,7 +462,7 @@ Each backend's module set follows a canonical structure. The responsibilities ar
 
 **`buffer_allocator.py`** — Consumes the plan's `Tuple[BufferDescriptor, ...]` (ADR-009). Allocates physical memory from `size_bytes`, builds the `BufferHandle` → physical map, and optionally uses `role`, `producing_node`, and `last_consumer` annotations to optimize memory reuse. Vulkan uses lifetime intervals for suballocation packing; OpenCL allocates discrete `cl.Buffer`s; CPU uses `malloc` or arena allocation.
 
-**`retrieval.py`** — Implements the `RetrievalFuture` Protocol (ADR-010). The OpenCL implementation (`_OpenCLRetrievalFuture`) absorbs `HostView`'s functionality: pre-allocated numpy host buffer, `cl.enqueue_copy`, `cl.Event` completion, padding-stripping via numpy slice in `.result()`. The CPU implementation wraps a zero-copy numpy view. The Vulkan implementation wraps `VkFence` + staging buffer. The `.release()` method bridges ADR-009's `last_consumer` semantics — the renderer retains `BATCH_OUTPUT` physical memory until the host signals consumption complete.
+**`retrieval.py`** — Implements the `RetrievalFuture` Protocol (ADR-010). The OpenCL implementation (`OpenCLRetrievalFuture`) absorbs `HostView`'s functionality: pre-allocated numpy host buffer, `cl.enqueue_copy`, `cl.Event` completion, padding-stripping via numpy slice in `.result()`. The CPU implementation wraps a zero-copy numpy view. The Vulkan implementation wraps `VkFence` + staging buffer. The `.release()` method bridges ADR-009's `last_consumer` semantics — the renderer retains `BATCH_OUTPUT` physical memory until the host signals consumption complete.
 
 **`renderer.py`** — The `PlanRenderer` that consumes the plan DAG (ADR-001) and renders it using the backend's native execution model. Its `render()` method returns `Dict[str, RetrievalFuture]` — one future per `RetrievalNode`. Reduction tree rendering (ADR-003) and streaming loop rendering (ADR-004) are internal to the renderer.
 
@@ -539,7 +539,7 @@ Per ADR-017's phasing:
 
 **Phase 2 (OpenCL Renderer — dual code path):**
 - Implement OpenCL `PlanRenderer` → `backends/opencl/renderer.py`.
-- Implement `_OpenCLRetrievalFuture` → `backends/opencl/retrieval.py`.
+- Implement `OpenCLRetrievalFuture` → `backends/opencl/retrieval.py`.
 - Implement OpenCL `KernelBinding`s → `backends/opencl/kernel_bindings/`.
 - Implement OpenCL `buffer_allocator.py`, `discovery.py`, `type_mapping.py`, `context.py`.
 - Validation gate: bit-identical results via new and old code paths.

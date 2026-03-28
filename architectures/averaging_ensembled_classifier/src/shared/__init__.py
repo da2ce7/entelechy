@@ -33,6 +33,9 @@ from .retrieval_future import RetrievalFuture
 # Kernel contracts
 from .kernel_contracts import KernelContract
 
+# Plan renderer protocol
+from .plan_renderer import PlanRenderer
+
 # Configuration types
 from .hardware_profile import HardwareProfile
 from .precision_config import PrecisionConfig

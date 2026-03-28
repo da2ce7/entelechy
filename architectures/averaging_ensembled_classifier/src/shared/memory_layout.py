@@ -74,7 +74,7 @@ class PaddingStrategy:
     target_dim_idx: int = -1
 
 
-def _pad_to_multiple(dim: int, multiple: int) -> int:
+def pad_to_multiple(dim: int, multiple: int) -> int:
     """A pure, stateless utility to calculate the next highest multiple."""
     # WHY: A defensive guard. If the padding multiple is zero, it would cause a
     # division-by-zero error. This ensures the function is robust.
@@ -161,7 +161,7 @@ class MemoryLayout:
             current_dim_size = padded_shape[dim_idx]
 
             if strategy.type == PaddingType.ELEMENT_COUNT:
-                padded_shape[dim_idx] = _pad_to_multiple(current_dim_size, strategy.value)
+                padded_shape[dim_idx] = pad_to_multiple(current_dim_size, strategy.value)
 
             elif strategy.type == PaddingType.BYTE_ALIGNMENT:
                 # WHY: This check enforces a critical architectural constraint.
@@ -177,7 +177,7 @@ class MemoryLayout:
 
                 row_elements = current_dim_size
                 row_bytes = row_elements * element_size_bytes
-                padded_row_bytes = _pad_to_multiple(row_bytes, strategy.value)
+                padded_row_bytes = pad_to_multiple(row_bytes, strategy.value)
 
                 # WHY: A CONTRACTUAL VERIFICATION. This is a critical sanity check.
                 # It is physically impossible for a padded row's byte count to

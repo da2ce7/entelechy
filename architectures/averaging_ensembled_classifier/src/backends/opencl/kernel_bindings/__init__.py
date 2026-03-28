@@ -71,6 +71,10 @@ from .phase_3_update import (
     ClampTemperaturesSignature,
 )
 
+# --- Phase 2B: New KernelBinding adapters (coexist with legacy Signatures) ---
+from .base import KernelBinding
+from .dispatch_table import build_dispatch_table
+
 # --- Public API Contract (`__all__`) ---
 # This list explicitly defines all symbols that are considered part of the
 # public, stable API of this package. Consumers should only rely on these names.
@@ -107,4 +111,7 @@ __all__ = [
     "AdamParameterGroup",
     "AdamUpdateSignature",
     "ClampTemperaturesSignature",
+    # New KernelBinding adapters (Phase 2B)
+    "KernelBinding",
+    "build_dispatch_table",
 ]

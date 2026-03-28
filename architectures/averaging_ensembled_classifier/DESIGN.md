@@ -276,7 +276,7 @@ averaging_ensembled_classifier/
 │   ├── backends/
 │   │   ├── opencl/                          # PyOpenCL backend — runtime kernel compilation
 │   │   │   ├── renderer.py                  # PlanRenderer implementation
-│   │   │   ├── retrieval.py                 # _OpenCLRetrievalFuture
+│   │   │   ├── retrieval.py                 # OpenCLRetrievalFuture
 │   │   │   ├── buffer_allocator.py
 │   │   │   ├── context.py
 │   │   │   ├── discovery.py                 # HardwareProfile population

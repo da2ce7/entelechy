@@ -1,0 +1,204 @@
+# src/backends/opencl/kernel_bindings/binding_phase_2_learn_C.py
+"""KernelBinding adapters for Learn-C reduction & aggregation kernels."""
+from __future__ import annotations
+
+from typing import Any, Callable
+
+import numpy as np
+import pyopencl as cl
+
+from ....shared.buffer_lifecycle import BufferHandle
+from ....shared.memory_layout import pad_to_multiple
+from .base import KernelBinding
+
+
+class AggregateRegisterReduceBinding(KernelBinding):
+    """Binding for aggregate_register_reduce (reduction engine tier 1)."""
+
+    def get_kernel_name(self) -> str:
+        return "aggregate_register_reduce"
+
+    def compute_grid(self, tile_index: int, scalar_params: dict[str, int | float], hardware_simd_width: int) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+        partial_width = int(scalar_params["partial_width"])
+        return (partial_width,), None
+
+    def marshal_args(self, get_buffer: Callable[[BufferHandle], cl.Buffer], buffer_bindings: dict[str, BufferHandle], scalar_params: dict[str, int | float], tile_index: int) -> list[Any]:
+        return [
+            get_buffer(buffer_bindings["partial_collection"]),
+            get_buffer(buffer_bindings["partial_offset_list"]),
+            get_buffer(buffer_bindings["dest"]),
+            np.uint32(scalar_params["partial_offset_list_count"]),
+            np.uint32(scalar_params["partial_width"]),
+            np.uint32(scalar_params.get("operation_type", 0)),
+        ]
+
+    # Reduction-specific interface for renderer direct use
+    def marshal_args_reduction(
+        self,
+        source: cl.Buffer,
+        offset_list: cl.Buffer,
+        dest: cl.Buffer,
+        offset_count: int,
+        partial_width: int,
+        operation_type: int,
+    ) -> list[Any]:
+        return [
+            source, offset_list, dest,
+            np.uint32(offset_count),
+            np.uint32(partial_width),
+            np.uint32(operation_type),
+        ]
+
+    def compute_grid_reduction(
+        self, partial_width: int, hardware_simd_width: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+        return (partial_width,), None
+
+
+class AggregateLocalReduceBinding(KernelBinding):
+    """Binding for aggregate_local_reduce (reduction engine tier 2)."""
+
+    def __init__(self, workgroup_size: int = 256) -> None:
+        self._workgroup_size = workgroup_size
+
+    def get_kernel_name(self) -> str:
+        return "aggregate_local_reduce"
+
+    def compute_grid(self, tile_index: int, scalar_params: dict[str, int | float], hardware_simd_width: int) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+        partial_width = int(scalar_params["partial_width"])
+        wg = self._workgroup_size
+        global_size = (pad_to_multiple(partial_width, wg),)
+        local_size = (wg,)
+        return global_size, local_size
+
+    def marshal_args(self, get_buffer: Callable[[BufferHandle], cl.Buffer], buffer_bindings: dict[str, BufferHandle], scalar_params: dict[str, int | float], tile_index: int) -> list[Any]:
+        element_size = int(scalar_params.get("element_size", 4))
+        local_mem_size = self._workgroup_size * element_size
+        return [
+            cl.LocalMemory(local_mem_size),
+            get_buffer(buffer_bindings["partial_collection"]),
+            get_buffer(buffer_bindings["partial_offset_list"]),
+            get_buffer(buffer_bindings["dest"]),
+            np.uint32(scalar_params["partial_offset_list_count"]),
+            np.uint32(scalar_params["partial_width"]),
+            np.uint32(scalar_params.get("operation_type", 0)),
+        ]
+
+    # Reduction-specific interface for renderer direct use
+    def marshal_args_reduction(
+        self,
+        source: cl.Buffer,
+        offset_list: cl.Buffer,
+        dest: cl.Buffer,
+        offset_count: int,
+        partial_width: int,
+        operation_type: int,
+        element_size: int = 4,
+    ) -> list[Any]:
+        local_mem_size = self._workgroup_size * element_size
+        return [
+            cl.LocalMemory(local_mem_size),
+            source, offset_list, dest,
+            np.uint32(offset_count),
+            np.uint32(partial_width),
+            np.uint32(operation_type),
+        ]
+
+    def compute_grid_reduction(
+        self, partial_width: int, hardware_simd_width: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+        wg = self._workgroup_size
+        global_size = (pad_to_multiple(partial_width, wg),)
+        local_size = (wg,)
+        return global_size, local_size
+
+
+class ClipIntermediateGradBinding(KernelBinding):
+    """Binding for clip_intermediate_grad (inter-stage clipping in sum_and_clip trees)."""
+
+    def __init__(self, workgroup_size: int = 256) -> None:
+        self._workgroup_size = workgroup_size
+
+    def get_kernel_name(self) -> str:
+        return "clip_intermediate_grad"
+
+    def compute_grid(self, tile_index: int, scalar_params: dict[str, int | float], hardware_simd_width: int) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+        param_count = int(scalar_params["parameter_count"])
+        wg = self._workgroup_size
+        global_size = (pad_to_multiple(param_count, wg),)
+        local_size = (wg,)
+        return global_size, local_size
+
+    def marshal_args(self, get_buffer: Callable[[BufferHandle], cl.Buffer], buffer_bindings: dict[str, BufferHandle], scalar_params: dict[str, int | float], tile_index: int) -> list[Any]:
+        element_size = int(scalar_params.get("element_size", 4))
+        local_mem_size = self._workgroup_size * element_size
+        return [
+            cl.LocalMemory(local_mem_size),
+            get_buffer(buffer_bindings["intermediate_grad"]),
+            np.float32(scalar_params["clipping_threshold"]),
+            np.float32(scalar_params["epsilon"]),
+            np.uint32(scalar_params["parameter_count"]),
+        ]
+
+    # Clip-specific interface for renderer direct use
+    def marshal_args_clip(
+        self,
+        buffer: cl.Buffer,
+        threshold: float,
+        epsilon: float,
+        param_count: int,
+        element_size: int = 4,
+    ) -> list[Any]:
+        local_mem_size = self._workgroup_size * element_size
+        return [
+            cl.LocalMemory(local_mem_size),
+            buffer,
+            np.float32(threshold),
+            np.float32(epsilon),
+            np.uint32(param_count),
+        ]
+
+    def compute_grid_clip(
+        self, param_count: int, hardware_simd_width: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+        wg = self._workgroup_size
+        global_size = (pad_to_multiple(param_count, wg),)
+        local_size = (wg,)
+        return global_size, local_size
+
+
+class StabilizeReduceGradHBinding(KernelBinding):
+    """Binding for stabilize_and_reduce_grad_hidden_activations (Node 16)."""
+
+    def __init__(self, workgroup_size: int = 256) -> None:
+        self._workgroup_size = workgroup_size
+
+    def get_kernel_name(self) -> str:
+        return "stabilize_and_reduce_grad_hidden_activations"
+
+    def compute_grid(self, tile_index: int, scalar_params: dict[str, int | float], hardware_simd_width: int) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+        total_batch = int(scalar_params["total_batch_count"])
+        padded_hidden = int(scalar_params["padded_hidden_count"])
+        wg = self._workgroup_size
+        num_rows = total_batch * padded_hidden
+        global_size = (num_rows * wg,)
+        local_size = (wg,)
+        return global_size, local_size
+
+    def marshal_args(self, get_buffer: Callable[[BufferHandle], cl.Buffer], buffer_bindings: dict[str, BufferHandle], scalar_params: dict[str, int | float], tile_index: int) -> list[Any]:
+        element_size = int(scalar_params.get("element_size", 4))
+        local_mem_size = self._workgroup_size * element_size
+        return [
+            cl.LocalMemory(local_mem_size),
+            get_buffer(buffer_bindings["permuted_soa"]),
+            get_buffer(buffer_bindings["final_grad_h"]),
+            np.float32(scalar_params["fp_max"]),
+            np.float32(scalar_params["policy_t_algorithmic"]),
+            np.float32(scalar_params["policy_lambda"]),
+            np.uint32(scalar_params["policy_max_k"]),
+            np.float32(scalar_params["epsilon"]),
+            np.uint32(scalar_params["total_batch_count"]),
+            np.uint32(scalar_params["padded_hidden_count"]),
+            np.uint32(scalar_params["total_modules_count"]),
+            np.uint32(scalar_params["padded_total_modules_count"]),
+        ]

@@ -268,3 +268,21 @@ class OpenCLContextManager:
             log_details = f"An unexpected OpenCL error occurred: {e}"
         full_error = "\n".join([log_header, log_details, "=" * 80])
         raise RuntimeError(full_error) from e
+
+
+# =========================================================================
+# === Phase 2A: Lightweight context for the new PlanRenderer path
+# =========================================================================
+
+
+@dataclass(frozen=True)
+class OpenCLContext:
+    """Holds the OpenCL context, queue, device, and compiled program.
+
+    Created by the renderer at initialization. This is the new renderer's
+    context object — independent of the legacy ComputeEnvironment.
+    """
+    context: cl.Context
+    queue: cl.CommandQueue
+    device: cl.Device
+    program: cl.Program

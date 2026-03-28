@@ -27,7 +27,7 @@ import pyopencl as cl
 
 # --- Foundational Primitives & Core Infrastructure ---
 from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
-from ....shared.memory_layout import _pad_to_multiple
+from ....shared.memory_layout import pad_to_multiple
 from ..context import DiscoveredArchConstants
 
 
@@ -95,7 +95,7 @@ class BackpropSharedWeightsChunkSignature(KernelSignature):
         work_group_size_1 = self._arch_consts.optimal_rectangular_tile_dim1
         global_size = (
             int(self.padded_input_count),
-            _pad_to_multiple(int(self.padded_hidden_count), work_group_size_1),
+            pad_to_multiple(int(self.padded_hidden_count), work_group_size_1),
         )
         local_size = (1, work_group_size_1)
         return global_size, local_size
@@ -227,7 +227,7 @@ class ClipSharedGradientsChunkSignature(KernelSignature):
         """Calculates grid to cover all elements in the concatenated gradient vector."""
         work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
         total_elements = self.weights_param_count + self.biases_param_count
-        global_size = (_pad_to_multiple(int(total_elements), work_group_size),)
+        global_size = (pad_to_multiple(int(total_elements), work_group_size),)
         local_size = (work_group_size,)
         return global_size, local_size
 

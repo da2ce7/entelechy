@@ -32,7 +32,7 @@ from ....shared.workload_primitives import WorkTile
 # --- Core Infrastructure (The Tools of the Artisan) ---
 # These are the foundational components upon which all signatures are built.
 from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
-from ....shared.memory_layout import _pad_to_multiple
+from ....shared.memory_layout import pad_to_multiple
 from ..context import DiscoveredArchConstants
 
 
@@ -84,7 +84,7 @@ class ForwardPassSignature(KernelSignature):
         """Calculates the execution grid from the injected hardware context."""
         simd = self._arch_consts.simd_width
         global_size = (
-            _pad_to_multiple(int(self.batch_chunk_count), simd),
+            pad_to_multiple(int(self.batch_chunk_count), simd),
             int(self.padded_hidden_count) // simd,
         )
         local_size = (simd, 1)

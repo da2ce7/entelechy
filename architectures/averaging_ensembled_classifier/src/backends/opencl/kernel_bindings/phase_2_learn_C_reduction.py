@@ -28,7 +28,7 @@ import pyopencl as cl
 
 # --- Foundational Primitives & Core Infrastructure ---
 from ..launcher_infra import BufferHandle, KernelSignature, BufferManager
-from ....shared.memory_layout import _pad_to_multiple
+from ....shared.memory_layout import pad_to_multiple
 from ..context import DiscoveredArchConstants
 
 
@@ -103,7 +103,7 @@ class AggregateLocalReduceSignature(KernelSignature):
         # where each work-group is responsible for reducing one slice of the
         # output vector across all input partials, using local memory for scalability.
         work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
-        global_size = (_pad_to_multiple(int(self.partial_width), work_group_size),)
+        global_size = (pad_to_multiple(int(self.partial_width), work_group_size),)
         local_size = (work_group_size,)
         return global_size, local_size
 
@@ -157,7 +157,7 @@ class ClipIntermediateGradSignature(KernelSignature):
     def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
         """Dispatches enough work-items to compute a single L2 norm over the entire buffer."""
         work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
-        global_size = (_pad_to_multiple(int(self.parameter_count), work_group_size),)
+        global_size = (pad_to_multiple(int(self.parameter_count), work_group_size),)
         local_size = (work_group_size,)
         return global_size, local_size
 
