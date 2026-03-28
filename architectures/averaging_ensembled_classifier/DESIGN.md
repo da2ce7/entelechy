@@ -72,11 +72,11 @@ The plan is a directed acyclic graph of typed, immutable node descriptors with e
 
 | Node Type | Semantics | Key Fields |
 | :--- | :--- | :--- |
-| `KernelDispatchNode` | A single logical kernel invocation | `kernel_name`, `buffer_bindings`, `scalar_params`, `tile_count`, `local_work_size`, `contract_ref` |
+| `KernelDispatchNode` | A single logical kernel invocation | `kernel_name`, `buffer_bindings`, `scalar_params`, `tile_count`, `local_work_size`, `contract`, `placement_strategy` |
 | `ReductionTreeNode` | A multi-stage $\log_K(N)$ reduction tree rendered atomically by the backend | `reduction_plan: ReductionTreePlan` |
 | `StreamingLoopNode` | A parametric loop over a chunk-indexed body of `KernelDispatchNode` references | `streaming_plan: StreamingLoopPlan` |
 | `BarrierNode` | A named synchronization point joining upstream edges; no dispatch payload | `barrier_name` |
-| `RetrievalNode` | A host-accessible result extraction point | `source_buffer`, `expected_shape`, `event_name` |
+| `RetrievalNode` | A host-accessible result extraction point | `source_buffer`, `logical_shape`, `event_name` |
 
 No additional node types may be introduced without a formal ADR. Dependency edges are the concurrency specification — nodes with no dependency relationship may execute in parallel at the backend's discretion.
 
@@ -87,11 +87,13 @@ A parametric header consumed atomically by the backend's renderer. The Policy ti
 ```python
 @dataclass(frozen=True)
 class ReductionTreePlan:
+    num_partials: int
     fan_in_K: int
     num_stages: int
+    elements_per_partial: int
     initial_offset_list: tuple[int, ...]
     tree_variant: Literal["sum", "sum_and_clip"]
-    threshold_schedule: tuple[float, ...]          # len == num_stages
+    threshold_schedule: tuple[float | None, ...]   # len == num_stages; None for "sum" variant stages
     partial_width: int
     source_buffer: BufferHandle
     destination_buffer: BufferHandle
@@ -106,11 +108,11 @@ A stride-based parametric specification. The body is a flat sequence of `KernelD
 ```python
 @dataclass(frozen=True)
 class StreamingLoopPlan:
-    chunk_count: int
-    iteration_dimension: IterationDimension
-    body_nodes: tuple[str, ...]                    # node IDs in the plan
+    iteration: IterationDimension                  # total_extent, chunk_count, chunk_size
+    body: tuple[str, ...]                          # node IDs in the plan
     parameter_strides: tuple[ParameterStride, ...]
     scratch_buffers: tuple[ScratchBufferSpec, ...]
+    constant_scalars: dict[str, float]             # scalars invariant across iterations
 ```
 
 The backend instantiates per-chunk parameter values from `base + index × stride`.
@@ -143,7 +145,7 @@ class PrecisionConfig:
     epsilon: float
 ```
 
-Constructed via `make_precision_config()` factory function. Eliminates `SCALAR_C_TYPE_NAME` from the shared layer.
+Constructed via `PrecisionConfig.float32()` and `PrecisionConfig.float16()` classmethods. `ModelSpec` consumes `PrecisionConfig` via composition; backward-compatible properties (`SCALAR_NP_TYPE`, `SCALAR_C_TYPE_NAME`) delegate to `self.precision`. Factory classmethods `ModelSpec.float32()` / `ModelSpec.float16()` and deprecated module-level `Float32ModelSpec()` / `Float16ModelSpec()` functions are available until Phase 6.
 
 ### 3.6 Buffer Lifecycle (ADR-009)
 
@@ -153,10 +155,14 @@ Every device-side buffer is described by a `BufferDescriptor`:
 @dataclass(frozen=True)
 class BufferDescriptor:
     handle: BufferHandle                           # opaque int id
+    logical_name: str                              # human-readable name
+    padded_shape: tuple[int, ...]                  # SIMD/cache-padded dimensions
+    element_size_bytes: int                        # bytes per element
+    size_bytes: int                                # total allocation size
     role: BufferRole                               # MODEL_STATE | BATCH_INPUT | BATCH_INTERMEDIATE | BATCH_OUTPUT
-    producing_node: str
+    producing_node: str | None                     # None for MODEL_STATE / BATCH_INPUT
     consumers: frozenset[str]
-    last_consumer: str
+    last_consumer: str | None
 ```
 
 Buffer lifetimes are plan-prescribed. Each plan's buffer namespace is fully self-contained — no buffer persists across plan boundaries.
@@ -166,10 +172,13 @@ Buffer lifetimes are plan-prescribed. Each plan's buffer namespace is fully self
 The sole host-facing type for observing device results:
 
 ```python
+@runtime_checkable
 class RetrievalFuture(Protocol):
-    def wait(self) -> None: ...
-    def result(self) -> np.ndarray: ...            # unpadded numpy array
-    def release(self) -> None: ...
+    @property
+    def node_id(self) -> str: ...              # originating RetrievalNode
+    def wait(self) -> None: ...                # block until host-accessible
+    def result(self) -> NDArray[np.floating]: ...  # unpadded numpy array
+    def release(self) -> None: ...             # free device resources
 ```
 
 The renderer owns padding-stripping. CPU backend degenerates to zero-copy.
@@ -420,7 +429,7 @@ Option names use the `aec_` prefix to namespace them within the Meson subproject
 
 | Tier | Scope | Execution Requirement | Gate |
 | :--- | :--- | :--- | :--- |
-| **Tier 1** | Host-side plan correctness: plan construction, contract validation, buffer lifecycle, reduction tree plan, streaming loop plan, strategy delegation, memory layout, precision config | None — pure Python | Always runs |
+| **Tier 1** | Host-side plan correctness: plan construction, contract validation, buffer lifecycle, reduction tree plan, streaming loop plan, strategy delegation, memory layout, precision config, hardware profile | None — pure Python | Always runs (140 tests) |
 | **Tier 2** | Per-backend kernel correctness against reference fixtures | Per-backend: `_build_config.BACKEND_<NAME> is True` | Per enabled backend |
 | **Tier 3** | Cross-backend parity with CPU as reference oracle | CPU + ≥1 other backend | Falls back to GPU-vs-GPU if CPU unavailable |
 
@@ -487,7 +496,7 @@ All phases proceed in parallel behind `_build_config.py` feature flags. Each pha
 | Phase | Objective | Rollback Gate | Status |
 | :--- | :--- | :--- | :--- |
 | **0: Foundation** | Create directory structure; move modules to `src/shared/` + `src/backends/opencl/`; create `meson.options` and `_build_config.py` template | All existing tests green | **Complete** |
-| **1: Plan Model** | Implement shared-layer plan data structures (node types, buffer lifecycle, reduction/streaming plans, retrieval protocol); write Tier 1 tests | Tier 1 green | Not started |
+| **1: Plan Model** | Implement shared-layer plan data structures (node types, buffer lifecycle, reduction/streaming plans, retrieval protocol); write Tier 1 tests | Tier 1 green | **Complete** |
 | **2: OpenCL Adapter** | Wrap existing PyOpenCL dispatch in `PlanRenderer` interface; write OpenCL Tier 2 tests | Tier 1 + OpenCL Tier 2 green | Not started |
 | **3: CPU Backend** | Implement C kernel library, ctypes FFI, `CPUPlanRenderer`; write CPU Tier 2 tests | Tier 1 + CPU Tier 2 green | Not started |
 | **4: Test Harness** | Full Tier 1/2/3 framework, fixtures, tolerance tables, oracle logic; can begin immediately | All enabled tiers green | Not started |
@@ -498,10 +507,10 @@ All phases proceed in parallel behind `_build_config.py` feature flags. Each pha
 ### 11.3 Phase Dependency Graph
 
 ```
-Phase 0 (Foundation) ────────── ✅ Complete (407 tests green)
+Phase 0 (Foundation) ────────────── ✅ Complete (192 tests green)
   │
   ▼
-Phase 1 (Plan Model) ──────── Tier 1 gate
+Phase 1 (Plan Model) ──────────── ✅ Complete (332 tests green: 192 Phase 0 + 140 Tier 1)
   │
   ├──▶ Phase 2 (OpenCL Adapter) ─── Tier 1 + OpenCL Tier 2 gate
   ├──▶ Phase 3 (CPU Backend) ────── Tier 1 + CPU Tier 2 gate

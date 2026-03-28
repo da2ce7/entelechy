@@ -1,96 +1,116 @@
 # model_spec.py
 
 """
-This module provides the `ModelSpec` class
-hierarchy. It has been refactored to embody its role as a precision-aware,
-abstract contract for the model's logical architecture.
+Backend-neutral model specification (ADR-008).
 
-Key Architectural Guarantees:
-- `ModelSpec` is now an Abstract Base Class inheriting from `PrecisionContext`.
-  This enforces the rule that any model specification MUST have a defined
-  precision, making it impossible to create an ambiguous, "precision-less" spec.
-- The padding calculation properties (`padded_..._dim`) are now fully
-  self-contained. They correctly use the `SCALAR_NP_TYPE` property provided by
-  their own inherited precision context, eliminating dependencies on external
-  objects for type information.
-- This creates a verifiable, compile-time link between the logical blueprint
-  (the model's shape) and its physical memory requirements on the device.
+ModelSpec is a frozen dataclass with PrecisionConfig composition.
+Backward-compatible properties delegate to self.precision for code
+that references the old PrecisionContext ABC interface.
 """
 
-import abc
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Any, Type
+
 import numpy as np
 
-from ..arch_primitives import PrecisionContext, Float32Context, Float16Context
+from .precision_config import PrecisionConfig
+
 
 @dataclass(frozen=True)
-class ModelSpec(PrecisionContext, abc.ABC):
+class ModelSpec:
+    """Backend-neutral model configuration (ADR-008).
+
+    PrecisionConfig composition replaces PrecisionContext ABC inheritance.
     """
-    An *abstract* contract for the model's logical architecture.
-    """
-    # Logical (unpadded) dimensions
+    precision: PrecisionConfig
     input_dim: int
     hidden_dim: int
     output_classes: int
     num_modules: int
-
-    # Architectural constraints for padding calculations
     simd_width: int
     cache_line_bytes: int
 
+    # ------------------------------------------------------------------
+    # Backward-compatible properties (deprecated — use self.precision.*)
+    # ------------------------------------------------------------------
+
+    @property
+    def SCALAR_NP_TYPE(self) -> Type[np.floating]:
+        """Deprecated: Use self.precision.numpy_dtype."""
+        return self.precision.numpy_dtype.type
+
+    @property
+    def SCALAR_C_TYPE_NAME(self) -> str:
+        """Deprecated: Use self.precision.numpy_dtype."""
+        if self.precision.numpy_dtype == np.dtype(np.float16):
+            return "half"
+        return "float"
+
+    # ------------------------------------------------------------------
+    # Padding calculations (unchanged from Phase 0)
+    # ------------------------------------------------------------------
+
     @property
     def padded_hidden_dim(self) -> int:
-        """Pads the hidden dimension to be an even multiple of the SIMD width."""
         if self.simd_width <= 0:
             return self.hidden_dim
         return (self.hidden_dim + self.simd_width - 1) // self.simd_width * self.simd_width
 
     @property
     def padded_input_dim(self) -> int:
-        """Pads the input dimension's row stride for cache-line alignment."""
         if self.cache_line_bytes <= 0:
             return self.input_dim
-        # This now correctly and safely uses the SCALAR_NP_TYPE from its own context.
-        item_size = self.SCALAR_NP_TYPE().itemsize
+        item_size = np.dtype(self.precision.numpy_dtype).itemsize
         row_bytes = self.input_dim * item_size
         padded_row_bytes = (row_bytes + self.cache_line_bytes - 1) // self.cache_line_bytes * self.cache_line_bytes
-        # Ensure the padded size is still a valid multiple of the element size.
         if padded_row_bytes % item_size != 0:
-            raise ValueError(f"Cache line padding resulted in indivisible byte count for dtype.")
+            raise ValueError("Cache line padding resulted in indivisible byte count for dtype.")
         return padded_row_bytes // item_size
 
     @property
     def padded_class_dim(self) -> int:
-        """Pads the class dimension's row stride for cache-line alignment."""
         if self.cache_line_bytes <= 0:
             return self.output_classes
-        item_size = self.SCALAR_NP_TYPE().itemsize
+        item_size = np.dtype(self.precision.numpy_dtype).itemsize
         row_bytes = self.output_classes * item_size
         padded_row_bytes = (row_bytes + self.cache_line_bytes - 1) // self.cache_line_bytes * self.cache_line_bytes
         if padded_row_bytes % item_size != 0:
-            raise ValueError(f"Cache line padding resulted in indivisible byte count for dtype.")
+            raise ValueError("Cache line padding resulted in indivisible byte count for dtype.")
         return padded_row_bytes // item_size
 
     @property
     def padded_module_dim(self) -> int:
-        """Pads the module dimension's row stride for cache-line alignment."""
         if self.cache_line_bytes <= 0:
             return self.num_modules
-        item_size = self.SCALAR_NP_TYPE().itemsize
+        item_size = np.dtype(self.precision.numpy_dtype).itemsize
         row_bytes = self.num_modules * item_size
         padded_row_bytes = (row_bytes + self.cache_line_bytes - 1) // self.cache_line_bytes * self.cache_line_bytes
         if padded_row_bytes % item_size != 0:
-            raise ValueError(f"Cache line padding resulted in indivisible byte count for dtype.")
+            raise ValueError("Cache line padding resulted in indivisible byte count for dtype.")
         return padded_row_bytes // item_size
 
+    # ------------------------------------------------------------------
+    # Factory classmethods (replace Float32ModelSpec / Float16ModelSpec)
+    # ------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class Float32ModelSpec(ModelSpec, Float32Context):
-    """A concrete model specification for 32-bit float precision."""
-    pass
+    @classmethod
+    def float32(cls, **kwargs: Any) -> "ModelSpec":
+        return cls(precision=PrecisionConfig.float32(), **kwargs)
+
+    @classmethod
+    def float16(cls, **kwargs: Any) -> "ModelSpec":
+        return cls(precision=PrecisionConfig.float16(), **kwargs)
 
 
-@dataclass(frozen=True)
-class Float16ModelSpec(ModelSpec, Float16Context):
-    """A concrete model specification for 16-bit float precision."""
-    pass
+# ------------------------------------------------------------------
+# Backward-compatible aliases (deprecated — removed in Phase 6)
+# ------------------------------------------------------------------
+
+def Float32ModelSpec(**kwargs: Any) -> ModelSpec:
+    """Deprecated: Use ModelSpec.float32() or ModelSpec(precision=PrecisionConfig.float32(), ...)."""
+    return ModelSpec(precision=PrecisionConfig.float32(), **kwargs)
+
+
+def Float16ModelSpec(**kwargs: Any) -> ModelSpec:
+    """Deprecated: Use ModelSpec.float16() or ModelSpec(precision=PrecisionConfig.float16(), ...)."""
+    return ModelSpec(precision=PrecisionConfig.float16(), **kwargs)

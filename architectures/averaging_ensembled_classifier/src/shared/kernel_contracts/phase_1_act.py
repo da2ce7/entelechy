@@ -1,16 +1,149 @@
 # src/shared/kernel_contracts/phase_1_act.py
-"""Phase 1 (Act) kernel contracts — stubs populated in Phase 1."""
-from dataclasses import dataclass
-from . import KernelContract
+"""Phase 1 (Act) kernel contracts — populated from kernels.cl.h."""
+from . import (
+    BufferParamSpec, KernelContract, KernelContractBlock, LocalMemorySpec,
+    PaddingContract, PlacementContract, ScalarParamSpec,
+)
 
+forward_pass_contract = KernelContract(
+    kernel_name="forward_pass",
+    contract_block=KernelContractBlock(
+        holistic_constraints="All constraints are defined by the parameter commentary blocks.",
+        idempotency="Strictly Idempotent",
+        synchronization_model="Streamable",
+        behavioral_invariants=None,
+    ),
+    buffer_params=(
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_input",
+            flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count", "padded_input_count"),
+            padding_contract=PaddingContract("CACHE", "Pad row stride to 128-byte alignment"),
+            calculability_proof=("total_batch_count", "padded_input_count"),
+            validation_preconditions=("batch slice within bounds",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_sample_mask",
+            flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_batch_count",),
+            validation_preconditions=("batch slice within bounds",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_CONST_weights_shared_simd_major",
+            flow="src", memory_scope="GLOBAL_CONST",
+            tensor_shape=("padded_hidden_count/SIMD_WIDTH", "padded_input_count", "SIMD_WIDTH"),
+            padding_contract=PaddingContract("SIMD", "hidden_dim padded to SIMD_WIDTH; input_dim padded for alignment"),
+            calculability_proof=("padded_hidden_count", "padded_input_count"),
+            validation_preconditions=("exact allocation size",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_CONST_biases_shared",
+            flow="src", memory_scope="GLOBAL_CONST",
+            tensor_shape=("padded_hidden_count",),
+            padding_contract=PaddingContract("SIMD", "Padded to SIMD_WIDTH"),
+            calculability_proof=("padded_hidden_count",),
+            validation_preconditions=("exact allocation size",),
+        ),
+        BufferParamSpec(
+            name="dest_buffer_GLOBAL_hidden_activations",
+            flow="dest", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count", "padded_hidden_count"),
+            padding_contract=PaddingContract("CACHE", "Padded to alignment"),
+            calculability_proof=("total_batch_count", "padded_hidden_count"),
+            validation_preconditions=("write slice within bounds",),
+        ),
+        BufferParamSpec(
+            name="dest_buffer_GLOBAL_hidden_mask",
+            flow="dest", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count", "padded_hidden_count"),
+            padding_contract=PaddingContract("CACHE", "Padded to alignment"),
+            calculability_proof=("total_batch_count", "padded_hidden_count"),
+            validation_preconditions=("write slice within bounds",),
+        ),
+    ),
+    scalar_params=(
+        ScalarParamSpec("batch_chunk_offset", "src", "NATURAL"),
+        ScalarParamSpec("batch_chunk_count", "src", "NATURAL"),
+        ScalarParamSpec("total_batch_count", "src", "NATURAL"),
+        ScalarParamSpec("padded_input_count", "src", "NATURAL"),
+        ScalarParamSpec("padded_hidden_count", "src", "NATURAL"),
+    ),
+    local_memory=(
+        LocalMemorySpec("simd_tile", "SIMD_WIDTH * (SIMD_WIDTH + LOCAL_MEM_BANK_PADDING) * sizeof(SCALAR_TYPE)"),
+    ),
+    placement=None,
+)
 
-@dataclass(frozen=True)
-class ForwardPassContract(KernelContract):
-    """Contract for the forward_pass kernel."""
-    pass
-
-
-@dataclass(frozen=True)
-class ComputeHiddenMaskContract(KernelContract):
-    """Contract for the compute_hidden_mask kernel."""
-    pass
+render_logits_chunk_contract = KernelContract(
+    kernel_name="render_logits_chunk",
+    contract_block=KernelContractBlock(
+        holistic_constraints="All constraints are defined by the parameter commentary blocks.",
+        idempotency="Strictly Idempotent",
+        synchronization_model="Monolithic Slice Renderer",
+        behavioral_invariants=None,
+    ),
+    buffer_params=(
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_hidden_activations",
+            flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count", "padded_hidden_count"),
+            padding_contract=PaddingContract("CACHE", "Padded to alignment"),
+            calculability_proof=("total_batch_count", "padded_hidden_count"),
+            validation_preconditions=("batch slice within bounds",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_hidden_mask",
+            flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count", "padded_hidden_count"),
+            padding_contract=PaddingContract("CACHE", "Padded to alignment"),
+            calculability_proof=("total_batch_count", "padded_hidden_count"),
+            validation_preconditions=("batch slice within bounds",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_CONST_weights_module",
+            flow="src", memory_scope="GLOBAL_CONST",
+            tensor_shape=("total_modules_count", "padded_hidden_count", "padded_total_output_class_count"),
+            padding_contract=PaddingContract("SIMD", "output_class_count padded for SIMD/Cache alignment"),
+            calculability_proof=("total_modules_count", "padded_hidden_count", "padded_total_output_class_count"),
+            validation_preconditions=("module and class slices within bounds",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_CONST_biases_module",
+            flow="src", memory_scope="GLOBAL_CONST",
+            tensor_shape=("total_modules_count", "padded_total_output_class_count"),
+            padding_contract=PaddingContract("SIMD", "output_class_count padded for SIMD alignment"),
+            calculability_proof=("total_modules_count", "padded_total_output_class_count"),
+            validation_preconditions=("module and class slices within bounds",),
+        ),
+        BufferParamSpec(
+            name="dest_buffer_GLOBAL_logits",
+            flow="dest", memory_scope="GLOBAL",
+            tensor_shape=("total_modules_count", "total_batch_count", "padded_total_output_class_count"),
+            padding_contract=PaddingContract("CACHE", "output_class_count padded for alignment"),
+            calculability_proof=("total_modules_count", "total_batch_count", "padded_total_output_class_count"),
+            validation_preconditions=("exact allocation size",),
+        ),
+    ),
+    scalar_params=(
+        ScalarParamSpec("batch_chunk_offset", "src", "NATURAL"),
+        ScalarParamSpec("batch_chunk_count", "src", "NATURAL"),
+        ScalarParamSpec("module_chunk_offset", "src", "NATURAL"),
+        ScalarParamSpec("module_chunk_count", "src", "NATURAL"),
+        ScalarParamSpec("class_chunk_offset", "src", "NATURAL"),
+        ScalarParamSpec("class_chunk_count", "src", "NATURAL"),
+        ScalarParamSpec("total_batch_count", "src", "NATURAL"),
+        ScalarParamSpec("hidden_count", "src", "NATURAL"),
+        ScalarParamSpec("padded_hidden_count", "src", "NATURAL"),
+        ScalarParamSpec("total_output_class_count", "src", "NATURAL"),
+        ScalarParamSpec("padded_total_output_class_count", "src", "NATURAL"),
+        ScalarParamSpec("total_modules_count", "src", "NATURAL"),
+    ),
+    local_memory=(),
+    placement=PlacementContract(
+        strategy="grid_mod_cls",
+        key_domain=None,
+        context_params={},
+    ),
+)

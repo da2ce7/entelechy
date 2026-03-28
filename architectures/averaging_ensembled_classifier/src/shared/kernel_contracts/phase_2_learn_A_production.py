@@ -1,28 +1,214 @@
 # src/shared/kernel_contracts/phase_2_learn_A_production.py
-"""Phase 2A (Gradient Production) kernel contracts — stubs populated in Phase 1."""
-from dataclasses import dataclass
-from . import KernelContract
+"""Phase 2A (Gradient Production) kernel contracts — populated from kernels.cl.h."""
+from . import (
+    BufferParamSpec, KernelContract, KernelContractBlock, LocalMemorySpec,
+    PaddingContract, PlacementContract, ScalarParamSpec,
+)
 
+compute_probs_loss_cce_contract = KernelContract(
+    kernel_name="compute_probs_loss_cce_chunk",
+    contract_block=KernelContractBlock(
+        holistic_constraints="All constraints are defined by the parameter commentary blocks.",
+        idempotency="Associatively Non-Idempotent",
+        synchronization_model="Partial Renderer for probabilities output.",
+        behavioral_invariants=("Fused, indivisible unit for numerically stable Softmax calculation.",),
+    ),
+    buffer_params=(
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_logits", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_modules_count", "total_batch_count", "padded_total_output_class_count"),
+            padding_contract=PaddingContract("CACHE", "output_class_count padded for alignment"),
+            calculability_proof=("total_modules_count", "total_batch_count", "padded_total_output_class_count"),
+            validation_preconditions=("tile within bounds",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_CONST_temps", flow="src", memory_scope="GLOBAL_CONST",
+            tensor_shape=("total_modules_count",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_modules_count",),
+            validation_preconditions=("exact allocation size",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_targets", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_batch_count",),
+            validation_preconditions=("values in [0, output_class_count-1]",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_sample_mask", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_batch_count",),
+            validation_preconditions=("exact allocation size",),
+        ),
+        BufferParamSpec(
+            name="dest_buffer_GLOBAL_partial_probs", flow="dest", memory_scope="GLOBAL",
+            tensor_shape=("total_tile_count", "modules_per_chunk", "total_batch_count", "classes_per_chunk"),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "classes_per_chunk"),
+            validation_preconditions=("tile write index valid",),
+        ),
+        BufferParamSpec(
+            name="dest_buffer_GLOBAL_final_loss", flow="dest", memory_scope="GLOBAL",
+            tensor_shape=("total_modules_count", "total_batch_count"),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_modules_count", "total_batch_count"),
+            validation_preconditions=("host zero-initialize",),
+        ),
+    ),
+    scalar_params=(
+        ScalarParamSpec("flat_tile_index", "src", "NATURAL"),
+        ScalarParamSpec("num_class_chunks", "src", "NATURAL"),
+        ScalarParamSpec("classes_per_chunk", "src", "NATURAL"),
+        ScalarParamSpec("modules_per_chunk", "src", "NATURAL"),
+        ScalarParamSpec("total_batch_count", "src", "NATURAL"),
+        ScalarParamSpec("total_output_class_count", "src", "NATURAL"),
+        ScalarParamSpec("padded_total_output_class_count", "src", "NATURAL"),
+        ScalarParamSpec("total_modules_count", "src", "NATURAL"),
+        ScalarParamSpec("total_tile_count", "src", "NATURAL"),
+    ),
+    local_memory=(),
+    placement=PlacementContract(strategy="grid_mod_cls", key_domain=None, context_params={}),
+)
 
-@dataclass(frozen=True)
-class ComputeProbsLossCceContract(KernelContract):
-    """Contract for the compute_probs_loss_cce_chunk kernel."""
-    pass
+compute_probs_loss_bce_contract = KernelContract(
+    kernel_name="compute_probs_loss_bce_chunk",
+    contract_block=KernelContractBlock(
+        holistic_constraints="All constraints are defined by the parameter commentary blocks.",
+        idempotency="Strictly Idempotent",
+        synchronization_model="Dual Partial Renderer.",
+        behavioral_invariants=None,
+    ),
+    buffer_params=(
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_logits", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_modules_count", "total_batch_count", "padded_total_output_class_count"),
+            padding_contract=PaddingContract("CACHE", "output_class_count padded for alignment"),
+            calculability_proof=("total_modules_count", "total_batch_count", "padded_total_output_class_count"),
+            validation_preconditions=("tile within bounds",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_CONST_temps", flow="src", memory_scope="GLOBAL_CONST",
+            tensor_shape=("total_modules_count",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_modules_count",),
+            validation_preconditions=("exact allocation size",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_targets", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count", "padded_total_output_class_count"),
+            padding_contract=PaddingContract("CACHE", "output_class_count padded for alignment"),
+            calculability_proof=("total_batch_count", "padded_total_output_class_count"),
+            validation_preconditions=("exact allocation size",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_sample_mask", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_batch_count",),
+            validation_preconditions=("exact allocation size",),
+        ),
+        BufferParamSpec(
+            name="dest_buffer_GLOBAL_partial_probs", flow="dest", memory_scope="GLOBAL",
+            tensor_shape=("total_tile_count", "modules_per_chunk", "total_batch_count", "classes_per_chunk"),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "classes_per_chunk"),
+            validation_preconditions=("tile write index valid",),
+        ),
+        BufferParamSpec(
+            name="dest_buffer_GLOBAL_partial_loss", flow="dest", memory_scope="GLOBAL",
+            tensor_shape=("total_tile_count", "modules_per_chunk", "total_batch_count"),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count"),
+            validation_preconditions=("tile write index valid",),
+        ),
+    ),
+    scalar_params=(
+        ScalarParamSpec("flat_tile_index", "src", "NATURAL"),
+        ScalarParamSpec("num_class_chunks", "src", "NATURAL"),
+        ScalarParamSpec("classes_per_chunk", "src", "NATURAL"),
+        ScalarParamSpec("modules_per_chunk", "src", "NATURAL"),
+        ScalarParamSpec("total_batch_count", "src", "NATURAL"),
+        ScalarParamSpec("total_output_class_count", "src", "NATURAL"),
+        ScalarParamSpec("padded_total_output_class_count", "src", "NATURAL"),
+        ScalarParamSpec("total_modules_count", "src", "NATURAL"),
+        ScalarParamSpec("total_tile_count", "src", "NATURAL"),
+    ),
+    local_memory=(),
+    placement=PlacementContract(strategy="grid_mod_cls", key_domain=None, context_params={}),
+)
 
-
-@dataclass(frozen=True)
-class ComputeProbsLossBceContract(KernelContract):
-    """Contract for the compute_probs_loss_bce_chunk kernel."""
-    pass
-
-
-@dataclass(frozen=True)
-class CalculateModuleParamGradsCceContract(KernelContract):
-    """Contract for the calculate_module_param_grads_cce kernel."""
-    pass
-
-
-@dataclass(frozen=True)
-class CalculateModuleParamGradsBceContract(KernelContract):
-    """Contract for the calculate_module_param_grads_bce kernel."""
-    pass
+calculate_module_param_grads_contract = KernelContract(
+    kernel_name="calculate_module_param_grads_chunk",
+    contract_block=KernelContractBlock(
+        holistic_constraints="All constraints are defined by the parameter commentary blocks.",
+        idempotency="Associatively Non-Idempotent",
+        synchronization_model="Dual Partial Renderer.",
+        behavioral_invariants=None,
+    ),
+    buffer_params=(
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_hidden_activations", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count", "padded_hidden_count"),
+            padding_contract=PaddingContract("CACHE", "Padded to alignment"),
+            calculability_proof=("total_batch_count", "padded_hidden_count"),
+            validation_preconditions=("batch slice within bounds",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_partial_probs", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_tile_count", "modules_per_chunk", "total_batch_count", "classes_per_chunk"),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "classes_per_chunk"),
+            validation_preconditions=("tile within bounds",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_targets", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("varies",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("problem_type",),
+            validation_preconditions=("type-punned pointer; host provides correct buffer",),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_sample_mask", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_batch_count",),
+            validation_preconditions=("batch slice within bounds",),
+        ),
+        BufferParamSpec(
+            name="dest_buffer_GLOBAL_partial_grad_weights_module", flow="dest", memory_scope="GLOBAL",
+            tensor_shape=("total_tile_count", "modules_per_chunk", "padded_hidden_count", "classes_per_chunk"),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_tile_count", "modules_per_chunk", "padded_hidden_count", "classes_per_chunk"),
+            validation_preconditions=("tile write index valid",),
+        ),
+        BufferParamSpec(
+            name="dest_buffer_GLOBAL_partial_grad_biases_module", flow="dest", memory_scope="GLOBAL",
+            tensor_shape=("total_tile_count", "modules_per_chunk", "classes_per_chunk"),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_tile_count", "modules_per_chunk", "classes_per_chunk"),
+            validation_preconditions=("tile write index valid",),
+        ),
+    ),
+    scalar_params=(
+        ScalarParamSpec("problem_type", "src", "FLAG"),
+        ScalarParamSpec("flat_tile_index", "src", "NATURAL"),
+        ScalarParamSpec("batch_chunk_offset", "src", "NATURAL"),
+        ScalarParamSpec("batch_chunk_count", "src", "NATURAL"),
+        ScalarParamSpec("num_class_chunks", "src", "NATURAL"),
+        ScalarParamSpec("classes_per_chunk", "src", "NATURAL"),
+        ScalarParamSpec("modules_per_chunk", "src", "NATURAL"),
+        ScalarParamSpec("total_batch_count", "src", "NATURAL"),
+        ScalarParamSpec("hidden_count", "src", "NATURAL"),
+        ScalarParamSpec("padded_hidden_count", "src", "NATURAL"),
+        ScalarParamSpec("total_output_class_count", "src", "NATURAL"),
+        ScalarParamSpec("padded_total_output_class_count", "src", "NATURAL"),
+        ScalarParamSpec("total_modules_count", "src", "NATURAL"),
+        ScalarParamSpec("total_tile_count", "src", "NATURAL"),
+    ),
+    local_memory=(
+        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(SCALAR_TYPE)"),
+    ),
+    placement=PlacementContract(strategy="grid_mod_cls", key_domain=None, context_params={}),
+)

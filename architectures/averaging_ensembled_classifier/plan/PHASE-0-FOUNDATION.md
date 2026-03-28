@@ -1,6 +1,6 @@
 # Phase 0: Foundation — Detailed Plan
 
-**Status: ✅ IMPLEMENTED** — All 407 tests pass. Rollback gate validated.  
+**Status: ✅ IMPLEMENTED** — All 192 tests pass. Rollback gate validated.  
 **Phase:** 0 of 6  
 **Objective:** Create the target directory structure and relocate existing modules without behavioral change. No new functionality is introduced.  
 **Governing ADRs:** ADR-012 (module factoring), ADR-014 (build system), ADR-006 (HardwareProfile extraction), ADR-007 (KernelContract extraction), ADR-008 (PrecisionConfig extraction), ADR-011 (ProblemTypeStrategy extraction), ADR-013 (kernel source designation)  
