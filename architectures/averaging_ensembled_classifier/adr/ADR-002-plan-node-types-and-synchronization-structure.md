@@ -5,7 +5,7 @@
 **Deciders:** —  
 **Supersedes:** —  
 **Blocked by:** ADR-001  
-**Blocks:** ADR-009, ADR-010
+**Blocks:** ADR-009, ADR-010, ADR-018
 
 ---
 
@@ -268,3 +268,4 @@ Per ADR-017 (Incremental Migration Path), this decision affects Phase 2:
 - [ADR-003: Reduction Tree Plan Representation](ADR-003-reduction-tree-plan-representation.md) — `ReductionTreeNode` internal structure (pending)
 - [ADR-004: Streaming Loop Representation](ADR-004-streaming-loop-representation.md) — `StreamingLoopNode` design (pending)
 - [ADR-007: KernelSignature Contract/Binding Split](ADR-007-kernel-signature-contract-binding-split.md) — `KernelContract` definition (pending)
+- [ADR-018: User-Facing API](ADR-018-user-facing-api.md) — confirms five-node closed taxonomy is preserved (Choices 1A + 4A); no new node types required for Act-only/Learn-only plan configurations

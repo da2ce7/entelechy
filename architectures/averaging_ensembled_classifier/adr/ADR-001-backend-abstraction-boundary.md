@@ -5,7 +5,7 @@
 **Deciders:** —  
 **Supersedes:** —  
 **Blocked by:** —  
-**Blocks:** ADR-002, ADR-003, ADR-004, ADR-005, ADR-006, ADR-010, ADR-011, ADR-012, ADR-016
+**Blocks:** ADR-002, ADR-003, ADR-004, ADR-005, ADR-006, ADR-010, ADR-011, ADR-012, ADR-016, ADR-018
 
 ---
 
@@ -266,3 +266,4 @@ Per ADR-017 (Incremental Migration Path), this decision validates the proposed p
 - [CPU_BACKEND.md](../CPU_BACKEND.md) — Threading model, `pool_dispatch_and_wait` execution
 - [VULKAN_BACKEND.md](../VULKAN_BACKEND.md) — Command buffer strategy, single-dispatch parallelism
 - [ADR_PLAN.md](../ADR_PLAN.md) — ADR-001 problem statement and option enumeration
+- [ADR-018: User-Facing API](ADR-018-user-facing-api.md) — user-facing API must not expose backend-specific types; `WorkTicket`/`Engine` sit above the plan boundary in the shared layer

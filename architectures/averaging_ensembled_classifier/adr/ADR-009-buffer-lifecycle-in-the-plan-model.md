@@ -5,7 +5,7 @@
 **Deciders:** —  
 **Supersedes:** —  
 **Blocked by:** ADR-002, ADR-003, ADR-004  
-**Blocks:** ADR-010, ADR-012
+**Blocks:** ADR-010, ADR-012, ADR-018
 
 ---
 
@@ -484,3 +484,4 @@ Per ADR-002's migration path:
 - [ADR-008: Precision Configuration](ADR-008-precision-configuration.md) — `PrecisionConfig` frozen dataclass; `element_size_bytes` derivation
 - [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback; §5 Host Orchestrator & Execution Policies (activation lifecycle, chunk definition); §8 Reduction Planning & Rendering
 - [CONTRACT.md](../CONTRACT.md) — Article 1.4 Collaborative Interface Verifiability; Article 2.1 Buffer Name Grammar (flow prefixes: `src_`, `dest_`, `update_`); Article 3.1 Padding Contract
+- [ADR-018: User-Facing API](ADR-018-user-facing-api.md) — Choice 4A (recompute) confirms no ADR-009 extension required; Act and Learn plans share no device-side buffers; each plan's `BufferDescriptor` namespace remains self-contained

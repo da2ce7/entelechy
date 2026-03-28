@@ -5,7 +5,7 @@
 **Deciders:** —  
 **Supersedes:** —  
 **Blocked by:** ADR-014, ADR-015, ADR-016  
-**Blocks:** —
+**Blocks:** ADR-018
 
 ---
 
@@ -316,6 +316,25 @@ The migration is organized into seven phases (Phase 0 through Phase 6). Phases 0
 
 **Dependencies:** All preceding phases. Phase 6 is the terminal phase and cannot begin until Phases 2, 3, 4, and 5 have passed their respective gates.
 
+#### User-Facing API Workstream (Phase 4-adjacent)
+
+**Objective:** Implement the `WorkTicket` / `LearnHandle` / `Engine` user-facing API surface on top of the plan model, enabling both Sequential and Event-Triggered execution modes (CONCEPT.md §4, §5). This workstream develops in parallel with Phase 4 (Test Harness), consuming the plan builder and `PlanRenderer` interfaces as they stabilize.
+
+**Deliverables:**
+- Implement `WorkTicket` (stateful ticket with `PENDING → ACT_COMPLETE → RESOLVED → CONSUMED` lifecycle) → `src/shared/work_ticket.py` (ADR-018).
+- Implement `LearnHandle` (Learn-phase future wrapping `RetrievalFuture`) → `src/shared/work_ticket.py` (ADR-018).
+- Implement `Engine` (user-facing entry point: `submit()`, `train_batch()`) → `src/shared/engine.py` (ADR-018).
+- Implement Act-only and Learn-only plan construction modes in the plan builder (ADR-018 Choice 3A + 4A: explicit batch, recompute).
+- Feature-flag gate: the ticket API is gated behind its own `_build_config.py` flag, independently toggleable.
+- Write Tier 1 tests for ticket lifecycle, plan-splitting correctness, and Engine convenience methods.
+- Write integration tests exercising the ticket API against each available backend's `PlanRenderer`.
+
+**Rollback gate:** Tier 1 green for ticket lifecycle tests + integration tests green against at least one backend renderer.
+
+**Dependencies:** Phase 1 (plan model must be stable). Independent of Phases 2, 3, and 5. Cross-pollinates with Phase 4: ticket API provides realistic plan builder usage; test harness validates ticket plan-construction patterns.
+
+**Risk:** If Phase 1's plan builder API undergoes significant revision, the ticket workstream must pause until the interface re-stabilizes. This risk is mitigated by the heavy constraint ADRs 001–010 place on the plan builder's shape.
+
 ### Phase dependency graph
 
 ```
@@ -330,6 +349,9 @@ Phase 1 (Plan Model) ──────── Tier 1 gate
   │
   ├──▶ Phase 5 (Vulkan Backend) ─── Tier 1 + Vulkan Tier 2 + Tier 3 gate
   │
+  ├──▶ User-Facing API ─────────── Tier 1 (ticket) + integration green
+  │    [Phase 4-adjacent; ADR-018]
+  │
   │    Phase 4 (Test Harness) ────── All enabled tiers green
   │    [can start in parallel with Phase 0]
   │
@@ -338,7 +360,7 @@ Phase 6 (Legacy Removal) ───── Tier 3 parity green, all backends, FP32
   [requires Phases 2, 3, 4, 5 complete]
 ```
 
-Phases 2, 3, and 5 are independent workstreams that fan out from Phase 1. Phase 4 has no hard dependency — it begins immediately and grows its coverage as backend infrastructure becomes available. Phase 6 is a join point that requires all preceding phases to have passed their gates.
+Phases 2, 3, and 5 are independent workstreams that fan out from Phase 1. The User-Facing API workstream also fans out from Phase 1 and cross-pollinates with Phase 4. Phase 4 has no hard dependency — it begins immediately and grows its coverage as backend infrastructure becomes available. Phase 6 is a join point that requires all preceding phases to have passed their gates.
 
 ### Feature-flag lifecycle
 
@@ -417,6 +439,7 @@ This decision formalizes the phase structure that ADRs 002, 012, 013, 014, 015, 
 | ADR-014 | Phases 0, 2, 3, 4 in Migration implications | Consistent — `meson.options` is Phase 0; per-backend `meson.build` files are created in their respective phases |
 | ADR-015 | Phase 3 in Migration implications | Consistent — CPU FFI is entirely within Phase 3 |
 | ADR-016 | All phases in Migration implications | Consistent — tier definitions map directly to rollback gates defined here |
+| ADR-018 | User-Facing API workstream (Phase 4-adjacent) | Consistent — `WorkTicket`/`Engine` develop behind feature flag, consuming plan builder post-Phase 1; cross-pollinates with Phase 4 test harness |
 
 ---
 
@@ -437,6 +460,7 @@ This decision formalizes the phase structure that ADRs 002, 012, 013, 014, 015, 
 - [ADR-014: Build System Integration](ADR-014-build-system-integration.md) — Meson with `meson-python`; `_build_config.py` manifest; `auto`/`enabled`/`disabled` feature options; conditional `subdir()` delegation
 - [ADR-015: Python ↔ Native Backend Interop](ADR-015-python-native-backend-interop.md) — ctypes FFI; `_verify_layouts()` pre-gate; dispatch table; `pool_dispatch_and_wait`
 - [ADR-016: Test Strategy](ADR-016-test-strategy.md) — layered pytest framework; Tier 1/2/3 definitions; CPU oracle; analytical + numpy fixtures; per-kernel tolerance tables; rollback gate definitions
+- [ADR-018: User-Facing API](ADR-018-user-facing-api.md) — `WorkTicket`/`LearnHandle`/`Engine` user-facing surface; parallel workstream (Phase 4-adjacent); feature-flag gated development
 - [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback; §5 Unified Execution Model
 - [CONTRACT.md](../CONTRACT.md) — Article 1.4 Collaborative Interface Verifiability
 - [CPU_BACKEND.md](../CPU_BACKEND.md) — `cpu_simd.h` ISA detection; `task_<kernel_name>` function signatures; `pool_dispatch_and_wait` threading model

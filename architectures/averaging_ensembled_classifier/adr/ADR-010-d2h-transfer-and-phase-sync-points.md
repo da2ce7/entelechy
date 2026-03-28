@@ -5,7 +5,7 @@
 **Deciders:** —  
 **Supersedes:** —  
 **Blocked by:** ADR-002, ADR-009  
-**Blocks:** —
+**Blocks:** ADR-018
 
 ---
 
@@ -746,3 +746,4 @@ Per ADR-002's migration path and ADR-012's structure:
 - [CONTRACT.md](../CONTRACT.md) — Article 1.4 Collaborative Interface Verifiability (pre-dispatch validation in the shared layer)
 - [VULKAN_BACKEND.md](../VULKAN_BACKEND.md) — Command buffer strategy (Act/Learn split); staging buffer allocation (`VMA_ALLOCATION_CREATE_MAPPED_BIT`); `VkFence` for host synchronization
 - [CPU_BACKEND.md](../CPU_BACKEND.md) — `pool_dispatch_and_wait` synchronous model; host-accessible memory (zero-copy D2H)
+- [ADR-018: User-Facing API](ADR-018-user-facing-api.md) — `WorkTicket` consumes `RetrievalFuture` internally; `get_prediction()` maps to `RetrievalFuture.result()` + `.release()`; `LearnHandle.wait()` maps to Learn plan's `RetrievalFuture.wait()`

@@ -5,7 +5,7 @@
 **Deciders:** —  
 **Supersedes:** —  
 **Blocked by:** ADR-009  
-**Blocks:** ADR-013, ADR-014, ADR-015
+**Blocks:** ADR-013, ADR-014, ADR-015, ADR-018
 
 ---
 
@@ -77,6 +77,7 @@ After all accepted ADRs are applied, the shared layer comprises:
 | `ProblemTypeStrategy`, `CceStrategy`, `BceStrategy` | Extracted from `execution_plan.py` | ADR-011 |
 | Plan node types | New, replaces `DependencyProvider` hierarchy | ADR-002 |
 | Plan builder | Extracted from `batch_processor.py` + `graph_recipes.py` | ADR-001 |
+| `WorkTicket`, `LearnHandle`, `Engine` | New, user-facing API surface | ADR-018 |
 | Workload primitives | `workload_primitives.py` + pure-math helpers from `compute_patterns.py` | — |
 
 ### The backend-layer module inventory
@@ -561,6 +562,7 @@ Per ADR-017's phasing:
 - [ADR-009: Buffer Lifecycle in the Plan Model](ADR-009-buffer-lifecycle-in-the-plan-model.md) — `BufferHandle`, `BufferRole`, `BufferDescriptor` → `shared/buffer_lifecycle.py`; physical allocation → `backends/<name>/buffer_allocator.py`
 - [ADR-010: D2H Transfer & Phase Sync Points](ADR-010-d2h-transfer-and-phase-sync-points.md) — `RetrievalFuture` Protocol → `shared/retrieval_future.py`; `HostView` dissolution → `backends/opencl/retrieval.py`
 - [ADR-011: CCE/BCE Strategy Delegation](ADR-011-cce-bce-strategy-delegation.md) — `ProblemTypeStrategy` → `shared/problem_type_strategy.py`; mixed Strategy B (Nodes 6/7) / Strategy A (Nodes 8/9/10); kernel contract organization impact
+- [ADR-018: User-Facing API](ADR-018-user-facing-api.md) — `WorkTicket`, `LearnHandle`, `Engine` → `shared/`; user-facing API types belong in the shared layer
 - [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback; §3 Modular Dumb Kernels
 - [CONTRACT.md](../CONTRACT.md) — Article 1.4 Collaborative Interface Verifiability; Article 2 Parameter Lexical Mandate
 - [STRUCTURE.md](../../STRUCTURE.md) — §2 Architectural Autonomy; §3 Specification of Implementation
