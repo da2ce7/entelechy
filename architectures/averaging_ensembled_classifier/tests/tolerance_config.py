@@ -37,6 +37,62 @@ KERNEL_TOLERANCES: dict[str, dict[str, TolerancePair]] = {
     },
 }
 
+# CPU-specific tolerance overrides — tighter than OpenCL due to IEEE 754
+# compliance and deterministic reduction order. Used via get_cpu_tolerance().
+CPU_KERNEL_TOLERANCES: dict[str, dict[str, TolerancePair]] = {
+    "forward_pass": {
+        "fp32": TolerancePair(atol=1e-6, rtol=1e-5),
+    },
+    "render_logits_chunk": {
+        "fp32": TolerancePair(atol=1e-6, rtol=1e-5),
+    },
+    "compute_probs_loss_cce_chunk": {
+        "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
+    },
+    "compute_probs_loss_bce_chunk": {
+        "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
+    },
+    "calculate_module_param_grads": {
+        "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
+    },
+    "backprop_error_to_hidden": {
+        "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
+    },
+    "clip_partial_gradients": {
+        "fp32": TolerancePair(atol=1e-6, rtol=1e-5),
+    },
+    "gather_and_permute_grad_h": {
+        "fp32": TolerancePair(atol=1e-6, rtol=1e-5),
+    },
+    "stabilize_reduce_grad_h": {
+        "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
+    },
+    "backprop_shared_weights": {
+        "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
+    },
+    "backprop_shared_biases": {
+        "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
+    },
+    "clip_shared_gradients": {
+        "fp32": TolerancePair(atol=1e-6, rtol=1e-5),
+    },
+    "normalize_gradients": {
+        "fp32": TolerancePair(atol=1e-7, rtol=1e-6),
+    },
+    "adam_update": {
+        "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
+    },
+    "clamp_temperatures": {
+        "fp32": TolerancePair(atol=0.0, rtol=0.0),
+    },
+    "act_plan_e2e": {
+        "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
+    },
+    "learn_plan_e2e": {
+        "fp32": TolerancePair(atol=1e-4, rtol=1e-3),
+    },
+}
+
 
 def get_tolerance(kernel_name: str, precision_label: str = "fp32") -> TolerancePair:
     """Look up tolerance for a kernel, falling back to defaults."""
@@ -45,3 +101,12 @@ def get_tolerance(kernel_name: str, precision_label: str = "fp32") -> ToleranceP
         if precision_label in overrides:
             return overrides[precision_label]
     return FP32_DEFAULT if precision_label == "fp32" else FP16_DEFAULT
+
+
+def get_cpu_tolerance(kernel_name: str, precision_label: str = "fp32") -> TolerancePair:
+    """Look up CPU-specific tolerance, falling back to shared defaults."""
+    if kernel_name in CPU_KERNEL_TOLERANCES:
+        overrides = CPU_KERNEL_TOLERANCES[kernel_name]
+        if precision_label in overrides:
+            return overrides[precision_label]
+    return get_tolerance(kernel_name, precision_label)

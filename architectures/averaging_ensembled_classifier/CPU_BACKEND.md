@@ -1,5 +1,7 @@
 # CPU Back-End: Architecture for SIMD + Multi-Core
 
+> **Implementation Status: ✅ Complete** — Phase 3 implemented. All components described in this document have been realized in `src/backends/cpu/` (9 Python modules, 6 C source files, 4 C headers) with a full Tier 2 test suite (16 test modules in `tests/tier2/cpu/`). The Meson `shared_library('cpu_kernels', ...)` build target produces `libcpu_kernels.so`. See [PHASE-3A](plan/PHASE-3A-CPU-KERNEL-LIBRARY-AND-BUILD.md), [PHASE-3B](plan/PHASE-3B-CPU-FFI-AND-RENDERER.md), [PHASE-3C](plan/PHASE-3C-CPU-TIER2-TESTS.md) for implementation details.
+
 ## Design Constraints
 
 Two hard requirements for the CPU back-end design:

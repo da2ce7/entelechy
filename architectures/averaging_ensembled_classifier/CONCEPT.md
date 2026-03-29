@@ -516,7 +516,7 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
   - **Loss Aggregation Strategy:** Employs a direct **scatter-write** for `final_loss_out`.
     - **Justification:** CCE loss produces a single scalar value per (module, sample) pair. This one-to-one mapping allows each parallel invocation to compute a unique, final write address and populate the destination buffer directly, eliminating the overhead of a reduction stage for the loss value itself.
 - **(7) `compute_probs_loss_bce_chunk`**: Invoked when `Operating Mode` is `BCE`. A streamable kernel computing probabilities and partial BCE loss.
-  - **Contract:** Generates probabilities and partial loss from `Full_Logits`.
+  - **Contract:** Performs the **complete, temperature-aware, numerically stable Sigmoid calculation internally** (two-branch form: positive/negative logit split to avoid `exp()` overflow), then computes binary cross-entropy loss. Generates probabilities and partial loss from `Full_Logits`.
   - **Loss Aggregation Strategy:** Produces `partial_loss_out` which adheres to the **Placement Contract**.
     - **Justification:** BCE loss is computed on a per-class basis. To derive the final loss for a given (module, sample) pair, these per-class values must be aggregated (summed). Therefore, this kernel is a **Partial Renderer** for loss, producing intermediate values that are contractually obligated to be processed by the **Recursive Clip-Aggregation Engine (Node 14)**.
   - **Contract:** Generates probabilities and partial loss from `Full_Logits`. Adheres to the Placement Contract for both `partial_loss_out` and `partial_probs_out`.

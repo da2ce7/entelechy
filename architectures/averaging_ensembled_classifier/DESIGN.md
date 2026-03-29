@@ -1,7 +1,7 @@
 # Design Document: Averaging Ensembled Classifier
 
-**Revision:** 2.0 — Post-ADR  
-**Last Updated:** 2026-03-28  
+**Revision:** 2.1 — Post-Phase 3  
+**Last Updated:** 2026-03-29  
 **Scope:** Implementation design for the multi-backend averaging ensembled classifier architecture.
 
 ---
@@ -295,24 +295,48 @@ averaging_ensembled_classifier/
 │   │   │       └── common.glsl              # Shared specialization constant declarations
 │   │   │
 │   │   └── cpu/                             # ctypes FFI backend — compiled C shared library
+│   │       ├── __init__.py                  # Public exports: CPUPlanRenderer, discover_hardware, etc.
 │   │       ├── renderer.py                  # CPUPlanRenderer with pool_dispatch_and_wait
-│   │       ├── retrieval.py                 # Zero-copy RetrievalFuture
+│   │       ├── retrieval.py                 # Zero-copy CPURetrievalFuture
 │   │       ├── buffer_allocator.py          # SIMD-aligned numpy arrays
-│   │       ├── discovery.py                 # Thread count, L1 size → HardwareProfile
-│   │       ├── type_mapping.py
-│   │       ├── _ffi_types.py                # ctypes struct definitions (ADR-015)
-│   │       ├── kernel_bindings/
-│   │       └── kernel_sources/              # C implementations + cpu_simd.h + cpu_kernels.h
+│   │       ├── discovery.py                 # Thread count, cache line size, SIMD width → HardwareProfile
+│   │       ├── type_mapping.py              # PrecisionConfig → numpy dtype mapping
+│   │       ├── _ffi_types.py                # ctypes struct definitions mirroring cpu_kernels.h (ADR-015)
+│   │       ├── _loader.py                   # Library loading via importlib.resources + _verify_layouts()
+│   │       ├── _dispatch_table.py           # kernel_name → (task_fn_ptr, args_struct_class) map
+│   │       └── kernel_sources/              # C implementations (compiled to libcpu_kernels.so)
+│   │           ├── cpu_simd.h               # SIMD abstraction (AVX-512/AVX2/SSE2/NEON/scalar)
+│   │           ├── cpu_threads.h            # Thread pool interface
+│   │           ├── cpu_threads.c            # Thread pool implementation (C11/pthreads)
+│   │           ├── cpu_kernels.h            # Public ABI: task prototypes, argument structs, get_struct_size_*
+│   │           ├── cpu_export.h             # Symbol visibility macros
+│   │           ├── phase_1_act.c            # forward_pass, render_logits, cce/bce loss
+│   │           ├── phase_2_learn_A_production.c  # module grads, backprop to hidden, temp grads
+│   │           ├── phase_2_learn_B_processing.c  # clip partials, gather_and_permute
+│   │           ├── phase_2_learn_C_reduction.c   # aggregate, clip intermediate, reduction tree, stabilize
+│   │           ├── phase_2_learn_D_backprop.c    # shared weight/bias backprop, clip shared grads
+│   │           └── phase_3_update.c              # normalize, adam_update, clamp_temperatures
 │   │
 │   ├── _build_config.py                     # Generated: BACKEND_OPENCL, BACKEND_VULKAN, BACKEND_CPU booleans
 │   └── main_orchestrator.py                 # Training orchestration (migrating to Engine)
 │
 ├── tests/                                   # Tiered test framework (ADR-016)
 │   ├── conftest.py                          # _build_config-driven skip logic
-│   ├── tolerance_config.py                  # Per-kernel tolerance tables
-│   ├── tier1/                               # Host-side plan correctness
+│   ├── tolerance_config.py                  # Per-kernel tolerance tables (FP32 + backend-specific)
+│   ├── tier1/                               # Host-side plan correctness (140 tests)
 │   ├── tier2/                               # Per-backend kernel correctness
-│   │   └── fixtures/                        # Analytical + numpy reference implementations
+│   │   ├── fixtures/                        # Analytical + numpy reference implementations (shared)
+│   │   │   ├── analytical.py                # Closed-form reference: clamp, normalize, clip, mask
+│   │   │   ├── data_generators.py           # Deterministic RNG-seeded test data factories
+│   │   │   ├── numpy_forward.py             # forward_pass, render_logits, softmax/sigmoid loss
+│   │   │   ├── numpy_gradients.py           # module grads, hidden grads, temp grads
+│   │   │   ├── numpy_reduction.py           # multi-stage reduction with clip
+│   │   │   ├── numpy_backprop.py            # shared weight/bias backprop
+│   │   │   └── numpy_update.py              # adam_update reference
+│   │   ├── opencl/                          # OpenCL Tier 2 tests
+│   │   └── cpu/                             # CPU Tier 2 tests (16 test modules)
+│   │       ├── conftest.py                  # Session-scoped CPU fixtures
+│   │       └── test_cpu_*.py                # Per-kernel correctness tests
 │   └── tier3/                               # Cross-backend parity (CPU oracle)
 │
 └── adr/                                     # Architectural Decision Records (ADR-001 through ADR-018)
@@ -357,12 +381,13 @@ The following legacy service modules are dissolved into stateless plan primitive
 ### 7.3 CPU Backend (ADR-015)
 
 - **Interop:** `ctypes` (Python stdlib). Zero additional dependencies (`cpu = []`).
-- **Kernel compilation:** C implementations compiled to `libcpu_kernels.so` by Meson's `shared_library()`. ISA selection via `-march=native` (overridable via `cpu_isa_flags` build option). SIMD through `cpu_simd.h` abstraction layer.
-- **Dispatch model:** `pool_dispatch_and_wait(pool, task_fn, args, task_count)` — blocking dispatch of N independent tasks to a persistent thread pool.
-- **ABI surface:** ~24 exported symbols. Uniform task function signature: `void task_<kernel_name>(void* args, uint task_index, uint thread_id)`.
-- **FFI types:** `src/backends/cpu/_ffi_types.py` — ctypes `Structure` subclasses mirroring `cpu_kernels.h` structs. Function pointer retrieval via `CFUNCTYPE(("symbol_name", lib))`. Dispatch table: `kernel_name → (task_fn_ptr, args_struct_class)`.
+- **Kernel compilation:** C implementations compiled to `libcpu_kernels.so` by Meson's `shared_library()`. ISA selection via `-march=native` (overridable via `aec_cpu_isa_flags` build option). SIMD through `cpu_simd.h` abstraction layer supporting AVX-512, AVX2, SSE2, ARM NEON, and scalar fallback.
+- **Dispatch model:** `pool_dispatch_and_wait(pool, task_fn, args, task_count)` — blocking dispatch of N independent tasks to a persistent thread pool. Atomic task claiming for natural load balancing.
+- **ABI surface:** 18 `task_<kernel_name>` functions + `execute_reduction_tree` + `pool_create`/`pool_destroy`/`pool_dispatch_and_wait` + `get_simd_width` + 18 `get_struct_size_*` verification exports. Uniform task function signature: `void task_<kernel_name>(void* args, uint task_index, uint thread_id)`.
+- **FFI types:** `src/backends/cpu/_ffi_types.py` — ctypes `Structure` subclasses mirroring `cpu_kernels.h` structs. `_loader.py` handles library discovery and `_verify_layouts()` at load time. `_dispatch_table.py` builds the `kernel_name → (task_fn_ptr, args_struct_class)` map.
 - **Layout verification:** `_verify_layouts()` at library load time asserts Python-side struct sizes match C-side `get_struct_size_*()` exports. Catches struct drift before any dispatch. Same-size field reorderings caught by Tier 2 behavioral tests.
 - **Library discovery:** `importlib.resources.files('averaging_ensembled_classifier.backends.cpu')` with platform-specific filename resolution.
+- **Status:** ✅ **Implemented** (Phase 3A + 3B + 3C complete). 6 C source files + 4 headers. 9 Python FFI modules. 16 Tier 2 test modules.
 
 ---
 
@@ -430,17 +455,18 @@ Option names use the `aec_` prefix to namespace them within the Meson subproject
 | Tier | Scope | Execution Requirement | Gate |
 | :--- | :--- | :--- | :--- |
 | **Tier 1** | Host-side plan correctness: plan construction, contract validation, buffer lifecycle, reduction tree plan, streaming loop plan, strategy delegation, memory layout, precision config, hardware profile | None — pure Python | Always runs (140 tests) |
-| **Tier 2** | Per-backend kernel correctness against reference fixtures | Per-backend: `_build_config.BACKEND_<NAME> is True` | Per enabled backend |
+| **Tier 2** | Per-backend kernel correctness against reference fixtures | Per-backend: `_build_config.BACKEND_<NAME> is True` | Per enabled backend (CPU: 16 test modules) |
 | **Tier 3** | Cross-backend parity with CPU as reference oracle | CPU + ≥1 other backend | Falls back to GPU-vs-GPU if CPU unavailable |
 
 ### 9.2 Tier 2 Fixtures
 
-- **Analytical fixtures** for closed-form kernels: `compute_hidden_mask`, `clamp_temperatures`, `normalize_gradients`, clipping kernels. The fixture *is* the mathematical definition.
-- **Numpy reference implementations** for complex kernels: `forward_pass`, `compute_probs_loss_cce/bce`, `calculate_module_param_grads`, `backprop_error_to_hidden`, `stabilize_reduce_grad_h`, `adam_update`, etc. Numpy code performs the mathematical operation without tiling, SIMD, or local memory.
+- **Analytical fixtures** for closed-form kernels: `compute_hidden_mask`, `clamp_temperatures`, `normalize_gradients`, clipping kernels. The fixture *is* the mathematical definition. Located in `tests/tier2/fixtures/analytical.py`.
+- **Numpy reference implementations** for complex kernels: `forward_pass`, `compute_probs_loss_cce/bce`, `calculate_module_param_grads`, `backprop_error_to_hidden`, `stabilize_reduce_grad_h`, `adam_update`, etc. Numpy code performs the mathematical operation without tiling, SIMD, or local memory. Organized across `tests/tier2/fixtures/numpy_forward.py`, `numpy_gradients.py`, `numpy_reduction.py`, `numpy_backprop.py`, and `numpy_update.py`.
+- **Data generators** in `tests/tier2/fixtures/data_generators.py` — deterministic RNG-seeded helper functions for creating test inputs, weights, biases, and targets.
 
 ### 9.3 Tolerance Configuration
 
-Base tolerances: FP32 `atol=1e-5, rtol=1e-5`; FP16 `atol=1e-2, rtol=1e-2`. Kernels with higher numerical sensitivity (Softmax, sigmoid near saturation, multi-stage reduction, Adam division) override to `atol=1e-4, rtol=1e-4` for FP32.
+Base tolerances: FP32 `atol=1e-5, rtol=1e-5`; FP16 `atol=1e-2, rtol=1e-2`. Kernels with higher numerical sensitivity (Softmax, numerically stable two-branch sigmoid near saturation, multi-stage reduction, Adam division) override to `atol=1e-4, rtol=1e-4` for FP32.
 
 ### 9.4 Oracle Model
 
@@ -498,7 +524,7 @@ All phases proceed in parallel behind `_build_config.py` feature flags. Each pha
 | **0: Foundation** | Create directory structure; move modules to `src/shared/` + `src/backends/opencl/`; create `meson.options` and `_build_config.py` template | All existing tests green | **Complete** |
 | **1: Plan Model** | Implement shared-layer plan data structures (node types, buffer lifecycle, reduction/streaming plans, retrieval protocol); write Tier 1 tests | Tier 1 green | **Complete** |
 | **2: OpenCL Adapter** | Wrap existing PyOpenCL dispatch in `PlanRenderer` interface; write OpenCL Tier 2 tests | Tier 1 + OpenCL Tier 2 green | Not started |
-| **3: CPU Backend** | Implement C kernel library, ctypes FFI, `CPUPlanRenderer`; write CPU Tier 2 tests | Tier 1 + CPU Tier 2 green | Not started |
+| **3: CPU Backend** | Implement C kernel library, ctypes FFI, `CPUPlanRenderer`; write CPU Tier 2 tests | Tier 1 + CPU Tier 2 green | **Complete** |
 | **4: Test Harness** | Full Tier 1/2/3 framework, fixtures, tolerance tables, oracle logic; can begin immediately | All enabled tiers green | Not started |
 | **5: Vulkan Backend** | GLSL shaders, SPIR-V compilation, vulkan-python `PlanRenderer`; write Vulkan Tier 2 tests | Tier 1 + Vulkan Tier 2 + Tier 3 parity green | Not started |
 | **User-Facing API** | `WorkTicket`, `LearnHandle`, `Engine`; parallel with Phase 4 | Tier 1 (ticket) + integration green | Not started |
@@ -513,7 +539,7 @@ Phase 0 (Foundation) ────────────── ✅ Complete (19
 Phase 1 (Plan Model) ──────────── ✅ Complete (332 tests green: 192 Phase 0 + 140 Tier 1)
   │
   ├──▶ Phase 2 (OpenCL Adapter) ─── Tier 1 + OpenCL Tier 2 gate
-  ├──▶ Phase 3 (CPU Backend) ────── Tier 1 + CPU Tier 2 gate
+  ├──▶ Phase 3 (CPU Backend) ────── ✅ Complete (Tier 1 green + CPU Tier 2 green)
   ├──▶ Phase 5 (Vulkan Backend) ─── Tier 1 + Vulkan Tier 2 + Tier 3 gate
   ├──▶ User-Facing API ─────────── Tier 1 (ticket) + integration green
   │

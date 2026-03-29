@@ -373,9 +373,17 @@ __kernel void compute_probs_loss_bce_chunk(
             const long base_read_idx = (long)module_global_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_total_output_class_count
                                        + (long)batch_idx * src_scalar_NATURAL_padded_total_output_class_count + c_global;
 
-            // Compute Sigmoid probability.
-            const SCALAR_TYPE logit = src_buffer_GLOBAL_logits[base_read_idx];
-            const SCALAR_TYPE prob  = 1.0f / (1.0f + MATH_FN exp(-logit * temp_inv));
+            // Compute Sigmoid probability (numerically stable two-branch form).
+            const SCALAR_TYPE logit        = src_buffer_GLOBAL_logits[base_read_idx];
+            const SCALAR_TYPE scaled_logit = logit * temp_inv;
+            SCALAR_TYPE prob;
+            if (scaled_logit >= 0.0f) {
+                const SCALAR_TYPE e = MATH_FN exp(-scaled_logit);
+                prob = 1.0f / (1.0f + e);
+            } else {
+                const SCALAR_TYPE e = MATH_FN exp(scaled_logit);
+                prob = e / (1.0f + e);
+            }
 
             // Write the probability to its unique, tile-local slot in the collection buffer.
             const long prob_write_idx = prob_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk

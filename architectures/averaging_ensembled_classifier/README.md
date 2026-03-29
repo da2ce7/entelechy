@@ -81,6 +81,17 @@ graph TD
 ### A Crucible of Constraint: The Power of OpenCL 1.2
 This architecture was forged in a crucible of deliberate constraint: to target **OpenCL 1.2 *without* relying on Atomics**. This restriction rendered the simple path of `atomic_add` impassable. It *forced* the design to confront the problem of parallelism head-on, giving rise to the more sophisticated, elegant, and ultimately more robust parallel reduction patterns that form the very heart of the engine. This choice ensures maximum hardware compatibility, allowing the organism to thrive in the widest possible range of computational environments.
 
+### Multi-Backend Execution
+The engine executes through a **plan-as-data-structure** model: a shared orchestration layer constructs an immutable, backend-neutral execution plan, which each backend renders using its native execution model.
+
+| Backend | Status | Execution Primitives |
+| :--- | :--- | :--- |
+| **OpenCL** | Reference implementation | `clEnqueueNDRange` + `cl.Event` synchronization |
+| **CPU** | ✅ **Implemented** | SIMD-vectorized C kernels (`libcpu_kernels.so`) + persistent thread pool via `pool_dispatch_and_wait` |
+| **Vulkan** | Planned | SPIR-V compute shaders via `vkCmdDispatch` + pipeline barriers |
+
+The CPU backend requires zero additional Python dependencies beyond `ctypes` (stdlib). It supports AVX-512, AVX2, SSE2, ARM NEON, and a scalar fallback, auto-detecting the optimal ISA at compile time. See [`CPU_BACKEND.md`](./CPU_BACKEND.md) for the full architecture.
+
 ---
 
 ### The Canonical Archives
@@ -90,3 +101,5 @@ This document provides the spirit of the architecture. To understand its flesh a
 *   **The Implementation Blueprint:** For concrete data structures, module layout, build system, multi-backend design, test strategy, and the phase-gated migration plan, see [2: `DESIGN.md`](./DESIGN.md).
 *   **The Book of Law:** For the inviolable Host-Device interface, parameter naming conventions, and memory layout contracts, see [3: `CONTRACT.md`](./CONTRACT.md).
 *   **The Kernel Declarations:** For the ground-truth C-level function signatures that are the final authority for all kernel launches, see [`kernels/kernels.cl.h`](./kernels/kernels.cl.h).
+*   **The CPU Architecture:** For the SIMD + multi-core execution model, threading design, reduction engine, and per-kernel analysis, see [`CPU_BACKEND.md`](./CPU_BACKEND.md).
+*   **The Vulkan Architecture:** For the explicit GPU compute model with pre-compiled SPIR-V pipelines, see [`VULKAN_BACKEND.md`](./VULKAN_BACKEND.md).

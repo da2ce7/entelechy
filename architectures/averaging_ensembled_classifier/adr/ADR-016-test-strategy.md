@@ -309,7 +309,7 @@ Kernels with higher numerical sensitivity override the defaults:
 | Kernel | Tolerance override | Rationale |
 | :--- | :--- | :--- |
 | `compute_probs_loss_cce` | `atol=1e-4, rtol=1e-4` (FP32) | `exp()` and `log()` accumulation in Softmax |
-| `compute_probs_loss_bce` | `atol=1e-4, rtol=1e-4` (FP32) | `sigmoid()` near saturation |
+| `compute_probs_loss_bce` | `atol=1e-4, rtol=1e-4` (FP32) | Numerically stable two-branch `sigmoid()` near saturation |
 | `stabilize_reduce_grad_h` | `atol=1e-4, rtol=1e-4` (FP32) | Multi-stage internal reduction |
 | `adam_update` | `atol=1e-4, rtol=1e-4` (FP32) | Division by `√(v̂+ε)` amplifies small differences |
 | `aggregate_local_reduce` | `atol=1e-4, rtol=1e-4` (FP32) | Multi-element summation order sensitivity |

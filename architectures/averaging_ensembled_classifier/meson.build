@@ -64,7 +64,7 @@ if backend_vulkan.allowed()
   # subdir('src/backends/vulkan')  # created in Phase 3
 endif
 if backend_cpu.allowed()
-  # subdir('src/backends/cpu')  # created in Phase 5
+  subdir('src/backends/cpu')
 endif
 
 # --- OpenCL kernel data files ---

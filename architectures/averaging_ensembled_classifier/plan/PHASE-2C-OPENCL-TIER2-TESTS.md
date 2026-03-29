@@ -545,7 +545,7 @@ This reference is intentionally straightforward — no tiling, no streaming, no 
 | Kernel | FP32 Override | Rationale |
 | :--- | :--- | :--- |
 | `compute_probs_loss_cce_chunk` | `atol=1e-4, rtol=1e-4` | Softmax `exp()` and `log()` accumulate error |
-| `compute_probs_loss_bce_chunk` | `atol=1e-4, rtol=1e-4` | Sigmoid near saturation |
+| `compute_probs_loss_bce_chunk` | `atol=1e-4, rtol=1e-4` | Numerically stable two-branch sigmoid near saturation |
 | `stabilize_reduce_grad_h` | `atol=1e-4, rtol=1e-4` | Multi-stage internal reduction accumulates rounding |
 | `adam_update` | `atol=1e-4, rtol=1e-4` | Division by $\sqrt{\hat{v}_t} + \epsilon$; sensitive near zero |
 | Reduction tree (multi-stage) | `atol=1e-4, rtol=1e-4` | Summation order differs between reference (sequential) and kernel (tree-structured) |
@@ -616,7 +616,7 @@ def get_tolerance(kernel_name: str, precision_label: str) -> TolerancePair:
 | Concern | Handling |
 | :--- | :--- |
 | Overflow in intermediate computation | Numpy reference uses FP32 internally; kernel operates in FP16. Tolerance accounts for range difference. |
-| Softmax/sigmoid saturation | FP16 `exp()` overflows earlier; loss values may clip to `±65504` (max half). Test verifies no NaN/Inf rather than exact value match. |
+| Softmax/sigmoid saturation | FP16 `exp()` overflows earlier; loss values may clip to `±65504` (max half). Test verifies no NaN/Inf rather than exact value match. All backends use the numerically stable two-branch sigmoid (positive/negative logit split) for BCE, matching the numpy reference. |
 | Adam update $\epsilon$ | `PrecisionConfig.float16().epsilon` is larger (`~1e-3` vs. `1e-7`); Adam denominator stability is tested. |
 | Reduction tree safety bound | $T_{\text{safe}} = 65504 / K$; FP16 safety bound is much tighter. Verify threshold schedule respects this. |
 

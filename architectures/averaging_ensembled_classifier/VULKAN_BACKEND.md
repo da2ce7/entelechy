@@ -1,5 +1,7 @@
 # Vulkan Back-End: Architecture for Explicit GPU Compute
 
+> **Implementation Status:** Not started — Phase 5 (post-Phase 3). This document is the architectural specification for future implementation.
+
 ## Design Constraints
 
 Two hard requirements for the Vulkan back-end design:
