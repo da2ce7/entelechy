@@ -86,6 +86,7 @@ struct ThreadPool {
     cnd_t          done_cond;
     atomic_int     shutdown;
     atomic_int     active;   /* 1 when a batch is submitted */
+    atomic_uint    batch_gen; /* monotonic batch generation counter */
 };
 
 /* ----------------------------------------------------------------
@@ -95,16 +96,20 @@ static int worker_main(void* arg) {
     WorkerContext* ctx = (WorkerContext*)arg;
     ThreadPool*    pool = ctx->pool;
     const uint     tid  = ctx->thread_id;
+    uint           my_gen = 0;
 
     for (;;) {
         mtx_lock(&pool->wake_mutex);
-        while (!atomic_load(&pool->active) && !atomic_load(&pool->shutdown)) {
+        while (atomic_load(&pool->batch_gen) <= my_gen
+               && !atomic_load(&pool->shutdown)) {
             cnd_wait(&pool->wake_cond, &pool->wake_mutex);
         }
         mtx_unlock(&pool->wake_mutex);
 
         if (atomic_load(&pool->shutdown))
             break;
+
+        my_gen = atomic_load(&pool->batch_gen);
 
         TaskBatch* batch = pool->current_batch;
         uint task;
@@ -137,6 +142,7 @@ ThreadPool* pool_create(uint num_threads) {
     pool->current_batch = NULL;
     atomic_init(&pool->shutdown, 0);
     atomic_init(&pool->active, 0);
+    atomic_init(&pool->batch_gen, 0);
 
     mtx_init(&pool->wake_mutex, mtx_plain);
     cnd_init(&pool->wake_cond);
@@ -199,6 +205,7 @@ void pool_dispatch_and_wait(ThreadPool* pool,
     mtx_lock(&pool->wake_mutex);
     pool->current_batch = &batch;
     atomic_store(&pool->active, 1);
+    atomic_fetch_add(&pool->batch_gen, 1);
     cnd_broadcast(&pool->wake_cond);
 
     /* Wait until all workers have finished this batch */

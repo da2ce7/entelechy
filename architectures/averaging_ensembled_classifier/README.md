@@ -92,6 +92,14 @@ The engine executes through a **plan-as-data-structure** model: a shared orchest
 
 The CPU backend requires zero additional Python dependencies beyond `ctypes` (stdlib). It supports AVX-512, AVX2, SSE2, ARM NEON, and a scalar fallback, auto-detecting the optimal ISA at compile time. See [`CPU_BACKEND.md`](./CPU_BACKEND.md) for the full architecture.
 
+Development rebuild note (CPU backend): when running from the source tree, the loader resolves `libcpu_kernels.so` from Meson build outputs (for example `builddir/...` or `build/cp*/...`). After editing any C source under `src/backends/cpu/kernel_sources/`, rebuild before testing:
+
+```bash
+ninja -C builddir
+```
+
+An editable Python reinstall alone does not guarantee recompilation of the native CPU shared library.
+
 ---
 
 ### The Canonical Archives

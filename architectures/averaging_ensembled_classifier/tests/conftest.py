@@ -79,6 +79,57 @@ requires_opencl = pytest.mark.skipif(
 )
 
 
+# ---------------------------------------------------------------------------
+# _build_config-driven backend availability (ADR-014, ADR-016)
+# ---------------------------------------------------------------------------
+def _load_build_config() -> dict[str, bool]:
+    """Load the build manifest; return a dict of backend availability."""
+    try:
+        from src._build_config import BACKEND_OPENCL, BACKEND_VULKAN, BACKEND_CPU
+        return {
+            "opencl": BACKEND_OPENCL,
+            "vulkan": BACKEND_VULKAN,
+            "cpu": BACKEND_CPU,
+        }
+    except ImportError:
+        # Pre-migration fallback: only OpenCL via runtime probe.
+        return {"opencl": _has_opencl_device, "vulkan": False, "cpu": False}
+
+
+BUILD_CONFIG = _load_build_config()
+
+
+# ---------------------------------------------------------------------------
+# pytest hooks — collection modifier and CLI options (ADR-016)
+# ---------------------------------------------------------------------------
+def pytest_addoption(parser):
+    parser.addoption(
+        "--all-pairs",
+        action="store_true",
+        default=False,
+        help="Run Tier 3 parity tests with all-pairs comparison (GPU-vs-GPU in addition to oracle)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip tests whose backend requirements are not met (ADR-016)."""
+    for item in items:
+        # Tier 2 / per-backend: skip if backend unavailable
+        for backend in ("opencl", "vulkan", "cpu"):
+            if backend in item.keywords and not BUILD_CONFIG.get(backend, False):
+                item.add_marker(pytest.mark.skip(
+                    reason=f"Backend '{backend}' not available (_build_config)",
+                ))
+
+        # Tier 3: skip parity tests if < 2 backends available
+        if "tier3" in item.keywords:
+            available = sum(BUILD_CONFIG.values())
+            if available < 2:
+                item.add_marker(pytest.mark.skip(
+                    reason=f"Tier 3 requires >= 2 backends ({available} available)",
+                ))
+
+
 # =========================================================================
 # Canonical "Iris-like" Small Model Configuration
 # =========================================================================

@@ -18,16 +18,16 @@ class NormalizeGradientsBinding(KernelBinding):
         return "normalize_gradients"
 
     def compute_grid(self, tile_index: int, scalar_params: dict[str, int | float], hardware_simd_width: int) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
-        element_count = int(scalar_params["element_count"])
+        element_count = int(scalar_params["parameter_count"])
         return (element_count,), None
 
     def marshal_args(self, get_buffer: Callable[[BufferHandle], cl.Buffer], buffer_bindings: dict[str, BufferHandle], scalar_params: dict[str, int | float], tile_index: int) -> list[Any]:
         return [
             get_buffer(buffer_bindings["summed_grad"]),
-            get_buffer(buffer_bindings["final_grad_out"]),
+            get_buffer(buffer_bindings["final_grad"]),
             np.float32(scalar_params["effective_batch_size"]),
             np.float32(scalar_params["epsilon"]),
-            np.uint32(scalar_params["element_count"]),
+            np.uint32(scalar_params["parameter_count"]),
         ]
 
 
@@ -47,10 +47,10 @@ class AdamUpdateBinding(KernelBinding):
 
     def marshal_args(self, get_buffer: Callable[[BufferHandle], cl.Buffer], buffer_bindings: dict[str, BufferHandle], scalar_params: dict[str, int | float], tile_index: int) -> list[Any]:
         return [
-            get_buffer(buffer_bindings["grad"]),
-            get_buffer(buffer_bindings["param"]),
-            get_buffer(buffer_bindings["m1_state"]),
-            get_buffer(buffer_bindings["m2_state"]),
+            get_buffer(buffer_bindings["final_grad"]),
+            get_buffer(buffer_bindings["parameters"]),
+            get_buffer(buffer_bindings["m1"]),
+            get_buffer(buffer_bindings["m2"]),
             np.float32(scalar_params["learning_rate"]),
             np.float32(scalar_params["beta1_pow_t"]),
             np.float32(scalar_params["beta2_pow_t"]),
@@ -68,13 +68,13 @@ class ClampTemperaturesBinding(KernelBinding):
         return "clamp_temperatures"
 
     def compute_grid(self, tile_index: int, scalar_params: dict[str, int | float], hardware_simd_width: int) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
-        element_count = int(scalar_params["element_count"])
+        element_count = int(scalar_params["total_modules_count"])
         return (element_count,), None
 
     def marshal_args(self, get_buffer: Callable[[BufferHandle], cl.Buffer], buffer_bindings: dict[str, BufferHandle], scalar_params: dict[str, int | float], tile_index: int) -> list[Any]:
         return [
-            get_buffer(buffer_bindings["temps"]),
-            np.float32(scalar_params["min_val"]),
-            np.float32(scalar_params["max_val"]),
-            np.uint32(scalar_params["element_count"]),
+            get_buffer(buffer_bindings["temperatures"]),
+            np.float32(scalar_params["min_value"]),
+            np.float32(scalar_params["max_value"]),
+            np.uint32(scalar_params["total_modules_count"]),
         ]

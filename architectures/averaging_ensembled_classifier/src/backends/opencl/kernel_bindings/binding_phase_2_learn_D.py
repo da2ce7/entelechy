@@ -39,9 +39,9 @@ class BackpropSharedWeightsBinding(KernelBinding):
             cl.LocalMemory(local_mem_size),
             get_buffer(buffer_bindings["input"]),
             get_buffer(buffer_bindings["hidden_activations"]),
-            get_buffer(buffer_bindings["grad_h"]),
+            get_buffer(buffer_bindings["summed_grad_hidden_activations"]),
             get_buffer(buffer_bindings["sample_mask"]),
-            get_buffer(buffer_bindings["partial_grad_sw"]),
+            get_buffer(buffer_bindings["partial_grad_weights_shared"]),
             np.uint32(scalar_params["batch_chunk_offset"]),
             np.uint32(scalar_params["batch_chunk_count"]),
             np.uint32(scalar_params["batch_chunk_index"]),
@@ -75,9 +75,9 @@ class BackpropSharedBiasesBinding(KernelBinding):
         return [
             cl.LocalMemory(local_mem_size),
             get_buffer(buffer_bindings["hidden_activations"]),
-            get_buffer(buffer_bindings["grad_h"]),
+            get_buffer(buffer_bindings["summed_grad_hidden_activations"]),
             get_buffer(buffer_bindings["sample_mask"]),
-            get_buffer(buffer_bindings["partial_grad_sb"]),
+            get_buffer(buffer_bindings["partial_grad_biases_shared"]),
             np.uint32(scalar_params["batch_chunk_offset"]),
             np.uint32(scalar_params["batch_chunk_count"]),
             np.uint32(scalar_params["batch_chunk_index"]),
@@ -99,8 +99,8 @@ class ClipSharedGradientsBinding(KernelBinding):
 
     def compute_grid(self, tile_index: int, scalar_params: dict[str, int | float], hardware_simd_width: int) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
         wg = self._workgroup_size
-        weights_count = int(scalar_params["weights_param_count"])
-        biases_count = int(scalar_params["biases_param_count"])
+        weights_count = int(scalar_params["weights_parameter_count"])
+        biases_count = int(scalar_params["biases_parameter_count"])
         total_elements = weights_count + biases_count
         global_size = (pad_to_multiple(total_elements, wg),)
         local_size = (wg,)
@@ -111,15 +111,15 @@ class ClipSharedGradientsBinding(KernelBinding):
         local_mem_size = self._workgroup_size * element_size
         return [
             cl.LocalMemory(local_mem_size),
-            get_buffer(buffer_bindings["grad_weights_shared_chunk"]),
-            get_buffer(buffer_bindings["grad_biases_shared_chunk"]),
-            get_buffer(buffer_bindings["clipped_grad_weights_shared_collection"]),
-            get_buffer(buffer_bindings["clipped_grad_biases_shared_collection"]),
-            np.float32(scalar_params["clipping_threshold_global"]),
+            get_buffer(buffer_bindings["partial_grad_weights_shared"]),
+            get_buffer(buffer_bindings["partial_grad_biases_shared"]),
+            get_buffer(buffer_bindings["clipped_partial_grad_weights_shared"]),
+            get_buffer(buffer_bindings["clipped_partial_grad_biases_shared"]),
+            np.float32(scalar_params["clipping_threshold_t_pre"]),
             np.float32(scalar_params["epsilon"]),
-            np.uint32(scalar_params["weights_param_count"]),
-            np.uint32(scalar_params["biases_param_count"]),
-            np.uint32(scalar_params["dest_weights_write_offset_elements"]),
-            np.uint32(scalar_params["dest_biases_write_offset_elements"]),
+            np.uint32(scalar_params["weights_parameter_count"]),
+            np.uint32(scalar_params["biases_parameter_count"]),
+            np.uint32(scalar_params["weights_write_offset_elements"]),
+            np.uint32(scalar_params["biases_write_offset_elements"]),
             np.uint32(scalar_params["num_batch_chunks"]),
         ]

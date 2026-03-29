@@ -74,7 +74,9 @@ class OpenCLPlanRenderer:
         # Store plan reference for streaming loop body lookup
         self._plan = plan
 
-        # 1. Allocate all plan buffers
+        # 1. Drain previous work, release stale buffers, allocate for this plan
+        self._queue.finish()
+        self._allocator.release_all()
         self._allocator.allocate_plan_buffers(plan.buffers)
 
         # 2. Traverse topological order, dispatching each node
@@ -159,17 +161,20 @@ class OpenCLPlanRenderer:
         binding = self._bindings[node.kernel_name]
         kernel = getattr(self._program, binding.get_kernel_name())
 
+        # Inject hardware-derived scalars that bindings may need
+        scalar_params = self._enrich_scalar_params(node.scalar_params)
+
         tile_events: list[cl.Event] = []
         for tile_idx in range(node.tile_count):
             args = binding.marshal_args(
                 get_buffer=self._allocator.get_buffer,
                 buffer_bindings=node.buffer_bindings,
-                scalar_params=node.scalar_params,
+                scalar_params=scalar_params,
                 tile_index=tile_idx,
             )
             global_size, local_size = binding.compute_grid(
                 tile_index=tile_idx,
-                scalar_params=node.scalar_params,
+                scalar_params=scalar_params,
                 hardware_simd_width=self._hardware.simd_width if self._hardware else 16,
             )
             kernel.set_args(*args)
@@ -182,6 +187,22 @@ class OpenCLPlanRenderer:
         if len(tile_events) == 1:
             return tile_events[0]
         return cl.enqueue_marker(self._queue, wait_for=tile_events)
+
+    # ------------------------------------------------------------------
+    # Hardware scalar injection
+    # ------------------------------------------------------------------
+
+    def _enrich_scalar_params(
+        self, scalar_params: dict[str, int | float],
+    ) -> dict[str, int | float]:
+        """Inject hardware-derived scalars that OpenCL bindings expect."""
+        enriched = dict(scalar_params)
+        simd = self._hardware.simd_width if self._hardware else 16
+        enriched.setdefault("work_group_size_0", min(simd * 8, 256))
+        enriched.setdefault("optimal_workgroup_size_1d_reduction", min(simd * 8, 256))
+        enriched.setdefault("simd_width", simd)
+        enriched.setdefault("element_size", 4)
+        return enriched
 
     # ------------------------------------------------------------------
     # Reduction tree (Phase 2B fills in full logic)
@@ -286,7 +307,7 @@ class OpenCLPlanRenderer:
         copy_event = cl.enqueue_copy(
             self._queue, dest_buf, ping,  # type: ignore[arg-type]
             byte_count=copy_size,
-            wait_for=[prev_event], is_blocking=False,
+            wait_for=[prev_event],
         )
         return copy_event
 
@@ -426,7 +447,9 @@ class OpenCLPlanRenderer:
                 assert isinstance(body_node, KernelDispatchNode)
 
                 # Merge chunk-specific scalars over the body node's base scalars
-                merged_scalars = {**body_node.scalar_params, **chunk_scalars}
+                merged_scalars = self._enrich_scalar_params(
+                    {**body_node.scalar_params, **chunk_scalars}
+                )
 
                 binding = self._bindings[body_node.kernel_name]
                 kernel = getattr(self._program, binding.get_kernel_name())

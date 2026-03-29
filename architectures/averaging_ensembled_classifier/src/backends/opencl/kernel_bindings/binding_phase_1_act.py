@@ -42,7 +42,6 @@ class ForwardPassBinding(KernelBinding):
             get_buffer(buffer_bindings["biases_shared"]),
             get_buffer(buffer_bindings["hidden_activations"]),
             get_buffer(buffer_bindings["hidden_mask"]),
-            np.uint32(tile_index),
             np.uint32(scalar_params["batch_chunk_offset"]),
             np.uint32(scalar_params["batch_chunk_count"]),
             np.uint32(scalar_params["total_batch_count"]),
@@ -69,8 +68,8 @@ class RenderLogitsChunkBinding(KernelBinding):
         return [
             get_buffer(buffer_bindings["hidden_activations"]),
             get_buffer(buffer_bindings["hidden_mask"]),
-            get_buffer(buffer_bindings["module_weights"]),
-            get_buffer(buffer_bindings["module_biases"]),
+            get_buffer(buffer_bindings["weights_module"]),
+            get_buffer(buffer_bindings["biases_module"]),
             get_buffer(buffer_bindings["logits"]),
             np.uint32(scalar_params["batch_chunk_offset"]),
             np.uint32(scalar_params["batch_chunk_count"]),
@@ -104,11 +103,11 @@ class ComputeProbsLossCceBinding(KernelBinding):
     def marshal_args(self, get_buffer: Callable[[BufferHandle], cl.Buffer], buffer_bindings: dict[str, BufferHandle], scalar_params: dict[str, int | float], tile_index: int) -> list[Any]:
         return [
             get_buffer(buffer_bindings["logits"]),
-            get_buffer(buffer_bindings["temperatures"]),
+            get_buffer(buffer_bindings["temps"]),
             get_buffer(buffer_bindings["targets"]),
             get_buffer(buffer_bindings["sample_mask"]),
-            get_buffer(buffer_bindings["probs"]),
-            get_buffer(buffer_bindings["loss"]),
+            get_buffer(buffer_bindings["partial_probs"]),
+            get_buffer(buffer_bindings["final_loss"]),
             np.uint32(tile_index),
             np.uint32(scalar_params["num_class_chunks"]),
             np.uint32(scalar_params["classes_per_chunk"]),
@@ -138,10 +137,10 @@ class ComputeProbsLossBceBinding(KernelBinding):
     def marshal_args(self, get_buffer: Callable[[BufferHandle], cl.Buffer], buffer_bindings: dict[str, BufferHandle], scalar_params: dict[str, int | float], tile_index: int) -> list[Any]:
         return [
             get_buffer(buffer_bindings["logits"]),
-            get_buffer(buffer_bindings["temperatures"]),
+            get_buffer(buffer_bindings["temps"]),
             get_buffer(buffer_bindings["targets"]),
             get_buffer(buffer_bindings["sample_mask"]),
-            get_buffer(buffer_bindings["probs"]),
+            get_buffer(buffer_bindings["partial_probs"]),
             get_buffer(buffer_bindings["partial_loss"]),
             np.uint32(tile_index),
             np.uint32(scalar_params["num_class_chunks"]),

@@ -108,7 +108,6 @@ void task_clip_shared_grads(void* raw_args, uint task_index, uint thread_id) {
 
     const uint n_w = a->weights_parameter_count;
     const uint n_b = a->biases_parameter_count;
-    const uint total = n_w + n_b;
 
     /* Pass 1: sum of squares */
     float sum_sq = 0.0f;

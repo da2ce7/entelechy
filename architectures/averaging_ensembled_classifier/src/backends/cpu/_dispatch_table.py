@@ -99,6 +99,11 @@ def build_dispatch_table(
     }
 
 
-def _fn_ptr(lib: ctypes.CDLL, symbol_name: str) -> Any:
-    """Resolve a task function's address from the loaded library."""
-    return getattr(lib, symbol_name)
+def _fn_ptr(lib: ctypes.CDLL, symbol_name: str) -> ctypes.c_void_p:
+    """Resolve a task function's raw C address from the loaded library.
+
+    Returns c_void_p to avoid creating a Python ffi closure when the
+    address is passed to pool_dispatch_and_wait.  Worker threads call
+    the function without the GIL, so the pointer must go straight to C.
+    """
+    return ctypes.cast(getattr(lib, symbol_name), ctypes.c_void_p)

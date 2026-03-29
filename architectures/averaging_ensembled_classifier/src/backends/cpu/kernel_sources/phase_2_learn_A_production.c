@@ -99,7 +99,7 @@ void task_cce_probs_loss(void* raw_args, uint task_index, uint thread_id) {
     /* Loss: re-compute true class probability from global softmax, then
      * scatter-write to monolithic (module, batch) buffer (matches OpenCL). */
     const int   true_class_idx = a->targets[batch_idx];
-    const float logit_true     = a->logits[base_logits_idx + true_class_idx];
+    const float logit_true     = a->logits[base_logits_idx + (uint)true_class_idx];
     const float prob_true      = expf(logit_true * inv_temp - max_scaled_logit) * inv_sum_exp;
     a->final_loss[loss_out_idx] = -logf(fmaxf(prob_true, NUMERICAL_STABILITY_EPSILON));
 }
@@ -209,8 +209,6 @@ void task_module_param_grads(void* raw_args, uint task_index, uint thread_id) {
         return;
 
     /* Decode tile structure */
-    const uint module_chunk_idx  = a->flat_tile_index / a->num_class_chunks;
-    const uint module_global_idx = module_chunk_idx * a->modules_per_chunk + module_local_idx;
     const uint class_chunk_idx   = a->flat_tile_index % a->num_class_chunks;
     const uint class_offset      = class_chunk_idx * a->classes_per_chunk;
 

@@ -36,12 +36,15 @@ class OpenCLBufferAllocator:
         MODEL_STATE buffers that already exist are kept (persisted across
         batches). All other roles are freshly allocated.
         """
+        zero_pattern = np.zeros(1, dtype=np.uint8)
         for handle, desc in descriptors.items():
             if handle in self._buffers:
                 # MODEL_STATE buffer already allocated from a previous batch
                 continue
             flags = self._flags_for_role(desc.role)
             buf = cl.Buffer(self._context, flags, size=desc.size_bytes)
+            # Zero-fill: GPU memory may contain residue from prior allocations
+            cl.enqueue_fill_buffer(self._queue, buf, zero_pattern, 0, desc.size_bytes)
             self._buffers[handle] = buf
             self._descriptors[handle] = desc
 
@@ -94,6 +97,16 @@ class OpenCLBufferAllocator:
             buf.release()
             del self._descriptors[h]
         # Release all internal buffers
+        for buf in self._internal_buffers:
+            buf.release()
+        self._internal_buffers.clear()
+
+    def release_all(self) -> None:
+        """Release every buffer (including MODEL_STATE) and reset state."""
+        for buf in self._buffers.values():
+            buf.release()
+        self._buffers.clear()
+        self._descriptors.clear()
         for buf in self._internal_buffers:
             buf.release()
         self._internal_buffers.clear()

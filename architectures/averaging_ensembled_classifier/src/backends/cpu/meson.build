@@ -16,17 +16,26 @@ if cpu_isa_flags.length() == 0
     cpu_isa_flags = ['-march=native']
 endif
 
-cpu_c_args = [
-    '-DCPU_KERNELS_BUILDING',
-    '-fvisibility=hidden',
-] + cpu_isa_flags
-
 # Math library (needed for sqrtf, expf, logf, fabsf on some platforms)
 cc = meson.get_compiler('c')
 m_dep = cc.find_library('m', required: false)
 
 # Thread library (needed for pthreads fallback)
 thread_dep = dependency('threads', required: false)
+
+cpu_warn_args = cc.get_supported_arguments(
+    '-Wall', '-Wextra', '-Wpedantic',
+    '-Wconversion', '-Wsign-conversion',
+    '-Wshadow', '-Wstrict-prototypes', '-Wmissing-prototypes',
+    '-Wformat=2', '-Wdouble-promotion',
+    '-Wundef', '-Wpointer-arith', '-Wcast-align',
+    '-Wnull-dereference', '-Wwrite-strings',
+)
+
+cpu_c_args = [
+    '-DCPU_KERNELS_BUILDING',
+    '-fvisibility=hidden',
+] + cpu_isa_flags + cpu_warn_args
 
 cpu_lib = shared_library(
     'cpu_kernels',

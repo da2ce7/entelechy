@@ -36,6 +36,18 @@ dev = [
     "flake8",
     "mypy",
     "black",
+    "cppcheck",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "tier1: Host-side plan correctness (no backend required)",
+    "tier2: Per-backend kernel correctness (requires enabled backend)",
+    "tier3: Cross-backend parity (requires >= 2 backends)",
+    "cpu: Requires CPU backend",
+    "opencl: Requires OpenCL backend",
+    "vulkan: Requires Vulkan backend",
+    "slow: Long-running test",
 ]
 
 [tool.black]

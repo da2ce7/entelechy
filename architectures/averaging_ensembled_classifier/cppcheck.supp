@@ -1,0 +1,16 @@
+// cppcheck suppressions for CPU kernel shared library (ADR-015).
+//
+// Usage: cppcheck --suppressions-list=cppcheck.supp ...
+//
+// Rationale for each suppression documented inline.
+
+// All task_* and pool_* functions are exported via CPU_KERNELS_EXPORT for
+// Python FFI consumption — cppcheck can't see the dynamic loading.
+unusedFunction
+
+// Header declarations use 'args' while definitions use 'raw_args' for
+// clarity at the cast site. This is intentional and harmless.
+funcArgNamesDifferent
+
+// System headers are not shipped with the project.
+missingIncludeSystem

@@ -20,8 +20,8 @@ from ...shared.plan_types import (
 )
 from ...shared.retrieval_future import RetrievalFuture
 from ._dispatch_table import build_dispatch_table
-from ._ffi_types import ReductionTreePlanFFI
-from ._loader import TASK_FUNC_TYPE, load_cpu_library
+from ._ffi_types import ReductionTreePlanFFI, c_float_p, c_int_p, c_uint_p
+from ._loader import load_cpu_library
 from .buffer_allocator import CPUBufferAllocator
 from .discovery import detect_thread_count
 from .retrieval import CPURetrievalFuture
@@ -96,14 +96,13 @@ class CPUPlanRenderer:
         allocator: CPUBufferAllocator,
     ) -> None:
         """Dispatch a KernelDispatchNode via pool_dispatch_and_wait."""
-        fn, struct_cls = self._dispatch_table[node.kernel_name]
+        fn_addr, struct_cls = self._dispatch_table[node.kernel_name]
 
         args = self._marshal_args(struct_cls, node, allocator)
 
-        fn_ptr = TASK_FUNC_TYPE(fn)
         self._lib.pool_dispatch_and_wait(
             self._pool,
-            fn_ptr,
+            fn_addr,
             ctypes.byref(args),
             node.tile_count,
         )
@@ -150,8 +149,9 @@ class CPUPlanRenderer:
 
         # Build the C plan struct
         c_plan = ReductionTreePlanFFI()
-        c_plan.partial_collection = allocator.get_data_pointer(
-            rtp.source_buffer
+        c_plan.partial_collection = ctypes.cast(
+            allocator.get_data_pointer(rtp.source_buffer),
+            ctypes.POINTER(ctypes.c_float),
         )
         c_plan.offset_lists_flat = ctypes.cast(
             offsets_array, ctypes.POINTER(ctypes.c_uint32)
@@ -171,7 +171,10 @@ class CPUPlanRenderer:
         c_plan.staging_buffer_1 = staging_1.ctypes.data_as(
             ctypes.POINTER(ctypes.c_float)
         )
-        c_plan.output = allocator.get_data_pointer(rtp.destination_buffer)
+        c_plan.output = ctypes.cast(
+            allocator.get_data_pointer(rtp.destination_buffer),
+            ctypes.POINTER(ctypes.c_float),
+        )
         c_plan.partial_width = pw
         c_plan.num_stages = num_stages
 
@@ -212,6 +215,8 @@ class CPUPlanRenderer:
     # Argument marshalling
     # -----------------------------------------------------------
 
+    _POINTER_TYPES = (c_float_p, c_uint_p, c_int_p, ctypes.c_void_p)
+
     def _marshal_args(
         self,
         struct_cls: type[ctypes.Structure],
@@ -221,23 +226,19 @@ class CPUPlanRenderer:
         """Construct a ctypes argument struct from plan node parameters."""
         args = struct_cls()
 
-        # Build a set of pointer field names for quick lookup
-        pointer_fields: set[str] = set()
-        scalar_fields: set[str] = set()
-        for field_entry in struct_cls._fields_:
-            field_name = field_entry[0]
-            field_type = field_entry[1]
-            if hasattr(field_type, '_type_'):
-                scalar_fields.add(field_name)
-            else:
-                pointer_fields.add(field_name)
-            del field_name, field_type
+        # Build a map of pointer field names -> field types for quick lookup
+        pointer_fields: dict[str, type] = {}
+        for field_name, field_type in struct_cls._fields_:
+            if field_type in self._POINTER_TYPES:
+                pointer_fields[field_name] = field_type
 
         # Set buffer pointer fields from buffer_bindings
         for binding_name, handle in node.buffer_bindings.items():
             field_name = self._binding_to_field(binding_name)
             if field_name in pointer_fields:
-                setattr(args, field_name, allocator.get_data_pointer(handle))
+                ptr = allocator.get_data_pointer(handle)
+                setattr(args, field_name,
+                        ctypes.cast(ptr, pointer_fields[field_name]))
 
         # Set scalar fields from scalar_params
         for param_name, value in node.scalar_params.items():

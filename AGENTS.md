@@ -16,3 +16,14 @@ Optimization pressure that violates these core principles shall be interpreted a
 > - Modeling fused operation in Design Document as new DAG node type
 > - Defining strict fusion contracts in Kernel Headers
 > - Implementing through host-controlled parameter switches, not hidden logic
+
+#### 2. Development Build Discipline (CPU Backend)
+
+When working in this repository, CPU backend native code is loaded from Meson build outputs during development. If any file under `architectures/averaging_ensembled_classifier/src/backends/cpu/kernel_sources/` is edited, rebuild the shared library before testing:
+
+```bash
+cd architectures/averaging_ensembled_classifier
+ninja -C builddir
+```
+
+Do not assume an editable Python reinstall will recompile the native CPU library.

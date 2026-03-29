@@ -158,9 +158,19 @@ class PlanProblemTypeStrategy(abc.ABC):
     def get_temp_grad_contract(self) -> KernelContract:
         ...
 
+    @property
+    @abc.abstractmethod
+    def problem_type_flag(self) -> int:
+        """0 for CCE, 1 for BCE — matches the FLAG field in kernel structs."""
+        ...
+
 
 class PlanCceStrategy(PlanProblemTypeStrategy):
     """CCE plan strategy — single-label classification."""
+
+    @property
+    def problem_type_flag(self) -> int:
+        return 0
 
     @property
     def required_targets_buffer_name(self) -> str:
@@ -181,6 +191,10 @@ class PlanCceStrategy(PlanProblemTypeStrategy):
 
 class PlanBceStrategy(PlanProblemTypeStrategy):
     """BCE plan strategy — multi-label classification."""
+
+    @property
+    def problem_type_flag(self) -> int:
+        return 1
 
     @property
     def required_targets_buffer_name(self) -> str:
