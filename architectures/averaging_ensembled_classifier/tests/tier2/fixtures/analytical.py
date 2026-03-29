@@ -43,9 +43,9 @@ def ref_clip_l2_norm(
     Used by clip_partial_gradients, clip_intermediate_grad,
     clip_shared_gradients.
     """
-    norm = np.sqrt(np.sum(grads * grads) + epsilon)
+    norm = np.sqrt(np.sum(grads * grads))
     if norm > threshold:
-        return grads * (threshold / norm)
+        return grads * (threshold / (norm + epsilon))
     return grads.copy()
 
 
@@ -75,8 +75,8 @@ def ref_clip_shared_gradients(
 ) -> tuple[NDArray[np.floating[Any]], NDArray[np.floating[Any]]]:
     """Reference: clip_shared_gradients — joint L2-norm clip on concatenated grads."""
     combined = np.concatenate([grad_sw.ravel(), grad_sb.ravel()])
-    norm = np.sqrt(np.sum(combined * combined) + epsilon)
+    norm = np.sqrt(np.sum(combined * combined))
     if norm > threshold:
-        scale = threshold / norm
+        scale = threshold / (norm + epsilon)
         return grad_sw * scale, grad_sb * scale
     return grad_sw.copy(), grad_sb.copy()

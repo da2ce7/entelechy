@@ -57,6 +57,11 @@ if "src" not in sys.modules:
     _pkg.__package__ = "src"
     sys.modules["src"] = _pkg
 
+# Make Meson-generated files (e.g. _build_config.py) discoverable as src.*
+_builddir = os.path.join(_arch_root, "builddir")
+if os.path.isdir(_builddir) and _builddir not in sys.modules["src"].__path__:
+    sys.modules["src"].__path__.append(_builddir)
+
 # ---------------------------------------------------------------------------
 # Architecture imports (host-side only – no device needed)
 # ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ from src.backends.opencl.kernel_bindings.binding_phase_2_learn_C import (
     AggregateLocalReduceBinding,
     AggregateRegisterReduceBinding,
     ClipIntermediateGradBinding,
+    ReduceKFanInAndClipBinding,
 )
 from src.backends.opencl.kernel_bindings.dispatch_table import build_dispatch_table
 from src.backends.opencl.kernel_compilation import load_and_compile_kernels_from_path
@@ -112,5 +113,6 @@ def renderer_fp32(
         register_reduce=AggregateRegisterReduceBinding(),
         local_reduce=AggregateLocalReduceBinding(),
         clip_intermediate=ClipIntermediateGradBinding(),
+        k_fan_in=ReduceKFanInAndClipBinding(),
     )
     return renderer

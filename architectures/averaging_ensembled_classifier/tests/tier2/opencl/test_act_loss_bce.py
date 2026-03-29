@@ -57,3 +57,32 @@ class TestLossBCE:
         probs1, loss1 = ref_compute_probs_loss_bce(logits, t1, mask)
         assert not np.any(np.isnan(probs1))
         assert not np.isnan(loss1)
+
+    def test_bce_epsilon_fmax_contract(self):
+        """Finding 1: fmax(prob, eps) vs prob+eps.
+
+        Validates the reference follows the kernels.cl.h fmax contract:
+          (a) Extreme probabilities yield finite results.
+          (b) A known analytical case matches the fmax formula precisely.
+        """
+        epsilon = 1e-7
+        # (a) Extreme logits
+        logits = np.array([[50.0, -50.0, 0.0, 30.0]], dtype=np.float32)
+        targets = np.array([[1.0, 1.0, 0.0, 0.0]], dtype=np.float32)
+        mask = np.ones(1, dtype=np.float32)
+
+        probs, loss = ref_compute_probs_loss_bce(logits, targets, mask)
+        assert not np.any(np.isnan(probs)), "Extreme logits produced NaN probs"
+        assert np.isfinite(loss), "Loss must be finite at extreme probabilities"
+
+        # (b) logits=0 → prob=0.5, target=0.5 → loss = -log(0.5)
+        logits_known = np.array([[0.0]], dtype=np.float32)
+        targets_known = np.array([[0.5]], dtype=np.float32)
+        _, loss_known = ref_compute_probs_loss_bce(
+            logits_known, targets_known, mask,
+        )
+        expected_fmax = float(-np.log(0.5))
+        np.testing.assert_allclose(
+            loss_known, expected_fmax, atol=1e-7,
+            err_msg="BCE loss should match fmax-based analytical value",
+        )

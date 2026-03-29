@@ -261,3 +261,62 @@ class StabilizeAndReduceGradHiddenActivationsSignature(KernelSignature):
             self.total_modules_count,
             self.padded_total_modules_count,
         ]
+
+
+# =========================================================================
+# === ADR-019: K-Fan-In Reduction Kernel Signature
+# =========================================================================
+
+
+@dataclass(frozen=True)
+class ReduceKFanInAndClipSignature(KernelSignature):
+    """(ADR-019) Signature for `reduce_k_fan_in_and_clip` — multi-stage K-fan-in reduction.
+
+    Each dispatch processes ``node_count`` independent reduction nodes.
+    Per node: gather K partials via offset list, sum, optionally L2-clip,
+    and write one output vector of ``partial_width`` elements.
+    """
+
+    _buffer_mgr: BufferManager
+    _arch_consts: DiscoveredArchConstants
+
+    partial_collection_ref: BufferHandle
+    offset_list_flat_ref: BufferHandle
+    stage_output_ref: BufferHandle
+
+    fan_in_K: np.uint32
+    node_count: np.uint32
+    partial_width: np.uint32
+    clipping_threshold: np.float32
+    epsilon: np.float32
+
+    def __post_init__(self):
+        super().__post_init__()
+
+    @property
+    def kernel_name(self) -> str:
+        return "reduce_k_fan_in_and_clip"
+
+    def get_grid(self) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
+        """One work-group per reduction node."""
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
+        global_size = (int(self.node_count) * work_group_size,)
+        local_size = (work_group_size,)
+        return global_size, local_size
+
+    def get_args(self) -> List:
+        """Assembles all 9 arguments in exact contractual order."""
+        work_group_size = self._arch_consts.optimal_workgroup_size_1d_reduction
+        scalar_size_bytes = self._arch_consts.SCALAR_NP_TYPE().itemsize
+        local_mem_size = work_group_size * scalar_size_bytes
+        return [
+            cl.LocalMemory(local_mem_size),
+            self._buffer_mgr.get_cl_buffer(self.partial_collection_ref),
+            self._buffer_mgr.get_cl_buffer(self.offset_list_flat_ref),
+            self._buffer_mgr.get_cl_buffer(self.stage_output_ref),
+            self.fan_in_K,
+            self.node_count,
+            self.partial_width,
+            self.clipping_threshold,
+            self.epsilon,
+        ]

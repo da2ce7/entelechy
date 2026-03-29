@@ -49,9 +49,9 @@ def ref_reduction_tree_sum_and_clip(
             threshold = threshold_schedule[stage]
             clipped: list[NDArray[np.floating[Any]]] = []
             for arr in next_level:
-                norm = np.sqrt(np.sum(arr * arr) + epsilon)
+                norm = np.sqrt(np.sum(arr * arr))
                 if norm > threshold:
-                    arr = arr * (threshold / norm)
+                    arr = arr * (threshold / (norm + epsilon))
                 clipped.append(arr)
             next_level = clipped
 
@@ -76,7 +76,7 @@ def ref_stabilize_reduce_grad_h(
     """
     result = sum(grad_h_partials[1:], grad_h_partials[0].copy())
     if clip_threshold is not None:
-        norm = np.sqrt(np.sum(result * result) + epsilon)
+        norm = np.sqrt(np.sum(result * result))
         if norm > clip_threshold:
-            result = result * (clip_threshold / norm)
+            result = result * (clip_threshold / (norm + epsilon))
     return result

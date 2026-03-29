@@ -176,8 +176,8 @@ void task_bce_probs_loss(void* raw_args, uint task_index, uint thread_id) {
         const size_t target_idx = (size_t)batch_idx
             * a->padded_total_output_class_count + c_global;
         float y = a->targets[target_idx];
-        float log_p   = logf(prob + NUMERICAL_STABILITY_EPSILON);
-        float log_1mp = logf(1.0f - prob + NUMERICAL_STABILITY_EPSILON);
+        float log_p   = logf(fmaxf(prob, NUMERICAL_STABILITY_EPSILON));
+        float log_1mp = logf(fmaxf(1.0f - prob, NUMERICAL_STABILITY_EPSILON));
         loss_sum += -(y * log_p + (1.0f - y) * log_1mp);
     }
 

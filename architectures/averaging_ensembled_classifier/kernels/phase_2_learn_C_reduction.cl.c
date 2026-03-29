@@ -292,3 +292,92 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
         dest_buffer_GLOBAL_summed_grad_hidden_activations[row_idx] = update_buffer_LOCAL_reduction_tile[0];
     }
 }
+
+// --- Implementation: reduce_k_fan_in_and_clip (ADR-019) ---
+// Strategy: One work-group per reduction node.  Threads within a work-group
+// collaborate on the element-wise K-partial summation (Phase 1), then perform
+// a local-memory parallel reduction for the L2 norm (Phase 2), and finally
+// conditionally clip and write (Phase 3).  This fuses the reduce+clip into a
+// single dispatch, eliminating intermediate global memory traffic.
+__kernel void reduce_k_fan_in_and_clip(
+    __local  SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_collection,
+    __global const uint        *src_buffer_GLOBAL_CONST_offset_list_flat,
+    __global SCALAR_TYPE       *dest_buffer_GLOBAL_stage_output,
+    uint src_scalar_NATURAL_fan_in_K,
+    uint src_scalar_NATURAL_node_count,
+    uint src_scalar_NATURAL_partial_width,
+    SCALAR_TYPE src_scalar_REAL_clipping_threshold,
+    SCALAR_TYPE src_scalar_REAL_epsilon) {
+
+    // --- 0. Work-Group to Reduction Node Mapping ---
+    const uint node_id = get_group_id(0);
+    const uint lid     = get_local_id(0);
+    const uint lsize   = get_local_size(0);
+
+    if (node_id >= src_scalar_NATURAL_node_count) {
+        return;
+    }
+
+    const uint offset_base = node_id * src_scalar_NATURAL_fan_in_K;
+    const uint dest_base   = node_id * src_scalar_NATURAL_partial_width;
+
+    // --- Phase 1: Gather and Accumulate (element-parallel with striding) ---
+    // Each thread strides across the partial_width dimension, accumulating
+    // element-wise sums across all K input partials for this node.
+    // We accumulate the sum of squares simultaneously for the L2 norm.
+    SCALAR_TYPE local_sq_sum = SCALAR_ZERO;
+
+    for (uint elem = lid; elem < src_scalar_NATURAL_partial_width; elem += lsize) {
+        SCALAR_TYPE accum = SCALAR_ZERO;
+
+        for (uint k = 0; k < src_scalar_NATURAL_fan_in_K; ++k) {
+            const uint offset = src_buffer_GLOBAL_CONST_offset_list_flat[offset_base + k];
+            if (offset != SENTINEL_ABSENT_PARTIAL) {
+                accum += src_buffer_GLOBAL_partial_collection[offset + elem];
+            }
+        }
+
+        // Store the accumulated sum in the destination, to be potentially
+        // scaled in-place during Phase 3.
+        dest_buffer_GLOBAL_stage_output[dest_base + elem] = accum;
+
+        // Accumulate the square for this thread's L2 norm contribution.
+        local_sq_sum += accum * accum;
+    }
+
+    // --- Phase 2: Per-Node L2 Norm via Local Memory Parallel Reduction ---
+    // Skip the norm/clip entirely if threshold == 0 (diagnostic mode).
+    if (src_scalar_REAL_clipping_threshold > SCALAR_ZERO) {
+        update_buffer_LOCAL_reduction_tile[lid] = local_sq_sum;
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
+            if (lid < stride) {
+                update_buffer_LOCAL_reduction_tile[lid] += update_buffer_LOCAL_reduction_tile[lid + stride];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+
+        // --- Compute scaling factor and broadcast ---
+        if (lid == 0) {
+            const SCALAR_TYPE total_sum_sq = update_buffer_LOCAL_reduction_tile[0];
+            const SCALAR_TYPE norm = MATH_FN sqrt(total_sum_sq);
+
+            SCALAR_TYPE scale_factor = (SCALAR_TYPE)1.0f;
+            if (norm > src_scalar_REAL_clipping_threshold) {
+                scale_factor = src_scalar_REAL_clipping_threshold / (norm + src_scalar_REAL_epsilon);
+            }
+            update_buffer_LOCAL_reduction_tile[0] = scale_factor;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const SCALAR_TYPE scale_factor = update_buffer_LOCAL_reduction_tile[0];
+
+        // --- Phase 3: Conditional In-Place Scaling ---
+        if (scale_factor < (SCALAR_TYPE)1.0f) {
+            for (uint elem = lid; elem < src_scalar_NATURAL_partial_width; elem += lsize) {
+                dest_buffer_GLOBAL_stage_output[dest_base + elem] *= scale_factor;
+            }
+        }
+    }
+}

@@ -550,20 +550,29 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
 - **The Recursive Clip-Aggregation Engine:** **[Architectural Concept, not a single kernel]**
 
   - **Description:** This refers to the intelligent composition of simple, single-purpose kernels by the Host Orchestrator to form a `log_K(N)` reduction tree. This is the physical implementation of the **Primacy of Memory Strategy**, using the **Indirection Contract** (`offset_list`) to sum scattered partials without intermediate copies.
-  - **Contextual Composition:** The Host Orchestrator renders the engine differently based on the data being processed:
-    - **For Diagnostic Reduction (Node 14):** The tree is composed exclusively of `aggregate_stage_j` kernels to perform a simple summation of `PARTIAL_Probs` and `PARTIALS_Loss_BCE`.
-    - **For Gradient Reduction (Nodes 15 & 20):** The tree is composed of a repeating, atomic `sum-then-clip` pattern, using both `aggregate_stage_j` and `clip_stage_j` kernels. This is the direct implementation of the `Gradient Stabilization` policy.
+  - **Contextual Composition:** The Host Orchestrator renders the engine differently based on the data being processed and the tree depth:
+    - **For Single-Stage Trees** (`num_stages == 1`): The tree is composed of the all-to-one `aggregate_stage_j` kernel (reducing all partials to a single output), optionally followed by `clip_stage_j` for gradient stabilization.
+    - **For Multi-Stage Trees** (`num_stages > 1`): The tree is composed of the K-fan-in `reduce_k_fan_in_and_clip` kernel at each stage (ADR-019). Each stage produces `ceil(N/K)` independent output nodes, each formed by summing exactly K input partials and applying an independent per-node L2 clip. This fused kernel eliminates intermediate global memory traffic between the sum and clip operations.
+    - **For Diagnostic Reduction (Node 14):** Clipping is disabled (the threshold sentinel bypasses the clip path), producing a simple summation of `PARTIAL_Probs` and `PARTIALS_Loss_BCE`.
+    - **For Gradient Reduction (Nodes 15 & 20):** Clipping is enabled at each stage, implementing the `Gradient Stabilization` policy's Quadratic Scaling threshold schedule.
 
-- **`aggregate_stage_j`**: **[Utility Kernel]** A stateless summation kernel.
+- **`aggregate_stage_j`**: **[Utility Kernel]** A stateless, all-to-one summation kernel.
 
-  - **Note:** The `aggregate_stage_j` is a conceptual role fulfilled by a tiered set of concrete kernels (e.g., aggregate_register_reduce, aggregate_local_reduce) selected by the Host Orchestrator based on reduction width.
+  - **Note:** The `aggregate_stage_j` is a conceptual role fulfilled by a tiered set of concrete kernels (e.g., `aggregate_register_reduce`, `aggregate_local_reduce`) selected by the Host Orchestrator based on reduction width.
 
-  - **Contract:** The fundamental building block of the aggregation engine. Accepts a generic memory pool (`partial_collection`) and an indirection table (`offset_list`) and produces a single, contiguous `Intermediate Sum` buffer. It performs no other logic.
-  - **Invocation:** Used by the Host Orchestrator in Nodes (14), (15a), and (20a).
+  - **Contract:** Accepts a generic memory pool (`partial_collection`) and an indirection table (`offset_list`) and reduces **all** referenced partials into a **single**, contiguous `Intermediate Sum` buffer of `partial_width` elements. It performs no other logic.
+  - **Invocation:** Used for single-stage trees in Nodes (14), (15a), and (20a).
 
 - **`clip_stage_j`**: **[Utility Kernel]** A stateless, partial-group-wise clipping kernel.
   - **Contract:** Accepts a single, contiguous `Intermediate Sum` buffer (the output of `aggregate_stage_j`) and a scalar threshold `T_j`. It computes a single L2 norm for the entire buffer and applies a single scaling factor if the norm is exceeded.
-  - **Invocation:** Used exclusively by the Host Orchestrator for gradient stabilization in Nodes (15b) and (20b) as part of the atomic `sum-then-clip` unit.
+  - **Invocation:** Used for single-stage gradient stabilization in Nodes (15b) and (20b), following an `aggregate_stage_j` dispatch.
+
+- **`reduce_k_fan_in_and_clip`**: **[Utility Kernel]** A stateless, fused K-fan-in reduction-and-clip kernel (ADR-019).
+
+  - **Note:** This kernel is the multi-stage counterpart to the `aggregate_stage_j` + `clip_stage_j` pipeline. It processes `ceil(N/K)` independent reduction nodes in a single dispatch, fusing summation and per-node clipping to avoid intermediate global memory traffic.
+
+  - **Contract:** Accepts a generic memory pool (`partial_collection`), a flat offset list with K consecutive entries per node, and a scalar clipping threshold `T_j`. For each node: sums K partials via the Indirection Contract, computes a per-node L2 norm, and conditionally scales the node's output independently. A threshold of `0.0` disables clipping (diagnostic mode). Absent partials in the tail node use a sentinel offset (`0xFFFFFFFF`).
+  - **Invocation:** Used for multi-stage trees (`num_stages > 1`) at each stage in Nodes (14), (15a), and (20a). Replaces the broken all-to-one aggregate + separate clip sequence that produced incorrect results for multi-stage trees.
 - **`(16) stabilize_and_reduce_grad_hidden_activations`**: **[Specialized Kernel]** A self-contained reduction engine that preserves maximum signal fidelity while applying the system's stabilization policy to the `Grad_H` vector.
   - **Contract:** Internally executes a multi-stage `log_K(M)` reduction. At each internal stage, it performs a **`sum-then-clip`** operation on its inputs, applying the host-provided **Quadratic Scaling Policy**.
   - **Justification for Specialization:** This kernel works in synergy with the mandatory leaf-level clipping from Node (11) to provide a complete, two-stage stabilization strategy. A generic engine is unsuitable because:

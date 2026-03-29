@@ -50,17 +50,20 @@ class OpenCLPlanRenderer:
         self._register_reduce_binding: Any | None = None
         self._local_reduce_binding: Any | None = None
         self._clip_intermediate_binding: Any | None = None
+        self._k_fan_in_binding: Any | None = None
 
     def set_reduction_bindings(
         self,
         register_reduce: Any,
         local_reduce: Any,
         clip_intermediate: Any,
+        k_fan_in: Any | None = None,
     ) -> None:
         """Inject reduction engine bindings (consumed by _render_reduction_tree)."""
         self._register_reduce_binding = register_reduce
         self._local_reduce_binding = local_reduce
         self._clip_intermediate_binding = clip_intermediate
+        self._k_fan_in_binding = k_fan_in
 
     @property
     def allocator(self) -> OpenCLBufferAllocator:
@@ -189,10 +192,30 @@ class OpenCLPlanRenderer:
         node: ReductionTreeNode,
         wait_for: list[cl.Event],
     ) -> cl.Event:
-        """Render a multi-stage log_K(N) reduction tree."""
+        """Render a multi-stage log_K(N) reduction tree.
+
+        Single-stage trees (num_stages == 1): dispatch existing all-to-one
+        aggregate kernel + clip_intermediate_grad (unchanged).
+
+        Multi-stage trees (num_stages > 1, ADR-019): dispatch
+        reduce_k_fan_in_and_clip at each stage — one dispatch per stage
+        with fused per-node summation and L2 clip.
+        """
         plan = node.reduction_plan
-        hw_simd = self._hardware.simd_width if self._hardware else 16
         element_size = 4  # float32 default
+
+        if plan.num_stages > 1:
+            return self._render_reduction_tree_multi_stage(plan, wait_for, element_size)
+        return self._render_reduction_tree_single_stage(plan, wait_for, element_size)
+
+    def _render_reduction_tree_single_stage(
+        self,
+        plan: Any,
+        wait_for: list[cl.Event],
+        element_size: int,
+    ) -> cl.Event:
+        """Single-stage tree: existing all-to-one aggregate + clip path."""
+        hw_simd = self._hardware.simd_width if self._hardware else 16
 
         # 1. Upload initial offset list to device
         offset_array = np.array(plan.initial_offset_list, dtype=np.uint32)
@@ -202,84 +225,157 @@ class OpenCLPlanRenderer:
             wait_for=wait_for or None, is_blocking=False,
         )
 
-        # 2. Allocate ping-pong intermediate buffers
+        # 2. Allocate output buffer
         intermed_size = plan.partial_width * element_size
         ping = self._allocator.allocate_internal(intermed_size)
-        pong = self._allocator.allocate_internal(intermed_size)
 
-        # 3. Stage loop
-        source_buf = self._allocator.get_buffer(plan.source_buffer)
+        # 3. Select kernel tier and dispatch
         current_N = plan.num_partials
+        if current_N <= MAX_REG_AGG and self._register_reduce_binding is not None:
+            binding = self._register_reduce_binding
+        elif self._local_reduce_binding is not None:
+            binding = self._local_reduce_binding
+        else:
+            raise RuntimeError("Reduction bindings not registered")
+
+        kernel = getattr(self._program, binding.get_kernel_name())
+        args = binding.marshal_args_reduction(
+            source=self._allocator.get_buffer(plan.source_buffer),
+            offset_list=offset_buf,
+            dest=ping,
+            offset_count=current_N,
+            partial_width=plan.partial_width,
+            operation_type=0,  # sum
+        )
+        global_size, local_size = binding.compute_grid_reduction(
+            partial_width=plan.partial_width,
+            hardware_simd_width=hw_simd,
+        )
+        kernel.set_args(*args)
+        prev_event = cl.enqueue_nd_range_kernel(
+            self._queue, kernel, global_size, local_size,
+            wait_for=[upload_evt],
+        )
+
+        # 4. Optional clip for "sum_and_clip"
+        if (plan.tree_variant == "sum_and_clip"
+                and plan.threshold_schedule
+                and plan.threshold_schedule[0] is not None
+                and self._clip_intermediate_binding is not None):
+            clip_binding = self._clip_intermediate_binding
+            clip_kernel = getattr(self._program, clip_binding.get_kernel_name())
+            clip_args = clip_binding.marshal_args_clip(
+                buffer=ping,
+                threshold=plan.threshold_schedule[0],
+                epsilon=1e-7,
+                param_count=plan.partial_width,
+            )
+            clip_global, clip_local = clip_binding.compute_grid_clip(
+                param_count=plan.partial_width,
+                hardware_simd_width=hw_simd,
+            )
+            clip_kernel.set_args(*clip_args)
+            prev_event = cl.enqueue_nd_range_kernel(
+                self._queue, clip_kernel, clip_global, clip_local,
+                wait_for=[prev_event],
+            )
+
+        # 5. Copy final result to destination buffer
+        dest_buf = self._allocator.get_buffer(plan.destination_buffer)
+        copy_size = plan.partial_width * element_size
+        copy_event = cl.enqueue_copy(
+            self._queue, dest_buf, ping,  # type: ignore[arg-type]
+            byte_count=copy_size,
+            wait_for=[prev_event], is_blocking=False,
+        )
+        return copy_event
+
+    # Sentinel value matching SENTINEL_ABSENT_PARTIAL in kernels.cl.h
+    _SENTINEL_ABSENT_PARTIAL = 0xFFFF_FFFF
+
+    def _render_reduction_tree_multi_stage(
+        self,
+        plan: Any,
+        wait_for: list[cl.Event],
+        element_size: int,
+    ) -> cl.Event:
+        """Multi-stage tree (ADR-019): dispatch reduce_k_fan_in_and_clip per stage."""
+        if self._k_fan_in_binding is None:
+            raise RuntimeError(
+                "Multi-stage reduction tree requires K-fan-in binding "
+                "(ADR-019). Call set_reduction_bindings with k_fan_in=..."
+            )
+
         K = plan.fan_in_K
+        current_N = plan.num_partials
+        source_buf = self._allocator.get_buffer(plan.source_buffer)
+
+        # Build initial flat offset list padded to node_count * K with sentinels
+        node_count = math.ceil(current_N / K)
+        flat_offsets = list(plan.initial_offset_list)
+        pad_count = node_count * K - len(flat_offsets)
+        flat_offsets.extend([self._SENTINEL_ABSENT_PARTIAL] * pad_count)
+        offset_array = np.array(flat_offsets, dtype=np.uint32)
+        offset_buf = self._allocator.allocate_internal(offset_array.nbytes)
+        upload_evt = cl.enqueue_copy(
+            self._queue, offset_buf, offset_array,
+            wait_for=wait_for or None, is_blocking=False,
+        )
+
+        # Allocate ping-pong intermediate buffers sized for max node output
+        max_output_elems = math.ceil(plan.num_partials / K) * plan.partial_width
+        ping = self._allocator.allocate_internal(max_output_elems * element_size)
+        pong = self._allocator.allocate_internal(max_output_elems * element_size)
+
+        fan_in_binding = self._k_fan_in_binding
+        fan_in_kernel = getattr(self._program, fan_in_binding.get_kernel_name())
         prev_events = [upload_evt]
 
         for stage in range(plan.num_stages):
             if current_N <= 1:
                 break
 
-            output_N = math.ceil(current_N / K)
+            node_count = math.ceil(current_N / K)
 
-            # Select kernel tier
-            if current_N <= MAX_REG_AGG and self._register_reduce_binding is not None:
-                binding = self._register_reduce_binding
-            elif self._local_reduce_binding is not None:
-                binding = self._local_reduce_binding
-            else:
-                raise RuntimeError("Reduction bindings not registered")
+            # Determine clipping threshold for this stage
+            threshold = 0.0
+            if (plan.tree_variant == "sum_and_clip"
+                    and stage < len(plan.threshold_schedule)
+                    and plan.threshold_schedule[stage] is not None):
+                threshold = plan.threshold_schedule[stage]
 
-            kernel = getattr(self._program, binding.get_kernel_name())
-
-            # Marshal and dispatch reduction stage
-            args = binding.marshal_args_reduction(
+            args = fan_in_binding.marshal_args_fan_in(
                 source=source_buf,
                 offset_list=offset_buf,
                 dest=ping,
-                offset_count=current_N,
+                fan_in_K=K,
+                node_count=node_count,
                 partial_width=plan.partial_width,
-                operation_type=0,  # sum
+                clipping_threshold=threshold,
+                epsilon=1e-7,
             )
-            global_size, local_size = binding.compute_grid_reduction(
-                partial_width=plan.partial_width,
-                hardware_simd_width=hw_simd,
+            global_size, local_size = fan_in_binding.compute_grid_fan_in(
+                node_count=node_count,
             )
-            kernel.set_args(*args)
-            agg_event = cl.enqueue_nd_range_kernel(
-                self._queue, kernel, global_size, local_size,
-                wait_for=prev_events or None,
+            fan_in_kernel.set_args(*args)
+            stage_event = cl.enqueue_nd_range_kernel(
+                self._queue, fan_in_kernel, global_size, local_size,
+                wait_for=prev_events,
             )
-            prev_events = [agg_event]
+            prev_events = [stage_event]
 
-            # Optional clip for "sum_and_clip"
-            if (plan.tree_variant == "sum_and_clip"
-                    and stage < len(plan.threshold_schedule)
-                    and plan.threshold_schedule[stage] is not None
-                    and self._clip_intermediate_binding is not None):
-                clip_binding = self._clip_intermediate_binding
-                clip_kernel = getattr(self._program, clip_binding.get_kernel_name())
-                clip_args = clip_binding.marshal_args_clip(
-                    buffer=ping,
-                    threshold=plan.threshold_schedule[stage],
-                    epsilon=1e-7,
-                    param_count=plan.partial_width,
-                )
-                clip_global, clip_local = clip_binding.compute_grid_clip(
-                    param_count=plan.partial_width,
-                    hardware_simd_width=hw_simd,
-                )
-                clip_kernel.set_args(*clip_args)
-                clip_event = cl.enqueue_nd_range_kernel(
-                    self._queue, clip_kernel, clip_global, clip_local,
-                    wait_for=prev_events,
-                )
-                prev_events = [clip_event]
-
-            # Swap ping-pong; source for next stage is the output ping
+            # Prepare for next stage: source is the output ping
             source_buf = ping
             ping, pong = pong, ping
 
-            # Compute contiguous offsets for next stage
-            if output_N > 1:
-                next_offsets = np.arange(output_N, dtype=np.uint32) * plan.partial_width
+            # Build contiguous offsets for next stage
+            current_N = node_count
+            if current_N > 1:
+                next_node_count = math.ceil(current_N / K)
+                next_flat_count = next_node_count * K
+                next_offsets = np.full(next_flat_count, self._SENTINEL_ABSENT_PARTIAL, dtype=np.uint32)
+                for i in range(current_N):
+                    next_offsets[i] = np.uint32(i * plan.partial_width)
                 new_offset_buf = self._allocator.allocate_internal(next_offsets.nbytes)
                 ofs_evt = cl.enqueue_copy(
                     self._queue, new_offset_buf, next_offsets,
@@ -288,9 +384,7 @@ class OpenCLPlanRenderer:
                 offset_buf = new_offset_buf
                 prev_events = [ofs_evt]
 
-            current_N = output_N
-
-        # 4. Copy final result to destination buffer
+        # Copy final result to destination buffer
         dest_buf = self._allocator.get_buffer(plan.destination_buffer)
         copy_size = plan.partial_width * element_size
         copy_event = cl.enqueue_copy(

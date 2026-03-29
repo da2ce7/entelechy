@@ -22,9 +22,9 @@ configure_file(
   input:  'src/_build_config.py.in',
   output: '_build_config.py',
   configuration: configuration_data({
-    'BACKEND_OPENCL': backend_opencl.to_string().to_upper(),
-    'BACKEND_VULKAN': backend_vulkan.allowed().to_string().to_upper(),
-    'BACKEND_CPU':    backend_cpu.allowed().to_string().to_upper(),
+    'BACKEND_OPENCL': backend_opencl ? 'True' : 'False',
+    'BACKEND_VULKAN': backend_vulkan.allowed() ? 'True' : 'False',
+    'BACKEND_CPU':    backend_cpu.allowed() ? 'True' : 'False',
   }),
   install: true,
   install_dir: py.get_install_dir() / 'averaging_ensembled_classifier' / 'src',

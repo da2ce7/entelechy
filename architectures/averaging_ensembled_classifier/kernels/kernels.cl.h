@@ -1491,4 +1491,105 @@ __kernel void clamp_temperatures(
     SCALAR_TYPE src_scalar_REAL_max_value,
     uint        src_scalar_NATURAL_total_modules_count);
 
+// --- ADR-019: K-Fan-In Reduction Kernel Primitive ---
+// Sentinel value indicating an absent partial in the tail node of a
+// K-fan-in reduction stage.  When num_partials is not divisible by K,
+// the final node's offset list is padded with this sentinel.
+#define SENTINEL_ABSENT_PARTIAL 0xFFFFFFFFu
+
+/**
+ * @brief (Node 14, 15a, 20a — multi-stage) Reduces groups of K scattered
+ *        partials into independent output nodes with optional per-node L2 clip.
+ * @kernel_contract
+ *        - Holistic Constraints: "Each work-group processes one reduction node.
+ *          The kernel reads K partials per node from the source buffer via an
+ *          offset list, sums them, optionally clips the result per-node, and
+ *          writes one output vector of partial_width elements. Supports absent
+ *          partials via sentinel offset 0xFFFFFFFF for the tail node."
+ *        - Behavioral Invariants: "When clipping_threshold > 0, per-node L2
+ *          clip is applied: scale = threshold / (norm + epsilon). When
+ *          clipping_threshold == 0, clip is bypassed (diagnostic mode).
+ *          Epsilon prevents division by zero."
+ *        - Idempotency: "Associatively Non-Idempotent"
+ *        - Synchronization Model: "Reduction Engine Stage"
+ */
+__kernel void reduce_k_fan_in_and_clip(
+    /**
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group
+     *        parallel L2 norm reduction.
+     *        - Tensor Shape: (get_local_size(0))
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [Implicit from work-group dispatch]
+     *        - Validation Preconditions: Host shall allocate local memory equal to
+     *          the work-group size in dimension 0 multiplied by `sizeof(SCALAR_TYPE)`.
+     */
+    __local SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
+
+    /**
+     * @param src_buffer_GLOBAL_partial_collection The memory pool containing all
+     *        partial results referenced by the offset list.
+     *        - Tensor Shape: Undefined.
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: N/A.
+     *        - Validation Preconditions: Host must provide a valid buffer that
+     *          encompasses all memory regions referenced by the combination of
+     *          `src_buffer_GLOBAL_CONST_offset_list_flat` and
+     *          `src_scalar_NATURAL_partial_width`.
+     */
+    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_collection,
+
+    /**
+     * @param src_buffer_GLOBAL_CONST_offset_list_flat Flat offset list with K
+     *        consecutive entries per node. Sentinel SENTINEL_ABSENT_PARTIAL
+     *        (0xFFFFFFFF) indicates an absent partial in the tail node.
+     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in_K)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_fan_in_K]
+     *        - Validation Preconditions: Host must provide a buffer containing exactly
+     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in_K` uint entries.
+     */
+    __global const uint *src_buffer_GLOBAL_CONST_offset_list_flat,
+
+    /**
+     * @param dest_buffer_GLOBAL_stage_output Contiguous output buffer. Node n writes
+     *        at `[n * partial_width, (n+1) * partial_width)`.
+     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_partial_width]
+     *        - Validation Preconditions: Host must allocate exactly
+     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width * sizeof(SCALAR_TYPE)` bytes.
+     */
+    __global SCALAR_TYPE *dest_buffer_GLOBAL_stage_output,
+
+    /**
+     * @param src_scalar_NATURAL_fan_in_K Number of partials to reduce per node.
+     *        - Validation Preconditions: Must be >= 2.
+     */
+    uint src_scalar_NATURAL_fan_in_K,
+
+    /**
+     * @param src_scalar_NATURAL_node_count Number of independent reduction nodes.
+     *        - Validation Preconditions: Must be >= 1.
+     */
+    uint src_scalar_NATURAL_node_count,
+
+    /**
+     * @param src_scalar_NATURAL_partial_width Number of elements per partial vector.
+     *        - Validation Preconditions: Must be >= 1.
+     */
+    uint src_scalar_NATURAL_partial_width,
+
+    /**
+     * @param src_scalar_REAL_clipping_threshold The clipping threshold for this stage.
+     *        Value 0.0 disables clip (diagnostic mode).
+     *        - Validation Preconditions: Must be >= 0.0.
+     */
+    SCALAR_TYPE src_scalar_REAL_clipping_threshold,
+
+    /**
+     * @param src_scalar_REAL_epsilon Small constant to prevent division by zero.
+     *        - Validation Preconditions: Must be a small, positive real number.
+     */
+    SCALAR_TYPE src_scalar_REAL_epsilon);
+
 #endif // KERNELS_CL_H

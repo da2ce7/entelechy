@@ -43,3 +43,28 @@ class TestClipPartialGradients:
         threshold = 1.0
         ref = ref_clip_l2_norm(grads, threshold)
         np.testing.assert_array_equal(ref, grads)
+
+    def test_clip_near_threshold_epsilon_placement(self):
+        """Bonus Finding: epsilon in denominator, not under sqrt.
+
+        Verifies scale = threshold / (norm + epsilon), matching the
+        kernel contract in kernels.cl.h. Uses small threshold so the
+        formulas diverge measurably.
+        """
+        epsilon = 1e-7
+        threshold = 1e-3
+        norm_target = threshold + 1e-5
+        grads = np.array([norm_target, 0.0], dtype=np.float32)
+
+        ref = ref_clip_l2_norm(grads, threshold, epsilon=epsilon)
+
+        norm = float(np.sqrt(np.sum(grads.astype(np.float64) ** 2)))
+        expected_scale = threshold / (norm + epsilon)
+        expected = grads.astype(np.float64) * expected_scale
+        np.testing.assert_allclose(ref, expected, atol=1e-6)
+
+        wrong_scale = threshold / np.sqrt(norm**2 + epsilon)
+        wrong_result = grads.astype(np.float64) * wrong_scale
+        assert not np.allclose(ref, wrong_result, atol=1e-5), (
+            "Clipped result should differ from sqrt(norm² + eps) formula"
+        )

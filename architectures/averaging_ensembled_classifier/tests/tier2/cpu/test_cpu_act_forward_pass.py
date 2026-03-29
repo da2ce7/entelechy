@@ -118,3 +118,29 @@ class TestCpuForwardPass:
         expected_pre_act = np.broadcast_to(b, (batch, hid))
         expected_act = np.maximum(expected_pre_act, 0.0)
         np.testing.assert_allclose(ref_act, expected_act, atol=tol.atol, rtol=tol.rtol)
+
+    def test_forward_pass_hidden_mask_binary(self):
+        """Finding 3: Hidden mask values are exactly 0.0 or 1.0.
+
+        The kernels.cl.h contract specifies the hidden mask is a derived
+        ReLU mask: 1 if activation > 0, else 0. This test ensures the
+        reference produces only binary {0.0, 1.0} values for a mix of
+        positive and negative pre-activations.
+        """
+        rng = make_rng(seed=47)
+        batch, inp, hid = 16, 8, 32
+        x = make_input_data(rng, batch, inp)
+        w = make_weights(rng, hid, inp)
+        b = make_biases(rng, hid)
+        mask = np.ones(batch, dtype=np.float32)
+
+        _, ref_mask = ref_forward_pass(x, w, b, mask)
+
+        unique_vals = set(np.unique(ref_mask))
+        assert unique_vals <= {0.0, 1.0}, (
+            f"Hidden mask must contain only {{0.0, 1.0}}, got {unique_vals}"
+        )
+        # Ensure the test exercises both branches (not all-zero or all-one)
+        assert 0.0 in unique_vals and 1.0 in unique_vals, (
+            "Test data should produce a mix of active and inactive pre-activations"
+        )

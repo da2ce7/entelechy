@@ -99,8 +99,8 @@ def ref_compute_probs_loss_bce(
     """
     probs = _sigmoid(logits)
     # BCE: -[target * log(prob) + (1-target) * log(1-prob)] per class per sample
-    log_p = np.log(probs + epsilon)
-    log_1mp = np.log(1.0 - probs + epsilon)
+    log_p = np.log(np.maximum(probs, epsilon))
+    log_1mp = np.log(np.maximum(1.0 - probs, epsilon))
     per_sample_loss = -np.sum(targets * log_p + (1.0 - targets) * log_1mp, axis=-1)
     active_count = np.sum(sample_mask)
     if active_count > 0:

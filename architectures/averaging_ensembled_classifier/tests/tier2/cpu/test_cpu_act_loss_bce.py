@@ -78,3 +78,41 @@ class TestCpuLossBCE:
         _, loss = ref_compute_probs_loss_bce(logits, targets, mask)
 
         assert loss == 0.0
+
+    def test_bce_epsilon_fmax_contract(self):
+        """Finding 1: fmax(prob, eps) vs prob+eps.
+
+        The kernels.cl.h contract specifies fmax-based clamping for the
+        log arguments in BCE loss.  This test verifies:
+          (a) Extreme probabilities remain numerically stable.
+          (b) The reference matches the analytical fmax-based formula,
+              NOT the additive-shift formula, for a known simple case.
+        """
+        epsilon = 1e-7
+        # (a) Extreme logits — must not produce NaN or Inf
+        logits_extreme = np.array(
+            [[50.0, -50.0, 0.0, 30.0]], dtype=np.float32,
+        )
+        targets_extreme = np.array(
+            [[1.0, 1.0, 0.0, 0.0]], dtype=np.float32,
+        )
+        mask = np.ones(1, dtype=np.float32)
+        probs_ext, loss_ext = ref_compute_probs_loss_bce(
+            logits_extreme, targets_extreme, mask,
+        )
+        assert not np.any(np.isnan(probs_ext)), "Extreme logits produced NaN probs"
+        assert np.isfinite(loss_ext), "Loss must be finite at extreme probabilities"
+
+        # (b) Analytical check: logits=0 → prob=0.5 exactly, target=0.5
+        # fmax formula: loss = -[0.5*log(max(0.5,eps)) + 0.5*log(max(0.5,eps))]
+        #             = -log(0.5) ≈ 0.693147...
+        logits_known = np.array([[0.0]], dtype=np.float32)
+        targets_known = np.array([[0.5]], dtype=np.float32)
+        _, loss_known = ref_compute_probs_loss_bce(
+            logits_known, targets_known, mask,
+        )
+        expected_fmax = float(-np.log(0.5))  # = 0.6931471805599453
+        np.testing.assert_allclose(
+            loss_known, expected_fmax, atol=1e-7,
+            err_msg="BCE loss should match fmax-based analytical value",
+        )

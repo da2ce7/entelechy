@@ -202,3 +202,80 @@ class StabilizeReduceGradHBinding(KernelBinding):
             np.uint32(scalar_params["total_modules_count"]),
             np.uint32(scalar_params["padded_total_modules_count"]),
         ]
+
+
+class ReduceKFanInAndClipBinding(KernelBinding):
+    """Binding for reduce_k_fan_in_and_clip (ADR-019: multi-stage K-fan-in)."""
+
+    def __init__(self, workgroup_size: int = 256) -> None:
+        self._workgroup_size = workgroup_size
+
+    def get_kernel_name(self) -> str:
+        return "reduce_k_fan_in_and_clip"
+
+    def compute_grid(
+        self,
+        tile_index: int,
+        scalar_params: dict[str, int | float],
+        hardware_simd_width: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+        node_count = int(scalar_params["node_count"])
+        wg = self._workgroup_size
+        global_size = (node_count * wg,)
+        local_size = (wg,)
+        return global_size, local_size
+
+    def marshal_args(
+        self,
+        get_buffer: Callable[[BufferHandle], cl.Buffer],
+        buffer_bindings: dict[str, BufferHandle],
+        scalar_params: dict[str, int | float],
+        tile_index: int,
+    ) -> list[Any]:
+        element_size = int(scalar_params.get("element_size", 4))
+        local_mem_size = self._workgroup_size * element_size
+        return [
+            cl.LocalMemory(local_mem_size),
+            get_buffer(buffer_bindings["partial_collection"]),
+            get_buffer(buffer_bindings["offset_list_flat"]),
+            get_buffer(buffer_bindings["stage_output"]),
+            np.uint32(scalar_params["fan_in_K"]),
+            np.uint32(scalar_params["node_count"]),
+            np.uint32(scalar_params["partial_width"]),
+            np.float32(scalar_params["clipping_threshold"]),
+            np.float32(scalar_params["epsilon"]),
+        ]
+
+    # Reduction-specific interface for renderer direct use
+    def marshal_args_fan_in(
+        self,
+        source: cl.Buffer,
+        offset_list: cl.Buffer,
+        dest: cl.Buffer,
+        fan_in_K: int,
+        node_count: int,
+        partial_width: int,
+        clipping_threshold: float,
+        epsilon: float,
+        element_size: int = 4,
+    ) -> list[Any]:
+        local_mem_size = self._workgroup_size * element_size
+        return [
+            cl.LocalMemory(local_mem_size),
+            source,
+            offset_list,
+            dest,
+            np.uint32(fan_in_K),
+            np.uint32(node_count),
+            np.uint32(partial_width),
+            np.float32(clipping_threshold),
+            np.float32(epsilon),
+        ]
+
+    def compute_grid_fan_in(
+        self, node_count: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        wg = self._workgroup_size
+        global_size = (node_count * wg,)
+        local_size = (wg,)
+        return global_size, local_size

@@ -200,3 +200,65 @@ stabilize_reduce_grad_h_contract = KernelContract(
     ),
     placement=None,
 )
+
+# --- ADR-019: K-Fan-In Reduction Kernel Primitive ---
+
+reduce_k_fan_in_and_clip_contract = KernelContract(
+    kernel_name="reduce_k_fan_in_and_clip",
+    contract_block=KernelContractBlock(
+        holistic_constraints=(
+            "Each work-group processes one reduction node. "
+            "Reads K partials per node via flat offset list, sums them, "
+            "optionally clips per-node, and writes one output vector."
+        ),
+        idempotency="Associatively Non-Idempotent",
+        synchronization_model="Reduction Engine Stage",
+        behavioral_invariants=(
+            "Per-node L2 clip when clipping_threshold > 0: "
+            "scale = threshold / (norm + epsilon).",
+            "Clip bypassed when clipping_threshold == 0 (diagnostic mode).",
+            "Sentinel offset 0xFFFFFFFF skips absent partials in tail node.",
+        ),
+    ),
+    buffer_params=(
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_partial_collection",
+            flow="src", memory_scope="GLOBAL",
+            tensor_shape=("undefined",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=(),
+            validation_preconditions=(
+                "valid buffer encompassing all offset references",
+            ),
+        ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_CONST_offset_list_flat",
+            flow="src", memory_scope="GLOBAL_CONST",
+            tensor_shape=("node_count * fan_in_K",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("node_count", "fan_in_K"),
+            validation_preconditions=(
+                "exactly node_count * fan_in_K uint entries",
+            ),
+        ),
+        BufferParamSpec(
+            name="dest_buffer_GLOBAL_stage_output",
+            flow="dest", memory_scope="GLOBAL",
+            tensor_shape=("node_count * partial_width",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("node_count", "partial_width"),
+            validation_preconditions=("exact allocation size",),
+        ),
+    ),
+    scalar_params=(
+        ScalarParamSpec("fan_in_K", "src", "NATURAL"),
+        ScalarParamSpec("node_count", "src", "NATURAL"),
+        ScalarParamSpec("partial_width", "src", "NATURAL"),
+        ScalarParamSpec("clipping_threshold", "src", "REAL"),
+        ScalarParamSpec("epsilon", "src", "REAL"),
+    ),
+    local_memory=(
+        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(SCALAR_TYPE)"),
+    ),
+    placement=None,
+)
