@@ -1,0 +1,29 @@
+// normalize_gradients.comp — Node 21: Gradient normalization by effective batch size
+//
+// Algorithmic reference: kernels.cl.h §normalize_gradients
+// Embarrassingly parallel element-wise kernel.
+// Converts batch-wide gradient sum into a true average gradient.
+//
+// Dispatch: vkCmdDispatch(ceil(parameter_count / SIMD_WIDTH), 1, 1)
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    float effective_batch_size;
+    float epsilon;
+    uint  parameter_count;
+} push;
+
+layout(set = 0, binding = 0) readonly buffer SrcGrad  { float data[]; } src_grad;
+layout(set = 0, binding = 1) writeonly buffer DstGrad  { float data[]; } dst_grad;
+
+void main() {
+    uint i = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (i >= push.parameter_count) return;
+
+    float normalizer = 1.0 / (push.effective_batch_size + push.epsilon);
+    dst_grad.data[i] = src_grad.data[i] * normalizer;
+}

@@ -1,0 +1,28 @@
+// clamp_temperatures.comp — Node 25: Temperature parameter clamping
+//
+// Algorithmic reference: kernels.cl.h §clamp_temperatures
+// Embarrassingly parallel element-wise kernel.
+// Clamps learnable temperature parameters to [min, max] range,
+// preventing numerical instability in Softmax/Sigmoid computations.
+//
+// Dispatch: vkCmdDispatch(ceil(total_modules_count / SIMD_WIDTH), 1, 1)
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    float min_value;
+    float max_value;
+    uint  total_modules_count;
+} push;
+
+layout(set = 0, binding = 0) buffer TempsBuf { float data[]; } temps;
+
+void main() {
+    uint idx = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (idx >= push.total_modules_count) return;
+
+    temps.data[idx] = clamp(temps.data[idx], push.min_value, push.max_value);
+}

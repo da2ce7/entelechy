@@ -1,0 +1,99 @@
+// backprop_error_to_hidden.comp — Node 9: Backpropagation error to hidden layer
+//
+// Algorithmic reference: kernels.cl.h §backprop_error_to_hidden_chunk
+// Strategy A: SPEC_PROBLEM_TYPE selects CCE/BCE d_loss_d_logit formula.
+// Dispatch: vkCmdDispatch(total_tile_count, 1, 1) with additional dimensions
+//   for (module_local, batch, hidden) coverage.
+// Each invocation computes one element of partial Grad_H via dot product
+// over the class chunk.
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_class_chunks;
+    uint classes_per_chunk;
+    uint modules_per_chunk;
+    uint total_batch_count;
+    uint hidden_count;
+    uint padded_hidden_count;
+    uint total_output_class_count;
+    uint padded_total_output_class_count;
+    uint total_modules_count;
+    uint total_tile_count;
+} push;
+
+layout(set = 0, binding = 0) readonly buffer ProbsBuf   { float data[]; } src_probs;
+layout(set = 0, binding = 1) readonly buffer TargetsCCE { int   data[]; } src_targets_cce;
+layout(set = 0, binding = 2) readonly buffer TargetsBCE { float data[]; } src_targets_bce;
+layout(set = 0, binding = 3) readonly buffer MaskBuf    { float data[]; } src_sample_mask;
+layout(set = 0, binding = 4) readonly buffer WeightsBuf { float data[]; } src_weights;
+layout(set = 0, binding = 5) writeonly buffer GradHBuf  { float data[]; } dest_grad_h;
+
+void main() {
+    // Flat invocation index decomposed into (module_local, batch, hidden)
+    uint gid = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+
+    uint total_work = push.modules_per_chunk * push.total_batch_count * push.hidden_count;
+    if (gid >= total_work) return;
+
+    uint h_idx            = gid % push.hidden_count;
+    uint rem              = gid / push.hidden_count;
+    uint batch_idx        = rem % push.total_batch_count;
+    uint module_local_idx = rem / push.total_batch_count;
+
+    // Tile index from WorkGroupID.y
+    uint tile_idx = gl_WorkGroupID.y;
+    if (tile_idx >= push.total_tile_count) return;
+
+    // Placement contract: AoS write address
+    uint tile_size    = push.modules_per_chunk * push.total_batch_count * push.padded_hidden_count;
+    uint tile_base    = tile_idx * tile_size;
+    uint local_offset = module_local_idx * push.total_batch_count * push.padded_hidden_count
+                      + batch_idx * push.padded_hidden_count + h_idx;
+    uint out_idx = tile_base + local_offset;
+
+    // Padded sample early exit
+    if (src_sample_mask.data[batch_idx] < 0.5) {
+        dest_grad_h.data[out_idx] = 0.0;
+        return;
+    }
+
+    // Decompose tile
+    uint module_chunk_idx  = tile_idx / push.num_class_chunks;
+    uint module_global_idx = module_chunk_idx * push.modules_per_chunk + module_local_idx;
+    uint class_chunk_idx   = tile_idx % push.num_class_chunks;
+    uint class_offset      = class_chunk_idx * push.classes_per_chunk;
+
+    uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
+
+    // Reduction over class chunk
+    float grad_h_accum = 0.0;
+    for (uint c_local = 0; c_local < push.classes_per_chunk; ++c_local) {
+        uint c_global = class_offset + c_local;
+        if (c_global < push.total_output_class_count) {
+            uint prob_idx = prob_tile_base
+                          + module_local_idx * push.total_batch_count * push.classes_per_chunk
+                          + batch_idx * push.classes_per_chunk + c_local;
+            float prob = src_probs.data[prob_idx];
+
+            float d_loss_d_logit;
+            if (SPEC_PROBLEM_TYPE == PROBLEM_TYPE_CCE) {
+                int target = src_targets_cce.data[batch_idx];
+                d_loss_d_logit = (c_global == target) ? (prob - 1.0) : prob;
+            } else {
+                float target = src_targets_bce.data[batch_idx * push.padded_total_output_class_count + c_global];
+                d_loss_d_logit = prob - target;
+            }
+
+            uint w_idx = module_global_idx * push.padded_hidden_count * push.padded_total_output_class_count
+                       + h_idx * push.padded_total_output_class_count + c_global;
+            float w_val = src_weights.data[w_idx];
+            grad_h_accum += d_loss_d_logit * w_val;
+        }
+    }
+
+    dest_grad_h.data[out_idx] = grad_h_accum;
+}

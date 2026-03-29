@@ -477,8 +477,6 @@ uint class_chunk  = flat_tile_index % num_class_chunks;
 
 - **Softmax numerics** (Node 6): The CCE loss kernel computes `exp(logit - max_logit)` for numerical stability, followed by normalization. The CPU implementation uses `expf()` from `<math.h>`. SIMD exponentiation is not attempted — the `exp` call is scalar within a SIMD-width loop. This is acceptable because Node 6 is mixed compute/memory-bound, not purely compute-bound.
 
-- **Sigmoid numerics** (Node 7): The BCE loss kernel uses a two-branch numerically stable sigmoid: for `z ≥ 0`, compute `1 / (1 + exp(-z))`; for `z < 0`, compute `exp(z) / (1 + exp(z))`. This avoids `exp()` overflow on large-magnitude logits. Both the CPU kernel (`task_bce_probs_loss`) and the OpenCL kernel (`compute_probs_loss_bce_chunk`) use this identical two-branch form, matching the numpy reference (`_sigmoid` in `numpy_forward.py`).
-
 - **`task_clip_partial_grads`** implements Partial-Group-Wise clipping within each tile: compute L2 norm across all partial gradient buffers for that tile, compare against threshold, conditionally scale. The SIMD implementation vectorizes the norm computation and the scaling loop.
 
 ---

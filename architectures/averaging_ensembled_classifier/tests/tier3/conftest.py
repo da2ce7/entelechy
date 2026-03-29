@@ -114,10 +114,19 @@ def _create_opencl_renderer() -> Any:
     return renderer
 
 
+def _create_vulkan_renderer() -> Any:
+    """Create a fully initialized VulkanPlanRenderer."""
+    from src.backends.vulkan.context import VulkanContext
+    from src.backends.vulkan.renderer import VulkanPlanRenderer
+
+    ctx = VulkanContext(enable_validation=False)
+    return VulkanPlanRenderer(context=ctx)
+
+
 _BACKEND_FACTORIES: dict[str, Any] = {
     "cpu": _create_cpu_renderer,
     "opencl": _create_opencl_renderer,
-    # "vulkan": _create_vulkan_renderer,  # Phase 5
+    "vulkan": _create_vulkan_renderer,
 }
 
 

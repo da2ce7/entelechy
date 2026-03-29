@@ -1,0 +1,96 @@
+// calculate_temp_gradients.comp — Node 10: Temperature gradient computation
+//
+// Algorithmic reference: kernels.cl.h §calculate_chunk_temp_gradients
+// Strategy A: SPEC_PROBLEM_TYPE selects CCE/BCE path.
+// Dispatch: vkCmdDispatch(total_tile_count, modules_per_chunk, 1)
+//   gl_WorkGroupID.x → flat tile index
+//   gl_WorkGroupID.y → module_local_idx
+// Each workgroup computes one module's partial temperature gradient via
+// hierarchical reduction over (batch × class_chunk).
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_class_chunks;
+    uint classes_per_chunk;
+    uint modules_per_chunk;
+    uint total_batch_count;
+    uint total_output_class_count;
+    uint padded_total_output_class_count;
+    uint total_modules_count;
+    uint total_tile_count;
+} push;
+
+layout(set = 0, binding = 0) readonly buffer LogitsBuf   { float data[]; } src_logits;
+layout(set = 0, binding = 1) readonly buffer ProbsBuf    { float data[]; } src_probs;
+layout(set = 0, binding = 2) readonly buffer TargetsCCE  { int   data[]; } src_targets_cce;
+layout(set = 0, binding = 3) readonly buffer TargetsBCE  { float data[]; } src_targets_bce;
+layout(set = 0, binding = 4) readonly buffer MaskBuf     { float data[]; } src_sample_mask;
+layout(set = 0, binding = 5) readonly buffer TempsBuf    { float data[]; } src_temps;
+layout(set = 0, binding = 6) writeonly buffer GradTempBuf { float data[]; } dest_grad_temps;
+
+void main() {
+    uint tile_idx = gl_WorkGroupID.x;
+    if (tile_idx >= push.total_tile_count) return;
+
+    uint module_local_idx = gl_WorkGroupID.y;
+    if (module_local_idx >= push.modules_per_chunk) return;
+
+    uint lid   = gl_LocalInvocationID.x;
+    uint lsize = gl_WorkGroupSize.x;
+
+    // Decompose flat tile index
+    uint module_chunk_idx  = tile_idx / push.num_class_chunks;
+    uint module_global_idx = module_chunk_idx * push.modules_per_chunk + module_local_idx;
+    uint class_chunk_idx   = tile_idx % push.num_class_chunks;
+    uint class_offset      = class_chunk_idx * push.classes_per_chunk;
+
+    uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
+
+    // Three-level reduction: batch (strided per thread) × class chunk (serial) → workgroup reduce
+    float p_grad_sum = 0.0;
+
+    for (uint b = lid; b < push.total_batch_count; b += lsize) {
+        if (src_sample_mask.data[b] < 0.5) continue;
+
+        float grad_contribution = 0.0;
+        for (uint c_local = 0; c_local < push.classes_per_chunk; c_local++) {
+            uint c_global = class_offset + c_local;
+            if (c_global < push.total_output_class_count) {
+                uint prob_idx = prob_tile_base
+                              + module_local_idx * push.total_batch_count * push.classes_per_chunk
+                              + b * push.classes_per_chunk + c_local;
+                float prob = src_probs.data[prob_idx];
+
+                float d_loss_d_logit;
+                if (SPEC_PROBLEM_TYPE == PROBLEM_TYPE_CCE) {
+                    int target = src_targets_cce.data[b];
+                    d_loss_d_logit = (c_global == target) ? (prob - 1.0) : prob;
+                } else {
+                    float target = src_targets_bce.data[b * push.padded_total_output_class_count + c_global];
+                    d_loss_d_logit = prob - target;
+                }
+
+                uint logit_idx = module_global_idx * push.total_batch_count * push.padded_total_output_class_count
+                               + b * push.padded_total_output_class_count + c_global;
+                grad_contribution += d_loss_d_logit * src_logits.data[logit_idx];
+            }
+        }
+        p_grad_sum += grad_contribution;
+    }
+
+    // Workgroup reduction
+    float total_sum = workgroup_reduce_add(p_grad_sum);
+
+    if (lid == 0) {
+        float temp = src_temps.data[module_global_idx];
+        // dL/dTemp = sum[(dL/dLogit) * Logit] * (-1 / temp^2)
+        float final_grad = total_sum * (-1.0 / (temp * temp));
+
+        uint tile_base = tile_idx * push.modules_per_chunk;
+        dest_grad_temps.data[tile_base + module_local_idx] = final_grad;
+    }
+}

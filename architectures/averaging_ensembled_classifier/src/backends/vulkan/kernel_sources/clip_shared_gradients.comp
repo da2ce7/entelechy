@@ -1,0 +1,74 @@
+// clip_shared_gradients.comp — Node 19: Clip shared weight & bias gradients
+//
+// Algorithmic reference: kernels.cl.h §clip_shared_gradients_chunk
+// Virtual-vector L2 norm clipping across weight and bias gradient buffers.
+// Two-pass: (1) compute joint L2 norm, (2) conditionally scale both buffers.
+// Output written to host-specified destination offsets (placement contract).
+//
+// Dispatch: vkCmdDispatch(1, 1, 1) — single workgroup.
+// Dispatched per streaming chunk.
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    float clipping_threshold;
+    float epsilon;
+    uint  weights_parameter_count;
+    uint  biases_parameter_count;
+    uint  weights_write_offset;
+    uint  biases_write_offset;
+    uint  num_batch_chunks;
+} push;
+
+layout(set = 0, binding = 0) readonly buffer SrcGradW  { float data[]; } src_grad_w;
+layout(set = 0, binding = 1) readonly buffer SrcGradB  { float data[]; } src_grad_b;
+layout(set = 0, binding = 2) writeonly buffer DstGradW { float data[]; } dst_grad_w;
+layout(set = 0, binding = 3) writeonly buffer DstGradB { float data[]; } dst_grad_b;
+
+void main() {
+    uint lid   = gl_LocalInvocationID.x;
+    uint lsize = gl_WorkGroupSize.x;
+    uint total_elements = push.weights_parameter_count + push.biases_parameter_count;
+
+    // ── Pass 1: Compute sum of squares for joint L2 norm ──
+    float local_sq_sum = 0.0;
+    for (uint i = lid; i < total_elements; i += lsize) {
+        float val;
+        if (i < push.weights_parameter_count) {
+            val = src_grad_w.data[i];
+        } else {
+            val = src_grad_b.data[i - push.weights_parameter_count];
+        }
+        local_sq_sum += val * val;
+    }
+
+    float total_sq = workgroup_reduce_add(local_sq_sum);
+
+    // ── Compute scaling factor and broadcast ──
+    float scale_factor;
+    if (lid == 0) {
+        float norm = sqrt(total_sq);
+        scale_factor = 1.0;
+        if (norm > push.clipping_threshold) {
+            scale_factor = push.clipping_threshold / (norm + push.epsilon);
+        }
+        _cross_subgroup_scratch[0] = scale_factor;
+    }
+    barrier();
+    scale_factor = _cross_subgroup_scratch[0];
+
+    // ── Pass 2: Scale and write to destination offsets ──
+    for (uint i = lid; i < total_elements; i += lsize) {
+        if (i < push.weights_parameter_count) {
+            float val = src_grad_w.data[i];
+            dst_grad_w.data[push.weights_write_offset + i] = val * scale_factor;
+        } else {
+            uint  rel = i - push.weights_parameter_count;
+            float val = src_grad_b.data[rel];
+            dst_grad_b.data[push.biases_write_offset + rel] = val * scale_factor;
+        }
+    }
+}

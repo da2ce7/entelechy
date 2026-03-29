@@ -466,7 +466,7 @@ Option names use the `aec_` prefix to namespace them within the Meson subproject
 
 ### 9.3 Tolerance Configuration
 
-Base tolerances: FP32 `atol=1e-5, rtol=1e-5`; FP16 `atol=1e-2, rtol=1e-2`. Kernels with higher numerical sensitivity (Softmax, numerically stable two-branch sigmoid near saturation, multi-stage reduction, Adam division) override to `atol=1e-4, rtol=1e-4` for FP32.
+Base tolerances: FP32 `atol=1e-5, rtol=1e-5`; FP16 `atol=1e-2, rtol=1e-2`. Kernels with higher numerical sensitivity (Softmax, sigmoid near saturation, multi-stage reduction, Adam division) override to `atol=1e-4, rtol=1e-4` for FP32.
 
 ### 9.4 Oracle Model
 

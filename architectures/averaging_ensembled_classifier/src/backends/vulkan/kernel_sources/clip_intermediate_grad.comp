@@ -1,0 +1,62 @@
+// clip_intermediate_grad.comp — Nodes 15b/20b: Per-stage intermediate gradient clipping
+//
+// Algorithmic reference: kernels.cl.h §clip_intermediate_grad
+// Two-pass in-place clipping:
+//   Pass 1: Parallel L2 norm via subgroup-accelerated workgroup reduction.
+//   Pass 2: Conditional in-place scaling if norm exceeds threshold.
+//
+// Dispatch: vkCmdDispatch(1, 1, 1)  — single workgroup per invocation.
+// The host provides the stage-specific clipping threshold, pre-computed from
+// the Quadratic Scaling Policy: T_j = T_algorithmic + lambda * j^2,
+// clamped by T_safety = FP_FORMAT_MAX / K_j.
+// Push descriptors updated per reduction stage.
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    float clipping_threshold;  // T_j for this reduction stage
+    float epsilon;
+    uint  parameter_count;
+} push;
+
+layout(set = 0, binding = 0) buffer GradBuffer { float data[]; } grad;
+
+void main() {
+    uint lid   = gl_LocalInvocationID.x;
+    uint lsize = gl_WorkGroupSize.x;
+
+    // ── Pass 1: Parallel reduction for sum of squares ──
+    float local_sq_sum = 0.0;
+    for (uint i = lid; i < push.parameter_count; i += lsize) {
+        float val = grad.data[i];
+        local_sq_sum += val * val;
+    }
+
+    float total_sq = workgroup_reduce_add(local_sq_sum);
+
+    // ── Compute scaling factor (leader broadcasts via shared memory) ──
+    float scale_factor;
+    if (lid == 0) {
+        float norm = sqrt(total_sq);
+        scale_factor = 1.0;
+        if (norm > push.clipping_threshold) {
+            scale_factor = push.clipping_threshold / (norm + push.epsilon);
+        }
+        _cross_subgroup_scratch[0] = scale_factor;
+    }
+    barrier();
+    scale_factor = _cross_subgroup_scratch[0];
+
+    // ── Early exit: no clipping needed ──
+    if (scale_factor >= 1.0) {
+        return;
+    }
+
+    // ── Pass 2: Conditional in-place scaling ──
+    for (uint i = lid; i < push.parameter_count; i += lsize) {
+        grad.data[i] *= scale_factor;
+    }
+}

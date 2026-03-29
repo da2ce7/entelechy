@@ -60,8 +60,8 @@ subdir('src/shared')
 subdir('src/backends/opencl')
 
 # Conditional backend subdirs (no-op in Phase 0)
-if backend_vulkan.allowed()
-  # subdir('src/backends/vulkan')  # created in Phase 3
+if backend_vulkan.allowed() and find_program('glslc', required: false).found()
+  subdir('src/backends/vulkan')
 endif
 if backend_cpu.allowed()
   subdir('src/backends/cpu')

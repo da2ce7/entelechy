@@ -1,0 +1,77 @@
+// render_logits.comp — Node 5: Module-layer logit computation
+//
+// Algorithmic reference: kernels.cl.h §render_logits_chunk
+// Dispatch: vkCmdDispatch(tile_count, 1, 1)
+//   gl_WorkGroupID.x → flat tile index encoding (module_chunk, batch, class_chunk)
+// Each invocation computes one logit element via dot product over hidden dim.
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+// ── Push Constants ─────────────────────────────────────────────────────
+layout(push_constant) uniform PushConstants {
+    uint batch_chunk_offset;
+    uint batch_chunk_count;
+    uint module_chunk_offset;
+    uint module_chunk_count;
+    uint class_chunk_offset;
+    uint class_chunk_count;
+    uint total_batch_count;
+    uint hidden_count;
+    uint padded_hidden_count;
+    uint total_output_class_count;
+    uint padded_total_output_class_count;
+    uint total_modules_count;
+} push;
+
+// ── Descriptor Bindings ────────────────────────────────────────────────
+layout(set = 0, binding = 0) readonly buffer HiddenBuf  { float data[]; } src_hidden;
+layout(set = 0, binding = 1) readonly buffer HMaskBuf   { float data[]; } src_hidden_mask;
+layout(set = 0, binding = 2) readonly buffer WeightsBuf { float data[]; } src_weights;
+layout(set = 0, binding = 3) readonly buffer BiasesBuf  { float data[]; } src_biases;
+layout(set = 0, binding = 4) writeonly buffer LogitsBuf { float data[]; } dest_logits;
+
+void main() {
+    // 3D logical mapping from invocation index
+    uint gid = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+
+    uint total_work = push.module_chunk_count * push.batch_chunk_count * push.class_chunk_count;
+    if (gid >= total_work) return;
+
+    // Decompose flat index → (module_local, batch_local, class_local)
+    uint class_local_idx  = gid % push.class_chunk_count;
+    uint rem              = gid / push.class_chunk_count;
+    uint batch_local_idx  = rem % push.batch_chunk_count;
+    uint module_local_idx = rem / push.batch_chunk_count;
+
+    uint module_global_idx = push.module_chunk_offset + module_local_idx;
+    uint batch_global_idx  = push.batch_chunk_offset + batch_local_idx;
+    uint class_global_idx  = push.class_chunk_offset + class_local_idx;
+
+    // Output address
+    uint out_idx = module_global_idx * push.total_batch_count * push.padded_total_output_class_count
+                 + batch_global_idx * push.padded_total_output_class_count
+                 + class_global_idx;
+
+    // Initialize with bias
+    float logit = src_biases.data[module_global_idx * push.padded_total_output_class_count + class_global_idx];
+
+    // Sparse dot product over hidden dimension
+    for (uint h = 0; h < push.hidden_count; ++h) {
+        uint  hidden_base = batch_global_idx * push.padded_hidden_count;
+        float h_mask = src_hidden_mask.data[hidden_base + h];
+
+        if (h_mask > 0.5) {
+            float h_val = src_hidden.data[hidden_base + h];
+            uint  w_idx = module_global_idx * push.padded_hidden_count * push.padded_total_output_class_count
+                        + h * push.padded_total_output_class_count
+                        + class_global_idx;
+            float w_val = src_weights.data[w_idx];
+            logit += h_val * w_val;
+        }
+    }
+
+    dest_logits.data[out_idx] = logit;
+}

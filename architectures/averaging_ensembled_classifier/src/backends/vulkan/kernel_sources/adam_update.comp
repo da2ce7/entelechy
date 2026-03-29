@@ -1,0 +1,57 @@
+// adam_update.comp — Node 24: Adam optimizer parameter update
+//
+// Algorithmic reference: kernels.cl.h §adam_update
+// Embarrassingly parallel element-wise kernel.
+// Updates parameters and first/second moment vectors using the Adam rule.
+// beta1_pow_t and beta2_pow_t are pre-computed on the host in FP64
+// (Contract: no on-device power calculations for long-term stability).
+//
+// Dispatch: vkCmdDispatch(ceil(parameter_count / SIMD_WIDTH), 1, 1)
+// Dispatched per parameter group (weights, biases, temps, shared_w, shared_b)
+// with different buffer bindings.
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    float learning_rate;
+    float beta1_pow_t;
+    float beta2_pow_t;
+    float beta1;
+    float beta2;
+    float epsilon;
+    uint  parameter_count;
+} push;
+
+layout(set = 0, binding = 0) readonly buffer GradBuf   { float data[]; } grads;
+layout(set = 0, binding = 1) buffer ParamBuf            { float data[]; } params;
+layout(set = 0, binding = 2) buffer M1Buf               { float data[]; } m1;
+layout(set = 0, binding = 3) buffer M2Buf               { float data[]; } m2;
+
+void main() {
+    uint i = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (i >= push.parameter_count) return;
+
+    // Load current state.
+    float g      = grads.data[i];
+    float m_prev = m1.data[i];
+    float v_prev = m2.data[i];
+
+    // Update biased moment estimates.
+    float m_new = push.beta1 * m_prev + (1.0 - push.beta1) * g;
+    float v_new = push.beta2 * v_prev + (1.0 - push.beta2) * (g * g);
+
+    // Bias-corrected estimates (using host-provided beta powers).
+    float m_hat = m_new / (1.0 - push.beta1_pow_t);
+    float v_hat = v_new / (1.0 - push.beta2_pow_t);
+
+    // Parameter update.
+    float update = push.learning_rate * m_hat / (sqrt(v_hat) + push.epsilon);
+
+    // Write back.
+    params.data[i] -= update;
+    m1.data[i] = m_new;
+    m2.data[i] = v_new;
+}

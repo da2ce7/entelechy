@@ -1,0 +1,60 @@
+// gather_and_permute.comp — Node 13: Gather scattered AoS → contiguous SoA
+//
+// Algorithmic reference: kernels.cl.h §gather_and_permute_grad_hidden_activations
+// Global barrier kernel: reads all tiles, sums partial Grad_H across class chunks,
+// and writes to SoA layout for downstream reduction.
+// Dispatch: vkCmdDispatch(ceil(bh_total / SIMD_WIDTH), total_modules, 1)
+//   gl_WorkGroupID.x covers (batch × padded_hidden) dimension
+//   gl_WorkGroupID.y → module_global_idx
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    uint total_batch_count;
+    uint hidden_count;
+    uint padded_hidden_count;
+    uint total_modules_count;
+    uint padded_total_modules_count;
+    uint num_module_chunks;
+    uint modules_per_chunk;
+    uint num_class_chunks;
+    uint total_tile_count;
+} push;
+
+layout(set = 0, binding = 0) readonly buffer GradHAoS  { float data[]; } src_grad_h_aos;
+layout(set = 0, binding = 1) writeonly buffer GradHSoA  { float data[]; } dest_grad_h_soa;
+
+void main() {
+    // Each invocation computes one element of the SoA output
+    uint bh_flat_idx       = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint module_global_idx = gl_WorkGroupID.y;
+
+    uint bh_total = push.total_batch_count * push.padded_hidden_count;
+    if (bh_flat_idx >= bh_total || module_global_idx >= push.total_modules_count) return;
+
+    uint batch_idx = bh_flat_idx / push.padded_hidden_count;
+    uint h_idx     = bh_flat_idx % push.padded_hidden_count;
+
+    // Gather: sum across all class chunks for this (batch, hidden, module)
+    uint module_chunk_idx = module_global_idx / push.modules_per_chunk;
+    uint module_local_idx = module_global_idx % push.modules_per_chunk;
+
+    float accum = 0.0;
+    for (uint class_chunk_idx = 0; class_chunk_idx < push.num_class_chunks; ++class_chunk_idx) {
+        uint flat_tile_idx = module_chunk_idx * push.num_class_chunks + class_chunk_idx;
+        if (flat_tile_idx < push.total_tile_count) {
+            uint tile_size = push.modules_per_chunk * push.total_batch_count * push.padded_hidden_count;
+            uint tile_base = flat_tile_idx * tile_size;
+            uint local_off = module_local_idx * push.total_batch_count * push.padded_hidden_count
+                           + batch_idx * push.padded_hidden_count + h_idx;
+            accum += src_grad_h_aos.data[tile_base + local_off];
+        }
+    }
+
+    // Write to SoA layout: [bh_flat_idx][module]
+    uint write_idx = bh_flat_idx * push.padded_total_modules_count + module_global_idx;
+    dest_grad_h_soa.data[write_idx] = accum;
+}

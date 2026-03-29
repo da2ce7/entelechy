@@ -1,0 +1,104 @@
+// compute_probs_loss_bce.comp — Node 7: Sigmoid probabilities + BCE loss
+//
+// Algorithmic reference: kernels.cl.h §compute_probs_loss_bce_chunk
+// Strategy B — separate shader for BCE.
+// Dispatch: vkCmdDispatch(tile_count, 1, 1)
+//   gl_WorkGroupID.x → flat tile index
+// Each invocation handles one (module_local, batch) pair: computes sigmoid
+// probabilities for a class chunk and accumulates partial BCE loss.
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_class_chunks;
+    uint classes_per_chunk;
+    uint modules_per_chunk;
+    uint total_batch_count;
+    uint total_output_class_count;
+    uint padded_total_output_class_count;
+    uint total_modules_count;
+    uint total_tile_count;
+} push;
+
+layout(set = 0, binding = 0) readonly buffer LogitsBuf  { float data[]; } src_logits;
+layout(set = 0, binding = 1) readonly buffer TempsBuf   { float data[]; } src_temps;
+layout(set = 0, binding = 2) readonly buffer TargetsBuf { float data[]; } src_targets;
+layout(set = 0, binding = 3) readonly buffer MaskBuf    { float data[]; } src_sample_mask;
+layout(set = 0, binding = 4) writeonly buffer ProbsBuf  { float data[]; } dest_probs;
+layout(set = 0, binding = 5) writeonly buffer LossBuf   { float data[]; } dest_loss;
+
+void main() {
+    uint tile_idx = gl_WorkGroupID.x;
+    if (tile_idx >= push.total_tile_count) return;
+
+    uint local_id         = gl_LocalInvocationID.x;
+    uint module_local_idx = local_id / push.total_batch_count;
+    uint batch_idx        = local_id % push.total_batch_count;
+
+    if (module_local_idx >= push.modules_per_chunk || batch_idx >= push.total_batch_count) return;
+
+    // Decompose flat tile index
+    uint module_chunk_idx  = tile_idx / push.num_class_chunks;
+    uint module_global_idx = module_chunk_idx * push.modules_per_chunk + module_local_idx;
+    uint class_chunk_idx   = tile_idx % push.num_class_chunks;
+    uint class_offset      = class_chunk_idx * push.classes_per_chunk;
+
+    // Loss write index
+    uint loss_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count;
+    uint loss_idx       = loss_tile_base + module_local_idx * push.total_batch_count + batch_idx;
+
+    // Handle padded samples
+    if (src_sample_mask.data[batch_idx] < 0.5) {
+        dest_loss.data[loss_idx] = 0.0;
+        uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
+        for (uint c_local = 0; c_local < push.classes_per_chunk; ++c_local) {
+            uint prob_idx = prob_tile_base
+                          + module_local_idx * push.total_batch_count * push.classes_per_chunk
+                          + batch_idx * push.classes_per_chunk + c_local;
+            dest_probs.data[prob_idx] = 0.0;
+        }
+        return;
+    }
+
+    // Fused sigmoid probability + BCE loss accumulation
+    float temp_inv = 1.0 / src_temps.data[module_global_idx];
+    float partial_loss_accum = 0.0;
+
+    uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
+
+    for (uint c_local = 0; c_local < push.classes_per_chunk; ++c_local) {
+        uint c_global = class_offset + c_local;
+        if (c_global < push.total_output_class_count) {
+            uint base_read = module_global_idx * push.total_batch_count * push.padded_total_output_class_count
+                           + batch_idx * push.padded_total_output_class_count + c_global;
+            float logit = src_logits.data[base_read];
+            float scaled_logit = logit * temp_inv;
+
+            // Numerically stable sigmoid (two-branch form)
+            float prob;
+            if (scaled_logit >= 0.0) {
+                float e = exp(-scaled_logit);
+                prob = 1.0 / (1.0 + e);
+            } else {
+                float e = exp(scaled_logit);
+                prob = e / (1.0 + e);
+            }
+
+            uint prob_idx = prob_tile_base
+                          + module_local_idx * push.total_batch_count * push.classes_per_chunk
+                          + batch_idx * push.classes_per_chunk + c_local;
+            dest_probs.data[prob_idx] = prob;
+
+            // BCE loss accumulation
+            float target_val = src_targets.data[batch_idx * push.padded_total_output_class_count + c_global];
+            float term1 = target_val * log(max(prob, NUMERICAL_STABILITY_EPSILON));
+            float term2 = (1.0 - target_val) * log(max(1.0 - prob, NUMERICAL_STABILITY_EPSILON));
+            partial_loss_accum += term1 + term2;
+        }
+    }
+
+    dest_loss.data[loss_idx] = -partial_loss_accum;
+}

@@ -1,0 +1,113 @@
+// stabilize_reduce_grad_h.comp — Node 16: Stabilized Grad_H reduction
+//
+// Algorithmic reference: kernels.cl.h §stabilize_and_reduce_grad_hidden_activations
+// Self-contained multi-stage reduction engine. Each workgroup reduces one row of
+// the permuted SoA grad_hidden buffer (batch × padded_hidden) across all modules.
+//
+// Strategy: "work-group per row" model.
+//   Phase 1: Reduce the global input row into local partial sums.
+//   Phase 2: Pre-compute the reduction plan (K-fan-in stages).
+//   Phase 3: Execute staged sum-then-clip reduction with policy-driven thresholds.
+//   Phase 4: Write final reduced scalar to output.
+//
+// The clipping threshold at each stage is synthesized from:
+//   T_policy = T_algorithmic + lambda * j^2   (quadratic scaling policy)
+//   T_safety = FP_MAX / K_actual              (overflow guard)
+//   T_final  = min(T_policy, T_safety)
+//
+// Dispatch: vkCmdDispatch(total_batch_count * padded_hidden_count, 1, 1)
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    float fp_max;
+    float policy_t_algorithmic;
+    float policy_lambda;
+    uint  policy_max_k;
+    float epsilon;
+    uint  total_batch_count;
+    uint  padded_hidden_count;
+    uint  total_modules_count;
+    uint  padded_total_modules_count;
+} push;
+
+layout(set = 0, binding = 0) readonly buffer SrcGradH  { float data[]; } src_grad_h;
+layout(set = 0, binding = 1) writeonly buffer DestGradH { float data[]; } dest_grad_h;
+
+// Local scratch for the staged reduction. Must accommodate full workgroup size.
+shared float reduction_tile[1024];
+
+void main() {
+    uint row_idx = gl_WorkGroupID.x;
+    uint lid     = gl_LocalInvocationID.x;
+    uint lsize   = gl_WorkGroupSize.x;
+
+    uint total_rows = push.total_batch_count * push.padded_hidden_count;
+    if (row_idx >= total_rows) return;
+
+    // ── Phase 1: Unified data ingress & initial reduction ──
+    // Reduce the global input row into lsize partial sums in shared memory.
+    float thread_accum = 0.0;
+    uint row_offset = row_idx * push.padded_total_modules_count;
+    for (uint i = lid; i < push.total_modules_count; i += lsize) {
+        thread_accum += src_grad_h.data[row_offset + i];
+    }
+    reduction_tile[lid] = thread_accum;
+    barrier();
+
+    // ── Phase 2: Pre-computation of reduction plan ──
+    uint K_plan = min(push.policy_max_k, lsize);
+    // Sanitize K_plan to be >= 2 (robust against host error in release builds).
+    K_plan = max(2u, K_plan);
+
+    uint num_items_in_stage = lsize;
+    uint num_stages_total   = 0;
+    uint temp_items         = lsize;
+
+    // Compute ceil(log_K(N)) — number of reduction stages needed.
+    while (temp_items > 1) {
+        temp_items = (temp_items + K_plan - 1) / K_plan;
+        num_stages_total++;
+    }
+
+    // ── Phase 3: Staged, stabilized reduction loop ──
+    for (uint s = 0; s < num_stages_total; ++s) {
+        // Synthesize stage-specific threshold (contract compliant).
+        uint  j               = num_stages_total - 1 - s;
+        float T_policy        = push.policy_t_algorithmic + push.policy_lambda * float(j * j);
+        uint  K_actual        = min(K_plan, num_items_in_stage);
+        float T_safety        = (K_actual > 0) ? (push.fp_max / float(K_actual)) : push.fp_max;
+        float final_threshold = min(T_policy, T_safety);
+
+        // Perform one level of sum-then-clip reduction.
+        // Each thread lid becomes a "sub-group leader" for a block of up to K_plan items.
+        if (lid < (num_items_in_stage + K_plan - 1) / K_plan) {
+            uint start_idx = lid * K_plan;
+            uint end_idx   = min(start_idx + K_plan, num_items_in_stage);
+
+            float sum_val = 0.0;
+            for (uint i = start_idx; i < end_idx; ++i) {
+                sum_val += reduction_tile[i];
+            }
+
+            // For a scalar sum, L2 norm is absolute value.
+            float norm = abs(sum_val);
+            if (norm > final_threshold) {
+                sum_val *= final_threshold / (norm + push.epsilon);
+            }
+            // Overwrite this sub-group's slot with the compacted value.
+            reduction_tile[lid] = sum_val;
+        }
+
+        barrier();
+        num_items_in_stage = (num_items_in_stage + K_plan - 1) / K_plan;
+    }
+
+    // ── Phase 4: Final write ──
+    if (lid == 0) {
+        dest_grad_h.data[row_idx] = reduction_tile[0];
+    }
+}

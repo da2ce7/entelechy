@@ -1,0 +1,113 @@
+// clip_partial_gradients.comp — Node 11: Group-wise gradient clipping
+//
+// Algorithmic reference: kernels.cl.h §clip_partial_gradients
+// Two-pass algorithm treating four gradient buffers as a virtual vector:
+//   Pass 1: L2 norm via workgroup_reduce_add(sq_sum)
+//   Pass 2: conditional scaling to all elements
+// Dispatch: vkCmdDispatch(total_tile_count, 1, 1)
+//   gl_WorkGroupID.x → flat tile index
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  use_per_item_norm;
+    float clipping_threshold;
+    float epsilon;
+    uint  num_class_chunks;
+    uint  classes_per_chunk;
+    uint  modules_per_chunk;
+    uint  total_batch_count;
+    uint  padded_hidden_count;
+    uint  padded_total_output_class_count;
+    uint  total_tile_count;
+} push;
+
+layout(set = 0, binding = 0) readonly buffer GradWIn    { float data[]; } src_grad_w;
+layout(set = 0, binding = 1) readonly buffer GradBIn    { float data[]; } src_grad_b;
+layout(set = 0, binding = 2) readonly buffer GradTIn    { float data[]; } src_grad_temps;
+layout(set = 0, binding = 3) readonly buffer GradHIn    { float data[]; } src_grad_h;
+layout(set = 0, binding = 4) readonly buffer ThreshBuf  { float data[]; } src_threshold_per_item;
+layout(set = 0, binding = 5) writeonly buffer GradWOut  { float data[]; } dest_grad_w;
+layout(set = 0, binding = 6) writeonly buffer GradBOut  { float data[]; } dest_grad_b;
+layout(set = 0, binding = 7) writeonly buffer GradTOut  { float data[]; } dest_grad_temps;
+layout(set = 0, binding = 8) writeonly buffer GradHOut  { float data[]; } dest_grad_h;
+
+// Shared memory for broadcasting scale factor
+shared float _clip_scale;
+
+void main() {
+    uint tile_idx = gl_WorkGroupID.x;
+    if (tile_idx >= push.total_tile_count) return;
+
+    uint lid   = gl_LocalInvocationID.x;
+    uint lsize = gl_WorkGroupSize.x;
+
+    // Per-buffer element counts
+    uint n_weights = push.modules_per_chunk * push.padded_hidden_count * push.padded_total_output_class_count;
+    uint n_biases  = push.modules_per_chunk * push.padded_total_output_class_count;
+    uint n_temps   = push.modules_per_chunk;
+    uint n_hidden  = push.modules_per_chunk * push.total_batch_count * push.padded_hidden_count;
+    uint total_elements = n_weights + n_biases + n_temps + n_hidden;
+
+    // Base offsets for this tile
+    uint w_base = tile_idx * n_weights;
+    uint b_base = tile_idx * n_biases;
+    uint t_base = tile_idx * n_temps;
+    uint h_base = tile_idx * n_hidden;
+
+    // Pass 1: sum of squares
+    float local_sq_sum = 0.0;
+    for (uint i = lid; i < total_elements; i += lsize) {
+        float val;
+        if (i < n_weights) {
+            val = src_grad_w.data[w_base + i];
+        } else if (i < n_weights + n_biases) {
+            val = src_grad_b.data[b_base + i - n_weights];
+        } else if (i < n_weights + n_biases + n_temps) {
+            val = src_grad_temps.data[t_base + i - n_weights - n_biases];
+        } else {
+            val = src_grad_h.data[h_base + i - n_weights - n_biases - n_temps];
+        }
+        local_sq_sum += val * val;
+    }
+
+    float total_sq = workgroup_reduce_add(local_sq_sum);
+
+    // Compute scale factor
+    if (lid == 0) {
+        float threshold;
+        if (push.use_per_item_norm == 1) {
+            threshold = src_threshold_per_item.data[tile_idx];
+        } else {
+            threshold = push.clipping_threshold;
+        }
+
+        float norm = sqrt(total_sq);
+        float scale = 1.0;
+        if (norm > threshold) {
+            scale = threshold / (norm + push.epsilon);
+        }
+        _clip_scale = scale;
+    }
+    barrier();
+    float scale_factor = _clip_scale;
+
+    // Pass 2: conditional scaling → destination
+    for (uint i = lid; i < total_elements; i += lsize) {
+        if (i < n_weights) {
+            dest_grad_w.data[w_base + i] = src_grad_w.data[w_base + i] * scale_factor;
+        } else if (i < n_weights + n_biases) {
+            uint ri = i - n_weights;
+            dest_grad_b.data[b_base + ri] = src_grad_b.data[b_base + ri] * scale_factor;
+        } else if (i < n_weights + n_biases + n_temps) {
+            uint ri = i - n_weights - n_biases;
+            dest_grad_temps.data[t_base + ri] = src_grad_temps.data[t_base + ri] * scale_factor;
+        } else {
+            uint ri = i - n_weights - n_biases - n_temps;
+            dest_grad_h.data[h_base + ri] = src_grad_h.data[h_base + ri] * scale_factor;
+        }
+    }
+}
