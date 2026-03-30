@@ -22,7 +22,7 @@ from src.shared.workload_primitives import (
     ContiguousGather,
     SCALAR_UINT_TYPE,
 )
-from src.shared.model_spec import Float32ModelSpec
+from src.shared.model_spec import ModelSpec
 
 
 # =========================================================================

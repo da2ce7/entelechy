@@ -32,7 +32,7 @@ from .conftest import (
     make_tile,
 )
 
-from src.kernel_signatures.phase_2_learn_B_processing import (
+from src.kernel_signatures.phase_2_learn_B_processing import (  # type: ignore[import-not-found]
     ClipPartialGradientsGlobalNormSignature,
     ClipPartialGradientsPerItemNormSignature,
     GradientHandles,

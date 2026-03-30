@@ -5,6 +5,8 @@ The marshal function converts plan node scalar_params into packed bytes.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import ctypes
 from typing import ClassVar
 
@@ -261,7 +263,7 @@ def _strip_param_prefix(param_name: str) -> str:
 
 def marshal_push_constants(
     kernel_name: str,
-    scalar_params: dict[str, int | float],
+    scalar_params: Mapping[str, int | float],
 ) -> bytes:
     """Convert plan scalar_params into packed push constant bytes.
 
@@ -273,7 +275,7 @@ def marshal_push_constants(
 
     # Build field type lookup
     field_types: dict[str, type] = {}
-    for fname, ftype in struct_cls._fields_:
+    for fname, ftype in struct_cls._fields_:  # type: ignore[reportAssignmentType]
         field_types[fname] = ftype
 
     for param_name, value in scalar_params.items():

@@ -23,7 +23,7 @@ from .conftest import (
     classify_python_arg,
 )
 
-from src.kernel_signatures.phase_3_update import (
+from src.kernel_signatures.phase_3_update import (  # type: ignore[import-not-found]
     NormalizeGradientsSignature,
     AdamParameterGroup,
     AdamUpdateSignature,

@@ -57,7 +57,7 @@ from src.backends.opencl.context import (
     Float16ComputeEnvironment,
 )
 from src.arch_primitives import Float32Context
-from src.shared.model_spec import Float32ModelSpec
+from src.shared.model_spec import Float32ModelSpec, ModelSpec
 from src.shared.parameter_space import ParameterSpace
 from src.main_orchestrator import (
     TrainingOrchestrator,

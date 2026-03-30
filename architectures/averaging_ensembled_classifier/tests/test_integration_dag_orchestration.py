@@ -36,7 +36,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from src.shared.model_spec import Float32ModelSpec
+from src.shared.model_spec import Float32ModelSpec, ModelSpec
 from src.shared.parameter_space import ParameterSpace
 from src.shared.stabilization_policy import StabilizationPolicy
 from src.shared.workload_primitives import (
@@ -94,7 +94,7 @@ def _dummy_event() -> MagicMock:
     return evt
 
 
-def _make_spec(**overrides: Any) -> Float32ModelSpec:
+def _make_spec(**overrides: Any) -> ModelSpec:
     defaults = dict(
         input_dim=4,
         hidden_dim=32,
@@ -107,7 +107,7 @@ def _make_spec(**overrides: Any) -> Float32ModelSpec:
     return Float32ModelSpec(**defaults)
 
 
-def _make_tiling(spec: Float32ModelSpec) -> TilingScheme:
+def _make_tiling(spec: ModelSpec) -> TilingScheme:
     return TilingScheme(
         num_module_chunks=(spec.num_modules + 15) // 16,
         num_class_chunks=(spec.output_classes + 15) // 16,

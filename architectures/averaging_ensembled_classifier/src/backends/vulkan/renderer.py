@@ -9,7 +9,7 @@ from __future__ import annotations
 import ctypes
 import logging
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -37,11 +37,16 @@ from .context import VulkanContext
 from .discovery import discover_hardware
 from .retrieval import VulkanRetrievalFuture
 
-try:
+if TYPE_CHECKING:
     import vulkan as vk  # type: ignore[import-untyped]
-    from vulkan._vulkan import ffi as _ffi
-except ImportError:
-    pass
+    from vulkan._vulkan import ffi as _ffi  # type: ignore[import-untyped]
+else:
+    try:
+        import vulkan as vk
+        from vulkan._vulkan import ffi as _ffi
+    except ImportError:
+        vk = None  # type: ignore[assignment]
+        _ffi = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +265,26 @@ class VulkanPlanRenderer:
 
     # ── Node type recording ──
 
+    # Per-element kernels (placement_strategy="linear_generic") need
+    # workgroup count derived from scalar params rather than tile_count.
+    # Maps kernel_name → callable(scalar_params, simd_width) → workgroup_count.
+    _WORKGROUP_COUNT_RESOLVERS: dict[str, Any] = {
+        # Element-wise: ceil(N / simd_width) workgroups
+        "normalize_gradients": lambda s, w: (
+            (int(s["parameter_count"]) + w - 1) // w
+        ),
+        "adam_update": lambda s, w: (
+            (int(s["parameter_count"]) + w - 1) // w
+        ),
+        "clamp_temperatures": lambda s, w: (
+            (int(s["total_modules_count"]) + w - 1) // w
+        ),
+        # Workgroup-per-row: one workgroup per (batch, hidden) row
+        "stabilize_reduce_grad_h": lambda s, w: (
+            int(s["total_batch_count"]) * int(s["padded_hidden_count"])
+        ),
+    }
+
     def _record_kernel_dispatch(
         self,
         cmd: Any,
@@ -313,7 +338,14 @@ class VulkanPlanRenderer:
                 x_groups = node.tile_count
             vk.vkCmdDispatch(cmd, x_groups, y_groups, 1)
         else:
-            vk.vkCmdDispatch(cmd, node.tile_count, 1, 1)
+            resolver = self._WORKGROUP_COUNT_RESOLVERS.get(node.kernel_name)
+            if resolver is not None:
+                wg_count = resolver(
+                    node.scalar_params, plan.hardware.simd_width,
+                )
+                vk.vkCmdDispatch(cmd, wg_count, 1, 1)
+            else:
+                vk.vkCmdDispatch(cmd, node.tile_count, 1, 1)
 
     def _record_reduction_tree(
         self,
@@ -482,6 +514,7 @@ class VulkanPlanRenderer:
                 and rtp.threshold_schedule[stage] is not None
             ):
                 threshold = rtp.threshold_schedule[stage]
+                assert threshold is not None
 
                 # clip_intermediate_grad operates in-place on current_dst
                 clip_bindings = [(0, current_dst)]

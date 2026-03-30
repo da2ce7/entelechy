@@ -6,15 +6,22 @@ and deterministic teardown. Uses vulkan-python for all Vulkan API calls.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
 
-try:
+if TYPE_CHECKING:
     import vulkan as vk  # type: ignore[import-untyped]
 
     _VULKAN_AVAILABLE = True
-except ImportError:
-    _VULKAN_AVAILABLE = False
+else:
+    try:
+        import vulkan as vk
+
+        _VULKAN_AVAILABLE = True
+    except ImportError:
+        vk = None  # type: ignore[assignment]
+        _VULKAN_AVAILABLE = False
 
 
 def _check_vulkan_available() -> None:
@@ -117,13 +124,13 @@ class VulkanContext:
             if qf_idx < 0:
                 continue
 
-            device_type = props.deviceType
+            device_type = props.deviceType  # type: ignore[reportAttributeAccessIssue]
             # Priority: discrete (2) > virtual (3) > integrated (1) > other
             priority = {
                 vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: 4,
                 vk.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: 3,
                 vk.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: 2,
-            }.get(device_type, 1)
+            }.get(device_type, 1)  # type: ignore[reportCallIssue, reportArgumentType]
 
             if priority > best_type:
                 best = dev
@@ -135,7 +142,7 @@ class VulkanContext:
 
         self._physical_device = best
         props = vk.vkGetPhysicalDeviceProperties(best)
-        logger.info("Selected Vulkan device: %s", props.deviceName)
+        logger.info("Selected Vulkan device: %s", props.deviceName)  # type: ignore[reportAttributeAccessIssue]
 
     @staticmethod
     def _find_compute_queue_family(device: object) -> int:

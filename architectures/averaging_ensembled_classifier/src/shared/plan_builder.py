@@ -52,7 +52,7 @@ from .streaming_loop_plan import (
     ParameterStride,
     StreamingLoopPlan,
 )
-from .workload_primitives import LinearlyChunkedGather, TiledGather, TilingScheme
+from .workload_primitives import GatherPrimitive, LinearlyChunkedGather, TiledGather, TilingScheme
 
 
 # =========================================================================
@@ -139,7 +139,7 @@ def _make_tiling(spec: ModelSpec) -> TilingScheme:
 def _build_reduction_tree(
     policy: StabilizationPolicy,
     hardware: HardwareProfile,
-    gather: TiledGather,
+    gather: GatherPrimitive,
     source_buf: BufferHandle,
     dest_buf: BufferHandle,
     tree_variant: Literal["sum", "sum_and_clip"],

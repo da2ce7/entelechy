@@ -263,7 +263,7 @@ class OpenCLContextManager:
         log_header = "\n" + "=" * 80 + "\n--- KERNEL BUILD FAILED ---\n" + "=" * 80
         log_details = ""
         if hasattr(e, "device_logs"):
-            log_details = "\n\n".join([f"Device: {dev.name}\n--- Build Log ---\n{log}" for dev, log in e.device_logs])
+            log_details = "\n\n".join([f"Device: {dev.name}\n--- Build Log ---\n{log}" for dev, log in e.device_logs])  # type: ignore[reportAttributeAccessIssue]
         else:
             log_details = f"An unexpected OpenCL error occurred: {e}"
         full_error = "\n".join([log_header, log_details, "=" * 80])

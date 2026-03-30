@@ -14,7 +14,7 @@ all signature classes:
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import numpy as np
 import pytest
@@ -76,7 +76,7 @@ from src.kernel_signatures import (
 # Signature Factory Functions
 # =========================================================================
 
-def _make_forward_pass(bm: MockBufferManager, ac: MockArchConsts):
+def _make_forward_pass(bm: Any, ac: Any):
     return ForwardPassSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -91,7 +91,7 @@ def _make_forward_pass(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_render_logits_chunk(bm: MockBufferManager, ac: MockArchConsts):
+def _make_render_logits_chunk(bm: Any, ac: Any):
     return RenderLogitsChunkSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -111,7 +111,7 @@ def _make_render_logits_chunk(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_compute_probs_loss_cce(bm: MockBufferManager, ac: MockArchConsts):
+def _make_compute_probs_loss_cce(bm: Any, ac: Any):
     return ComputeProbsLossCceChunkSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -128,7 +128,7 @@ def _make_compute_probs_loss_cce(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_compute_probs_loss_bce(bm: MockBufferManager, ac: MockArchConsts):
+def _make_compute_probs_loss_bce(bm: Any, ac: Any):
     return ComputeProbsLossBceChunkSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -147,7 +147,7 @@ def _make_compute_probs_loss_bce(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_calc_module_grads_cce(bm: MockBufferManager, ac: MockArchConsts):
+def _make_calc_module_grads_cce(bm: Any, ac: Any):
     return CalculateModuleParamGradsCceSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -174,7 +174,7 @@ def _make_calc_module_grads_cce(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_calc_module_grads_bce(bm: MockBufferManager, ac: MockArchConsts):
+def _make_calc_module_grads_bce(bm: Any, ac: Any):
     return CalculateModuleParamGradsBceSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -201,7 +201,7 @@ def _make_calc_module_grads_bce(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_backprop_hidden_cce(bm: MockBufferManager, ac: MockArchConsts):
+def _make_backprop_hidden_cce(bm: Any, ac: Any):
     return BackpropErrorToHiddenChunkCceSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -220,7 +220,7 @@ def _make_backprop_hidden_cce(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_backprop_hidden_bce(bm: MockBufferManager, ac: MockArchConsts):
+def _make_backprop_hidden_bce(bm: Any, ac: Any):
     return BackpropErrorToHiddenChunkBceSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -239,7 +239,7 @@ def _make_backprop_hidden_bce(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_temp_grads_cce(bm: MockBufferManager, ac: MockArchConsts):
+def _make_temp_grads_cce(bm: Any, ac: Any):
     return CalculateChunkTempGradientsCceSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -257,7 +257,7 @@ def _make_temp_grads_cce(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_temp_grads_bce(bm: MockBufferManager, ac: MockArchConsts):
+def _make_temp_grads_bce(bm: Any, ac: Any):
     return CalculateChunkTempGradientsBceSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -300,7 +300,7 @@ def _make_gradient_handles(bm: MockBufferManager) -> GradientHandles:
     )
 
 
-def _make_clip_global(bm: MockBufferManager, ac: MockArchConsts):
+def _make_clip_global(bm: Any, ac: Any):
     return ClipPartialGradientsGlobalNormSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -311,7 +311,7 @@ def _make_clip_global(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_clip_per_item(bm: MockBufferManager, ac: MockArchConsts):
+def _make_clip_per_item(bm: Any, ac: Any):
     return ClipPartialGradientsPerItemNormSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -322,7 +322,7 @@ def _make_clip_per_item(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_gather_permute(bm: MockBufferManager, ac: MockArchConsts):
+def _make_gather_permute(bm: Any, ac: Any):
     return GatherAndPermuteGradHiddenActivationsSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -341,7 +341,7 @@ def _make_gather_permute(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_aggregate_register(bm: MockBufferManager, ac: MockArchConsts):
+def _make_aggregate_register(bm: Any, ac: Any):
     return AggregateRegisterReduceSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -354,7 +354,7 @@ def _make_aggregate_register(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_aggregate_local(bm: MockBufferManager, ac: MockArchConsts):
+def _make_aggregate_local(bm: Any, ac: Any):
     return AggregateLocalReduceSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -367,7 +367,7 @@ def _make_aggregate_local(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_clip_intermediate(bm: MockBufferManager, ac: MockArchConsts):
+def _make_clip_intermediate(bm: Any, ac: Any):
     return ClipIntermediateGradSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -377,7 +377,7 @@ def _make_clip_intermediate(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_stabilize_reduce(bm: MockBufferManager, ac: MockArchConsts):
+def _make_stabilize_reduce(bm: Any, ac: Any):
     return StabilizeAndReduceGradHiddenActivationsSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -397,7 +397,7 @@ def _make_stabilize_reduce(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_backprop_shared_weights(bm: MockBufferManager, ac: MockArchConsts):
+def _make_backprop_shared_weights(bm: Any, ac: Any):
     return BackpropSharedWeightsChunkSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -415,7 +415,7 @@ def _make_backprop_shared_weights(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_backprop_shared_biases(bm: MockBufferManager, ac: MockArchConsts):
+def _make_backprop_shared_biases(bm: Any, ac: Any):
     return BackpropSharedBiasesChunkSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -430,7 +430,7 @@ def _make_backprop_shared_biases(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_clip_shared(bm: MockBufferManager, ac: MockArchConsts):
+def _make_clip_shared(bm: Any, ac: Any):
     return ClipSharedGradientsChunkSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -452,7 +452,7 @@ def _make_clip_shared(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_normalize(bm: MockBufferManager, ac: MockArchConsts):
+def _make_normalize(bm: Any, ac: Any):
     return NormalizeGradientsSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -463,7 +463,7 @@ def _make_normalize(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_adam_update(bm: MockBufferManager, ac: MockArchConsts):
+def _make_adam_update(bm: Any, ac: Any):
     return AdamUpdateSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,
@@ -482,7 +482,7 @@ def _make_adam_update(bm: MockBufferManager, ac: MockArchConsts):
     )
 
 
-def _make_clamp_temps(bm: MockBufferManager, ac: MockArchConsts):
+def _make_clamp_temps(bm: Any, ac: Any):
     return ClampTemperaturesSignature(
         _buffer_mgr=bm,
         _arch_consts=ac,

@@ -179,3 +179,215 @@ def renderer_factory():
 def tier3_pairs(request) -> list[tuple[str, str]]:
     """Backend pairs for Tier 3 comparison."""
     return _get_tier3_pairs(request.config)
+
+
+# ---------------------------------------------------------------------------
+# Single-kernel plan extraction (Step 4.5)
+# ---------------------------------------------------------------------------
+
+def _extract_node_plan(
+    source_plan: Any,
+    node_id: str,
+    output_binding_name: str,
+) -> Any:
+    """Extract a single node from a plan into a minimal ExecutionPlan.
+
+    Creates a two-node plan: the target kernel (with dependencies cleared)
+    followed by a RetrievalNode on the specified output buffer. Both
+    backends execute this identical plan from zero-initialized buffers,
+    making the comparison meaningful for cross-backend parity.
+    """
+    from dataclasses import replace
+
+    from src.shared.plan_types import (
+        ExecutionPlan,
+        KernelDispatchNode,
+        ReductionTreeNode,
+        RetrievalNode,
+    )
+
+    node = source_plan.nodes[node_id]
+
+    if isinstance(node, KernelDispatchNode):
+        isolated = replace(node, depends_on=frozenset())
+        needed_handles = set(node.buffer_bindings.values())
+        output_handle = node.buffer_bindings[output_binding_name]
+    elif isinstance(node, ReductionTreeNode):
+        isolated = replace(node, depends_on=frozenset())
+        rp = node.reduction_plan
+        needed_handles = {rp.source_buffer, rp.destination_buffer}
+        output_handle = rp.destination_buffer
+    else:
+        raise ValueError(f"Cannot extract node type {type(node)}")
+
+    output_desc = source_plan.buffers[output_handle]
+
+    retrieval = RetrievalNode(
+        node_id="retrieval",
+        depends_on=frozenset({node_id}),
+        source_buffer=output_handle,
+        logical_shape=output_desc.padded_shape,
+        event_name="output",
+    )
+
+    needed_handles.add(output_handle)
+    buffers = {h: source_plan.buffers[h] for h in needed_handles}
+    nodes_dict = {node_id: isolated, "retrieval": retrieval}
+    topo = (node_id, "retrieval")
+
+    return ExecutionPlan(
+        nodes=nodes_dict,
+        buffers=buffers,
+        topological_order=topo,
+        precision=source_plan.precision,
+        hardware=source_plan.hardware,
+    )
+
+
+class _SingleKernelPlanBuilder:
+    """Builds minimal single-kernel plans by extracting from full plans.
+
+    Constructs full Act and Learn plans on init, then exposes a build()
+    method that extracts any named kernel into a minimal two-node plan
+    (kernel + retrieval). Both backends execute the same plan from
+    zero-initialized buffers for parity comparison.
+    """
+
+    # Mapping: abbreviated kernel name →
+    #   (plan_attr, node_id, output_binding_name_or_None_for_reduction)
+    _KERNEL_MAP: dict[str, tuple[str, str, str | None]] = {
+        # Act phase
+        "forward_pass": ("_act_cce", "forward_pass", "hidden_activations"),
+        "render_logits_chunk": ("_act_cce", "render_logits", "logits"),
+        "compute_probs_loss_cce_chunk": (
+            "_act_cce", "loss_computation", "partial_probs",
+        ),
+        "compute_probs_loss_bce_chunk": (
+            "_act_bce", "loss_computation", "partial_probs",
+        ),
+        # Learn Phase I — gradient production
+        "calculate_module_param_grads": (
+            "_learn_cce", "calc_module_grads",
+            "partial_grad_weights_module",
+        ),
+        "backprop_error_to_hidden": (
+            "_learn_cce", "backprop_error_hidden",
+            "partial_grad_hidden_activations_aos",
+        ),
+        "calculate_temp_gradients": (
+            "_learn_cce", "calc_temp_grads", "partial_grad_temps",
+        ),
+        "clip_partial_gradients": (
+            "_learn_cce", "clip_partial_grads",
+            "clipped_partial_grad_weights_module",
+        ),
+        # Learn Phase II — aggregation
+        "gather_and_permute_grad_h": (
+            "_learn_cce", "gather_permute_grad_h",
+            "clipped_grad_hidden_activations_permuted_soa",
+        ),
+        "stabilize_reduce_grad_h": (
+            "_learn_cce", "stabilize_reduce_grad_h",
+            "summed_grad_hidden_activations",
+        ),
+        "aggregate_register_reduce": (
+            "_learn_cce", "reduce_mod_grads", None,
+        ),
+        "aggregate_local_reduce": (
+            "_learn_cce", "reduce_temp_grads", None,
+        ),
+        "clip_intermediate_grad": (
+            "_learn_cce", "reduce_mod_grads", None,
+        ),
+        # Learn Phase III — streaming backprop
+        "backprop_shared_weights": (
+            "_learn_cce", "backprop_shared_weights",
+            "partial_grad_weights_shared",
+        ),
+        "backprop_shared_biases": (
+            "_learn_cce", "backprop_shared_biases",
+            "partial_grad_biases_shared",
+        ),
+        "clip_shared_gradients": (
+            "_learn_cce", "clip_shared_grads",
+            "clipped_partial_grad_weights_shared",
+        ),
+        # Learn Phase IV — normalization
+        "normalize_gradients": (
+            "_learn_cce", "normalize_gradients_module", "final_grad",
+        ),
+        # Learn Phase V — parameter update
+        "adam_update": (
+            "_learn_cce", "adam_update_shared", "parameters",
+        ),
+        "clamp_temperatures": (
+            "_learn_cce", "clamp_temperatures", "temperatures",
+        ),
+    }
+
+    def __init__(self) -> None:
+        import numpy as np_
+
+        from src.shared.hardware_profile import HardwareProfile
+        from src.shared.model_spec import ModelSpec
+        from src.shared.plan_builder import build_act_plan, build_learn_plan
+        from src.shared.precision_config import PrecisionConfig
+        from src.shared.problem_type_strategy import PlanBceStrategy, PlanCceStrategy
+        from src.shared.stabilization_policy import StabilizationPolicy
+
+        iris = dict(input_dim=4, hidden_dim=32, output_classes=3, num_modules=8)
+        batch = 150
+
+        prec = PrecisionConfig.float32()
+        spec = ModelSpec(
+            precision=prec, simd_width=4, cache_line_bytes=64, **iris,
+        )
+        hw = HardwareProfile(
+            simd_width=4, cache_line_bytes=64, max_reduce_fan_in=256,
+            max_local_mem_bytes=65536, global_mem_bytes=4 * 1024**3,
+        )
+        policy = StabilizationPolicy(
+            t_algorithmic=1.0, lambda_=1.0,
+            fp_format_max=float(np_.finfo(np_.float32).max),
+        )
+
+        cce = PlanCceStrategy()
+        bce = PlanBceStrategy()
+
+        self._act_cce = build_act_plan(spec, hw, cce, batch)
+        self._act_bce = build_act_plan(spec, hw, bce, batch)
+        self._learn_cce = build_learn_plan(spec, hw, cce, batch, policy)
+        self._learn_bce = build_learn_plan(spec, hw, bce, batch, policy)
+
+    def build(self, kernel_name: str) -> Any:
+        """Build a minimal ExecutionPlan for the given kernel.
+
+        Returns an ExecutionPlan containing a single kernel dispatch node
+        (or reduction tree node) plus a retrieval node. The retrieval
+        event is always named "output".
+        """
+        if kernel_name not in self._KERNEL_MAP:
+            raise ValueError(
+                f"Unknown kernel '{kernel_name}'. "
+                f"Known: {sorted(self._KERNEL_MAP)}"
+            )
+
+        plan_attr, node_id, output_binding = self._KERNEL_MAP[kernel_name]
+        source_plan = getattr(self, plan_attr)
+
+        if output_binding is None:
+            # Reduction node — output_binding not used
+            return _extract_node_plan(source_plan, node_id, "")
+        return _extract_node_plan(source_plan, node_id, output_binding)
+
+
+@pytest.fixture(scope="session")
+def single_kernel_plan_factory():
+    """Session-scoped factory for building minimal single-kernel plans.
+
+    Usage: ``plan = single_kernel_plan_factory.build("forward_pass")``
+
+    The factory builds full Act/Learn plans once, then extracts
+    individual kernels into minimal two-node plans (kernel + retrieval).
+    """
+    return _SingleKernelPlanBuilder()

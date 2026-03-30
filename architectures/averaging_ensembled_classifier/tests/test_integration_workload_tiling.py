@@ -19,7 +19,7 @@ No OpenCL device is required.
 import numpy as np
 import pytest
 
-from src.shared.model_spec import Float32ModelSpec
+from src.shared.model_spec import ModelSpec
 from src.shared.workload_primitives import (
     ContiguousGather,
     GatherPrimitive,
@@ -154,7 +154,7 @@ class TestIndirectionContract:
 class TestTilingGatherIntegration:
     """Verify tiling-to-gather consistency at scale."""
 
-    def test_hydra_tiling_produces_many_tiles(self, fp32_hydra_spec: Float32ModelSpec) -> None:
+    def test_hydra_tiling_produces_many_tiles(self, fp32_hydra_spec: ModelSpec) -> None:
         """256 modules chunked into groups of 16 → 16 module chunks."""
         grid = TilingScheme(
             num_module_chunks=(fp32_hydra_spec.num_modules + 15) // 16,
@@ -166,7 +166,7 @@ class TestTilingGatherIntegration:
         gather = TiledGather(scheme=grid, _elements_per_partial=42)
         assert gather.num_partials == grid.total_tiles
 
-    def test_lexicon_tiling_many_class_chunks(self, fp32_lexicon_spec: Float32ModelSpec) -> None:
+    def test_lexicon_tiling_many_class_chunks(self, fp32_lexicon_spec: ModelSpec) -> None:
         """10,000 classes chunked into groups of 16 → 625 class chunks."""
         grid = TilingScheme(
             num_module_chunks=(fp32_lexicon_spec.num_modules + 15) // 16,

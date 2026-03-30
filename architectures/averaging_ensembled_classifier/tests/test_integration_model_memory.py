@@ -21,6 +21,8 @@ num_heads, and massive output_classes.
 import numpy as np
 import pytest
 
+from collections.abc import Callable
+
 from src.shared.memory_layout import MemoryLayout, PaddingStrategy, PaddingType
 from src.shared.model_spec import Float16ModelSpec, Float32ModelSpec, ModelSpec
 from src.shared.parameter_space import ParameterSpace
@@ -48,21 +50,21 @@ def _make_tiling(spec: ModelSpec) -> TilingScheme:
 class TestModelSpecPadding:
     """Verify that padded dimension properties are SIMD/cache-aligned."""
 
-    def test_padded_hidden_dim_is_simd_aligned(self, fp32_iris_spec: Float32ModelSpec) -> None:
+    def test_padded_hidden_dim_is_simd_aligned(self, fp32_iris_spec: ModelSpec) -> None:
         spec = fp32_iris_spec
         assert spec.padded_hidden_dim % spec.simd_width == 0
 
-    def test_padded_input_dim_is_cache_aligned(self, fp32_iris_spec: Float32ModelSpec) -> None:
+    def test_padded_input_dim_is_cache_aligned(self, fp32_iris_spec: ModelSpec) -> None:
         spec = fp32_iris_spec
         byte_stride = spec.padded_input_dim * np.dtype(spec.SCALAR_NP_TYPE).itemsize
         assert byte_stride % spec.cache_line_bytes == 0
 
-    def test_padded_class_dim_is_cache_aligned(self, fp32_iris_spec: Float32ModelSpec) -> None:
+    def test_padded_class_dim_is_cache_aligned(self, fp32_iris_spec: ModelSpec) -> None:
         spec = fp32_iris_spec
         byte_stride = spec.padded_class_dim * np.dtype(spec.SCALAR_NP_TYPE).itemsize
         assert byte_stride % spec.cache_line_bytes == 0
 
-    def test_padded_dims_are_ge_logical(self, fp32_iris_spec: Float32ModelSpec) -> None:
+    def test_padded_dims_are_ge_logical(self, fp32_iris_spec: ModelSpec) -> None:
         spec = fp32_iris_spec
         assert spec.padded_hidden_dim >= spec.hidden_dim
         assert spec.padded_input_dim >= spec.input_dim
@@ -70,7 +72,7 @@ class TestModelSpecPadding:
         assert spec.padded_module_dim >= spec.num_modules
 
     def test_fp16_padding_differs_from_fp32(
-        self, fp32_iris_spec: Float32ModelSpec, fp16_iris_spec: Float16ModelSpec
+        self, fp32_iris_spec: ModelSpec, fp16_iris_spec: ModelSpec
     ) -> None:
         """FP16's smaller element size should yield wider padded dims (in elements)."""
         # Same cache line, half the bytes per element -> twice the elements per row
@@ -99,7 +101,7 @@ class TestParameterSpaceLayouts:
     """Verify that ParameterSpace produces a complete, consistent memory plan."""
 
     def test_all_expected_buffers_present(
-        self, fp32_iris_spec: Float32ModelSpec, iris_param_space: ParameterSpace
+        self, fp32_iris_spec: ModelSpec, iris_param_space: ParameterSpace
     ) -> None:
         grid = _make_tiling(fp32_iris_spec)
         layouts = iris_param_space.get_all_memory_layouts(
@@ -137,7 +139,7 @@ class TestParameterSpaceLayouts:
             assert f"partial_grad_{stem}" in layouts, f"Missing buffer: partial_grad_{stem}"
 
     def test_optimizer_state_shapes_match_param_shapes(
-        self, fp32_iris_spec: Float32ModelSpec, iris_param_space: ParameterSpace
+        self, fp32_iris_spec: ModelSpec, iris_param_space: ParameterSpace
     ) -> None:
         """Contract: m1 and m2 shapes must equal their parent parameter shapes."""
         grid = _make_tiling(fp32_iris_spec)
@@ -157,7 +159,7 @@ class TestParameterSpaceLayouts:
             assert m2_shape == param_shape, f"m2 shape mismatch for {flow.name}"
 
     def test_clipped_shapes_equal_partial_shapes(
-        self, fp32_iris_spec: Float32ModelSpec, iris_param_space: ParameterSpace
+        self, fp32_iris_spec: ModelSpec, iris_param_space: ParameterSpace
     ) -> None:
         """Contract: clipped partials have identical shape to raw partials."""
         grid = _make_tiling(fp32_iris_spec)
@@ -176,7 +178,7 @@ class TestParameterSpaceLayouts:
                     ), f"Shape mismatch: {key} vs {clipped_key}"
 
     def test_shared_weights_shape_uses_padded_hidden_major_layout(
-        self, fp32_iris_spec: Float32ModelSpec, iris_param_space: ParameterSpace
+        self, fp32_iris_spec: ModelSpec, iris_param_space: ParameterSpace
     ) -> None:
         """Contract: shared_weights is (padded_hidden_dim, padded_input_dim) — hidden-major."""
         grid = _make_tiling(fp32_iris_spec)
@@ -190,7 +192,7 @@ class TestParameterSpaceLayouts:
         assert sw_shape[1] == fp32_iris_spec.padded_input_dim
 
     def test_partial_grad_shared_weights_first_dim_equals_num_batch_chunks(
-        self, fp32_iris_spec: Float32ModelSpec, iris_param_space: ParameterSpace
+        self, fp32_iris_spec: ModelSpec, iris_param_space: ParameterSpace
     ) -> None:
         """The streaming model writes one partial per batch chunk."""
         grid = _make_tiling(fp32_iris_spec)
@@ -219,7 +221,7 @@ class TestCrossPrecisionConsistency:
             (Float16ModelSpec, "fp16"),
         ],
     )
-    def test_layout_pipeline_end_to_end(self, spec_cls: type[ModelSpec], ctx_cls: str) -> None:
+    def test_layout_pipeline_end_to_end(self, spec_cls: Callable[..., ModelSpec], ctx_cls: str) -> None:
         spec = spec_cls(
             input_dim=4,
             hidden_dim=32,
@@ -248,7 +250,7 @@ class TestCrossPrecisionConsistency:
 class TestScalingScenarios:
     """Verify that the memory planning pipeline handles extreme configurations."""
 
-    def test_hydra_massive_modules(self, fp32_hydra_spec: Float32ModelSpec) -> None:
+    def test_hydra_massive_modules(self, fp32_hydra_spec: ModelSpec) -> None:
         """Hydra: 256 modules.  All buffers must be allocated without error."""
         ps = ParameterSpace(spec=fp32_hydra_spec)
         grid = _make_tiling(fp32_hydra_spec)
@@ -263,7 +265,7 @@ class TestScalingScenarios:
             padded = layout.get_padded_shape(dtype)
             assert all(d > 0 for d in padded), f"Bad shape for {name}: {padded}"
 
-    def test_lexicon_massive_classes(self, fp32_lexicon_spec: Float32ModelSpec) -> None:
+    def test_lexicon_massive_classes(self, fp32_lexicon_spec: ModelSpec) -> None:
         """Lexicon: 10,000 output classes.  Tiling and layout must succeed."""
         ps = ParameterSpace(spec=fp32_lexicon_spec)
         grid = _make_tiling(fp32_lexicon_spec)
@@ -275,7 +277,7 @@ class TestScalingScenarios:
             padded = layout.get_padded_shape(dtype)
             assert all(d > 0 for d in padded), f"Bad shape for {name}: {padded}"
 
-    def test_single_sample_batch(self, fp32_iris_spec: Float32ModelSpec) -> None:
+    def test_single_sample_batch(self, fp32_iris_spec: ModelSpec) -> None:
         """Graceful degradation: batch_size=1 must still produce valid layouts."""
         ps = ParameterSpace(spec=fp32_iris_spec)
         grid = _make_tiling(fp32_iris_spec)

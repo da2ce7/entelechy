@@ -65,7 +65,7 @@ if os.path.isdir(_builddir) and _builddir not in sys.modules["src"].__path__:
 # ---------------------------------------------------------------------------
 # Architecture imports (host-side only – no device needed)
 # ---------------------------------------------------------------------------
-from src.shared.model_spec import Float16ModelSpec, Float32ModelSpec  # noqa: E402
+from src.shared.model_spec import Float16ModelSpec, Float32ModelSpec, ModelSpec  # noqa: E402
 from src.shared.parameter_space import ParameterSpace  # noqa: E402
 from src.shared.stabilization_policy import StabilizationPolicy  # noqa: E402
 from src.shared.workload_primitives import TilingScheme  # noqa: E402
@@ -85,7 +85,7 @@ requires_opencl = pytest.mark.skipif(
 def _load_build_config() -> dict[str, bool]:
     """Load the build manifest; return a dict of backend availability."""
     try:
-        from src._build_config import BACKEND_OPENCL, BACKEND_VULKAN, BACKEND_CPU
+        from src._build_config import BACKEND_OPENCL, BACKEND_VULKAN, BACKEND_CPU  # type: ignore[import-not-found]
         return {
             "opencl": BACKEND_OPENCL,
             "vulkan": BACKEND_VULKAN,
@@ -144,7 +144,7 @@ IRIS_CACHE_LINE_BYTES = 64
 
 
 @pytest.fixture
-def fp32_iris_spec() -> Float32ModelSpec:
+def fp32_iris_spec() -> ModelSpec:
     """A small FP32 model spec modeled after the Iris validation scenario."""
     return Float32ModelSpec(
         input_dim=IRIS_INPUT_DIM,
@@ -157,7 +157,7 @@ def fp32_iris_spec() -> Float32ModelSpec:
 
 
 @pytest.fixture
-def fp16_iris_spec() -> Float16ModelSpec:
+def fp16_iris_spec() -> ModelSpec:
     """A small FP16 model spec modeled after the Iris validation scenario."""
     return Float16ModelSpec(
         input_dim=IRIS_INPUT_DIM,
@@ -181,7 +181,7 @@ HYDRA_BATCH_SIZE = 32
 
 
 @pytest.fixture
-def fp32_hydra_spec() -> Float32ModelSpec:
+def fp32_hydra_spec() -> ModelSpec:
     """A large FP32 model spec modeled after the Hydra validation scenario."""
     return Float32ModelSpec(
         input_dim=HYDRA_INPUT_DIM,
@@ -204,7 +204,7 @@ LEXICON_NUM_MODULES = 4
 
 
 @pytest.fixture
-def fp32_lexicon_spec() -> Float32ModelSpec:
+def fp32_lexicon_spec() -> ModelSpec:
     """A model spec with massive output classes (Lexicon scenario)."""
     return Float32ModelSpec(
         input_dim=LEXICON_INPUT_DIM,
@@ -222,12 +222,12 @@ def fp32_lexicon_spec() -> Float32ModelSpec:
 
 
 @pytest.fixture
-def iris_param_space(fp32_iris_spec: Float32ModelSpec) -> ParameterSpace:
+def iris_param_space(fp32_iris_spec: ModelSpec) -> ParameterSpace:
     return ParameterSpace(spec=fp32_iris_spec)
 
 
 @pytest.fixture
-def iris_tiling(fp32_iris_spec: Float32ModelSpec) -> TilingScheme:
+def iris_tiling(fp32_iris_spec: ModelSpec) -> TilingScheme:
     spec = fp32_iris_spec
     return TilingScheme(
         num_module_chunks=(spec.num_modules + 15) // 16,

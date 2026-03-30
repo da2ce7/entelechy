@@ -27,3 +27,8 @@ ninja -C builddir
 ```
 
 Do not assume an editable Python reinstall will recompile the native CPU library.
+
+## Running Tests
+
+When running tests or lints, tee to a temp file (`/tmp/...`) and then grep that
+file after the tests have completed. Rerunning a test to get a different grep is wasteful.

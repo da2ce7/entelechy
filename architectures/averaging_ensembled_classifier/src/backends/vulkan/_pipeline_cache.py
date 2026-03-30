@@ -11,14 +11,17 @@ import importlib.resources
 import pathlib
 import struct
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .context import VulkanContext
 
-try:
+if TYPE_CHECKING:
     import vulkan as vk  # type: ignore[import-untyped]
-except ImportError:
-    pass
+else:
+    try:
+        import vulkan as vk
+    except ImportError:
+        vk = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)

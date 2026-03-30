@@ -37,7 +37,7 @@ from src.shared.workload_primitives import (
 # Canonical Model Configurations (mirroring conftest.py scenarios)
 # =========================================================================
 
-_SPECS: dict[str, Float32ModelSpec] = {
+_SPECS: dict[str, ModelSpec] = {
     "iris": Float32ModelSpec(
         input_dim=4, hidden_dim=32, output_classes=3,
         num_modules=8, simd_width=4, cache_line_bytes=64,

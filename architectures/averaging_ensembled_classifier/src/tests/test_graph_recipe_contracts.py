@@ -22,7 +22,7 @@ from typing import Dict, Tuple
 import numpy as np
 import pytest
 
-from src.shared.model_spec import Float32ModelSpec
+from src.shared.model_spec import ModelSpec
 from src.shared.parameter_space import ParameterSpace, ParameterFlowConfig
 from src.shared.memory_layout import MemoryLayout
 from src.shared.workload_primitives import TilingScheme
@@ -34,7 +34,7 @@ from src.backends.opencl.execution_plan import CceStrategy, BceStrategy
 # =========================================================================
 
 
-def _make_tiling(spec: Float32ModelSpec) -> TilingScheme:
+def _make_tiling(spec: ModelSpec) -> TilingScheme:
     return TilingScheme(
         num_module_chunks=(spec.num_modules + 15) // 16,
         num_class_chunks=(spec.output_classes + 15) // 16,
@@ -43,7 +43,7 @@ def _make_tiling(spec: Float32ModelSpec) -> TilingScheme:
     )
 
 
-def _get_layouts(spec: Float32ModelSpec, batch_size: int = 150, num_chunks: int = 4):
+def _get_layouts(spec: ModelSpec, batch_size: int = 150, num_chunks: int = 4):
     ps = ParameterSpace(spec=spec)
     grid = _make_tiling(spec)
     return ps.get_all_memory_layouts(batch_size=batch_size, grid=grid, num_batch_chunks=num_chunks), grid, ps
@@ -325,7 +325,7 @@ class TestStrategyKwargsFiltering:
             "loss_out_ref": "fake_loss",
             "partial_loss_out_ref": "fake_partial_loss",
         }
-        strategy = CceStrategy(targets_cce_ref="fake_targets")
+        strategy = CceStrategy(targets_cce_ref="fake_targets")  # type: ignore[arg-type]
         # This should NOT raise a TypeError about partial_loss_out_ref
         try:
             result = strategy.get_loss_signature(**kwargs)
@@ -353,7 +353,7 @@ class TestStrategyKwargsFiltering:
             "loss_out_ref": "fake_loss",
             "partial_loss_out_ref": "fake_partial_loss",
         }
-        strategy = BceStrategy(targets_bce_ref="fake_targets")
+        strategy = BceStrategy(targets_bce_ref="fake_targets")  # type: ignore[arg-type]
         try:
             result = strategy.get_loss_signature(**kwargs)
         except TypeError as e:

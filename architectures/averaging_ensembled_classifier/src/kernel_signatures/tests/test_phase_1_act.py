@@ -33,7 +33,7 @@ from .conftest import (
     make_tile,
 )
 
-from src.kernel_signatures.phase_1_act import (
+from src.kernel_signatures.phase_1_act import (  # type: ignore[import-not-found]
     ForwardPassSignature,
     RenderLogitsChunkSignature,
     ComputeProbsLossCceChunkSignature,

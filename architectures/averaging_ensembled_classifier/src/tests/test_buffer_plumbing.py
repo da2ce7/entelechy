@@ -23,7 +23,7 @@ from typing import Dict
 import numpy as np
 import pytest
 
-from src.shared.model_spec import Float32ModelSpec
+from src.shared.model_spec import ModelSpec
 from src.shared.parameter_space import ParameterSpace, ParameterFlowConfig
 from src.shared.memory_layout import MemoryLayout
 from src.shared.workload_primitives import (
@@ -34,7 +34,7 @@ from src.shared.workload_primitives import (
 )
 
 
-def _make_tiling(spec: Float32ModelSpec) -> TilingScheme:
+def _make_tiling(spec: ModelSpec) -> TilingScheme:
     return TilingScheme(
         num_module_chunks=(spec.num_modules + 15) // 16,
         num_class_chunks=(spec.output_classes + 15) // 16,
@@ -43,7 +43,7 @@ def _make_tiling(spec: Float32ModelSpec) -> TilingScheme:
     )
 
 
-def _get_layouts(spec: Float32ModelSpec, batch_size: int = 150, num_chunks: int = 4):
+def _get_layouts(spec: ModelSpec, batch_size: int = 150, num_chunks: int = 4):
     ps = ParameterSpace(spec=spec)
     grid = _make_tiling(spec)
     return ps.get_all_memory_layouts(batch_size=batch_size, grid=grid, num_batch_chunks=num_chunks), grid, ps
@@ -108,7 +108,7 @@ class TestElementsPerPartial:
     This test verifies that calculation is self-consistent.
     """
 
-    def test_module_weights_epp(self, iris_spec: Float32ModelSpec) -> None:
+    def test_module_weights_epp(self, iris_spec: ModelSpec) -> None:
         """elements_per_partial for clipped_partial_grad_module_weights."""
         layouts, grid, ps = _get_layouts(iris_spec)
         layout = layouts["clipped_partial_grad_module_weights"]
@@ -121,21 +121,21 @@ class TestElementsPerPartial:
         tg = TiledGather(scheme=grid, _elements_per_partial=epp)
         assert tg.num_partials == grid.total_tiles
 
-    def test_module_biases_epp(self, iris_spec: Float32ModelSpec) -> None:
+    def test_module_biases_epp(self, iris_spec: ModelSpec) -> None:
         layouts, grid, ps = _get_layouts(iris_spec)
         shape = layouts["clipped_partial_grad_module_biases"].logical_shape
         assert len(shape) == 3  # (total_tiles, max_mods_per_tile, max_cls_per_tile)
         epp = int(np.prod(shape[1:]))
         assert epp > 0
 
-    def test_temps_epp(self, iris_spec: Float32ModelSpec) -> None:
+    def test_temps_epp(self, iris_spec: ModelSpec) -> None:
         layouts, grid, ps = _get_layouts(iris_spec)
         shape = layouts["clipped_partial_grad_temps"].logical_shape
         assert len(shape) == 2  # (total_tiles, max_mods_per_tile)
         epp = int(np.prod(shape[1:]))
         assert epp > 0
 
-    def test_shared_weights_epp_linear_chunked(self, iris_spec: Float32ModelSpec) -> None:
+    def test_shared_weights_epp_linear_chunked(self, iris_spec: ModelSpec) -> None:
         """Shared weights use LinearlyChunkedGather with num_batch_chunks."""
         layouts, grid, ps = _get_layouts(iris_spec, num_chunks=4)
         shape = layouts["clipped_partial_grad_shared_weights"].logical_shape
@@ -145,7 +145,7 @@ class TestElementsPerPartial:
         g = LinearlyChunkedGather(num_chunks=4, elements_per_chunk=epp)
         assert g.num_partials == 4
 
-    def test_shared_biases_epp_linear_chunked(self, iris_spec: Float32ModelSpec) -> None:
+    def test_shared_biases_epp_linear_chunked(self, iris_spec: ModelSpec) -> None:
         layouts, grid, ps = _get_layouts(iris_spec, num_chunks=4)
         shape = layouts["clipped_partial_grad_shared_biases"].logical_shape
         assert len(shape) == 2  # (num_batch_chunks, padded_hidden_dim)
@@ -200,7 +200,7 @@ class TestDiagnosticAggregation:
     The destination is final_probs.  Its total element count must be >= epp.
     """
 
-    def test_final_probs_consistent_with_partial(self, iris_spec: Float32ModelSpec) -> None:
+    def test_final_probs_consistent_with_partial(self, iris_spec: ModelSpec) -> None:
         layouts, grid, _ = _get_layouts(iris_spec)
         partial_shape = layouts["partial_probs"].logical_shape
         final_shape = layouts["final_probs"].logical_shape
@@ -213,7 +213,7 @@ class TestDiagnosticAggregation:
             f"one partial has {epp} (from partial_probs {partial_shape})"
         )
 
-    def test_final_loss_consistent_with_partial(self, iris_spec: Float32ModelSpec) -> None:
+    def test_final_loss_consistent_with_partial(self, iris_spec: ModelSpec) -> None:
         layouts, grid, _ = _get_layouts(iris_spec)
         partial_shape = layouts["partial_loss"].logical_shape
         final_shape = layouts["final_loss"].logical_shape

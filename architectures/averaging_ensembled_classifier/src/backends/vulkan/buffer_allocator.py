@@ -8,17 +8,20 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from ...shared.buffer_lifecycle import BufferDescriptor, BufferHandle, BufferRole
 from .context import VulkanContext
 
-try:
+if TYPE_CHECKING:
     import vulkan as vk  # type: ignore[import-untyped]
-except ImportError:
-    pass
+else:
+    try:
+        import vulkan as vk
+    except ImportError:
+        vk = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -184,11 +187,11 @@ class VulkanBufferAllocator:
 
         mem_req = vk.vkGetBufferMemoryRequirements(self._device, buffer)
         mem_type_idx = self._find_memory_type(
-            mem_req.memoryTypeBits, memory_properties
+            mem_req.memoryTypeBits, memory_properties  # type: ignore[reportAttributeAccessIssue]
         )
 
         alloc_info = vk.VkMemoryAllocateInfo(
-            allocationSize=mem_req.size,
+            allocationSize=mem_req.size,  # type: ignore[reportAttributeAccessIssue]
             memoryTypeIndex=mem_type_idx,
         )
         memory = vk.vkAllocateMemory(self._device, alloc_info, None)
@@ -200,14 +203,14 @@ class VulkanBufferAllocator:
         self, type_filter: int, properties: int
     ) -> int:
         """Find a memory type index satisfying the filter and property flags."""
-        for i in range(self._mem_props.memoryTypeCount):
+        for i in range(self._mem_props.memoryTypeCount):  # type: ignore[reportAttributeAccessIssue]
             if (type_filter & (1 << i)) and (
-                self._mem_props.memoryTypes[i].propertyFlags & properties
+                self._mem_props.memoryTypes[i].propertyFlags & properties  # type: ignore[reportAttributeAccessIssue]
             ) == properties:
                 return i
         raise RuntimeError(
             f"No suitable memory type found for properties {properties:#x}. "
-            f"Available types: {[self._mem_props.memoryTypes[i].propertyFlags for i in range(self._mem_props.memoryTypeCount)]}"
+            f"Available types: {[self._mem_props.memoryTypes[i].propertyFlags for i in range(self._mem_props.memoryTypeCount)]}"  # type: ignore[reportAttributeAccessIssue]
         )
 
     def _destroy_staging(self, staging: VulkanStagingBuffer) -> None:

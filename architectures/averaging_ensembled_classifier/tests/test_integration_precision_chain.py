@@ -22,7 +22,7 @@ Target CONCEPT.md Principle:
 No OpenCL device is required.
 """
 
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pytest
@@ -37,7 +37,7 @@ from src.shared.workload_primitives import TilingScheme
 # =========================================================================
 
 
-def _make_spec(cls: type[ModelSpec], **overrides: Any) -> ModelSpec:
+def _make_spec(cls: Callable[..., ModelSpec], **overrides: Any) -> ModelSpec:
     defaults = dict(
         input_dim=4,
         hidden_dim=32,
@@ -170,7 +170,7 @@ class TestPrecisionEdgeCases:
 
     def test_scalar_type_consistency_through_pipeline(self):
         """The dtype used for padding must match the spec's SCALAR_NP_TYPE."""
-        test_cases: list[tuple[type[ModelSpec], type]] = [
+        test_cases: list[tuple[Callable[..., ModelSpec], type]] = [
             (Float32ModelSpec, np.float32),
             (Float16ModelSpec, np.float16),
         ]

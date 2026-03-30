@@ -1,6 +1,6 @@
 # Phase 4: Test Harness — Detailed Plan
 
-**Status:** Not started  
+**Status:** ✅ Complete  
 **Phase:** 4 of 6  
 **Objective:** Bring the full Tier 1/2/3 test framework to operational status, providing validation infrastructure that serves all backend development phases. The test harness grows its coverage incrementally as backends become available — its gate is satisfied when all enabled tiers are green.  
 **Governing ADRs:** ADR-016 (test strategy — layered pytest framework, CPU oracle, analytical + numpy fixtures), ADR-014 (build system — `_build_config.py` backend flags), ADR-008 (precision configuration — per-kernel tolerances), ADR-013 (kernel source strategy — kernel inventory), ADR-015 (CPU FFI — layout verification as pre-gate; Tier 2 as FFI behavioral verification), ADR-011 (CCE/BCE strategy delegation — Strategy A/B test matrix), ADR-005 (Node 16 opacity — fixture complexity)  
@@ -37,12 +37,12 @@ Several Phase 4 deliverables already exist due to organic development during Pha
 | Numpy reference: update | ✅ Complete | `tests/tier2/fixtures/numpy_update.py` |
 | Data generators | ✅ Complete | `tests/tier2/fixtures/data_generators.py` |
 | Tolerance configuration | ✅ Complete | `tests/tolerance_config.py` |
-| Top-level conftest (legacy) | ⚠️ Partial | `tests/conftest.py` — legacy probe-based skip logic; not yet `_build_config`-driven collection modifier |
-| Tier 3 directory and files | ❌ Not started | `tests/tier3/` does not exist |
-| Tier 3 oracle selection | ❌ Not started | — |
-| `--all-pairs` mode | ❌ Not started | — |
-| Tier 2 Vulkan test files | ❌ Not started (Phase 5 dependency) | — |
-| pytest marker registration | ⚠️ Partial | `tier1`, `tier2` markers used implicitly; `tier3`, `cpu`, `opencl`, `vulkan` not formally registered |
+| Top-level conftest (legacy) | ✅ Complete | `tests/conftest.py` — modernized to `_build_config`-driven `pytest_collection_modifyitems` skip logic |
+| Tier 3 directory and files | ✅ Complete | `tests/tier3/` — `conftest.py`, `test_parity_per_kernel.py`, `test_parity_e2e.py` |
+| Tier 3 oracle selection | ✅ Complete | `tests/tier3/conftest.py` — CPU oracle with GPU-vs-GPU fallback |
+| `--all-pairs` mode | ✅ Complete | `tests/conftest.py` — `--all-pairs` option triggers supplementary GPU-vs-GPU comparison |
+| Tier 2 Vulkan test files | ✅ Complete | `tests/tier2/vulkan/` — 17 test stubs, conftest with `_build_config` skip |
+| pytest marker registration | ✅ Complete | `pyproject.toml` — `tier1`, `tier2`, `tier3`, `cpu`, `opencl`, `vulkan`, `slow` formally registered |
 
 ---
 

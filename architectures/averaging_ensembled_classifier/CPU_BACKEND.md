@@ -145,14 +145,14 @@ void execute_learn_phase(PipelineContext* ctx, ThreadPool* pool) {
     execute_reduction_tree(pool, ctx, GRAD_SHARED_BIASES);   // Node 20
 
     pool_dispatch_and_wait(pool, task_normalize_gradients,
-                           ctx, NUM_PARAM_GROUPS);           // Node 21
+                           ctx, ctx->parameter_count);       // Node 21
 
-    // Phase V: Update — one task per parameter group
+    // Phase V: Update — one task per parameter element
     pool_dispatch_and_wait(pool, task_adam_update,
-                           ctx, NUM_PARAM_GROUPS);           // Node 24
+                           ctx, ctx->parameter_count);       // Node 24
 
-    // Node 25: single-threaded, trivial
-    clamp_temperatures_cpu(ctx);
+    pool_dispatch_and_wait(pool, task_clamp_temperatures,
+                           ctx, ctx->total_modules_count);   // Node 25
 }
 ```
 

@@ -11,13 +11,18 @@ import ctypes
 import numpy as np
 from numpy.typing import NDArray
 
+from typing import TYPE_CHECKING
+
 from .buffer_allocator import VulkanStagingBuffer
 from .context import VulkanContext
 
-try:
+if TYPE_CHECKING:
     import vulkan as vk  # type: ignore[import-untyped]
-except ImportError:
-    pass
+else:
+    try:
+        import vulkan as vk
+    except ImportError:
+        vk = None  # type: ignore[assignment]
 
 _UINT64_MAX = 2**64 - 1
 

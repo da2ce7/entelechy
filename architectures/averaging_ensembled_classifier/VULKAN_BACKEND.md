@@ -1,6 +1,6 @@
 # Vulkan Back-End: Architecture for Explicit GPU Compute
 
-> **Implementation Status:** Not started — Phase 5 (post-Phase 3). This document is the architectural specification for future implementation.
+> **Implementation Status: ✅ Complete** — Phase 5 implemented. All components described in this document have been realized in `src/backends/vulkan/` with a Vulkan renderer, GLSL compute shaders compiled to SPIR-V, and Tier 2/3 test coverage. The Meson build target produces the Vulkan shared library. See [PHASE-5](plan/PHASE-5-VULKAN-BACKEND.md) for implementation details. Dispatch geometry for `linear_generic` placement strategy kernels (`normalize_gradients`, `adam_update`, `clamp_temperatures`, `stabilize_reduce_grad_h`) uses per-kernel workgroup count resolvers rather than `tile_count`.
 
 ## Design Constraints
 

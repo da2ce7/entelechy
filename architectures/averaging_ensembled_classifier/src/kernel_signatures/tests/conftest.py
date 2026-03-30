@@ -265,9 +265,9 @@ def classify_python_arg(arg: object) -> ParamCategory:
     if arg is None:
         # None is used for NULL buffer pointers (e.g., unused per-item norm buffer)
         return ParamCategory.GLOBAL_BUFFER
-    if isinstance(arg, np.uint32):
+    if isinstance(arg, np.uint32):  # type: ignore[arg-type]
         return ParamCategory.UINT_SCALAR
-    if isinstance(arg, (np.float32, np.float16)):
+    if isinstance(arg, (np.float32, np.float16)):  # type: ignore[arg-type]
         return ParamCategory.FLOAT_SCALAR
     raise ValueError(
         f"Cannot classify Python arg: {arg!r} (type: {type(arg).__name__})"
@@ -278,7 +278,7 @@ def classify_python_arg(arg: object) -> ParamCategory:
 # Standard WorkTile Factory
 # =========================================================================
 
-from src.workload_primitives import WorkTile
+from src.workload_primitives import WorkTile  # type: ignore[import-not-found]
 
 
 def make_tile(

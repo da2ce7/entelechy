@@ -60,7 +60,7 @@ import numpy as np
 import pytest
 
 from src.backends.opencl.launcher_infra import BufferHandle, KernelSignature
-from src.shared.model_spec import Float32ModelSpec
+from src.shared.model_spec import Float32ModelSpec, ModelSpec
 from src.shared.parameter_space import ParameterSpace
 from src.shared.workload_primitives import TilingScheme, WorkTile
 
@@ -72,7 +72,7 @@ def _h(n: int) -> BufferHandle:
     return BufferHandle(id=n)
 
 
-def _make_iris_spec(simd_width: int = 1) -> Float32ModelSpec:
+def _make_iris_spec(simd_width: int = 1) -> ModelSpec:
     return Float32ModelSpec(
         input_dim=4,
         hidden_dim=32,
@@ -83,7 +83,7 @@ def _make_iris_spec(simd_width: int = 1) -> Float32ModelSpec:
     )
 
 
-def _make_tiling(spec: Float32ModelSpec) -> TilingScheme:
+def _make_tiling(spec: ModelSpec) -> TilingScheme:
     return TilingScheme(
         num_module_chunks=(spec.num_modules + 15) // 16,
         num_class_chunks=(spec.output_classes + 15) // 16,
@@ -159,7 +159,7 @@ class TestComputeOnceProvider:
         mock_exec.launch.return_value = MagicMock()
         sentinel_events = [MagicMock(), MagicMock()]
 
-        provider.resolve(mock_queue, mock_exec, wait_for=sentinel_events)
+        provider.resolve(mock_queue, mock_exec, wait_for=sentinel_events)  # type: ignore[arg-type]
         mock_exec.launch.assert_called_once_with(mock_queue, mock_sig, wait_for=sentinel_events)
 
     def test_frozen_dataclass_allows_cache_mutation(self) -> None:
@@ -187,7 +187,7 @@ class TestComputeOnceProvider:
         provider = CacheProvider(handle=handle, ready_event=stale_event)
 
         fresh_events = [MagicMock(), MagicMock()]
-        ret_handle, ret_event = provider.resolve(MagicMock(), MagicMock(), wait_for=fresh_events)
+        ret_handle, ret_event = provider.resolve(MagicMock(), MagicMock(), wait_for=fresh_events)  # type: ignore[arg-type]
 
         # CacheProvider always returns the stale event — it cannot honour
         # fresh_events.  This is WHY ComputeOnceProvider was needed.
@@ -272,8 +272,8 @@ class TestNode8DispatchGrid:
         )
 
         return CalculateModuleParamGradsCceSignature(
-            _buffer_mgr=bm,
-            _arch_consts=arch,
+            _buffer_mgr=bm,  # type: ignore[arg-type]
+            _arch_consts=arch,  # type: ignore[arg-type]
             work_group_size_0=work_group_size_0,
             h_ref=h_ref,
             prob_ref=prob_ref,
@@ -303,6 +303,7 @@ class TestNode8DispatchGrid:
         for wg_size in [32, 64, 128, 256]:
             sig = self._make_signature(work_group_size_0=wg_size)
             _, local_size = sig.get_grid()
+            assert local_size is not None
             assert local_size[0] == wg_size, (
                 f"Expected local_size[0]={wg_size}, got {local_size[0]}"
             )
@@ -311,6 +312,7 @@ class TestNode8DispatchGrid:
         """Dims 1 and 2 map to hidden and class indices — one work-group each."""
         sig = self._make_signature()
         _, local_size = sig.get_grid()
+        assert local_size is not None
         assert len(local_size) == 3
         assert local_size[1] == 1
         assert local_size[2] == 1
@@ -341,6 +343,7 @@ class TestNode8DispatchGrid:
             classes_per_chunk=C, work_group_size_0=WG,
         )
         global_size, local_size = sig.get_grid()
+        assert local_size is not None
         num_wg_d0 = global_size[0] // local_size[0]
         num_wg_d1 = global_size[1] // local_size[1]
         num_wg_d2 = global_size[2] // local_size[2]
@@ -358,6 +361,7 @@ class TestNode8DispatchGrid:
             classes_per_chunk=3, work_group_size_0=256,
         )
         global_size, local_size = sig.get_grid()
+        assert local_size is not None
         # The grid must request 8 separate work-groups in dim 0
         assert global_size[0] // local_size[0] == 8, (
             "Must have exactly 8 work-groups in dim 0 (one per module)"
@@ -398,7 +402,7 @@ class TestBufferZeroInitialization:
     """
 
     @staticmethod
-    def _get_all_buffer_names(spec: Float32ModelSpec, batch_size: int = 150) -> set:
+    def _get_all_buffer_names(spec: ModelSpec, batch_size: int = 150) -> set:
         ps = ParameterSpace(spec=spec)
         grid = _make_tiling(spec)
         layouts = ps.get_all_memory_layouts(
@@ -571,8 +575,8 @@ class TestNode10DispatchGrid:
         )
 
         return CalculateChunkTempGradientsCceSignature(
-            _buffer_mgr=bm,
-            _arch_consts=arch,
+            _buffer_mgr=bm,  # type: ignore[arg-type]
+            _arch_consts=arch,  # type: ignore[arg-type]
             work_group_size_0=wg_size,
             logit_ref=logit_ref,
             prob_ref=prob_ref,
@@ -592,18 +596,21 @@ class TestNode10DispatchGrid:
     def test_temp_kernel_local_dim0_equals_wg_size(self) -> None:
         sig = self._make_temp_signature(wg_size=128)
         _, local_size = sig.get_grid()
+        assert local_size is not None
         assert local_size[0] == 128
 
     def test_temp_kernel_grid_is_1d(self) -> None:
         """Temp gradient grid is 1D, not 3D like Node 8."""
         sig = self._make_temp_signature()
         global_size, local_size = sig.get_grid()
+        assert local_size is not None
         assert len(global_size) == 1
         assert len(local_size) == 1
 
     def test_temp_kernel_work_groups_equals_modules(self) -> None:
         sig = self._make_temp_signature(modules_per_chunk=4, wg_size=64)
         global_size, local_size = sig.get_grid()
+        assert local_size is not None
         assert global_size[0] // local_size[0] == 4
 
 
@@ -624,7 +631,7 @@ class TestSharedWeightsLayout:
     """
 
     @staticmethod
-    def _get_sw_layout(spec: Float32ModelSpec):
+    def _get_sw_layout(spec: ModelSpec):
         ps = ParameterSpace(spec=spec)
         grid = _make_tiling(spec)
         layouts = ps.get_all_memory_layouts(batch_size=150, grid=grid, num_batch_chunks=4)
@@ -750,8 +757,8 @@ class TestBackpropGradientLayoutAlignment:
         arch = _FakeArchConsts(reduction_wg=256, rect_tile_dim1=16)
 
         return BackpropSharedWeightsChunkSignature(
-            _buffer_mgr=bm,
-            _arch_consts=arch,
+            _buffer_mgr=bm,  # type: ignore[arg-type]
+            _arch_consts=arch,  # type: ignore[arg-type]
             input_ref=input_ref,
             h_ref=h_ref,
             grad_h_ref=grad_h_ref,
@@ -783,6 +790,7 @@ class TestBackpropGradientLayoutAlignment:
         """Grid dim 1 must cover all hidden neurons (padded to tile size)."""
         sig = self._make_backprop_sw_sig(padded_input=16, padded_hidden=32)
         global_size, local_size = sig.get_grid()
+        assert local_size is not None
         assert global_size[1] >= 32
         # Must be a multiple of local_size[1]
         assert global_size[1] % local_size[1] == 0
@@ -857,7 +865,7 @@ class TestBatchChunkIndexContract:
         arch = _FakeArchConsts(rect_tile_dim1=16)
 
         return BackpropSharedWeightsChunkSignature(
-            _buffer_mgr=bm, _arch_consts=arch,
+            _buffer_mgr=bm,  # type: ignore[arg-type] _arch_consts=arch,  # type: ignore[arg-type]
             input_ref=input_ref, h_ref=h_ref, grad_h_ref=grad_h_ref,
             mask_ref=mask_ref, partial_gsw_out_ref=out_ref,
             batch_chunk_offset=np.uint32(0),

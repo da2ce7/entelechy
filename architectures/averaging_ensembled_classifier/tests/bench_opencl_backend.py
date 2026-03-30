@@ -36,7 +36,7 @@ if TYPE_CHECKING:
         Float32DiscoveredArchConstants,
     )
     from src.arch_primitives import Float32Context
-    from src.shared.model_spec import Float32ModelSpec
+    from src.shared.model_spec import Float32ModelSpec, ModelSpec
     from src.shared.parameter_space import ParameterSpace
     from src.shared.memory_layout import MemoryLayout
     from src.shared.workload_primitives import TilingScheme
@@ -160,7 +160,7 @@ _IRIS_SPEC = None
 _HYDRA_SPEC = None
 
 
-def _get_iris_spec(arch_consts: Float32DiscoveredArchConstants) -> Float32ModelSpec:
+def _get_iris_spec(arch_consts: Float32DiscoveredArchConstants) -> ModelSpec:
     return Float32ModelSpec(
         input_dim=4, hidden_dim=32, output_classes=3,
         num_modules=8, simd_width=arch_consts.simd_width,
@@ -168,7 +168,7 @@ def _get_iris_spec(arch_consts: Float32DiscoveredArchConstants) -> Float32ModelS
     )
 
 
-def _get_hydra_spec(arch_consts: Float32DiscoveredArchConstants) -> Float32ModelSpec:
+def _get_hydra_spec(arch_consts: Float32DiscoveredArchConstants) -> ModelSpec:
     return Float32ModelSpec(
         input_dim=16, hidden_dim=64, output_classes=10,
         num_modules=256, simd_width=arch_consts.simd_width,
@@ -176,7 +176,7 @@ def _get_hydra_spec(arch_consts: Float32DiscoveredArchConstants) -> Float32Model
     )
 
 
-def _make_tiling(spec: Float32ModelSpec) -> TilingScheme:
+def _make_tiling(spec: ModelSpec) -> TilingScheme:
     return TilingScheme(
         num_module_chunks=(spec.num_modules + 15) // 16,
         num_class_chunks=(spec.output_classes + 15) // 16,
@@ -187,7 +187,7 @@ def _make_tiling(spec: Float32ModelSpec) -> TilingScheme:
 
 def _allocate_model_buffers(
     bm: BufferManager,
-    spec: Float32ModelSpec,
+    spec: ModelSpec,
     batch_size: int,
 ) -> None:
     """

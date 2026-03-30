@@ -7,15 +7,18 @@ Two-track strategy (VULKAN_BACKEND.md §Descriptor Set Strategy):
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .buffer_allocator import VulkanBuffer
 from .context import VulkanContext
 
-try:
+if TYPE_CHECKING:
     import vulkan as vk  # type: ignore[import-untyped]
-except ImportError:
-    pass
+else:
+    try:
+        import vulkan as vk
+    except ImportError:
+        vk = None  # type: ignore[assignment]
 
 
 class VulkanDescriptorManager:
@@ -120,7 +123,7 @@ class VulkanDescriptorManager:
             writes.append(write)
         if writes:
             push_fn = self._ctx.cmd_push_descriptor_set_khr
-            push_fn(
+            push_fn(  # type: ignore[reportCallIssue]
                 cmd,
                 vk.VK_PIPELINE_BIND_POINT_COMPUTE,
                 layout,

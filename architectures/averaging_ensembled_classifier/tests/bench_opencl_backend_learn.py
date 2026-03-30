@@ -63,7 +63,7 @@ if TYPE_CHECKING:
         Float32DiscoveredArchConstants,
     )
     from src.arch_primitives import Float32Context
-    from src.shared.model_spec import Float32ModelSpec
+    from src.shared.model_spec import Float32ModelSpec, ModelSpec
     from src.shared.parameter_space import ParameterSpace
     from src.shared.workload_primitives import TilingScheme
     from src.backends.opencl.launcher_infra import (
@@ -189,7 +189,7 @@ def ex(program: cl.Program) -> KernelExecutor:
 
 # --- Canonical model specifications ---
 
-def _get_iris_spec(arch_consts: Float32DiscoveredArchConstants) -> Float32ModelSpec:
+def _get_iris_spec(arch_consts: Float32DiscoveredArchConstants) -> ModelSpec:
     return Float32ModelSpec(
         input_dim=4, hidden_dim=32, output_classes=3,
         num_modules=8, simd_width=arch_consts.simd_width,
@@ -197,7 +197,7 @@ def _get_iris_spec(arch_consts: Float32DiscoveredArchConstants) -> Float32ModelS
     )
 
 
-def _make_tiling(spec: Float32ModelSpec) -> TilingScheme:
+def _make_tiling(spec: ModelSpec) -> TilingScheme:
     return TilingScheme(
         num_module_chunks=(spec.num_modules + 15) // 16,
         num_class_chunks=(spec.output_classes + 15) // 16,
@@ -208,7 +208,7 @@ def _make_tiling(spec: Float32ModelSpec) -> TilingScheme:
 
 def _allocate_model_buffers(
     bm: BufferManager,
-    spec: Float32ModelSpec,
+    spec: ModelSpec,
     batch_size: int,
     num_batch_chunks: int = 4,
 ) -> TilingScheme:
@@ -315,7 +315,7 @@ class TestBenchLossKernels:
     def _setup_loss_prereqs(
         self, compute_env: Float32ComputeEnvironment,
         arch_consts: Float32DiscoveredArchConstants,
-        spec: Float32ModelSpec, batch_size: int,
+        spec: ModelSpec, batch_size: int,
     ):
         """Common setup: allocate buffers and seed inputs for loss kernels."""
         q = compute_env.cl_bundle.queue
@@ -477,7 +477,7 @@ class TestBenchGradientProductionKernels:
     def _setup_gradient_prereqs(
         self, compute_env: Float32ComputeEnvironment,
         arch_consts: Float32DiscoveredArchConstants,
-        spec: Float32ModelSpec, batch_size: int,
+        spec: ModelSpec, batch_size: int,
     ):
         """Common setup for gradient production benchmarks."""
         q = compute_env.cl_bundle.queue
@@ -652,10 +652,10 @@ class TestBenchClipPartialGradients:
             grad_biases_module=bm.get_handle_by_name("partial_grad_module_biases"),
             grad_temps=bm.get_handle_by_name("partial_grad_temps"),
             grad_hidden_activations_aos=bm.get_handle_by_name("partial_grad_hidden_activations"),
-            clipped_grad_weights_module=bm.get_handle_by_name("clipped_grad_module_weights"),
-            clipped_grad_biases_module=bm.get_handle_by_name("clipped_grad_module_biases"),
-            clipped_grad_temps=bm.get_handle_by_name("clipped_grad_temps"),
-            clipped_grad_hidden_activations_aos=bm.get_handle_by_name("clipped_grad_hidden_activations"),
+            clipped_grad_weights_module=bm.get_handle_by_name("clipped_partial_grad_module_weights"),
+            clipped_grad_biases_module=bm.get_handle_by_name("clipped_partial_grad_module_biases"),
+            clipped_grad_temps=bm.get_handle_by_name("clipped_partial_grad_temps"),
+            clipped_grad_hidden_activations_aos=bm.get_handle_by_name("clipped_partial_grad_hidden_activations"),
         )
 
         sig = ClipPartialGradientsGlobalNormSignature(
@@ -701,7 +701,7 @@ class TestBenchGatherAndPermute:
         _grid = _allocate_model_buffers(bm, spec, batch_size)
 
         # Seed the clipped partials buffer
-        _seed_buffer(q, bm, "clipped_grad_hidden_activations")
+        _seed_buffer(q, bm, "clipped_partial_grad_hidden_activations")
 
         max_mods_per_tile = (
             (spec.num_modules + _grid.num_module_chunks - 1) // _grid.num_module_chunks
@@ -709,7 +709,7 @@ class TestBenchGatherAndPermute:
 
         sig = GatherAndPermuteGradHiddenActivationsSignature(
             _buffer_mgr=bm, _arch_consts=arch_consts,
-            clipped_partials_aos_ref=bm.get_handle_by_name("clipped_grad_hidden_activations"),
+            clipped_partials_aos_ref=bm.get_handle_by_name("clipped_partial_grad_hidden_activations"),
             permuted_soa_out_ref=bm.get_handle_by_name("permuted_grad_h"),
             total_modules_count=np.uint32(spec.num_modules),
             hidden_count=np.uint32(spec.hidden_dim),
@@ -795,7 +795,7 @@ class TestBenchSharedLayerBackprop:
     def _setup_shared_backprop(
         self, compute_env: Float32ComputeEnvironment,
         arch_consts: Float32DiscoveredArchConstants,
-        spec: Float32ModelSpec, batch_size: int,
+        spec: ModelSpec, batch_size: int,
     ):
         """Common setup for shared backprop benchmarks."""
         num_batch_chunks = 4
@@ -908,8 +908,8 @@ class TestBenchSharedLayerBackprop:
         handles = SharedGradientHandles(
             grad_weights_shared_chunk=bm.get_handle_by_name("partial_grad_shared_weights"),
             grad_biases_shared_chunk=bm.get_handle_by_name("partial_grad_shared_biases"),
-            clipped_grad_weights_shared_collection=bm.get_handle_by_name("clipped_grad_shared_weights"),
-            clipped_grad_biases_shared_collection=bm.get_handle_by_name("clipped_grad_shared_biases"),
+            clipped_grad_weights_shared_collection=bm.get_handle_by_name("clipped_partial_grad_shared_weights"),
+            clipped_grad_biases_shared_collection=bm.get_handle_by_name("clipped_partial_grad_shared_biases"),
         )
 
         sig = ClipSharedGradientsChunkSignature(
@@ -1097,10 +1097,10 @@ class TestBenchComposedLearnPipelines:
             grad_biases_module=bm.get_handle_by_name("partial_grad_module_biases"),
             grad_temps=bm.get_handle_by_name("partial_grad_temps"),
             grad_hidden_activations_aos=bm.get_handle_by_name("partial_grad_hidden_activations"),
-            clipped_grad_weights_module=bm.get_handle_by_name("clipped_grad_module_weights"),
-            clipped_grad_biases_module=bm.get_handle_by_name("clipped_grad_module_biases"),
-            clipped_grad_temps=bm.get_handle_by_name("clipped_grad_temps"),
-            clipped_grad_hidden_activations_aos=bm.get_handle_by_name("clipped_grad_hidden_activations"),
+            clipped_grad_weights_module=bm.get_handle_by_name("clipped_partial_grad_module_weights"),
+            clipped_grad_biases_module=bm.get_handle_by_name("clipped_partial_grad_module_biases"),
+            clipped_grad_temps=bm.get_handle_by_name("clipped_partial_grad_temps"),
+            clipped_grad_hidden_activations_aos=bm.get_handle_by_name("clipped_partial_grad_hidden_activations"),
         )
 
         sig_11 = ClipPartialGradientsGlobalNormSignature(
@@ -1199,8 +1199,8 @@ class TestBenchComposedLearnPipelines:
             handles_19 = SharedGradientHandles(
                 grad_weights_shared_chunk=bm.get_handle_by_name("partial_grad_shared_weights"),
                 grad_biases_shared_chunk=bm.get_handle_by_name("partial_grad_shared_biases"),
-                clipped_grad_weights_shared_collection=bm.get_handle_by_name("clipped_grad_shared_weights"),
-                clipped_grad_biases_shared_collection=bm.get_handle_by_name("clipped_grad_shared_biases"),
+                clipped_grad_weights_shared_collection=bm.get_handle_by_name("clipped_partial_grad_shared_weights"),
+                clipped_grad_biases_shared_collection=bm.get_handle_by_name("clipped_partial_grad_shared_biases"),
             )
 
             sigs_19.append(ClipSharedGradientsChunkSignature(

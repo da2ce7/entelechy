@@ -141,6 +141,7 @@ class ComputeOnceProvider(DependencyProvider):
         if self._cached_event is None:
             event = ex.launch(queue, self.signature, wait_for=wait_for)
             object.__setattr__(self, "_cached_event", event)
+        assert self._cached_event is not None
         return self.output_handle, self._cached_event
 
 

@@ -90,6 +90,30 @@ class CPUPlanRenderer:
     # Node-type dispatch methods
     # -----------------------------------------------------------
 
+    # Per-element kernels (placement_strategy="linear_generic") need
+    # their task count derived from scalar params, not tile_count.
+    # Each maps kernel_name → callable(scalar_params) → int.
+    _TASK_COUNT_RESOLVERS: dict[str, Any] = {
+        "stabilize_reduce_grad_h": lambda s: (
+            int(s["total_batch_count"]) * int(s["padded_hidden_count"])
+        ),
+        "normalize_gradients": lambda s: int(s["parameter_count"]),
+        "adam_update": lambda s: int(s["parameter_count"]),
+        "clamp_temperatures": lambda s: int(s["total_modules_count"]),
+    }
+
+    def _resolve_task_count(self, node: KernelDispatchNode) -> int:
+        """Compute the actual task count for a KernelDispatchNode.
+
+        For 'linear_generic' kernels each CPU task processes one element,
+        so the task count must be derived from the kernel's scalar params.
+        For all other placement strategies, tile_count is used directly.
+        """
+        resolver = self._TASK_COUNT_RESOLVERS.get(node.kernel_name)
+        if resolver is not None:
+            return resolver(node.scalar_params)
+        return node.tile_count
+
     def _render_kernel_dispatch(
         self,
         node: KernelDispatchNode,
@@ -104,7 +128,7 @@ class CPUPlanRenderer:
             self._pool,
             fn_addr,
             ctypes.byref(args),
-            node.tile_count,
+            self._resolve_task_count(node),
         )
 
     def _render_reduction_tree(
@@ -228,7 +252,7 @@ class CPUPlanRenderer:
 
         # Build a map of pointer field names -> field types for quick lookup
         pointer_fields: dict[str, type] = {}
-        for field_name, field_type in struct_cls._fields_:
+        for field_name, field_type in struct_cls._fields_:  # type: ignore[reportAssignmentType]
             if field_type in self._POINTER_TYPES:
                 pointer_fields[field_name] = field_type
 

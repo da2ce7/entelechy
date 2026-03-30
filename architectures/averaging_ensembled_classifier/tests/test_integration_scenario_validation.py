@@ -26,12 +26,12 @@ No OpenCL device is required.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pytest
 
-from src.shared.model_spec import Float32ModelSpec, Float16ModelSpec
+from src.shared.model_spec import Float32ModelSpec, Float16ModelSpec, ModelSpec
 from src.shared.parameter_space import ParameterSpace
 from src.shared.stabilization_policy import StabilizationPolicy
 from src.shared.workload_primitives import LinearlyChunkedGather, TilingScheme
@@ -41,7 +41,7 @@ from src.shared.workload_primitives import LinearlyChunkedGather, TilingScheme
 # =========================================================================
 
 
-def _make_spec(cls: type[Float32ModelSpec], **kwargs: Any) -> Float32ModelSpec:
+def _make_spec(cls: Callable[..., ModelSpec], **kwargs: Any) -> ModelSpec:
     defaults: dict[str, Any] = dict(
         input_dim=4,
         hidden_dim=32,
@@ -54,7 +54,7 @@ def _make_spec(cls: type[Float32ModelSpec], **kwargs: Any) -> Float32ModelSpec:
     return cls(**defaults)
 
 
-def _make_tiling(spec: Float32ModelSpec) -> TilingScheme:
+def _make_tiling(spec: ModelSpec) -> TilingScheme:
     return TilingScheme(
         num_module_chunks=(spec.num_modules + 15) // 16,
         num_class_chunks=(spec.output_classes + 15) // 16,
@@ -260,11 +260,11 @@ class TestHydra:
     that the planning pipeline handles the resulting memory pressure.
     """
 
-    def test_hydra_produces_many_tiles(self, fp32_hydra_spec: Float32ModelSpec) -> None:
+    def test_hydra_produces_many_tiles(self, fp32_hydra_spec: ModelSpec) -> None:
         grid = _make_tiling(fp32_hydra_spec)
         assert grid.total_tiles >= 16  # 256/16 = 16 at minimum
 
-    def test_hydra_reduction_tree_is_valid(self, fp32_hydra_spec: Float32ModelSpec) -> None:
+    def test_hydra_reduction_tree_is_valid(self, fp32_hydra_spec: ModelSpec) -> None:
         grid = _make_tiling(fp32_hydra_spec)
         policy = StabilizationPolicy(
             t_algorithmic=1.0,
@@ -279,7 +279,7 @@ class TestHydra:
             assert k >= 2
             assert stages >= 1
 
-    def test_hydra_all_tiles_have_valid_indices(self, fp32_hydra_spec: Float32ModelSpec) -> None:
+    def test_hydra_all_tiles_have_valid_indices(self, fp32_hydra_spec: ModelSpec) -> None:
         grid = _make_tiling(fp32_hydra_spec)
         indices: set[int] = set()
         for tile in grid:
@@ -299,11 +299,11 @@ class TestLexicon:
     memory layouts without pathological sizes.
     """
 
-    def test_lexicon_class_chunking(self, fp32_lexicon_spec: Float32ModelSpec) -> None:
+    def test_lexicon_class_chunking(self, fp32_lexicon_spec: ModelSpec) -> None:
         grid = _make_tiling(fp32_lexicon_spec)
         assert grid.num_class_chunks > 100
 
-    def test_lexicon_partial_buffer_shapes_valid(self, fp32_lexicon_spec: Float32ModelSpec) -> None:
+    def test_lexicon_partial_buffer_shapes_valid(self, fp32_lexicon_spec: ModelSpec) -> None:
         ps = ParameterSpace(spec=fp32_lexicon_spec)
         grid = _make_tiling(fp32_lexicon_spec)
         layouts = ps.get_all_memory_layouts(batch_size=16, grid=grid, num_batch_chunks=4)
@@ -455,7 +455,7 @@ class TestBehemoth:
     """
 
     @pytest.fixture
-    def behemoth_spec(self) -> Float32ModelSpec:
+    def behemoth_spec(self) -> ModelSpec:
         """A model with massive hidden_dim to stress memory layouts."""
         return _make_spec(
             Float32ModelSpec,
@@ -465,7 +465,7 @@ class TestBehemoth:
             num_modules=8,
         )
 
-    def test_hidden_activations_dominate_memory(self, behemoth_spec: Float32ModelSpec) -> None:
+    def test_hidden_activations_dominate_memory(self, behemoth_spec: ModelSpec) -> None:
         """With hidden_dim=2048, the hidden_activations buffer should be
         substantially larger than the module-level gradient buffers."""
         ps = ParameterSpace(spec=behemoth_spec)
@@ -488,7 +488,7 @@ class TestBehemoth:
         # With batch_size=256 and hidden_dim=2048, this buffer is at least 2MB
         assert hidden_bytes >= 256 * 2048 * dtype.itemsize
 
-    def test_permuted_grad_h_scales_with_hidden_dim(self, behemoth_spec: Float32ModelSpec) -> None:
+    def test_permuted_grad_h_scales_with_hidden_dim(self, behemoth_spec: ModelSpec) -> None:
         """The permuted_grad_h buffer grows linearly with hidden_dim and batch."""
         ps = ParameterSpace(spec=behemoth_spec)
         grid = _make_tiling(behemoth_spec)
@@ -507,7 +507,7 @@ class TestBehemoth:
         assert permuted.logical_shape[0] == batch_size * behemoth_spec.padded_hidden_dim
         assert permuted_bytes > 0
 
-    def test_cache_strategy_memory_footprint(self, behemoth_spec: Float32ModelSpec) -> None:
+    def test_cache_strategy_memory_footprint(self, behemoth_spec: ModelSpec) -> None:
         """Under CACHE strategy, hidden_activations are retained in full."""
         ps = ParameterSpace(spec=behemoth_spec)
         grid = _make_tiling(behemoth_spec)
@@ -520,7 +520,7 @@ class TestBehemoth:
             assert hidden.logical_shape[0] == batch_size
             assert hidden.logical_shape[1] == behemoth_spec.padded_hidden_dim
 
-    def test_recompute_strategy_reduces_partial_grad_hidden(self, behemoth_spec: Float32ModelSpec) -> None:
+    def test_recompute_strategy_reduces_partial_grad_hidden(self, behemoth_spec: ModelSpec) -> None:
         """Under RECOMPUTE, the partial_grad_hidden buffer is allocated per-tile,
         but each tile is processed serially and the scratch is reused.
 
@@ -545,7 +545,7 @@ class TestBehemoth:
         scratch_bytes = full_hidden_bytes  # Same shape, but transient
         assert scratch_bytes <= full_hidden_bytes
 
-    def test_behemoth_layouts_produce_valid_shapes(self, behemoth_spec: Float32ModelSpec) -> None:
+    def test_behemoth_layouts_produce_valid_shapes(self, behemoth_spec: ModelSpec) -> None:
         """All layouts for the Behemoth must produce non-zero shapes."""
         ps = ParameterSpace(spec=behemoth_spec)
         grid = _make_tiling(behemoth_spec)
@@ -558,7 +558,7 @@ class TestBehemoth:
             total_bytes = int(np.prod(shape)) * dtype.itemsize
             assert total_bytes > 0, f"{name} has zero bytes"
 
-    def test_behemoth_reduction_tree_valid(self, behemoth_spec: Float32ModelSpec) -> None:
+    def test_behemoth_reduction_tree_valid(self, behemoth_spec: ModelSpec) -> None:
         """The reduction tree for a Behemoth model must be valid."""
         grid = _make_tiling(behemoth_spec)
         policy = StabilizationPolicy(
@@ -574,7 +574,7 @@ class TestBehemoth:
             assert k >= 2
             assert k ** stages >= grid.total_tiles
 
-    def test_behemoth_shared_weight_layout_scales(self, behemoth_spec: Float32ModelSpec) -> None:
+    def test_behemoth_shared_weight_layout_scales(self, behemoth_spec: ModelSpec) -> None:
         """The shared_weights buffer grows with hidden_dim."""
         ps = ParameterSpace(spec=behemoth_spec)
         grid = _make_tiling(behemoth_spec)

@@ -21,7 +21,7 @@ if "src" not in sys.modules:
     _pkg.__package__ = "src"
     sys.modules["src"] = _pkg
 
-from src.shared.model_spec import Float32ModelSpec, Float16ModelSpec
+from src.shared.model_spec import Float32ModelSpec, Float16ModelSpec, ModelSpec
 from src.shared.parameter_space import ParameterSpace
 from src.shared.workload_primitives import TilingScheme
 from src.shared.stabilization_policy import StabilizationPolicy
@@ -40,17 +40,17 @@ IRIS = dict(
 
 
 @pytest.fixture
-def iris_spec() -> Float32ModelSpec:
+def iris_spec() -> ModelSpec:
     return Float32ModelSpec(**IRIS)
 
 
 @pytest.fixture
-def iris_param_space(iris_spec: Float32ModelSpec) -> ParameterSpace:
+def iris_param_space(iris_spec: ModelSpec) -> ParameterSpace:
     return ParameterSpace(spec=iris_spec)
 
 
 @pytest.fixture
-def iris_tiling(iris_spec: Float32ModelSpec) -> TilingScheme:
+def iris_tiling(iris_spec: ModelSpec) -> TilingScheme:
     s = iris_spec
     return TilingScheme(
         num_module_chunks=(s.num_modules + 15) // 16,
@@ -73,7 +73,7 @@ HYDRA = dict(
 
 
 @pytest.fixture
-def hydra_spec() -> Float32ModelSpec:
+def hydra_spec() -> ModelSpec:
     return Float32ModelSpec(**HYDRA)
 
 
@@ -90,5 +90,5 @@ LEXICON = dict(
 
 
 @pytest.fixture
-def lexicon_spec() -> Float32ModelSpec:
+def lexicon_spec() -> ModelSpec:
     return Float32ModelSpec(**LEXICON)
