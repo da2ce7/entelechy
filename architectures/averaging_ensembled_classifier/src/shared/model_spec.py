@@ -100,17 +100,3 @@ class ModelSpec:
     @classmethod
     def float16(cls, **kwargs: Any) -> "ModelSpec":
         return cls(precision=PrecisionConfig.float16(), **kwargs)
-
-
-# ------------------------------------------------------------------
-# Backward-compatible aliases (deprecated — removed in Phase 6)
-# ------------------------------------------------------------------
-
-def Float32ModelSpec(**kwargs: Any) -> ModelSpec:
-    """Deprecated: Use ModelSpec.float32() or ModelSpec(precision=PrecisionConfig.float32(), ...)."""
-    return ModelSpec(precision=PrecisionConfig.float32(), **kwargs)
-
-
-def Float16ModelSpec(**kwargs: Any) -> ModelSpec:
-    """Deprecated: Use ModelSpec.float16() or ModelSpec(precision=PrecisionConfig.float16(), ...)."""
-    return ModelSpec(precision=PrecisionConfig.float16(), **kwargs)

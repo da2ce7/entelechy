@@ -11,11 +11,14 @@
 # ISA targeting (all platforms):
 #   meson setup builddir -Daec_cpu_isa_flags=['-mavx2','-mfma','-mf16c']
 
-option('aec_backend_vulkan', type: 'feature', value: 'auto',
+option('aec_backend_vulkan', type: 'feature', value: 'enabled',
        description: 'Build Vulkan SPIR-V compute shaders (requires glslc)')
 
-option('aec_backend_cpu', type: 'feature', value: 'auto',
+option('aec_backend_cpu', type: 'feature', value: 'enabled',
        description: 'Build CPU SIMD kernel shared library')
+
+option('aec_backend_opencl', type: 'feature', value: 'enabled',
+       description: 'OpenCL backend via PyOpenCL (runtime kernel compilation)')
 
 option('aec_cpu_isa_flags', type: 'array', value: [],
        description: 'C compiler ISA flags for CPU backend (e.g., [\'-mavx2\']. Empty = -march=native)')

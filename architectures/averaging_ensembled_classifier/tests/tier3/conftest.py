@@ -86,7 +86,7 @@ def _create_opencl_renderer() -> Any:
         ReduceKFanInAndClipBinding,
     )
     from src.backends.opencl.kernel_bindings.dispatch_table import build_dispatch_table
-    from src.backends.opencl.kernel_compilation import load_and_compile_kernels_from_path
+    from src.backends.opencl.context import load_and_compile_kernels_from_path
     from src.backends.opencl.renderer import OpenCLPlanRenderer
     from src.backends.opencl.type_mapping import build_compiler_flags
     from src.shared.hardware_profile import HardwareProfile

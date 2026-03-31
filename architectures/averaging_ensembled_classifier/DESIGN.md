@@ -145,7 +145,7 @@ class PrecisionConfig:
     epsilon: float
 ```
 
-Constructed via `PrecisionConfig.float32()` and `PrecisionConfig.float16()` classmethods. `ModelSpec` consumes `PrecisionConfig` via composition; backward-compatible properties (`SCALAR_NP_TYPE`, `SCALAR_C_TYPE_NAME`) delegate to `self.precision`. Factory classmethods `ModelSpec.float32()` / `ModelSpec.float16()` and deprecated module-level `Float32ModelSpec()` / `Float16ModelSpec()` functions are available until Phase 6.
+Constructed via `PrecisionConfig.float32()` and `PrecisionConfig.float16()` classmethods. `ModelSpec` consumes `PrecisionConfig` via composition; backward-compatible properties (`SCALAR_NP_TYPE`, `SCALAR_C_TYPE_NAME`) delegate to `self.precision`. Factory classmethods `ModelSpec.float32()` / `ModelSpec.float16()` are the sole construction API (deprecated `Float32ModelSpec()` / `Float16ModelSpec()` module-level functions were removed in Phase 6).
 
 ### 3.6 Buffer Lifecycle (ADR-009)
 
@@ -523,12 +523,12 @@ All phases proceed in parallel behind `_build_config.py` feature flags. Each pha
 | :--- | :--- | :--- | :--- |
 | **0: Foundation** | Create directory structure; move modules to `src/shared/` + `src/backends/opencl/`; create `meson.options` and `_build_config.py` template | All existing tests green | **Complete** |
 | **1: Plan Model** | Implement shared-layer plan data structures (node types, buffer lifecycle, reduction/streaming plans, retrieval protocol); write Tier 1 tests | Tier 1 green | **Complete** |
-| **2: OpenCL Adapter** | Wrap existing PyOpenCL dispatch in `PlanRenderer` interface; write OpenCL Tier 2 tests | Tier 1 + OpenCL Tier 2 green | Not started |
+| **2: OpenCL Adapter** | Wrap existing PyOpenCL dispatch in `PlanRenderer` interface; write OpenCL Tier 2 tests | Tier 1 + OpenCL Tier 2 green | **Complete** |
 | **3: CPU Backend** | Implement C kernel library, ctypes FFI, `CPUPlanRenderer`; write CPU Tier 2 tests | Tier 1 + CPU Tier 2 green | **Complete** |
-| **4: Test Harness** | Full Tier 1/2/3 framework, fixtures, tolerance tables, oracle logic; can begin immediately | All enabled tiers green | Not started |
-| **5: Vulkan Backend** | GLSL shaders, SPIR-V compilation, vulkan-python `PlanRenderer`; write Vulkan Tier 2 tests | Tier 1 + Vulkan Tier 2 + Tier 3 parity green | Not started |
+| **4: Test Harness** | Full Tier 1/2/3 framework, fixtures, tolerance tables, oracle logic; can begin immediately | All enabled tiers green | **Complete** |
+| **5: Vulkan Backend** | GLSL shaders, SPIR-V compilation, vulkan-python `PlanRenderer`; write Vulkan Tier 2 tests | Tier 1 + Vulkan Tier 2 + Tier 3 parity green | **Complete** |
 | **User-Facing API** | `WorkTicket`, `LearnHandle`, `Engine`; parallel with Phase 4 | Tier 1 (ticket) + integration green | Not started |
-| **6: Legacy Removal** | Delete dissolved modules; system operates exclusively through plan-model dispatch | Tier 3 parity green, all backends, FP32 + FP16 | Not started |
+| **6: Legacy Removal** | Delete dissolved modules; system operates exclusively through plan-model dispatch | Tier 3 parity green, all backends, FP32 + FP16 | **✅ Complete** |
 
 ### 11.3 Phase Dependency Graph
 
@@ -538,17 +538,16 @@ Phase 0 (Foundation) ────────────── ✅ Complete (19
   ▼
 Phase 1 (Plan Model) ──────────── ✅ Complete (332 tests green: 192 Phase 0 + 140 Tier 1)
   │
-  ├──▶ Phase 2 (OpenCL Adapter) ─── Tier 1 + OpenCL Tier 2 gate
-  ├──▶ Phase 3 (CPU Backend) ────── ✅ Complete (Tier 1 green + CPU Tier 2 green)
-  ├──▶ Phase 5 (Vulkan Backend) ─── Tier 1 + Vulkan Tier 2 + Tier 3 gate
-  ├──▶ User-Facing API ─────────── Tier 1 (ticket) + integration green
+  ├──▶ Phase 2 (OpenCL Adapter) ─── ✅ Complete
+  ├──▶ Phase 3 (CPU Backend) ────── ✅ Complete
+  ├──▶ Phase 5 (Vulkan Backend) ─── ✅ Complete
+  ├──▶ User-Facing API ─────────── Not started
   │
-  │    Phase 4 (Test Harness) ────── All enabled tiers green
-  │    [can start in parallel with Phase 0]
+  │    Phase 4 (Test Harness) ────── ✅ Complete
   │
   ▼
-Phase 6 (Legacy Removal) ───── Tier 3 parity green, all backends, FP32 + FP16
-  [requires Phases 2, 3, 4, 5 complete]
+Phase 6 (Legacy Removal) ───── ✅ Complete
+  [all prerequisite phases passed their gates]
 ```
 
 Phases 2, 3, and 5 are independent workstreams. Phase 4 has no hard dependency. Phase 6 is a join point requiring all preceding phases.
@@ -559,7 +558,9 @@ Phases 2, 3, and 5 are independent workstreams. Phase 4 has no hard dependency. 
 | :--- | :--- | :--- |
 | Development | `auto` | Backend available when toolchain detected; CI skips if absent |
 | Validated | `enabled` | Tier gate passed; CI requires the backend |
-| Mandatory | `enabled` (enforced) | Phase 6 complete; backend is a required component |
+| **Mandatory** | **`enabled` (enforced)** | **Phase 6 complete; all three backends are required components** |
+
+As of Phase 6 completion, all three backend flags (`aec_backend_cpu`, `aec_backend_vulkan`, `aec_backend_opencl`) are at the **Mandatory** stage (`value: 'enabled'` in `meson.options`). The build fails if any backend's toolchain is absent.
 
 ### 11.5 Rollback Protocol
 

@@ -1,6 +1,6 @@
 # Phase 6: Legacy PyOpenCL Removal — Detailed Plan
 
-**Status:** Not started  
+**Status:** ✅ Complete  
 **Phase:** 6 of 6 (terminal phase)  
 **Objective:** Remove the legacy PyOpenCL code path, Phase 0 shim modules, deprecated compatibility APIs, and legacy test infrastructure. After this phase, the system operates exclusively through plan-model dispatch via `PlanRenderer` implementations. The physical directory structure reaches its final state (ADR-012). The `main_orchestrator.py` is rewritten to use the `Engine` / `WorkTicket` user-facing API (ADR-018) or, at minimum, direct `PlanRenderer` dispatch — with no references to the dissolved legacy modules.  
 **Governing ADRs:** ADR-012 (module factoring — services dissolution; dissolved module inventory), ADR-001 (backend abstraction boundary — plan-as-data-structure; `PlanRenderer` as sole backend contract), ADR-007 (KernelContract/KernelBinding split — `kernel_signatures/` dissolution), ADR-008 (PrecisionConfig — deprecated `Float32ModelSpec`/`Float16ModelSpec` factory removal), ADR-014 (build system — feature flags promoted to `enabled`/mandatory), ADR-016 (test strategy — Tier 1/2/3 as sole test infrastructure), ADR-017 (migration path — Phase 6 definition; rollback gate; feature-flag lifecycle), ADR-018 (user-facing API — `Engine`/`WorkTicket` as orchestrator entry point)  

@@ -88,7 +88,7 @@ The engine executes through a **plan-as-data-structure** model: a shared orchest
 | :--- | :--- | :--- |
 | **OpenCL** | Reference implementation | `clEnqueueNDRange` + `cl.Event` synchronization |
 | **CPU** | ✅ **Implemented** | SIMD-vectorized C kernels (`libcpu_kernels.so`) + persistent thread pool via `pool_dispatch_and_wait` |
-| **Vulkan** | Planned | SPIR-V compute shaders via `vkCmdDispatch` + pipeline barriers |
+| **Vulkan** | ✅ **Implemented** | SPIR-V compute shaders via `vkCmdDispatch` + pipeline barriers |
 
 The CPU backend requires zero additional Python dependencies beyond `ctypes` (stdlib). It supports AVX-512, AVX2, SSE2, ARM NEON, and a scalar fallback, auto-detecting the optimal ISA at compile time. See [`CPU_BACKEND.md`](./CPU_BACKEND.md) for the full architecture.
 

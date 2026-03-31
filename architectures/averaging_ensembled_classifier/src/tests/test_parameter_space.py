@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.shared.model_spec import Float32ModelSpec, Float16ModelSpec, ModelSpec
+from src.shared.model_spec import ModelSpec
 from src.shared.parameter_space import ParameterSpace, ParameterFlowConfig
 from src.shared.workload_primitives import TilingScheme
 
@@ -31,7 +31,7 @@ class TestParameterFlowConfigNaming:
 
     def test_standard_flow_names(self) -> None:
         """A non-specialized flow should produce six distinct buffer name fields."""
-        ps = ParameterSpace(spec=Float32ModelSpec(
+        ps = ParameterSpace(spec=ModelSpec.float32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         ))
@@ -59,7 +59,7 @@ class TestParameterFlowConfigNaming:
 
     def test_specialized_flow_has_empty_buffer_names(self) -> None:
         """The hidden_activations flow is specialized and should not have intermediate buffer names."""
-        ps = ParameterSpace(spec=Float32ModelSpec(
+        ps = ParameterSpace(spec=ModelSpec.float32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         ))
@@ -76,7 +76,7 @@ class TestParameterFlowConfigNaming:
 
     def test_temperatures_use_temps_grad_name(self) -> None:
         """The temperatures flow uses 'temps' as the grad name, not 'temperatures'."""
-        ps = ParameterSpace(spec=Float32ModelSpec(
+        ps = ParameterSpace(spec=ModelSpec.float32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         ))

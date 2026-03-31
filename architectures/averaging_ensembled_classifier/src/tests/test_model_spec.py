@@ -5,7 +5,7 @@ Unit tests for ModelSpec: padding calculations and precision contracts.
 Bug-hunting focus:
 * padded_input_dim, padded_hidden_dim, padded_class_dim, padded_module_dim
   must each be ≥ the logical dim and an appropriate multiple.
-* Float32ModelSpec and Float16ModelSpec must produce different padding when
+* ModelSpec.float32() and ModelSpec.float16() must produce different padding when
   cache_line_bytes causes different per-element byte strides.
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.shared.model_spec import Float32ModelSpec, Float16ModelSpec, ModelSpec
+from src.shared.model_spec import ModelSpec
 
 
 class TestPaddingCalculations:
@@ -25,14 +25,14 @@ class TestPaddingCalculations:
         (33, 8, 40),   # 33 → 40
     ])
     def test_padded_hidden_dim(self, hidden_dim, simd_width, expected) -> None:
-        spec = Float32ModelSpec(
+        spec = ModelSpec.float32(
             input_dim=4, hidden_dim=hidden_dim, output_classes=3,
             num_modules=8, simd_width=simd_width, cache_line_bytes=64,
         )
         assert spec.padded_hidden_dim == expected
 
     def test_padded_hidden_ge_logical(self) -> None:
-        spec = Float32ModelSpec(
+        spec = ModelSpec.float32(
             input_dim=4, hidden_dim=17, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )
@@ -40,7 +40,7 @@ class TestPaddingCalculations:
 
     def test_padded_input_dim_cache_aligned(self) -> None:
         """With 4-byte float32 and 64-byte cache line → row must be multiple of 16 elements."""
-        spec = Float32ModelSpec(
+        spec = ModelSpec.float32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )
@@ -48,7 +48,7 @@ class TestPaddingCalculations:
         assert (spec.padded_input_dim * 4) % 64 == 0
 
     def test_padded_class_dim_cache_aligned(self) -> None:
-        spec = Float32ModelSpec(
+        spec = ModelSpec.float32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )
@@ -56,7 +56,7 @@ class TestPaddingCalculations:
         assert (spec.padded_class_dim * 4) % 64 == 0
 
     def test_padded_module_dim_cache_aligned(self) -> None:
-        spec = Float32ModelSpec(
+        spec = ModelSpec.float32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )
@@ -65,11 +65,11 @@ class TestPaddingCalculations:
 
     def test_fp16_different_padding_from_fp32(self) -> None:
         """With 2-byte float16 and 64-byte cache line, row stride is 32 elements (not 16)."""
-        fp32 = Float32ModelSpec(
+        fp32 = ModelSpec.float32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )
-        fp16 = Float16ModelSpec(
+        fp16 = ModelSpec.float16(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )
@@ -78,11 +78,11 @@ class TestPaddingCalculations:
         assert fp16.padded_input_dim >= fp32.padded_input_dim
 
     def test_scalar_np_type_is_correct(self) -> None:
-        fp32 = Float32ModelSpec(
+        fp32 = ModelSpec.float32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )
-        fp16 = Float16ModelSpec(
+        fp16 = ModelSpec.float16(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )

@@ -366,9 +366,9 @@ class TestUpdateSubgraphFlowFiltering:
 
     def test_non_specialized_flows_have_expected_names(self):
         from src.shared.parameter_space import ParameterSpace
-        from src.shared.model_spec import Float32ModelSpec
+        from src.shared.model_spec import ModelSpec
 
-        spec = Float32ModelSpec(
+        spec = ModelSpec.float32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )
@@ -389,9 +389,9 @@ class TestUpdateSubgraphFlowFiltering:
         This verifies that the name used as dict key is the same as flow.name.
         """
         from src.shared.parameter_space import ParameterSpace
-        from src.shared.model_spec import Float32ModelSpec
+        from src.shared.model_spec import ModelSpec
 
-        spec = Float32ModelSpec(
+        spec = ModelSpec.float32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )

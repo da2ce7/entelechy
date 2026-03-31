@@ -2,12 +2,12 @@
 
 opencl_sources = files(
   '__init__.py',
-  'batch_processor.py',
-  'compute_patterns.py',
+  'buffer_allocator.py',
   'context.py',
-  'execution_plan.py',
-  'graph_recipes.py',
-  'launcher_infra.py',
+  'discovery.py',
+  'renderer.py',
+  'retrieval.py',
+  'type_mapping.py',
 )
 
 py.install_sources(opencl_sources,

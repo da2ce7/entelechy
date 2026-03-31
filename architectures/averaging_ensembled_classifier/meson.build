@@ -13,16 +13,14 @@ py = import('python').find_installation()
 # --- Feature-flag probing (ADR-014) ---
 backend_vulkan = get_option('aec_backend_vulkan')
 backend_cpu    = get_option('aec_backend_cpu')
-
-# OpenCL backend is always enabled (runtime kernel compilation via PyOpenCL).
-backend_opencl = true
+backend_opencl = get_option('aec_backend_opencl')
 
 # --- Build-time configuration (ADR-014) ---
 configure_file(
   input:  'src/_build_config.py.in',
   output: '_build_config.py',
   configuration: configuration_data({
-    'BACKEND_OPENCL': backend_opencl ? 'True' : 'False',
+    'BACKEND_OPENCL': backend_opencl.allowed() ? 'True' : 'False',
     'BACKEND_VULKAN': backend_vulkan.allowed() ? 'True' : 'False',
     'BACKEND_CPU':    backend_cpu.allowed() ? 'True' : 'False',
   }),
@@ -33,23 +31,11 @@ configure_file(
 # --- Top-level src/ Python modules ---
 src_root_sources = files(
   'src/__init__.py',
-  'src/arch_primitives.py',
   'src/main_orchestrator.py',
-  # Shim adapters (backward-compat, removed in Phase 6)
-  'src/batch_processor.py',
-  'src/cl_context_manager.py',
-  'src/compute_patterns.py',
-  'src/execution_plan.py',
-  'src/graph_recipes.py',
-  'src/launcher_infra.py',
 )
 
 py.install_sources(src_root_sources,
   subdir: 'averaging_ensembled_classifier' / 'src')
-
-# Shim for kernel_signatures (backward-compat)
-py.install_sources(files('src/kernel_signatures/__init__.py'),
-  subdir: 'averaging_ensembled_classifier' / 'src' / 'kernel_signatures')
 
 # Backends __init__ markers
 py.install_sources(files('src/backends/__init__.py'),

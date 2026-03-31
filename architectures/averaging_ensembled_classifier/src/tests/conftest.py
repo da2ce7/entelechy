@@ -21,7 +21,7 @@ if "src" not in sys.modules:
     _pkg.__package__ = "src"
     sys.modules["src"] = _pkg
 
-from src.shared.model_spec import Float32ModelSpec, Float16ModelSpec, ModelSpec
+from src.shared.model_spec import ModelSpec
 from src.shared.parameter_space import ParameterSpace
 from src.shared.workload_primitives import TilingScheme
 from src.shared.stabilization_policy import StabilizationPolicy
@@ -41,7 +41,7 @@ IRIS = dict(
 
 @pytest.fixture
 def iris_spec() -> ModelSpec:
-    return Float32ModelSpec(**IRIS)
+    return ModelSpec.float32(**IRIS)
 
 
 @pytest.fixture
@@ -74,7 +74,7 @@ HYDRA = dict(
 
 @pytest.fixture
 def hydra_spec() -> ModelSpec:
-    return Float32ModelSpec(**HYDRA)
+    return ModelSpec.float32(**HYDRA)
 
 
 # ── Stress model (Lexicon — huge output_classes) ──
@@ -91,4 +91,4 @@ LEXICON = dict(
 
 @pytest.fixture
 def lexicon_spec() -> ModelSpec:
-    return Float32ModelSpec(**LEXICON)
+    return ModelSpec.float32(**LEXICON)
