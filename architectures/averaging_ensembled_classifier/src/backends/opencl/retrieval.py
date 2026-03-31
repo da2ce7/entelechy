@@ -9,6 +9,21 @@ import pyopencl as cl
 from numpy.typing import NDArray
 
 
+class OpenCLKernelError(RuntimeError):
+    """An OpenCL kernel dispatch or event wait failed.
+
+    Attributes:
+        node_id: The plan node whose event reported the error.
+        event_status: The ``command_execution_status`` of the failed event
+            (negative values indicate device-side errors).
+    """
+
+    def __init__(self, message: str, *, node_id: str, event_status: int) -> None:
+        super().__init__(message)
+        self.node_id = node_id
+        self.event_status = event_status
+
+
 class OpenCLRetrievalFuture:
     """OpenCL implementation of RetrievalFuture (ADR-010).
 
@@ -44,7 +59,23 @@ class OpenCLRetrievalFuture:
 
     def wait(self) -> None:
         if not self._released and self._event is not None:
-            self._event.wait()
+            try:
+                self._event.wait()
+            except cl.RuntimeError as exc:
+                try:
+                    status = self._event.command_execution_status
+                except Exception:
+                    status = None
+                raise OpenCLKernelError(
+                    f"OpenCL event wait failed for retrieval node "
+                    f"'{self._node_id}': {exc}. "
+                    f"Event status={status}. "
+                    f"A preceding kernel dispatch likely failed on "
+                    f"the device (resource exhaustion, invalid "
+                    f"work-group size, or driver error).",
+                    node_id=self._node_id,
+                    event_status=status if isinstance(status, int) else -1,
+                ) from exc
 
     def result(self) -> NDArray[np.floating[Any]]:
         if self._released:

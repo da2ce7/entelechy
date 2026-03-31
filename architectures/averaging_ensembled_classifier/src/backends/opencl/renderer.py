@@ -19,7 +19,7 @@ from ...shared.plan_types import (
 )
 from ...shared.retrieval_future import RetrievalFuture
 from .buffer_allocator import OpenCLBufferAllocator
-from .retrieval import OpenCLRetrievalFuture
+from .retrieval import OpenCLKernelError, OpenCLRetrievalFuture
 
 # Maximum fan-in for register-reduce (vs. local-reduce) tier selection.
 MAX_REG_AGG = 16
@@ -83,31 +83,40 @@ class OpenCLPlanRenderer:
         event_map: dict[str, cl.Event] = {}
         futures: dict[str, RetrievalFuture] = {}
 
-        for node_id in plan.topological_order:
-            node = plan.nodes[node_id]
-            wait_for = self._collect_dependency_events(node.depends_on, event_map)
+        try:
+            for node_id in plan.topological_order:
+                node = plan.nodes[node_id]
+                wait_for = self._collect_dependency_events(node.depends_on, event_map)
 
-            if isinstance(node, KernelDispatchNode):
-                event = self._render_kernel_dispatch(node, wait_for)
-                event_map[node_id] = event
+                if isinstance(node, KernelDispatchNode):
+                    event = self._render_kernel_dispatch(node, wait_for)
+                    event_map[node_id] = event
 
-            elif isinstance(node, ReductionTreeNode):
-                event = self._render_reduction_tree(node, wait_for)
-                event_map[node_id] = event
+                elif isinstance(node, ReductionTreeNode):
+                    event = self._render_reduction_tree(node, wait_for)
+                    event_map[node_id] = event
 
-            elif isinstance(node, StreamingLoopNode):
-                event = self._render_streaming_loop(node, wait_for)
-                event_map[node_id] = event
+                elif isinstance(node, StreamingLoopNode):
+                    event = self._render_streaming_loop(node, wait_for)
+                    event_map[node_id] = event
 
-            elif isinstance(node, BarrierNode):
-                event = self._render_barrier(wait_for)
-                event_map[node_id] = event
+                elif isinstance(node, BarrierNode):
+                    event = self._render_barrier(wait_for)
+                    event_map[node_id] = event
 
-            else:  # RetrievalNode
-                assert isinstance(node, RetrievalNode)
-                future = self._render_retrieval(node, wait_for, plan)
-                futures[node.event_name] = future
-                event_map[node_id] = future.event
+                else:  # RetrievalNode
+                    assert isinstance(node, RetrievalNode)
+                    future = self._render_retrieval(node, wait_for, plan)
+                    futures[node.event_name] = future
+                    event_map[node_id] = future.event
+        except OpenCLKernelError:
+            # Drain the queue so the device is not left in a dirty state
+            # before re-raising. finish() waits for all enqueued work.
+            try:
+                self._queue.finish()
+            except cl.RuntimeError:
+                pass  # queue drain is best-effort during error recovery
+            raise
 
         return futures
 
@@ -493,13 +502,32 @@ class OpenCLPlanRenderer:
     # ------------------------------------------------------------------
 
     @staticmethod
+    @staticmethod
     def _collect_dependency_events(
         depends_on: frozenset[str],
         event_map: dict[str, cl.Event],
     ) -> list[cl.Event]:
-        """Collect cl.Events for all dependency node IDs."""
+        """Collect cl.Events for all dependency node IDs.
+
+        Raises OpenCLKernelError if any dependency event completed with
+        an error status, preventing cascading dispatches against a
+        failed event chain.
+        """
         events: list[cl.Event] = []
         for dep_id in depends_on:
             if dep_id in event_map:
-                events.append(event_map[dep_id])
+                evt = event_map[dep_id]
+                try:
+                    status = evt.command_execution_status
+                except Exception:
+                    status = 0  # treat query failure as non-error
+                if status < 0:
+                    raise OpenCLKernelError(
+                        f"Upstream node '{dep_id}' completed with "
+                        f"error status {status}. Aborting downstream "
+                        f"dispatch to prevent cascading failures.",
+                        node_id=dep_id,
+                        event_status=status,
+                    )
+                events.append(evt)
         return events

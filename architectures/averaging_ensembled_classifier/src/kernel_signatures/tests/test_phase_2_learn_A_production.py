@@ -32,7 +32,7 @@ from .conftest import (
     make_tile,
 )
 
-from src.kernel_signatures.phase_2_learn_A_production import (  # type: ignore[import-not-found]
+from src.backends.opencl.kernel_bindings.phase_2_learn_A_production import (  # type: ignore[import-not-found]
     CalculateModuleParamGradsCceSignature,
     CalculateModuleParamGradsBceSignature,
     BackpropErrorToHiddenChunkCceSignature,

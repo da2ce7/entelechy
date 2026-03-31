@@ -61,6 +61,7 @@ from src.kernel_signatures import (
     AggregateLocalReduceSignature,
     ClipIntermediateGradSignature,
     StabilizeAndReduceGradHiddenActivationsSignature,
+    ReduceKFanInAndClipSignature,
     BackpropSharedWeightsChunkSignature,
     BackpropSharedBiasesChunkSignature,
     SharedGradientHandles,
@@ -377,6 +378,21 @@ def _make_clip_intermediate(bm: Any, ac: Any):
     )
 
 
+def _make_reduce_k_fan_in(bm: Any, ac: Any):
+    return ReduceKFanInAndClipSignature(
+        _buffer_mgr=bm,
+        _arch_consts=ac,
+        partial_collection_ref=bm.make_handle((128,)),
+        offset_list_flat_ref=bm.make_handle((16,)),
+        stage_output_ref=bm.make_handle((32,)),
+        fan_in_K=np.uint32(4),
+        node_count=np.uint32(4),
+        partial_width=np.uint32(32),
+        clipping_threshold=np.float32(1.0),
+        epsilon=np.float32(1e-6),
+    )
+
+
 def _make_stabilize_reduce(bm: Any, ac: Any):
     return StabilizeAndReduceGradHiddenActivationsSignature(
         _buffer_mgr=bm,
@@ -516,6 +532,7 @@ SIGNATURE_REGISTRY: Dict[str, tuple] = {
     "AggregateRegisterReduceSignature": (_make_aggregate_register, "aggregate_register_reduce"),
     "AggregateLocalReduceSignature": (_make_aggregate_local, "aggregate_local_reduce"),
     "ClipIntermediateGradSignature": (_make_clip_intermediate, "clip_intermediate_grad"),
+    "ReduceKFanInAndClipSignature": (_make_reduce_k_fan_in, "reduce_k_fan_in_and_clip"),
     "StabilizeAndReduceGradHiddenActivationsSignature": (_make_stabilize_reduce, "stabilize_and_reduce_grad_hidden_activations"),
     "BackpropSharedWeightsChunkSignature": (_make_backprop_shared_weights, "backprop_shared_weights_chunk"),
     "BackpropSharedBiasesChunkSignature": (_make_backprop_shared_biases, "backprop_shared_biases_chunk"),

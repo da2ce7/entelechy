@@ -26,7 +26,7 @@ from .conftest import (
     classify_python_arg,
 )
 
-from src.kernel_signatures.phase_2_learn_C_reduction import (  # type: ignore[import-not-found]
+from src.backends.opencl.kernel_bindings.phase_2_learn_C_reduction import (  # type: ignore[import-not-found]
     AggregateRegisterReduceSignature,
     AggregateLocalReduceSignature,
     ClipIntermediateGradSignature,

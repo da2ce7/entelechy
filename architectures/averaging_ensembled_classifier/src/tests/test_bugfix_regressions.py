@@ -865,7 +865,8 @@ class TestBatchChunkIndexContract:
         arch = _FakeArchConsts(rect_tile_dim1=16)
 
         return BackpropSharedWeightsChunkSignature(
-            _buffer_mgr=bm,  # type: ignore[arg-type] _arch_consts=arch,  # type: ignore[arg-type]
+            _buffer_mgr=bm,  # type: ignore[arg-type]
+            _arch_consts=arch,  # type: ignore[arg-type]
             input_ref=input_ref, h_ref=h_ref, grad_h_ref=grad_h_ref,
             mask_ref=mask_ref, partial_gsw_out_ref=out_ref,
             batch_chunk_offset=np.uint32(0),

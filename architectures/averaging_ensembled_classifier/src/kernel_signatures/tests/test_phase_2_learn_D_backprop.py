@@ -25,7 +25,7 @@ from .conftest import (
     classify_python_arg,
 )
 
-from src.kernel_signatures.phase_2_learn_D_backprop import (  # type: ignore[import-not-found]
+from src.backends.opencl.kernel_bindings.phase_2_learn_D_backprop import (  # type: ignore[import-not-found]
     BackpropSharedWeightsChunkSignature,
     BackpropSharedBiasesChunkSignature,
     SharedGradientHandles,

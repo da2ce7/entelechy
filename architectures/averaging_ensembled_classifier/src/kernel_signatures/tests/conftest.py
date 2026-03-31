@@ -96,6 +96,11 @@ def parse_kernel_header(path: str) -> Dict[str, List[ParamCategory]]:
     with open(path) as f:
         text = f.read()
 
+    # Strip all comments first so that parentheses inside Doxygen blocks
+    # (e.g. ``(n+1)``) do not confuse the depth-tracking parser below.
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//[^\n]*", "", text)
+
     kernel_re = re.compile(r"__kernel\s+(?:KERNEL_ATTR\s+)?void\s+(\w+)\s*\(")
     kernels: Dict[str, List[ParamCategory]] = {}
 
@@ -114,11 +119,6 @@ def parse_kernel_header(path: str) -> Dict[str, List[ParamCategory]]:
             pos += 1
 
         param_text = text[start : pos - 1]
-
-        # Strip block comments (/** ... */ and /* ... */)
-        param_text = re.sub(r"/\*.*?\*/", "", param_text, flags=re.DOTALL)
-        # Strip line comments (// ...)
-        param_text = re.sub(r"//[^\n]*", "", param_text)
 
         # Split by comma and classify
         raw_params = [p.strip() for p in param_text.split(",")]
@@ -278,7 +278,7 @@ def classify_python_arg(arg: object) -> ParamCategory:
 # Standard WorkTile Factory
 # =========================================================================
 
-from src.workload_primitives import WorkTile  # type: ignore[import-not-found]
+from src.shared.workload_primitives import WorkTile  # type: ignore[import-not-found]
 
 
 def make_tile(
