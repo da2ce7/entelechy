@@ -2,12 +2,7 @@
 
 cpu_kernel_sources = files(
     'kernel_sources/cpu_threads.c',
-    'kernel_sources/phase_1_act.c',
-    'kernel_sources/phase_2_learn_A_production.c',
-    'kernel_sources/phase_2_learn_B_processing.c',
-    'kernel_sources/phase_2_learn_C_reduction.c',
-    'kernel_sources/phase_2_learn_D_backprop.c',
-    'kernel_sources/phase_3_update.c',
+    'kernel_sources/cpu_kernels.c',
 )
 
 # ISA flags: use aec_cpu_isa_flags if provided, else -march=native
@@ -23,20 +18,42 @@ m_dep = cc.find_library('m', required: false)
 # Thread library (needed for pthreads fallback)
 thread_dep = dependency('threads', required: false)
 
-cpu_warn_args = cc.get_supported_arguments(
-    '-Wall', '-Wextra', '-Wpedantic',
-    '-Wconversion', '-Wsign-conversion',
-    '-Wshadow', '-Wstrict-prototypes', '-Wmissing-prototypes',
-    '-Wformat=2', '-Wdouble-promotion',
-    '-Wundef', '-Wpointer-arith', '-Wcast-align',
-    '-Wnull-dereference', '-Wwrite-strings',
-)
+# --- Platform-adaptive warning flags ---
+# MSVC uses /W4; GCC/Clang use the comprehensive -W set.
+if cc.get_id() == 'msvc'
+    cpu_warn_args = ['/W4']
+else
+    cpu_warn_args = cc.get_supported_arguments(
+        '-Wall', '-Wextra', '-Wpedantic',
+        '-Wconversion', '-Wsign-conversion',
+        '-Wshadow', '-Wstrict-prototypes', '-Wmissing-prototypes',
+        '-Wformat=2', '-Wdouble-promotion',
+        '-Wundef', '-Wpointer-arith', '-Wcast-align',
+        '-Wnull-dereference', '-Wwrite-strings',
+    )
+endif
 
-cpu_c_args = [
-    '-DCPU_KERNELS_BUILDING',
-    '-fvisibility=hidden',
-] + cpu_isa_flags + cpu_warn_args
+# --- Base compile flags ---
+cpu_c_args = ['-DCPU_KERNELS_BUILDING']
 
+if cc.get_id() == 'msvc'
+    # MSVC: no -fvisibility, no -march; use /arch: for ISA targeting.
+    # __declspec(dllexport) is handled by cpu_export.h via CPU_KERNELS_BUILDING.
+    cpu_c_args += cpu_warn_args
+else
+    cpu_c_args += cpu_isa_flags + cpu_warn_args
+endif
+
+# --- Debug assertions (bounds checks, NaN guards) ---
+if get_option('aec_cpu_debug_asserts')
+    cpu_c_args += ['-DCPU_DEBUG_ASSERTS=1']
+endif
+
+# --- Shared library target ---
+# Symbol visibility:
+#   Unix:    gnu_symbol_visibility='hidden' + CPU_KERNELS_EXPORT attribute
+#   Windows: cpu_export.h __declspec(dllexport/dllimport) via CPU_KERNELS_BUILDING
+#   (Meson ignores gnu_symbol_visibility on Windows, so it is always safe to set.)
 cpu_lib = shared_library(
     'cpu_kernels',
     cpu_kernel_sources,
@@ -51,6 +68,7 @@ cpu_lib = shared_library(
 # Install Python source files for the CPU backend
 cpu_py_sources = files(
     '__init__.py',
+    '_compiler.py',
     '_ffi_types.py',
     '_loader.py',
     '_dispatch_table.py',
@@ -64,4 +82,26 @@ cpu_py_sources = files(
 py.install_sources(
     cpu_py_sources,
     subdir: 'averaging_ensembled_classifier' / 'backends' / 'cpu',
+)
+
+# Install C kernel sources for JIT compilation on Linux/macOS
+cpu_kernel_headers_and_sources = files(
+    'kernel_sources/cpu_export.h',
+    'kernel_sources/cpu_kernels.c',
+    'kernel_sources/cpu_kernels.h',
+    'kernel_sources/cpu_precision.h',
+    'kernel_sources/cpu_simd.h',
+    'kernel_sources/cpu_threads.c',
+    'kernel_sources/cpu_threads.h',
+    'kernel_sources/phase_1_act.inc',
+    'kernel_sources/phase_2_learn_A_production.inc',
+    'kernel_sources/phase_2_learn_B_processing.inc',
+    'kernel_sources/phase_2_learn_C_reduction.inc',
+    'kernel_sources/phase_2_learn_D_backprop.inc',
+    'kernel_sources/phase_3_update.inc',
+)
+
+install_data(
+    cpu_kernel_headers_and_sources,
+    install_dir: py.get_install_dir() / 'averaging_ensembled_classifier' / 'backends' / 'cpu' / 'kernel_sources',
 )

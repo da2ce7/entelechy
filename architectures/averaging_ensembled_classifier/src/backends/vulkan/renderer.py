@@ -50,30 +50,8 @@ else:
 
 logger = logging.getLogger(__name__)
 
-# Plan kernel name → Vulkan shader name mapping.
-# Plan models use OpenCL-era naming; Vulkan shaders use abbreviated names.
-_PLAN_TO_SHADER_NAME: dict[str, str] = {
-    "compute_probs_loss_cce_chunk": "compute_probs_loss_cce",
-    "compute_probs_loss_bce_chunk": "compute_probs_loss_bce",
-    "render_logits_chunk": "render_logits",
-    "calculate_module_param_grads_chunk": "calculate_module_param_grads",
-    "backprop_error_to_hidden_chunk": "backprop_error_to_hidden",
-    "calculate_chunk_temp_gradients": "calculate_temp_gradients",
-    "backprop_shared_weights_chunk": "backprop_shared_weights",
-    "backprop_shared_biases_chunk": "backprop_shared_biases",
-    "clip_shared_gradients_chunk": "clip_shared_gradients",
-    "gather_and_permute_grad_hidden_activations": "gather_and_permute",
-    "stabilize_and_reduce_grad_hidden_activations": "stabilize_reduce_grad_h",
-}
-
-
-def _shader_name(plan_kernel_name: str) -> str:
-    """Translate a plan-model kernel name to its Vulkan shader name."""
-    return _PLAN_TO_SHADER_NAME.get(plan_kernel_name, plan_kernel_name)
-
-
 # Shaders whose dispatch uses 2D workgroups (x, y, 1)
-_2D_DISPATCH_KERNELS = frozenset({"forward_pass", "backprop_shared_weights"})
+_2D_DISPATCH_KERNELS = frozenset({"forward_pass", "backprop_shared_weights_chunk"})
 
 # Reduction engine shaders using push descriptors
 _REDUCTION_SHADERS = frozenset({"aggregate_partials", "clip_intermediate_grad"})
@@ -222,19 +200,18 @@ class VulkanPlanRenderer:
                     kernel_names.add("clip_intermediate_grad")
 
         for name in kernel_names:
-            shader = _shader_name(name)
-            binding_count = DESCRIPTOR_BINDING_COUNTS[shader]
+            binding_count = DESCRIPTOR_BINDING_COUNTS[name]
             layout = self._descriptor_mgr.create_layout(binding_count)
             self._descriptor_layouts[name] = layout
 
-            push_size = ctypes.sizeof(PUSH_CONSTANT_STRUCTS[shader])
+            push_size = ctypes.sizeof(PUSH_CONSTANT_STRUCTS[name])
             pipeline = self._pipeline_cache.create_pipeline(
-                shader, layout, push_size, spec
+                name, layout, push_size, spec
             )
             self._pipelines[name] = pipeline
 
             # Pre-allocate descriptor set for fixed-binding kernels
-            if shader not in _REDUCTION_SHADERS:
+            if name not in _REDUCTION_SHADERS:
                 desc_set = self._descriptor_mgr.allocate_set(layout)
                 self._descriptor_sets[name] = desc_set
 
@@ -248,7 +225,7 @@ class VulkanPlanRenderer:
                     kernel_bindings[node.kernel_name] = node.buffer_bindings
 
         for kernel_name, bindings in kernel_bindings.items():
-            if _shader_name(kernel_name) in _REDUCTION_SHADERS:
+            if kernel_name in _REDUCTION_SHADERS:
                 continue  # Dynamic push descriptors
             desc_set = self._descriptor_sets.get(kernel_name)
             if desc_set is None:
@@ -280,7 +257,7 @@ class VulkanPlanRenderer:
             (int(s["total_modules_count"]) + w - 1) // w
         ),
         # Workgroup-per-row: one workgroup per (batch, hidden) row
-        "stabilize_reduce_grad_h": lambda s, w: (
+        "stabilize_and_reduce_grad_hidden_activations": lambda s, w: (
             int(s["total_batch_count"]) * int(s["padded_hidden_count"])
         ),
     }
@@ -292,15 +269,15 @@ class VulkanPlanRenderer:
         plan: ExecutionPlan,
     ) -> None:
         """Record a single kernel dispatch into the command buffer."""
-        shader = _shader_name(node.kernel_name)
-        pipeline = self._pipelines[node.kernel_name]
+        kernel = node.kernel_name
+        pipeline = self._pipelines[kernel]
 
         vk.vkCmdBindPipeline(
             cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline
         )
 
         # Bind descriptor set
-        desc_set = self._descriptor_sets.get(node.kernel_name)
+        desc_set = self._descriptor_sets.get(kernel)
         if desc_set is not None:
             vk.vkCmdBindDescriptorSets(
                 cmd,
@@ -315,7 +292,7 @@ class VulkanPlanRenderer:
 
         # Push constants
         pc_bytes = marshal_push_constants(
-            shader, node.scalar_params
+            kernel, node.scalar_params
         )
         pc_buf = _ffi.from_buffer(pc_bytes)
         vk.vkCmdPushConstants(
@@ -328,7 +305,7 @@ class VulkanPlanRenderer:
         )
 
         # Dispatch
-        if shader in _2D_DISPATCH_KERNELS:
+        if kernel in _2D_DISPATCH_KERNELS:
             # 2D dispatch: tile_count encodes (x * y), local_work_size
             # provides the second dimension hint
             x_groups = node.tile_count

@@ -94,7 +94,7 @@
     #define simd_fmadd(a, b, c)    simd_add(simd_mul(a, b), c)
 
     static inline float simd_reduce_add(simd_float v) {
-        __m128 shuf = _mm_movehdup_ps(v);
+        __m128 shuf = _mm_shuffle_ps(v, v, _MM_SHUFFLE(3, 3, 1, 1));
         __m128 sums = _mm_add_ps(v, shuf);
         shuf = _mm_movehl_ps(shuf, sums);
         sums = _mm_add_ss(sums, shuf);
@@ -181,6 +181,173 @@ static inline void simd_free(void* ptr) {
 #else
     free(ptr);
 #endif
+}
+
+/* ================================================================
+ * Precision Load/Store Wrappers (ADR-008)
+ *
+ * Computation always uses float (FP32) via simd_float.  These
+ * wrappers convert between the storage type and the FP32 compute
+ * type on load and store.
+ *
+ * - fp32: identity (no conversion)
+ * - fp16: widen _Float16 → float on load, narrow on store
+ * - fp64: narrow double → float on load, widen on store
+ *
+ * The SIMD variants process SIMD_WIDTH elements.  The scalar
+ * variants process a single element.
+ *
+ * FP16 SIMD uses F16C intrinsics on AVX2+/AVX-512.  On ISAs
+ * without F16C (SSE2, NEON, scalar fallback), FP16 SIMD falls
+ * back to scalar loop conversion.
+ * ================================================================ */
+
+/* --- FP32: identity ------------------------------------------- */
+
+static inline simd_float simd_load_real_fp32(const float* p) {
+    return simd_load(p);
+}
+static inline void simd_store_real_fp32(float* p, simd_float v) {
+    simd_store(p, v);
+}
+static inline float scalar_load_real_fp32(const float* p) {
+    return *p;
+}
+static inline void scalar_store_real_fp32(float* p, float v) {
+    *p = v;
+}
+
+/* --- FP16: _Float16 ↔ float ---------------------------------- */
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* AVX-512 + F16C: 16-wide convert */
+static inline simd_float simd_load_real_fp16(const _Float16* p) {
+    __m256i half_vec = _mm256_loadu_si256((const __m256i*)p);
+    return _mm512_cvtph_ps(half_vec);
+}
+static inline void simd_store_real_fp16(_Float16* p, simd_float v) {
+    __m256i half_vec = _mm512_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+    _mm256_storeu_si256((__m256i*)p, half_vec);
+}
+#elif defined(__AVX2__) && defined(__F16C__)
+/* AVX2 + F16C: 8-wide convert */
+static inline simd_float simd_load_real_fp16(const _Float16* p) {
+    __m128i half_vec = _mm_loadu_si128((const __m128i*)p);
+    return _mm256_cvtph_ps(half_vec);
+}
+static inline void simd_store_real_fp16(_Float16* p, simd_float v) {
+    __m128i half_vec = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+    _mm_storeu_si128((__m128i*)p, half_vec);
+}
+#elif defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+/* NEON: 4-wide convert via vcvt */
+static inline simd_float simd_load_real_fp16(const _Float16* p) {
+    float16x4_t half_vec = vld1_f16((const float16_t*)p);
+    return vcvt_f32_f16(half_vec);
+}
+static inline void simd_store_real_fp16(_Float16* p, simd_float v) {
+    float16x4_t half_vec = vcvt_f16_f32(v);
+    vst1_f16((float16_t*)p, half_vec);
+}
+#else
+/* Scalar / SSE2 fallback: element-wise conversion */
+static inline simd_float simd_load_real_fp16(const _Float16* p) {
+    float tmp[SIMD_WIDTH];
+    for (int i = 0; i < SIMD_WIDTH; i++) tmp[i] = (float)p[i];
+    return simd_load(tmp);
+}
+static inline void simd_store_real_fp16(_Float16* p, simd_float v) {
+    float tmp[SIMD_WIDTH];
+    simd_store(tmp, v);
+    for (int i = 0; i < SIMD_WIDTH; i++) p[i] = (_Float16)tmp[i];
+}
+#endif
+
+static inline float scalar_load_real_fp16(const _Float16* p) {
+    return (float)*p;
+}
+static inline void scalar_store_real_fp16(_Float16* p, float v) {
+    *p = (_Float16)v;
+}
+
+/* --- FP64: double ↔ float ------------------------------------- */
+
+#if defined(__AVX512F__)
+/* AVX-512: load 16 doubles (two 512-bit loads), narrow to 16 floats */
+static inline simd_float simd_load_real_fp64(const double* p) {
+    __m512d lo = _mm512_loadu_pd(p);
+    __m512d hi = _mm512_loadu_pd(p + 8);
+    __m256  lo_f = _mm512_cvtpd_ps(lo);
+    __m256  hi_f = _mm512_cvtpd_ps(hi);
+    return _mm512_insertf32x8(_mm512_castps256_ps512(lo_f), hi_f, 1);
+}
+static inline void simd_store_real_fp64(double* p, simd_float v) {
+    __m256 lo_f = _mm512_castps512_ps256(v);
+    __m256 hi_f = _mm512_extractf32x8_ps(v, 1);
+    __m512d lo = _mm512_cvtps_pd(lo_f);
+    __m512d hi = _mm512_cvtps_pd(hi_f);
+    _mm512_storeu_pd(p, lo);
+    _mm512_storeu_pd(p + 8, hi);
+}
+#elif defined(__AVX2__)
+/* AVX2: load 8 doubles (two 256-bit loads), narrow to 8 floats */
+static inline simd_float simd_load_real_fp64(const double* p) {
+    __m256d lo = _mm256_loadu_pd(p);
+    __m256d hi = _mm256_loadu_pd(p + 4);
+    __m128  lo_f = _mm256_cvtpd_ps(lo);
+    __m128  hi_f = _mm256_cvtpd_ps(hi);
+    return _mm256_set_m128(hi_f, lo_f);
+}
+static inline void simd_store_real_fp64(double* p, simd_float v) {
+    __m128 lo_f = _mm256_castps256_ps128(v);
+    __m128 hi_f = _mm256_extractf128_ps(v, 1);
+    __m256d lo = _mm256_cvtps_pd(lo_f);
+    __m256d hi = _mm256_cvtps_pd(hi_f);
+    _mm256_storeu_pd(p, lo);
+    _mm256_storeu_pd(p + 4, hi);
+}
+#elif defined(__SSE2__)
+/* SSE2: load 4 doubles (two 128-bit loads), narrow to 4 floats */
+static inline simd_float simd_load_real_fp64(const double* p) {
+    __m128d lo = _mm_loadu_pd(p);
+    __m128d hi = _mm_loadu_pd(p + 2);
+    __m128  lo_f = _mm_cvtpd_ps(lo);
+    __m128  hi_f = _mm_cvtpd_ps(hi);
+    return _mm_movelh_ps(lo_f, hi_f);
+}
+static inline void simd_store_real_fp64(double* p, simd_float v) {
+    __m128d lo = _mm_cvtps_pd(v);
+    __m128  hi_f = _mm_movehl_ps(v, v);
+    __m128d hi = _mm_cvtps_pd(hi_f);
+    _mm_storeu_pd(p, lo);
+    _mm_storeu_pd(p + 2, hi);
+}
+#elif defined(__ARM_NEON)
+/* NEON: load 4 doubles via scalar, convert to float32x4 */
+static inline simd_float simd_load_real_fp64(const double* p) {
+    float tmp[4] = {(float)p[0], (float)p[1], (float)p[2], (float)p[3]};
+    return vld1q_f32(tmp);
+}
+static inline void simd_store_real_fp64(double* p, simd_float v) {
+    float tmp[4];
+    vst1q_f32(tmp, v);
+    for (int i = 0; i < 4; i++) p[i] = (double)tmp[i];
+}
+#else
+/* Scalar fallback */
+static inline simd_float simd_load_real_fp64(const double* p) {
+    return (float)*p;
+}
+static inline void simd_store_real_fp64(double* p, simd_float v) {
+    *p = (double)v;
+}
+#endif
+
+static inline float scalar_load_real_fp64(const double* p) {
+    return (float)*p;
+}
+static inline void scalar_store_real_fp64(double* p, float v) {
+    *p = (double)v;
 }
 
 #endif /* CPU_SIMD_H */

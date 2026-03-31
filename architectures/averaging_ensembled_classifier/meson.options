@@ -1,4 +1,15 @@
 # meson.options — Build feature options for averaging_ensembled_classifier
+#
+# Debug / sanitizer builds:
+#   meson setup builddir-debug -Dbuildtype=debug -Db_sanitize=address,undefined
+#   meson setup builddir-release -Dbuildtype=release
+#
+# Windows DLL cross-compile:
+#   meson setup builddir-win --cross-file=cross/x86_64-w64-mingw32.ini
+#   meson setup builddir-win --cross-file=cross/msvc.ini
+#
+# ISA targeting (all platforms):
+#   meson setup builddir -Daec_cpu_isa_flags=['-mavx2','-mfma','-mf16c']
 
 option('aec_backend_vulkan', type: 'feature', value: 'auto',
        description: 'Build Vulkan SPIR-V compute shaders (requires glslc)')
@@ -8,3 +19,6 @@ option('aec_backend_cpu', type: 'feature', value: 'auto',
 
 option('aec_cpu_isa_flags', type: 'array', value: [],
        description: 'C compiler ISA flags for CPU backend (e.g., [\'-mavx2\']. Empty = -march=native)')
+
+option('aec_cpu_debug_asserts', type: 'boolean', value: false,
+       description: 'Enable CPU kernel runtime assertions (bounds checks, NaN guards)')

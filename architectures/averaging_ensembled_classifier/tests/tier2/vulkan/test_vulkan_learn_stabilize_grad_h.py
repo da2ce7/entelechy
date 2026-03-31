@@ -18,7 +18,7 @@ class TestVulkanStabilizeReduceGradH:
         partials = [rng.standard_normal((4, 8)).astype(np.float32) for _ in range(3)]
         ref = ref_stabilize_reduce_grad_h(partials)
         expected = sum(partials[1:], partials[0].copy())
-        tol = get_tolerance("stabilize_reduce_grad_h", "fp32")
+        tol = get_tolerance("stabilize_and_reduce_grad_hidden_activations", "fp32")
         np.testing.assert_allclose(ref, expected, atol=tol.atol, rtol=tol.rtol)
 
     def test_stabilize_reduce_with_clipping(self):

@@ -27,16 +27,12 @@ export PATH="/var/data/python/bin:$HOME/.local/bin:$PATH"
 
 C_FILES=(
     "$KERNEL_DIR/cpu_threads.c"
-    "$KERNEL_DIR/phase_1_act.c"
-    "$KERNEL_DIR/phase_2_learn_A_production.c"
-    "$KERNEL_DIR/phase_2_learn_B_processing.c"
-    "$KERNEL_DIR/phase_2_learn_C_reduction.c"
-    "$KERNEL_DIR/phase_2_learn_D_backprop.c"
-    "$KERNEL_DIR/phase_3_update.c"
+    "$KERNEL_DIR/cpu_kernels.c"
 )
 
 H_FILES=(
     "$KERNEL_DIR/cpu_kernels.h"
+    "$KERNEL_DIR/cpu_precision.h"
     "$KERNEL_DIR/cpu_simd.h"
     "$KERNEL_DIR/cpu_threads.h"
     "$KERNEL_DIR/cpu_export.h"

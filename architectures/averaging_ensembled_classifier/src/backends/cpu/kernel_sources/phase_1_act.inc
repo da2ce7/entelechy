@@ -1,9 +1,8 @@
-/* phase_1_act.c — CPU Act-phase kernel implementations (Nodes 4, 5).
+/* phase_1_act.inc — Precision-parameterized Act-phase kernels (Nodes 4, 5).
  *
+ * Included by phase_1_act.c with REAL_T / PRECISION_SUFFIX defined.
  * Algorithmic reference: kernels/phase_1_act.cl.c
- * Translation strategy: OpenCL work-items → SIMD lanes within a task.
  */
-#include "cpu_kernels.h"
 
 /* ================================================================
  * task_forward_pass (Node 4)
@@ -11,26 +10,26 @@
  * Each task processes one sample (task_index = sample within chunk).
  * SIMD-major weight layout: weights[h_block][input_dim][SIMD_WIDTH]
  * ================================================================ */
-void task_forward_pass(void* raw_args, uint task_index, uint thread_id) {
+void PREC_FN(task_forward_pass)(void* raw_args, uint task_index, uint thread_id) {
     (void)thread_id;
-    ForwardPassArgs* a = (ForwardPassArgs*)raw_args;
+    PREC_TY(ForwardPassArgs)* a = (PREC_TY(ForwardPassArgs)*)raw_args;
 
     if (task_index >= a->batch_chunk_count) return;
 
     const uint sample = a->batch_chunk_offset + task_index;
     const float mask_val = a->sample_mask[sample];
 
-    float* hidden_row     = a->hidden_activations + (size_t)sample * a->padded_hidden_count;
-    float* hidden_msk_row = a->hidden_mask + (size_t)sample * a->padded_hidden_count;
+    REAL_T* hidden_row     = a->hidden_activations + (size_t)sample * a->padded_hidden_count;
+    REAL_T* hidden_msk_row = a->hidden_mask + (size_t)sample * a->padded_hidden_count;
 
     /* Padded samples: zero out and return */
     if (mask_val < 0.5f) {
-        memset(hidden_row, 0, a->padded_hidden_count * sizeof(float));
-        memset(hidden_msk_row, 0, a->padded_hidden_count * sizeof(float));
+        memset(hidden_row, 0, a->padded_hidden_count * PREC_SIZEOF_REAL);
+        memset(hidden_msk_row, 0, a->padded_hidden_count * PREC_SIZEOF_REAL);
         return;
     }
 
-    const float* input_row = a->input + (size_t)sample * a->padded_input_count;
+    const REAL_T* input_row = a->input + (size_t)sample * a->padded_input_count;
     const uint padded_input  = a->padded_input_count;
     const uint padded_hidden = a->padded_hidden_count;
     const uint num_h_blocks  = padded_hidden / SIMD_WIDTH;
@@ -42,17 +41,17 @@ void task_forward_pass(void* raw_args, uint task_index, uint thread_id) {
         const uint h_offset = hb * SIMD_WIDTH;
 
         /* Initialize with bias */
-        simd_float accum = simd_load(&a->biases_shared[h_offset]);
+        simd_float accum = simd_load_real(&a->biases_shared[h_offset]);
 
         /* Weight pointer for this h_block:
          * weights_simd_major[hb * padded_input * SIMD_WIDTH + i * SIMD_WIDTH] */
-        const float* w_block = a->weights_shared_simd_major
-                              + (size_t)hb * padded_input * SIMD_WIDTH;
+        const REAL_T* w_block = a->weights_shared_simd_major
+                               + (size_t)hb * padded_input * SIMD_WIDTH;
 
         /* Dot product across all input dimensions */
         for (uint i = 0; i < padded_input; i++) {
             simd_float x_broadcast = simd_set1(input_row[i]);
-            simd_float w_vec = simd_load(&w_block[(size_t)i * SIMD_WIDTH]);
+            simd_float w_vec = simd_load_real(&w_block[(size_t)i * SIMD_WIDTH]);
             accum = simd_fmadd(w_vec, x_broadcast, accum);
         }
 
@@ -63,11 +62,11 @@ void task_forward_pass(void* raw_args, uint task_index, uint thread_id) {
         activated = simd_mul(activated, v_mask);
 
         /* Store hidden activations */
-        simd_store(&hidden_row[h_offset], activated);
+        simd_store_real(&hidden_row[h_offset], activated);
 
         /* Hidden mask: 1.0 where pre-ReLU > 0 AND sample is valid */
         simd_float relu_mask = simd_select(v_zero, v_mask, accum);
-        simd_store(&hidden_msk_row[h_offset], relu_mask);
+        simd_store_real(&hidden_msk_row[h_offset], relu_mask);
     }
 }
 
@@ -77,9 +76,9 @@ void task_forward_pass(void* raw_args, uint task_index, uint thread_id) {
  * Each task processes one flat work-unit.  We decompose task_index
  * into (module_local, batch_local, class_local) using the chunk dims.
  * ================================================================ */
-void task_render_logits(void* raw_args, uint task_index, uint thread_id) {
+void PREC_FN(task_render_logits)(void* raw_args, uint task_index, uint thread_id) {
     (void)thread_id;
-    RenderLogitsArgs* a = (RenderLogitsArgs*)raw_args;
+    PREC_TY(RenderLogitsArgs)* a = (PREC_TY(RenderLogitsArgs)*)raw_args;
 
     /* Decompose flat task_index into 3D coordinates:
      * task_index = module_local * (batch_chunk_count * class_chunk_count)

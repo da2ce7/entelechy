@@ -6,6 +6,7 @@
 #include "cpu_threads.h"
 
 #include <stdatomic.h>
+#include <stdalign.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -63,12 +64,14 @@
 /* ----------------------------------------------------------------
  * Internal types
  * ---------------------------------------------------------------- */
+#define CACHE_LINE 64
+
 typedef struct {
     void (*function)(void* args, uint task_index, uint thread_id);
     void*       args;
     uint        task_count;
-    atomic_uint next_task;
-    atomic_uint tasks_completed;
+    alignas(CACHE_LINE) atomic_uint next_task;
+    alignas(CACHE_LINE) atomic_uint tasks_completed;
 } TaskBatch;
 
 typedef struct {
@@ -80,13 +83,14 @@ struct ThreadPool {
     thrd_t*        threads;
     WorkerContext*  contexts;
     uint           thread_count;
+    uint           threads_created; /* actual number successfully spawned */
     TaskBatch*     current_batch;
     mtx_t          wake_mutex;
     cnd_t          wake_cond;
     cnd_t          done_cond;
     atomic_int     shutdown;
     atomic_int     active;   /* 1 when a batch is submitted */
-    atomic_uint    batch_gen; /* monotonic batch generation counter */
+    _Atomic uint64_t batch_gen; /* monotonic batch generation counter */
 };
 
 /* ----------------------------------------------------------------
@@ -96,7 +100,7 @@ static int worker_main(void* arg) {
     WorkerContext* ctx = (WorkerContext*)arg;
     ThreadPool*    pool = ctx->pool;
     const uint     tid  = ctx->thread_id;
-    uint           my_gen = 0;
+    uint64_t       my_gen = 0;
 
     for (;;) {
         mtx_lock(&pool->wake_mutex);
@@ -138,11 +142,12 @@ ThreadPool* pool_create(uint num_threads) {
     ThreadPool* pool = (ThreadPool*)calloc(1, sizeof(ThreadPool));
     if (!pool) return NULL;
 
-    pool->thread_count  = num_threads;
-    pool->current_batch = NULL;
+    pool->thread_count    = num_threads;
+    pool->threads_created = 0;
+    pool->current_batch   = NULL;
     atomic_init(&pool->shutdown, 0);
     atomic_init(&pool->active, 0);
-    atomic_init(&pool->batch_gen, 0);
+    atomic_init(&pool->batch_gen, (uint64_t)0);
 
     mtx_init(&pool->wake_mutex, mtx_plain);
     cnd_init(&pool->wake_cond);
@@ -160,8 +165,20 @@ ThreadPool* pool_create(uint num_threads) {
     for (uint i = 0; i < num_threads; i++) {
         pool->contexts[i].pool      = pool;
         pool->contexts[i].thread_id = i;
-        thrd_create(&pool->threads[i], worker_main, &pool->contexts[i]);
+        if (thrd_create(&pool->threads[i], worker_main, &pool->contexts[i]) != 0) {
+            /* Partial creation: adjust counts and tear down */
+            pool->thread_count = i;
+            pool->threads_created = i;
+            if (i == 0) {
+                pool_destroy(pool);
+                return NULL;
+            }
+            break;
+        }
+        pool->threads_created = i + 1;
     }
+    /* Reconcile thread_count to actual threads alive */
+    pool->thread_count = pool->threads_created;
     return pool;
 }
 
@@ -174,8 +191,8 @@ void pool_destroy(ThreadPool* pool) {
     cnd_broadcast(&pool->wake_cond);
     mtx_unlock(&pool->wake_mutex);
 
-    /* Join all workers */
-    for (uint i = 0; i < pool->thread_count; i++) {
+    /* Join only the workers that were successfully created */
+    for (uint i = 0; i < pool->threads_created; i++) {
         thrd_join(pool->threads[i], NULL);
     }
 
@@ -195,6 +212,14 @@ void pool_dispatch_and_wait(ThreadPool* pool,
     /* Edge case: no tasks */
     if (task_count == 0) return;
 
+    /* Fast path: run inline when tasks are few enough that pool
+     * wake/barrier overhead would dominate the actual work. */
+    if (task_count <= pool->thread_count / 2) {
+        for (uint i = 0; i < task_count; i++)
+            fn(args, i, 0);
+        return;
+    }
+
     TaskBatch batch;
     batch.function = fn;
     batch.args     = args;
@@ -205,7 +230,7 @@ void pool_dispatch_and_wait(ThreadPool* pool,
     mtx_lock(&pool->wake_mutex);
     pool->current_batch = &batch;
     atomic_store(&pool->active, 1);
-    atomic_fetch_add(&pool->batch_gen, 1);
+    atomic_fetch_add(&pool->batch_gen, (uint64_t)1);
     cnd_broadcast(&pool->wake_cond);
 
     /* Wait until all workers have finished this batch */

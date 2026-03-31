@@ -32,7 +32,7 @@ from .conftest import _get_available_backends, _select_oracle
 # is not blocked by a pathological edge case.
 # ---------------------------------------------------------------------------
 _ZERO_INIT_XFAIL = {
-    "calculate_temp_gradients",
+    "calculate_chunk_temp_gradients",
 }
 
 # ---------------------------------------------------------------------------
@@ -47,18 +47,18 @@ KERNEL_INVENTORY = [
     "render_logits_chunk",
     "compute_probs_loss_cce_chunk",
     "compute_probs_loss_bce_chunk",
-    "calculate_module_param_grads",
-    "backprop_error_to_hidden",
-    "calculate_temp_gradients",
+    "calculate_module_param_grads_chunk",
+    "backprop_error_to_hidden_chunk",
+    "calculate_chunk_temp_gradients",
     "clip_partial_gradients",
-    "gather_and_permute_grad_h",
+    "gather_and_permute_grad_hidden_activations",
     "aggregate_register_reduce",
     "aggregate_local_reduce",
     "clip_intermediate_grad",
-    "stabilize_reduce_grad_h",
-    "backprop_shared_weights",
-    "backprop_shared_biases",
-    "clip_shared_gradients",
+    "stabilize_and_reduce_grad_hidden_activations",
+    "backprop_shared_weights_chunk",
+    "backprop_shared_biases_chunk",
+    "clip_shared_gradients_chunk",
     "normalize_gradients",
     "adam_update",
     "clamp_temperatures",
@@ -66,9 +66,9 @@ KERNEL_INVENTORY = [
 
 # Strategy A kernels — additionally parameterized over problem type.
 STRATEGY_A_KERNELS = {
-    "calculate_module_param_grads",
-    "backprop_error_to_hidden",
-    "calculate_temp_gradients",
+    "calculate_module_param_grads_chunk",
+    "backprop_error_to_hidden_chunk",
+    "calculate_chunk_temp_gradients",
 }
 
 

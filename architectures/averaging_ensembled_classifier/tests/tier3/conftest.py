@@ -266,15 +266,15 @@ class _SingleKernelPlanBuilder:
             "_act_bce", "loss_computation", "partial_probs",
         ),
         # Learn Phase I — gradient production
-        "calculate_module_param_grads": (
+        "calculate_module_param_grads_chunk": (
             "_learn_cce", "calc_module_grads",
             "partial_grad_weights_module",
         ),
-        "backprop_error_to_hidden": (
+        "backprop_error_to_hidden_chunk": (
             "_learn_cce", "backprop_error_hidden",
             "partial_grad_hidden_activations_aos",
         ),
-        "calculate_temp_gradients": (
+        "calculate_chunk_temp_gradients": (
             "_learn_cce", "calc_temp_grads", "partial_grad_temps",
         ),
         "clip_partial_gradients": (
@@ -282,11 +282,11 @@ class _SingleKernelPlanBuilder:
             "clipped_partial_grad_weights_module",
         ),
         # Learn Phase II — aggregation
-        "gather_and_permute_grad_h": (
+        "gather_and_permute_grad_hidden_activations": (
             "_learn_cce", "gather_permute_grad_h",
             "clipped_grad_hidden_activations_permuted_soa",
         ),
-        "stabilize_reduce_grad_h": (
+        "stabilize_and_reduce_grad_hidden_activations": (
             "_learn_cce", "stabilize_reduce_grad_h",
             "summed_grad_hidden_activations",
         ),
@@ -300,15 +300,15 @@ class _SingleKernelPlanBuilder:
             "_learn_cce", "reduce_mod_grads", None,
         ),
         # Learn Phase III — streaming backprop
-        "backprop_shared_weights": (
+        "backprop_shared_weights_chunk": (
             "_learn_cce", "backprop_shared_weights",
             "partial_grad_weights_shared",
         ),
-        "backprop_shared_biases": (
+        "backprop_shared_biases_chunk": (
             "_learn_cce", "backprop_shared_biases",
             "partial_grad_biases_shared",
         ),
-        "clip_shared_gradients": (
+        "clip_shared_gradients_chunk": (
             "_learn_cce", "clip_shared_grads",
             "clipped_partial_grad_weights_shared",
         ),

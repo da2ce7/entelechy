@@ -28,7 +28,7 @@ class TestHiddenGrads:
         probs, _ = ref_compute_probs_loss_cce(logits, targets, mask)
         grad_h = ref_backprop_error_to_hidden(probs, targets, module_w, hidden_mask, mask)
 
-        _tol = get_tolerance("backprop_error_to_hidden", "fp32")
+        _tol = get_tolerance("backprop_error_to_hidden_chunk", "fp32")
         assert grad_h.shape == (batch, hid)
         assert not np.any(np.isnan(grad_h))
 

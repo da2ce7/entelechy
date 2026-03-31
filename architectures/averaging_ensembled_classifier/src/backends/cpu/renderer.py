@@ -6,6 +6,7 @@ node via the CPU kernel library's pool_dispatch_and_wait.
 from __future__ import annotations
 
 import ctypes
+from ctypes import POINTER, c_int32, c_uint32, c_void_p
 from dataclasses import replace
 from typing import Any
 
@@ -20,11 +21,20 @@ from ...shared.plan_types import (
 )
 from ...shared.retrieval_future import RetrievalFuture
 from ._dispatch_table import build_dispatch_table
-from ._ffi_types import ReductionTreePlanFFI, c_float_p, c_int_p, c_uint_p
+from ._ffi_types import PRECISION_C_TYPES, PRECISION_STRUCTS, PRECISION_SUFFIXES
 from ._loader import load_cpu_library
 from .buffer_allocator import CPUBufferAllocator
 from .discovery import detect_thread_count
 from .retrieval import CPURetrievalFuture
+
+c_uint_p = POINTER(c_uint32)
+c_int_p = POINTER(c_int32)
+
+_DTYPE_TO_SUFFIX: dict[np.dtype, str] = {
+    np.dtype(np.float16): "fp16",
+    np.dtype(np.float32): "fp32",
+    np.dtype(np.float64): "fp64",
+}
 
 
 class CPUPlanRenderer:
@@ -36,7 +46,10 @@ class CPUPlanRenderer:
 
     def __init__(self, thread_count: int | None = None) -> None:
         self._lib = load_cpu_library()
-        self._dispatch_table = build_dispatch_table(self._lib)
+        self._dispatch_tables = {
+            suffix: build_dispatch_table(self._lib, suffix)
+            for suffix in PRECISION_SUFFIXES
+        }
 
         if thread_count is None:
             thread_count = detect_thread_count()
@@ -56,6 +69,7 @@ class CPUPlanRenderer:
         Allocates SIMD-aligned numpy buffers, traverses the plan's
         topological order, and dispatches each node type.
         """
+        suffix = _DTYPE_TO_SUFFIX[plan.precision.numpy_dtype]
         allocator = CPUBufferAllocator(
             simd_alignment=plan.hardware.cache_line_bytes,
             dtype=plan.precision.numpy_dtype,
@@ -69,11 +83,11 @@ class CPUPlanRenderer:
             node = plan.nodes[node_id]
 
             if isinstance(node, KernelDispatchNode):
-                self._render_kernel_dispatch(node, allocator)
+                self._render_kernel_dispatch(node, allocator, suffix)
             elif isinstance(node, ReductionTreeNode):
-                self._render_reduction_tree(node, allocator, plan)
+                self._render_reduction_tree(node, allocator, plan, suffix)
             elif isinstance(node, StreamingLoopNode):
-                self._render_streaming_loop(node, allocator, plan)
+                self._render_streaming_loop(node, allocator, plan, suffix)
             elif isinstance(node, BarrierNode):
                 pass  # Implicit — blocking dispatch provides sync
             else:
@@ -94,7 +108,7 @@ class CPUPlanRenderer:
     # their task count derived from scalar params, not tile_count.
     # Each maps kernel_name → callable(scalar_params) → int.
     _TASK_COUNT_RESOLVERS: dict[str, Any] = {
-        "stabilize_reduce_grad_h": lambda s: (
+        "stabilize_and_reduce_grad_hidden_activations": lambda s: (
             int(s["total_batch_count"]) * int(s["padded_hidden_count"])
         ),
         "normalize_gradients": lambda s: int(s["parameter_count"]),
@@ -118,9 +132,10 @@ class CPUPlanRenderer:
         self,
         node: KernelDispatchNode,
         allocator: CPUBufferAllocator,
+        suffix: str,
     ) -> None:
         """Dispatch a KernelDispatchNode via pool_dispatch_and_wait."""
-        fn_addr, struct_cls = self._dispatch_table[node.kernel_name]
+        fn_addr, struct_cls = self._dispatch_tables[suffix][node.kernel_name]
 
         args = self._marshal_args(struct_cls, node, allocator)
 
@@ -136,26 +151,21 @@ class CPUPlanRenderer:
         node: ReductionTreeNode,
         allocator: CPUBufferAllocator,
         plan: ExecutionPlan,
+        suffix: str,
     ) -> None:
         """Render a ReductionTreeNode via execute_reduction_tree."""
+        _, c_real_p, _ = PRECISION_C_TYPES[suffix]
+        ReductionTreePlanFFI = PRECISION_STRUCTS[suffix]["ReductionTreePlanFFI"]
+
         rtp = node.reduction_plan
 
-        # Build offset list and stage metadata arrays
         offsets = rtp.initial_offset_list
         fan_in = rtp.fan_in_K
         num_stages = rtp.num_stages
+        pw = rtp.partial_width
+        SENTINEL = 0xFFFFFFFF
 
-        # Flatten: for a simple fan-in tree, construct per-stage offset lists
-        # The shared-layer ReductionTreePlan provides initial_offset_list
-        offsets_array = (ctypes.c_uint32 * len(offsets))(*offsets)
-
-        # Stage offsets: stage 0 starts at 0; single-stage tree
-        stage_offsets = (ctypes.c_uint32 * num_stages)(
-            *[i * fan_in for i in range(num_stages)]
-        )
-        stage_fan_in = (ctypes.c_uint32 * num_stages)(*([fan_in] * num_stages))
-
-        # Node counts per stage
+        # Compute node counts per stage
         n_partials = rtp.num_partials
         stage_counts: list[int] = []
         current_n = n_partials
@@ -163,19 +173,43 @@ class CPUPlanRenderer:
             nodes_at_stage = (current_n + fan_in - 1) // fan_in
             stage_counts.append(nodes_at_stage)
             current_n = nodes_at_stage
+
+        # Build the complete flat offset list for all stages.
+        # Each stage s needs stage_counts[s] * fan_in entries.
+        # Stage 0: initial_offset_list, padded with sentinels.
+        # Stages 1+: sequential offsets into the staging buffer.
+        flat_offsets: list[int] = []
+        stage_offset_values: list[int] = []
+
+        for s in range(num_stages):
+            stage_offset_values.append(len(flat_offsets))
+            entries_needed = stage_counts[s] * fan_in
+            if s == 0:
+                # Use initial offsets, pad remainder with sentinel
+                flat_offsets.extend(offsets)
+                flat_offsets.extend([SENTINEL] * (entries_needed - len(offsets)))
+            else:
+                # Previous stage wrote contiguously: offset i -> i * pw
+                prev_count = stage_counts[s - 1]
+                for i in range(prev_count):
+                    flat_offsets.append(i * pw)
+                flat_offsets.extend([SENTINEL] * (entries_needed - prev_count))
+
+        offsets_array = (ctypes.c_uint32 * len(flat_offsets))(*flat_offsets)
+        stage_offsets = (ctypes.c_uint32 * num_stages)(*stage_offset_values)
+        stage_fan_in = (ctypes.c_uint32 * num_stages)(*([fan_in] * num_stages))
         stage_node_counts = (ctypes.c_uint32 * num_stages)(*stage_counts)
 
         # Allocate staging buffers (ping-pong)
-        pw = rtp.partial_width
         max_intermediates: int = max(stage_counts) if stage_counts else 1
-        staging_0 = np.zeros(max_intermediates * pw, dtype=np.float32)
-        staging_1 = np.zeros(max_intermediates * pw, dtype=np.float32)
+        staging_0 = np.zeros(max_intermediates * pw, dtype=plan.precision.numpy_dtype)
+        staging_1 = np.zeros(max_intermediates * pw, dtype=plan.precision.numpy_dtype)
 
         # Build the C plan struct
         c_plan = ReductionTreePlanFFI()
         c_plan.partial_collection = ctypes.cast(
             allocator.get_data_pointer(rtp.source_buffer),
-            ctypes.POINTER(ctypes.c_float),
+            c_real_p,
         )
         c_plan.offset_lists_flat = ctypes.cast(
             offsets_array, ctypes.POINTER(ctypes.c_uint32)
@@ -189,15 +223,11 @@ class CPUPlanRenderer:
         c_plan.stage_node_counts = ctypes.cast(
             stage_node_counts, ctypes.POINTER(ctypes.c_uint32)
         )
-        c_plan.staging_buffer_0 = staging_0.ctypes.data_as(
-            ctypes.POINTER(ctypes.c_float)
-        )
-        c_plan.staging_buffer_1 = staging_1.ctypes.data_as(
-            ctypes.POINTER(ctypes.c_float)
-        )
+        c_plan.staging_buffer_0 = staging_0.ctypes.data_as(c_real_p)
+        c_plan.staging_buffer_1 = staging_1.ctypes.data_as(c_real_p)
         c_plan.output = ctypes.cast(
             allocator.get_data_pointer(rtp.destination_buffer),
-            ctypes.POINTER(ctypes.c_float),
+            c_real_p,
         )
         c_plan.partial_width = pw
         c_plan.num_stages = num_stages
@@ -213,7 +243,7 @@ class CPUPlanRenderer:
         c_plan.fp_max = plan.precision.fp_format_max
         c_plan.epsilon = plan.precision.epsilon
 
-        self._lib.execute_reduction_tree(
+        getattr(self._lib, f"execute_reduction_tree_{suffix}")(
             self._pool, ctypes.byref(c_plan)
         )
 
@@ -222,6 +252,7 @@ class CPUPlanRenderer:
         node: StreamingLoopNode,
         allocator: CPUBufferAllocator,
         plan: ExecutionPlan,
+        suffix: str,
     ) -> None:
         """Render a StreamingLoopNode by iterating chunks."""
         sp = node.streaming_plan
@@ -233,13 +264,16 @@ class CPUPlanRenderer:
                     adjusted = self._apply_strides(
                         body_node, sp, chunk_index
                     )
-                    self._render_kernel_dispatch(adjusted, allocator)
+                    self._render_kernel_dispatch(adjusted, allocator, suffix)
 
     # -----------------------------------------------------------
     # Argument marshalling
     # -----------------------------------------------------------
 
-    _POINTER_TYPES = (c_float_p, c_uint_p, c_int_p, ctypes.c_void_p)
+    _POINTER_TYPES = (
+        *(ct[1] for ct in PRECISION_C_TYPES.values()),
+        c_uint_p, c_int_p, c_void_p,
+    )
 
     def _marshal_args(
         self,

@@ -23,7 +23,7 @@ KERNEL_TOLERANCES: dict[str, dict[str, TolerancePair]] = {
         "fp32": TolerancePair(atol=1e-4, rtol=1e-4),
         "fp16": TolerancePair(atol=5e-2, rtol=5e-2),
     },
-    "stabilize_reduce_grad_h": {
+    "stabilize_and_reduce_grad_hidden_activations": {
         "fp32": TolerancePair(atol=1e-4, rtol=1e-4),
     },
     "adam_update": {
@@ -52,28 +52,28 @@ CPU_KERNEL_TOLERANCES: dict[str, dict[str, TolerancePair]] = {
     "compute_probs_loss_bce_chunk": {
         "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
     },
-    "calculate_module_param_grads": {
+    "calculate_module_param_grads_chunk": {
         "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
     },
-    "backprop_error_to_hidden": {
+    "backprop_error_to_hidden_chunk": {
         "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
     },
     "clip_partial_gradients": {
         "fp32": TolerancePair(atol=1e-6, rtol=1e-5),
     },
-    "gather_and_permute_grad_h": {
+    "gather_and_permute_grad_hidden_activations": {
         "fp32": TolerancePair(atol=1e-6, rtol=1e-5),
     },
-    "stabilize_reduce_grad_h": {
+    "stabilize_and_reduce_grad_hidden_activations": {
         "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
     },
-    "backprop_shared_weights": {
+    "backprop_shared_weights_chunk": {
         "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
     },
-    "backprop_shared_biases": {
+    "backprop_shared_biases_chunk": {
         "fp32": TolerancePair(atol=1e-5, rtol=1e-4),
     },
-    "clip_shared_gradients": {
+    "clip_shared_gradients_chunk": {
         "fp32": TolerancePair(atol=1e-6, rtol=1e-5),
     },
     "normalize_gradients": {
@@ -132,19 +132,19 @@ VULKAN_KERNEL_TOLERANCES: dict[str, dict[str, TolerancePair]] = {
     "compute_probs_loss_bce_chunk": {
         "fp32": TolerancePair(atol=1e-4, rtol=1e-4),
     },
-    "calculate_module_param_grads": {
+    "calculate_module_param_grads_chunk": {
         "fp32": TolerancePair(atol=1e-4, rtol=1e-4),
     },
-    "backprop_error_to_hidden": {
+    "backprop_error_to_hidden_chunk": {
         "fp32": TolerancePair(atol=1e-4, rtol=1e-4),
     },
     "clip_partial_gradients": {
         "fp32": TolerancePair(atol=1e-5, rtol=1e-5),
     },
-    "gather_and_permute_grad_h": {
+    "gather_and_permute_grad_hidden_activations": {
         "fp32": TolerancePair(atol=1e-5, rtol=1e-5),
     },
-    "stabilize_reduce_grad_h": {
+    "stabilize_and_reduce_grad_hidden_activations": {
         "fp32": TolerancePair(atol=1e-4, rtol=1e-4),
     },
     "aggregate_local_reduce": {
@@ -153,13 +153,13 @@ VULKAN_KERNEL_TOLERANCES: dict[str, dict[str, TolerancePair]] = {
     "aggregate_register_reduce": {
         "fp32": TolerancePair(atol=1e-4, rtol=1e-4),
     },
-    "backprop_shared_weights": {
+    "backprop_shared_weights_chunk": {
         "fp32": TolerancePair(atol=1e-4, rtol=1e-4),
     },
-    "backprop_shared_biases": {
+    "backprop_shared_biases_chunk": {
         "fp32": TolerancePair(atol=1e-4, rtol=1e-4),
     },
-    "clip_shared_gradients": {
+    "clip_shared_gradients_chunk": {
         "fp32": TolerancePair(atol=1e-5, rtol=1e-5),
     },
     "normalize_gradients": {
@@ -206,7 +206,7 @@ TIER3_KERNEL_TOLERANCES: dict[str, dict[str, TolerancePair]] = {
     "compute_probs_loss_bce_chunk": {
         "fp32": TolerancePair(atol=5e-4, rtol=5e-4),
     },
-    "stabilize_reduce_grad_h": {
+    "stabilize_and_reduce_grad_hidden_activations": {
         "fp32": TolerancePair(atol=5e-4, rtol=5e-4),
     },
     "adam_update": {
