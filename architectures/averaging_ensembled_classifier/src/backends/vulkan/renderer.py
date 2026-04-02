@@ -154,7 +154,7 @@ class VulkanPlanRenderer:
                     padded_size_bytes=plan.buffers[
                         node.source_buffer
                     ].size_bytes,
-                    dtype=plan.precision.numpy_dtype,
+                    dtype=plan.precision.storage_dtype,
                 )
                 futures[node.event_name] = future
 
@@ -523,7 +523,7 @@ class VulkanPlanRenderer:
 
                 clip_params = {
                     "src_scalar_REAL_clipping_threshold": float(threshold),
-                    "src_scalar_REAL_epsilon": plan.precision.epsilon,
+                    "src_scalar_REAL_epsilon": plan.precision.compute_epsilon,
                     "src_scalar_NATURAL_parameter_count": nodes_at_stage * pw,
                 }
                 clip_pc = marshal_push_constants(

@@ -55,9 +55,10 @@ class StabilizationPolicy:
     lambda_: float
 
     # WHY: This parameter represents a non-negotiable physical system boundary.
-    # It is the absolute maximum finite value for the target floating-point
-    # format and serves as the basis for all hardware-aware safety calculations.
-    fp_format_max: float
+    # The maximum representable value of the compute precision format. Governs
+    # overflow safety during reduction tree summation. Under the three-role model,
+    # the safety ceiling is bounded by arithmetic precision, not storage precision.
+    compute_fp_format_max: float
 
     # WHY: This parameter is a mandatory system-level safeguard. It establishes
     # a floor for all computed thresholds, preventing signal annihilation that
@@ -92,7 +93,7 @@ class StabilizationPolicy:
         # system's fundamental `min_threshold`. It guarantees that the hardware
         # safety ceiling (`fp_format_max / K`) can never fall below this
         # non-negotiable floor, thus preventing signal annihilation.
-        math_safety_k_limit = self.fp_format_max / self.min_threshold if self.min_threshold > 0 else float("inf")
+        math_safety_k_limit = self.compute_fp_format_max / self.min_threshold if self.min_threshold > 0 else float("inf")
 
         # Synthesis and Finalization.
         # WHY: The final value is contractually obligated to be the most
@@ -183,7 +184,7 @@ class StabilizationPolicy:
         # WHY: A 10% safety margin below the absolute hardware maximum provides
         # a robust buffer against unforeseen floating-point edge cases without
         # being overly restrictive for a coarse safety gate.
-        return self.fp_format_max * 0.9
+        return self.compute_fp_format_max * 0.9
 
     # =========================================================================
     # === Internal Calculation Primitives                                   ===
@@ -201,9 +202,9 @@ class StabilizationPolicy:
             return float("inf")
 
         # Calculate the K-limit imposed by the absolute minimum threshold.
-        absolute_k_max = self.fp_format_max / self.min_threshold if self.min_threshold > 0 else float("inf")
+        absolute_k_max = self.compute_fp_format_max / self.min_threshold if self.min_threshold > 0 else float("inf")
         # Calculate the K-limit imposed by the policy at this stage.
-        policy_k_max = self.fp_format_max / effective_floor
+        policy_k_max = self.compute_fp_format_max / effective_floor
 
         # The true limit is the more restrictive of the two.
         return min(absolute_k_max, policy_k_max)
@@ -215,7 +216,7 @@ class StabilizationPolicy:
         validated_k = max(2, min(runtime_fan_in_k, math_limit))
 
         # Calculate the canonical hardware safety ceiling for this fan-in.
-        safety_ceiling = self.fp_format_max / validated_k
+        safety_ceiling = self.compute_fp_format_max / validated_k
 
         # For safety-only policies, the hardware ceiling is the only constraint.
         if self.t_algorithmic <= 0:

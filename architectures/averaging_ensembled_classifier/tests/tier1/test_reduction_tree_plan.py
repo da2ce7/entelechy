@@ -15,7 +15,7 @@ def _make_tree(
     fp_max: float = 3.4028235e+38,
 ) -> ReductionTreePlan:
     num_stages = max(1, math.ceil(math.log(num_partials) / math.log(fan_in))) if num_partials > 1 else 1
-    policy = StabilizationPolicy(t_algorithmic=1.0, lambda_=0.1, fp_format_max=fp_max)
+    policy = StabilizationPolicy(t_algorithmic=1.0, lambda_=0.1, compute_fp_format_max=fp_max)
     if variant == "sum_and_clip":
         schedule = tuple(
             policy.get_threshold_for_generic_stage(j, fan_in)

@@ -20,6 +20,7 @@ backprop_shared_weights_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "Padded to alignment"),
             calculability_proof=("total_batch_count", "padded_input_count"),
             validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_hidden_activations", flow="src", memory_scope="GLOBAL",
@@ -27,6 +28,7 @@ backprop_shared_weights_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "Padded to alignment"),
             calculability_proof=("total_batch_count", "padded_hidden_count"),
             validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_summed_grad_hidden_activations", flow="src", memory_scope="GLOBAL",
@@ -41,6 +43,7 @@ backprop_shared_weights_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_batch_count",),
             validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_grad_weights_shared", flow="dest", memory_scope="GLOBAL",
@@ -48,6 +51,7 @@ backprop_shared_weights_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("num_batch_chunks_count", "padded_input_count", "padded_hidden_count"),
             validation_preconditions=("chunk write index valid",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -61,7 +65,7 @@ backprop_shared_weights_contract = KernelContract(
         ScalarParamSpec("final_grad_hidden_total_element_count", "src", "NATURAL"),
     ),
     local_memory=(
-        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(SCALAR_TYPE)"),
+        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
     ),
     placement=PlacementContract(strategy="linear_batch", key_domain=None, context_params={}),
 )
@@ -81,6 +85,7 @@ backprop_shared_biases_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "Padded to alignment"),
             calculability_proof=("total_batch_count", "padded_hidden_count"),
             validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_summed_grad_hidden_activations", flow="src", memory_scope="GLOBAL",
@@ -95,6 +100,7 @@ backprop_shared_biases_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_batch_count",),
             validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_grad_biases_shared", flow="dest", memory_scope="GLOBAL",
@@ -102,6 +108,7 @@ backprop_shared_biases_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("num_batch_chunks_count", "padded_hidden_count"),
             validation_preconditions=("chunk write index valid",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -114,7 +121,7 @@ backprop_shared_biases_contract = KernelContract(
         ScalarParamSpec("final_grad_hidden_total_element_count", "src", "NATURAL"),
     ),
     local_memory=(
-        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(SCALAR_TYPE)"),
+        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
     ),
     placement=PlacementContract(strategy="linear_batch", key_domain=None, context_params={}),
 )
@@ -137,6 +144,7 @@ clip_shared_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("weights_parameter_count",),
             validation_preconditions=("contiguous chunk region",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_partial_grad_biases_shared", flow="src", memory_scope="GLOBAL",
@@ -144,6 +152,7 @@ clip_shared_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("biases_parameter_count",),
             validation_preconditions=("contiguous chunk region",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_clipped_partial_grad_weights_shared", flow="dest", memory_scope="GLOBAL",
@@ -151,6 +160,7 @@ clip_shared_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("num_batch_chunks", "weights_parameter_count"),
             validation_preconditions=("write offset within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_clipped_partial_grad_biases_shared", flow="dest", memory_scope="GLOBAL",
@@ -158,6 +168,7 @@ clip_shared_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("num_batch_chunks", "biases_parameter_count"),
             validation_preconditions=("write offset within bounds",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -170,7 +181,7 @@ clip_shared_gradients_contract = KernelContract(
         ScalarParamSpec("num_batch_chunks", "src", "NATURAL"),
     ),
     local_memory=(
-        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(SCALAR_TYPE)"),
+        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
     ),
     placement=PlacementContract(strategy="linear_batch", key_domain=None, context_params={}),
 )

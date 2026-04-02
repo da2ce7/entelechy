@@ -144,7 +144,7 @@ class OpenCLPlanRenderer:
         total_elements = 1
         for d in padded_shape:
             total_elements *= d
-        host_buffer = np.empty(total_elements, dtype=plan.precision.numpy_dtype)
+        host_buffer = np.empty(total_elements, dtype=plan.precision.storage_dtype)
 
         event = self._allocator.enqueue_read(
             node.source_buffer, host_buffer, wait_for=wait_for or None,

@@ -69,10 +69,10 @@ class CPUPlanRenderer:
         Allocates SIMD-aligned numpy buffers, traverses the plan's
         topological order, and dispatches each node type.
         """
-        suffix = _DTYPE_TO_SUFFIX[plan.precision.numpy_dtype]
+        suffix = _DTYPE_TO_SUFFIX[plan.precision.storage_dtype]
         allocator = CPUBufferAllocator(
             simd_alignment=plan.hardware.cache_line_bytes,
-            dtype=plan.precision.numpy_dtype,
+            dtype=plan.precision.storage_dtype,
         )
         for descriptor in plan.buffers.values():
             allocator.allocate(descriptor)
@@ -202,8 +202,8 @@ class CPUPlanRenderer:
 
         # Allocate staging buffers (ping-pong)
         max_intermediates: int = max(stage_counts) if stage_counts else 1
-        staging_0 = np.zeros(max_intermediates * pw, dtype=plan.precision.numpy_dtype)
-        staging_1 = np.zeros(max_intermediates * pw, dtype=plan.precision.numpy_dtype)
+        staging_0 = np.zeros(max_intermediates * pw, dtype=plan.precision.storage_dtype)
+        staging_1 = np.zeros(max_intermediates * pw, dtype=plan.precision.storage_dtype)
 
         # Build the C plan struct
         c_plan = ReductionTreePlanFFI()
@@ -240,8 +240,8 @@ class CPUPlanRenderer:
             if len(rtp.threshold_schedule) > 1 and rtp.threshold_schedule[1] is not None
             else 0.0
         )
-        c_plan.fp_max = plan.precision.fp_format_max
-        c_plan.epsilon = plan.precision.epsilon
+        c_plan.fp_max = plan.precision.compute_fp_format_max
+        c_plan.epsilon = plan.precision.compute_epsilon
 
         getattr(self._lib, f"execute_reduction_tree_{suffix}")(
             self._pool, ctypes.byref(c_plan)

@@ -63,7 +63,7 @@ def policy(precision_fp32: PrecisionConfig) -> StabilizationPolicy:
     return StabilizationPolicy(
         t_algorithmic=1.0,
         lambda_=0.1,
-        fp_format_max=precision_fp32.fp_format_max,
+        compute_fp_format_max=precision_fp32.compute_fp_format_max,
     )
 
 

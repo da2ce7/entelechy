@@ -153,7 +153,7 @@ class TestReductionTreePlanning:
     ])
     def test_tree_depth(self, n_partials, max_k, expected_stages_min) -> None:
         policy = StabilizationPolicy(
-            t_algorithmic=1.0, lambda_=0.9, fp_format_max=3.4e38
+            t_algorithmic=1.0, lambda_=0.9, compute_fp_format_max=3.4e38
         )
         safe_k, num_stages = policy.plan_uniform_reduction_tree(
             num_partials=n_partials, hardware_max_fan_in=max_k
@@ -167,7 +167,7 @@ class TestReductionTreePlanning:
     def test_tree_correctness_full_reduction(self) -> None:
         """For n=8, k=4: stage 0 → 8/4=2 partials, stage 1 → 2/2=1 final."""
         policy = StabilizationPolicy(
-            t_algorithmic=1.0, lambda_=0.9, fp_format_max=3.4e38
+            t_algorithmic=1.0, lambda_=0.9, compute_fp_format_max=3.4e38
         )
         safe_k, num_stages = policy.plan_uniform_reduction_tree(
             num_partials=8, hardware_max_fan_in=4
@@ -184,7 +184,7 @@ class TestReductionTreePlanning:
     def test_stabilization_disabled(self) -> None:
         """When t_algorithmic == 0, no stabilization is active."""
         policy = StabilizationPolicy(
-            t_algorithmic=0.0, lambda_=0.9, fp_format_max=3.4e38
+            t_algorithmic=0.0, lambda_=0.9, compute_fp_format_max=3.4e38
         )
         # With stabilization disabled, the pipeline uses the raw k directly
         # and num_stages should be 0

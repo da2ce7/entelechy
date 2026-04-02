@@ -2,6 +2,7 @@
 """Plan-level buffer lifecycle types (ADR-009)."""
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Literal
 
 
 class BufferHandle(int):
@@ -36,6 +37,9 @@ class BufferDescriptor:
     element_size_bytes: int
     size_bytes: int
     role: BufferRole
-    producing_node: str | None
-    consumers: frozenset[str]
-    last_consumer: str | None
+    # Transitional default "compute" will be removed in Phase 7B once all
+    # BufferDescriptor construction sites in plan_builder.py are updated.
+    precision_role: Literal["storage", "compute", "state"] = "compute"
+    producing_node: str | None = None
+    consumers: frozenset[str] = frozenset()
+    last_consumer: str | None = None

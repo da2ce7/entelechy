@@ -77,7 +77,8 @@ class TestPaddingCalculations:
         # fp32 row = 4*4=16 bytes, padded to 64 → 16 elements
         assert fp16.padded_input_dim >= fp32.padded_input_dim
 
-    def test_scalar_np_type_is_correct(self) -> None:
+    def test_precision_storage_dtype_is_correct(self) -> None:
+        """Verify precision.storage_dtype gives expected np.dtype."""
         fp32 = ModelSpec.float32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
@@ -86,5 +87,5 @@ class TestPaddingCalculations:
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )
-        assert fp32.SCALAR_NP_TYPE == np.float32
-        assert fp16.SCALAR_NP_TYPE == np.float16
+        assert fp32.precision.storage_dtype == np.dtype(np.float32)
+        assert fp16.precision.storage_dtype == np.dtype(np.float16)

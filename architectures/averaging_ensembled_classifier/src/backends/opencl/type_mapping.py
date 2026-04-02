@@ -20,8 +20,8 @@ def build_compiler_flags(
     NUMERICAL_STABILITY_EPSILON, LOCAL_MEM_BANK_PADDING.
     """
     cl_type = numpy_dtype_to_cl_type_name(precision)
-    is_half = 1 if precision.numpy_dtype == np.dtype(np.float16) else 0
-    eps = f"{precision.epsilon}f" if not is_half else str(precision.epsilon)
+    is_half = 1 if precision.compute_dtype == np.dtype(np.float16) else 0
+    eps = f"{precision.compute_epsilon}f" if not is_half else str(precision.compute_epsilon)
     return [
         f"-DSCALAR_TYPE={cl_type}",
         f"-DSIMD_WIDTH={hardware.simd_width}",
@@ -33,9 +33,9 @@ def build_compiler_flags(
 
 
 def numpy_dtype_to_cl_type_name(precision: PrecisionConfig) -> str:
-    """Map PrecisionConfig.numpy_dtype to OpenCL C type name."""
+    """Map PrecisionConfig.compute_dtype to OpenCL C type name."""
     mapping = {
         np.dtype(np.float32): "float",
         np.dtype(np.float16): "half",
     }
-    return mapping[precision.numpy_dtype]
+    return mapping[precision.compute_dtype]

@@ -20,6 +20,7 @@ compute_probs_loss_cce_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "output_class_count padded for alignment"),
             calculability_proof=("total_modules_count", "total_batch_count", "padded_total_output_class_count"),
             validation_preconditions=("tile within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_temps", flow="src", memory_scope="GLOBAL_CONST",
@@ -27,6 +28,7 @@ compute_probs_loss_cce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_modules_count",),
             validation_preconditions=("exact allocation size",),
+            precision_role="state",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_targets", flow="src", memory_scope="GLOBAL",
@@ -34,6 +36,7 @@ compute_probs_loss_cce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_batch_count",),
             validation_preconditions=("values in [0, output_class_count-1]",),
+            precision_role=None,
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_sample_mask", flow="src", memory_scope="GLOBAL",
@@ -41,6 +44,7 @@ compute_probs_loss_cce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_batch_count",),
             validation_preconditions=("exact allocation size",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_probs", flow="dest", memory_scope="GLOBAL",
@@ -48,6 +52,7 @@ compute_probs_loss_cce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "classes_per_chunk"),
             validation_preconditions=("tile write index valid",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_final_loss", flow="dest", memory_scope="GLOBAL",
@@ -87,6 +92,7 @@ compute_probs_loss_bce_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "output_class_count padded for alignment"),
             calculability_proof=("total_modules_count", "total_batch_count", "padded_total_output_class_count"),
             validation_preconditions=("tile within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_temps", flow="src", memory_scope="GLOBAL_CONST",
@@ -94,6 +100,7 @@ compute_probs_loss_bce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_modules_count",),
             validation_preconditions=("exact allocation size",),
+            precision_role="state",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_targets", flow="src", memory_scope="GLOBAL",
@@ -101,6 +108,7 @@ compute_probs_loss_bce_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "output_class_count padded for alignment"),
             calculability_proof=("total_batch_count", "padded_total_output_class_count"),
             validation_preconditions=("exact allocation size",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_sample_mask", flow="src", memory_scope="GLOBAL",
@@ -108,6 +116,7 @@ compute_probs_loss_bce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_batch_count",),
             validation_preconditions=("exact allocation size",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_probs", flow="dest", memory_scope="GLOBAL",
@@ -115,6 +124,7 @@ compute_probs_loss_bce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "classes_per_chunk"),
             validation_preconditions=("tile write index valid",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_loss", flow="dest", memory_scope="GLOBAL",
@@ -122,6 +132,7 @@ compute_probs_loss_bce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count"),
             validation_preconditions=("tile write index valid",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -154,6 +165,7 @@ calculate_module_param_grads_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "Padded to alignment"),
             calculability_proof=("total_batch_count", "padded_hidden_count"),
             validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_partial_probs", flow="src", memory_scope="GLOBAL",
@@ -161,6 +173,7 @@ calculate_module_param_grads_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "classes_per_chunk"),
             validation_preconditions=("tile within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_targets", flow="src", memory_scope="GLOBAL",
@@ -168,6 +181,7 @@ calculate_module_param_grads_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("problem_type",),
             validation_preconditions=("type-punned pointer; host provides correct buffer",),
+            precision_role=None,
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_sample_mask", flow="src", memory_scope="GLOBAL",
@@ -175,6 +189,7 @@ calculate_module_param_grads_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_batch_count",),
             validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_grad_weights_module", flow="dest", memory_scope="GLOBAL",
@@ -182,6 +197,7 @@ calculate_module_param_grads_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "padded_hidden_count", "classes_per_chunk"),
             validation_preconditions=("tile write index valid",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_grad_biases_module", flow="dest", memory_scope="GLOBAL",
@@ -189,6 +205,7 @@ calculate_module_param_grads_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "classes_per_chunk"),
             validation_preconditions=("tile write index valid",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -208,7 +225,7 @@ calculate_module_param_grads_contract = KernelContract(
         ScalarParamSpec("total_tile_count", "src", "NATURAL"),
     ),
     local_memory=(
-        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(SCALAR_TYPE)"),
+        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
     ),
     placement=PlacementContract(strategy="grid_mod_cls", key_domain=None, context_params={}),
 )

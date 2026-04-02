@@ -66,6 +66,7 @@ adam_update_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("parameter_count",),
             validation_preconditions=("identical layout to final_grad, m1, m2",),
+            precision_role="state",
         ),
         BufferParamSpec(
             name="update_buffer_GLOBAL_m1", flow="update", memory_scope="GLOBAL",
@@ -73,6 +74,7 @@ adam_update_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("parameter_count",),
             validation_preconditions=("identical layout to other state buffers",),
+            precision_role="state",
         ),
         BufferParamSpec(
             name="update_buffer_GLOBAL_m2", flow="update", memory_scope="GLOBAL",
@@ -80,6 +82,7 @@ adam_update_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("parameter_count",),
             validation_preconditions=("identical layout to other state buffers",),
+            precision_role="state",
         ),
     ),
     scalar_params=(
@@ -110,6 +113,7 @@ clamp_temperatures_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_modules_count",),
             validation_preconditions=("exact allocation size",),
+            precision_role="state",
         ),
     ),
     scalar_params=(

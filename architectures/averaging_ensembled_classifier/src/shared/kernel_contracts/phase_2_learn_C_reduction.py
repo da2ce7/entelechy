@@ -20,6 +20,7 @@ gather_and_permute_grad_h_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "padded_hidden_count"),
             validation_preconditions=("fully populated by Node 11",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa", flow="dest", memory_scope="GLOBAL",
@@ -27,6 +28,7 @@ gather_and_permute_grad_h_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "Trailing dimension padded to padded_total_modules_count for alignment."),
             calculability_proof=("total_batch_count", "padded_hidden_count", "padded_total_modules_count"),
             validation_preconditions=("exact allocation size",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -59,6 +61,7 @@ aggregate_register_reduce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=(),
             validation_preconditions=("valid buffer encompassing all offset references",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_partial_offset_list", flow="src", memory_scope="GLOBAL_CONST",
@@ -66,6 +69,7 @@ aggregate_register_reduce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("partial_offset_list_count",),
             validation_preconditions=("exact offset count",),
+            precision_role=None,
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial", flow="dest", memory_scope="GLOBAL",
@@ -73,6 +77,7 @@ aggregate_register_reduce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("partial_width",),
             validation_preconditions=("exact allocation size",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -99,6 +104,7 @@ aggregate_local_reduce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=(),
             validation_preconditions=("valid buffer encompassing all offset references",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_partial_offset_list", flow="src", memory_scope="GLOBAL_CONST",
@@ -106,6 +112,7 @@ aggregate_local_reduce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("partial_offset_list_count",),
             validation_preconditions=("exact offset count",),
+            precision_role=None,
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial", flow="dest", memory_scope="GLOBAL",
@@ -113,6 +120,7 @@ aggregate_local_reduce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("partial_width",),
             validation_preconditions=("exact allocation size",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -121,7 +129,7 @@ aggregate_local_reduce_contract = KernelContract(
         ScalarParamSpec("operation_type", "src", "FLAG"),
     ),
     local_memory=(
-        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(SCALAR_TYPE)"),
+        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
     ),
     placement=None,
 )
@@ -144,6 +152,7 @@ clip_intermediate_grad_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("parameter_count",),
             validation_preconditions=("exact element count",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -152,7 +161,7 @@ clip_intermediate_grad_contract = KernelContract(
         ScalarParamSpec("parameter_count", "src", "NATURAL"),
     ),
     local_memory=(
-        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(SCALAR_TYPE)"),
+        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
     ),
     placement=None,
 )
@@ -175,6 +184,7 @@ stabilize_reduce_grad_h_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "Trailing dimension padded for alignment."),
             calculability_proof=("total_batch_count", "padded_hidden_count", "padded_total_modules_count"),
             validation_preconditions=("fully populated by Node 13",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_summed_grad_hidden_activations", flow="dest", memory_scope="GLOBAL",
@@ -196,7 +206,7 @@ stabilize_reduce_grad_h_contract = KernelContract(
         ScalarParamSpec("padded_total_modules_count", "src", "NATURAL"),
     ),
     local_memory=(
-        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(SCALAR_TYPE)"),
+        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
     ),
     placement=None,
 )
@@ -230,6 +240,7 @@ reduce_k_fan_in_and_clip_contract = KernelContract(
             validation_preconditions=(
                 "valid buffer encompassing all offset references",
             ),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_offset_list_flat",
@@ -240,6 +251,7 @@ reduce_k_fan_in_and_clip_contract = KernelContract(
             validation_preconditions=(
                 "exactly node_count * fan_in_K uint entries",
             ),
+            precision_role=None,
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_stage_output",
@@ -248,6 +260,7 @@ reduce_k_fan_in_and_clip_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("node_count", "partial_width"),
             validation_preconditions=("exact allocation size",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -258,7 +271,7 @@ reduce_k_fan_in_and_clip_contract = KernelContract(
         ScalarParamSpec("epsilon", "src", "REAL"),
     ),
     local_memory=(
-        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(SCALAR_TYPE)"),
+        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
     ),
     placement=None,
 )

@@ -20,6 +20,7 @@ backprop_error_to_hidden_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "classes_per_chunk"),
             validation_preconditions=("tile within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_targets", flow="src", memory_scope="GLOBAL",
@@ -27,6 +28,7 @@ backprop_error_to_hidden_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("problem_type",),
             validation_preconditions=("type-punned pointer; host provides correct buffer",),
+            precision_role=None,
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_sample_mask", flow="src", memory_scope="GLOBAL",
@@ -34,6 +36,7 @@ backprop_error_to_hidden_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_batch_count",),
             validation_preconditions=("exact allocation size",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_weights_module", flow="src", memory_scope="GLOBAL_CONST",
@@ -41,6 +44,7 @@ backprop_error_to_hidden_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "output_class_count padded for alignment"),
             calculability_proof=("total_modules_count", "padded_hidden_count", "padded_total_output_class_count"),
             validation_preconditions=("tile index valid",),
+            precision_role="state",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_grad_hidden_activations_aos", flow="dest", memory_scope="GLOBAL",
@@ -48,6 +52,7 @@ backprop_error_to_hidden_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "padded_hidden_count"),
             validation_preconditions=("tile write index valid", "no batch streaming for this buffer"),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -83,6 +88,7 @@ calculate_chunk_temp_gradients_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "output_class_count padded for alignment"),
             calculability_proof=("total_modules_count", "total_batch_count", "padded_total_output_class_count"),
             validation_preconditions=("tile within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_partial_probs", flow="src", memory_scope="GLOBAL",
@@ -90,6 +96,7 @@ calculate_chunk_temp_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "classes_per_chunk"),
             validation_preconditions=("tile within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_targets", flow="src", memory_scope="GLOBAL",
@@ -97,6 +104,7 @@ calculate_chunk_temp_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("problem_type",),
             validation_preconditions=("type-punned pointer; host provides correct buffer",),
+            precision_role=None,
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_sample_mask", flow="src", memory_scope="GLOBAL",
@@ -104,6 +112,7 @@ calculate_chunk_temp_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_batch_count",),
             validation_preconditions=("exact allocation size",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_temps", flow="src", memory_scope="GLOBAL_CONST",
@@ -111,6 +120,7 @@ calculate_chunk_temp_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_modules_count",),
             validation_preconditions=("exact allocation size",),
+            precision_role="state",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_grad_temps", flow="dest", memory_scope="GLOBAL",
@@ -118,6 +128,7 @@ calculate_chunk_temp_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk"),
             validation_preconditions=("tile write index valid",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -133,7 +144,7 @@ calculate_chunk_temp_gradients_contract = KernelContract(
         ScalarParamSpec("total_tile_count", "src", "NATURAL"),
     ),
     local_memory=(
-        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(SCALAR_TYPE)"),
+        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
     ),
     placement=PlacementContract(strategy="grid_mod_cls", key_domain=None, context_params={}),
 )
@@ -156,6 +167,7 @@ clip_partial_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "padded_hidden_count", "classes_per_chunk"),
             validation_preconditions=("flat_tile_index within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_partial_grad_biases_module", flow="src", memory_scope="GLOBAL",
@@ -163,6 +175,7 @@ clip_partial_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "classes_per_chunk"),
             validation_preconditions=("flat_tile_index within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_partial_grad_temps", flow="src", memory_scope="GLOBAL",
@@ -170,6 +183,7 @@ clip_partial_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk"),
             validation_preconditions=("flat_tile_index within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_partial_grad_hidden_activations_aos", flow="src", memory_scope="GLOBAL",
@@ -177,6 +191,7 @@ clip_partial_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "padded_hidden_count"),
             validation_preconditions=("flat_tile_index within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_clipped_partial_grad_weights_module", flow="dest", memory_scope="GLOBAL",
@@ -184,6 +199,7 @@ clip_partial_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "padded_hidden_count", "classes_per_chunk"),
             validation_preconditions=("identical to src counterpart",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_clipped_partial_grad_biases_module", flow="dest", memory_scope="GLOBAL",
@@ -191,6 +207,7 @@ clip_partial_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "classes_per_chunk"),
             validation_preconditions=("identical to src counterpart",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_clipped_partial_grad_temps", flow="dest", memory_scope="GLOBAL",
@@ -198,6 +215,7 @@ clip_partial_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk"),
             validation_preconditions=("identical to src counterpart",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_clipped_partial_grad_hidden_activations_aos", flow="dest", memory_scope="GLOBAL",
@@ -205,6 +223,7 @@ clip_partial_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "padded_hidden_count"),
             validation_preconditions=("identical to src counterpart",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -221,7 +240,7 @@ clip_partial_gradients_contract = KernelContract(
         ScalarParamSpec("total_tile_count", "src", "NATURAL"),
     ),
     local_memory=(
-        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(SCALAR_TYPE)"),
+        LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
     ),
     placement=PlacementContract(strategy="grid_mod_cls", key_domain=None, context_params={}),
 )

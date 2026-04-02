@@ -39,30 +39,18 @@ class TestModelSpecComposition:
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=16, cache_line_bytes=64,
         )
-        assert spec.precision.numpy_dtype == np.dtype(np.float32)
+        assert spec.precision.storage_dtype == np.dtype(np.float32)
 
-    def test_backward_compat_scalar_np_type(self):
-        spec = ModelSpec.float32(
+    def test_precision_storage_dtype_fp16(self):
+        spec = ModelSpec.float16(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=16, cache_line_bytes=64,
         )
-        assert spec.SCALAR_NP_TYPE == np.float32
-
-    def test_backward_compat_c_type_name(self):
-        fp32 = ModelSpec.float32(
-            input_dim=4, hidden_dim=32, output_classes=3,
-            num_modules=8, simd_width=16, cache_line_bytes=64,
-        )
-        fp16 = ModelSpec.float16(
-            input_dim=4, hidden_dim=32, output_classes=3,
-            num_modules=8, simd_width=16, cache_line_bytes=64,
-        )
-        assert fp32.SCALAR_C_TYPE_NAME == "float"
-        assert fp16.SCALAR_C_TYPE_NAME == "half"
+        assert spec.precision.storage_dtype == np.dtype(np.float16)
 
     def test_factory_classmethod(self):
         spec = ModelSpec.float16(
             input_dim=8, hidden_dim=16, output_classes=5,
             num_modules=2, simd_width=4, cache_line_bytes=64,
         )
-        assert spec.precision.numpy_dtype == np.dtype(np.float16)
+        assert spec.precision.storage_dtype == np.dtype(np.float16)

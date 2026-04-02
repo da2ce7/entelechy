@@ -5,7 +5,7 @@ Each contract is a frozen dataclass describing a kernel's interface
 independently of any backend.
 """
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,10 @@ class BufferParamSpec:
     padding_contract: PaddingContract
     calculability_proof: tuple[str, ...]
     validation_preconditions: tuple[str, ...]
+    # Transitional default "compute" will be removed in Phase 7B once all
+    # existing call sites in the contract files carry explicit role values.
+    # None is reserved for integer-typed buffers (e.g. CCE/BCE targets).
+    precision_role: Optional[Literal["storage", "compute", "state"]] = "compute"
 
 
 @dataclass(frozen=True)

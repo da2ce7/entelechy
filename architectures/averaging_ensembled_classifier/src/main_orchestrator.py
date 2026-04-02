@@ -81,11 +81,10 @@ class TrainingOrchestrator:
         else:
             raise ValueError(f"Unknown problem type: {problem_type_name!r}")
 
-        fp_max = float(np.finfo(model_spec.precision.numpy_dtype).max)
         self.stabilization_policy = StabilizationPolicy(
             t_algorithmic=hyperparams.stabilization.max_grad_norm,
             lambda_=hyperparams.stabilization.lambda_,
-            fp_format_max=fp_max,
+            compute_fp_format_max=model_spec.precision.compute_fp_format_max,
         )
 
     def train(self, X_train: np.ndarray, y_train: np.ndarray) -> np.ndarray:

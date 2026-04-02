@@ -79,14 +79,14 @@ def _rodeo_spec(hw: HardwareProfile) -> ModelSpec:
 def _fp32_policy() -> StabilizationPolicy:
     return StabilizationPolicy(
         t_algorithmic=1.0, lambda_=1.0,
-        fp_format_max=_PREC_FP32.fp_format_max,
+        compute_fp_format_max=_PREC_FP32.compute_fp_format_max,
     )
 
 
 def _fp16_aggressive_policy() -> StabilizationPolicy:
     return StabilizationPolicy(
         t_algorithmic=0.1, lambda_=0.01,
-        fp_format_max=_PREC_FP16.fp_format_max,
+        compute_fp_format_max=_PREC_FP16.compute_fp_format_max,
     )
 
 

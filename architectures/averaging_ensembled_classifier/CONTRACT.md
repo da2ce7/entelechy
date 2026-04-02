@@ -55,6 +55,8 @@ A buffer identifier shall be constructed as:
 - **`GLOBAL_CONST_`**: Read-only `__global` device memory holding persistent model state (learnable parameters: weights, biases, temperatures) that is invariant for the duration of a kernel dispatch.
 - **`DEVICE_CONST_`**: The hardware-specific, read-only `__constant` address space.
 
+> **Note (Article 1.2 — Axiom of Semantic Uniqueness):** A buffer's precision role is determined by its C type declaration (`STORAGE_TYPE`, `COMPUTE_TYPE`, or `STATE_TYPE`) and formally specified in the parameter's `Precision Role` commentary key (Article 3). It is not encoded in the buffer name's `[ContextAndUsage]` component. The C declaration encodes the precision role via the type symbol. Duplicating this in the name would violate the prohibition on cross-jurisdictional redundancy.
+
 **2.2. Scalar Name Grammar**
 A scalar identifier shall be constructed as:
 `[Flow] :: "scalar" :: [NumberType] :: [ContextAndUsage]`
@@ -78,8 +80,8 @@ The `[NumberType]` component defines the set of valid values for a scalar.
 The `@param` block constitutes the complete logical specification for a parameter. It shall contain the following keys as required:
 
 - **`Tensor Shape`**: The logical dimensions of the tensor.
-- **`Padding Contract`**: A key-value object literal specifying padding strategy.
-- **`Calculability Proof`**: Defines the derivation of buffer dimensions or scalar values through a constructive arithmetic expression composed solely of parameters present within the kernel’s interface. All terms in this expression shall correspond to kernel arguments, satisfying the Axiom of Interface Verifiability (1.4).
+- **`Padding Contract`**: A key-value object literal specifying padding strategy.  > Under the three-role precision model, padding byte counts use the element size of the buffer's actual `precision_role` type: `sizeof(STORAGE_TYPE)`, `sizeof(COMPUTE_TYPE)`, or `sizeof(STATE_TYPE)` as appropriate. Using a different role's `sizeof` in a `Padding Contract` expression is a contract violation.
+- **`Precision Role`**: One of `"storage"`, `"compute"`, or `"state"`. Declares which precision-role dtype from the active `PrecisionConfig` governs this buffer's element type and allocation size. **Mandatory** for all buffer parameters.- **`Calculability Proof`**: Defines the derivation of buffer dimensions or scalar values through a constructive arithmetic expression composed solely of parameters present within the kernel’s interface. All terms in this expression shall correspond to kernel arguments, satisfying the Axiom of Interface Verifiability (1.4).
 - **`Validation Preconditions`**: Mandatory conditions the host must meet.
 - **`Performance Notes`**: Optional, non-binding performance optimization hints.
 
@@ -129,7 +131,7 @@ The following strategy names are exhaustive. Their use contractually binds the i
 | **`Holistic Constraints`**  | This key is a tool of last resort, to be used only when a constraint truly has no logical owner in the parameter list. If none exist, this key **shall** contain the exact string: _"All constraints are defined by the parameter commentary blocks."_ | **Mandatory** |
 | **`Idempotency`**           | Declares the kernel's precise deterministic and state-modifying behavior. It **shall** be one of the following string literals: `Strictly Idempotent`, `Associatively Non-Idempotent`, or `Fundamentally Non-Idempotent (Stateful)`.                   | **Mandatory** |
 | **`Synchronization Model`** | Describes the kernel's role within the global DAG, using terms defined in **Article 4.3**.                                                                                                                                                             | Optional      |
-| **`Behavioral Invariants`** | Defines strict rules governing the kernel's internal implementation (e.g., "Forbidden from using `pown`").                                                                                                                                             | Optional      |
+| **`Behavioral Invariants`** | Defines strict rules governing the kernel's internal implementation (e.g., "Forbidden from using `pown`"). The recognized values include: `Precision Boundary Conversion` — required for any kernel that accesses buffers whose `precision_role` is `"storage"` or `"state"`. Declares that storage-role and state-role inputs are widened to `COMPUTE_TYPE` upon load, and that outputs to storage-role or state-role buffers are narrowed from `COMPUTE_TYPE` upon store. All intermediate arithmetic is exclusively `COMPUTE_TYPE`. Kernels that access only `"compute"`-role and integer buffers do not require this invariant. | Optional      |
 
 **4.3. Canonical Behavioral Vocabulary.**
 This section defines the canonical terms used to describe a kernel's behavior or its role in the system DAG, typically within the `Synchronization Model` key.
@@ -149,15 +151,24 @@ This article defines fixed, system-wide constants that are contractually binding
 
 - `LOCAL_MEM_BANK_PADDING`: Defined with a mandatory value of **`1`**.
 
+`PrecisionConfig` is a frozen dataclass with three independent dtype fields — `storage_dtype`, `compute_dtype`, `state_dtype` — and three derived scalar constants: `storage_fp_format_max`, `compute_fp_format_max`, and `compute_epsilon`. The invariant `storage_dtype.itemsize ≤ compute_dtype.itemsize` and `storage_dtype.itemsize ≤ state_dtype.itemsize` is enforced by `__post_init__`. Three factory classmethods are defined: `float32()` (all FP32), `float16()` (all FP16), `mixed_f16_f32()` (FP16 storage, FP32 compute, FP32 state). The retired fields `numpy_dtype`, `fp_format_max`, and `epsilon` do not exist in this type.
+
 ### **Article 6: Mandatory Build-Time Symbols**
 
 This article defines symbols that must be provided by the host build environment at compile time (e.g., via `-D` flags). Their values constitute the "hardware target profile" for a given compilation.
 
-- `SCALAR_TYPE`: Defines the primary floating-point type (e.g., `float`, `half`).
-- `SIMD_WIDTH`: Defines the target SIMD vector width (e.g., `8`, `16`).
-- `C_TILE_SIZE`: Defines the block/tile dimension for tiled algorithms.
-- `SCALAR_IS_HALF`: Integer flag (`0` or `1`) indicating whether `SCALAR_TYPE` is `half`. Required because the C preprocessor cannot perform type-name comparison.
-- `NUMERICAL_STABILITY_EPSILON`: The minimum epsilon value used for numerical stability guards (e.g., division-by-zero prevention). Its value is precision-dependent and must be consistent with `SCALAR_TYPE`.
+| Symbol | Type | Meaning |
+|:---|:---|:---|
+| `STORAGE_TYPE` | OpenCL/C type name | Element type for storage-role buffers |
+| `COMPUTE_TYPE` | OpenCL/C type name | Element type for arithmetic and compute-role buffers |
+| `STATE_TYPE` | OpenCL/C type name | Element type for state-role buffers |
+| `STORAGE_TYPE_IS_HALF` | `int` (0 or 1) | 1 when `STORAGE_TYPE == half`; gates `cl_khr_fp16` extension and `vload_half`/`vstore_half` |
+| `COMPUTE_TYPE_IS_HALF` | `int` (0 or 1) | 1 when `COMPUTE_TYPE == half`; enables FP16 arithmetic extension if required |
+| `SIMD_WIDTH` | `int` | Hardware SIMD lane count from `HardwareProfile` |
+| `C_TILE_SIZE` | `int` | Column tile size for the module-chunking strategy |
+| `NUMERICAL_STABILITY_EPSILON` | float literal | Epsilon for numerical stability guards; derived from `compute_epsilon` |
+
+The symbols `SCALAR_TYPE` and `SCALAR_IS_HALF` are **retired**. They must not appear in any kernel source file after Phase 7B migration is complete (transitional aliases exist during Phase 7B).
 
 ### **Article 7: Canonical Interface Instantiation**
 

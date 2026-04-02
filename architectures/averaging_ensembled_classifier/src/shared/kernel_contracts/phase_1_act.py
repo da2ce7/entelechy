@@ -21,6 +21,7 @@ forward_pass_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "Pad row stride to 128-byte alignment"),
             calculability_proof=("total_batch_count", "padded_input_count"),
             validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_sample_mask",
@@ -29,6 +30,7 @@ forward_pass_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_batch_count",),
             validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_weights_shared_simd_major",
@@ -37,6 +39,7 @@ forward_pass_contract = KernelContract(
             padding_contract=PaddingContract("SIMD", "hidden_dim padded to SIMD_WIDTH; input_dim padded for alignment"),
             calculability_proof=("padded_hidden_count", "padded_input_count"),
             validation_preconditions=("exact allocation size",),
+            precision_role="state",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_biases_shared",
@@ -45,6 +48,7 @@ forward_pass_contract = KernelContract(
             padding_contract=PaddingContract("SIMD", "Padded to SIMD_WIDTH"),
             calculability_proof=("padded_hidden_count",),
             validation_preconditions=("exact allocation size",),
+            precision_role="state",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_hidden_activations",
@@ -53,6 +57,7 @@ forward_pass_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "Padded to alignment"),
             calculability_proof=("total_batch_count", "padded_hidden_count"),
             validation_preconditions=("write slice within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_hidden_mask",
@@ -61,6 +66,7 @@ forward_pass_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "Padded to alignment"),
             calculability_proof=("total_batch_count", "padded_hidden_count"),
             validation_preconditions=("write slice within bounds",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(
@@ -71,7 +77,7 @@ forward_pass_contract = KernelContract(
         ScalarParamSpec("padded_hidden_count", "src", "NATURAL"),
     ),
     local_memory=(
-        LocalMemorySpec("simd_tile", "SIMD_WIDTH * (SIMD_WIDTH + LOCAL_MEM_BANK_PADDING) * sizeof(SCALAR_TYPE)"),
+        LocalMemorySpec("simd_tile", "SIMD_WIDTH * (SIMD_WIDTH + LOCAL_MEM_BANK_PADDING) * sizeof(COMPUTE_TYPE)"),
     ),
     placement=None,
 )
@@ -92,6 +98,7 @@ render_logits_chunk_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "Padded to alignment"),
             calculability_proof=("total_batch_count", "padded_hidden_count"),
             validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_hidden_mask",
@@ -100,6 +107,7 @@ render_logits_chunk_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "Padded to alignment"),
             calculability_proof=("total_batch_count", "padded_hidden_count"),
             validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_weights_module",
@@ -108,6 +116,7 @@ render_logits_chunk_contract = KernelContract(
             padding_contract=PaddingContract("SIMD", "output_class_count padded for SIMD/Cache alignment"),
             calculability_proof=("total_modules_count", "padded_hidden_count", "padded_total_output_class_count"),
             validation_preconditions=("module and class slices within bounds",),
+            precision_role="state",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_biases_module",
@@ -116,6 +125,7 @@ render_logits_chunk_contract = KernelContract(
             padding_contract=PaddingContract("SIMD", "output_class_count padded for SIMD alignment"),
             calculability_proof=("total_modules_count", "padded_total_output_class_count"),
             validation_preconditions=("module and class slices within bounds",),
+            precision_role="state",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_logits",
@@ -124,6 +134,7 @@ render_logits_chunk_contract = KernelContract(
             padding_contract=PaddingContract("CACHE", "output_class_count padded for alignment"),
             calculability_proof=("total_modules_count", "total_batch_count", "padded_total_output_class_count"),
             validation_preconditions=("exact allocation size",),
+            precision_role="storage",
         ),
     ),
     scalar_params=(

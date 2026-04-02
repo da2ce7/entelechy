@@ -191,7 +191,7 @@ _SPEC_FACTORIES = {
 def _make_policy(prec: PrecisionConfig = _PREC_FP32) -> StabilizationPolicy:
     return StabilizationPolicy(
         t_algorithmic=1.0, lambda_=1.0,
-        fp_format_max=prec.fp_format_max,
+        compute_fp_format_max=prec.compute_fp_format_max,
     )
 
 
@@ -199,7 +199,7 @@ def _make_aggressive_policy(prec: PrecisionConfig = _PREC_FP32) -> Stabilization
     """Tight funnel — stresses clipping at every reduction stage."""
     return StabilizationPolicy(
         t_algorithmic=0.1, lambda_=0.01,
-        fp_format_max=prec.fp_format_max,
+        compute_fp_format_max=prec.compute_fp_format_max,
     )
 
 

@@ -213,7 +213,7 @@ def build_act_plan(
 ) -> ExecutionPlan:
     """Construct an Act-phase (forward pass + inference retrieval) plan."""
     alloc = _BufferAllocator()
-    elem = int(np.dtype(model_spec.precision.numpy_dtype).itemsize)
+    elem = model_spec.precision.storage_dtype.itemsize
     tiling = _make_tiling(model_spec)
     tile_count = tiling.total_tiles
 
@@ -388,7 +388,7 @@ def build_act_plan(
     diag_tree = _build_reduction_tree(
         StabilizationPolicy(
             t_algorithmic=0.0, lambda_=0.0,
-            fp_format_max=model_spec.precision.fp_format_max,
+            compute_fp_format_max=model_spec.precision.compute_fp_format_max,
         ),
         hardware, probs_gather,
         source_buf=b_partial_probs,
@@ -443,7 +443,7 @@ def build_learn_plan(
 ) -> ExecutionPlan:
     """Construct a Learn-phase (gradient production → update) plan."""
     alloc = _BufferAllocator()
-    elem = int(np.dtype(model_spec.precision.numpy_dtype).itemsize)
+    elem = model_spec.precision.storage_dtype.itemsize
     tiling = _make_tiling(model_spec)
     tile_count = tiling.total_tiles
     nodes: dict[str, PlanNode] = {}
@@ -753,7 +753,7 @@ def build_learn_plan(
          "clipped_partial_grad_hidden_activations_aos": b_clipped_grad_hidden},
         {"use_per_item_norm": 0,
          "clipping_threshold_t_pre": policy.get_leaf_safety_threshold(),
-         "epsilon": model_spec.precision.epsilon,
+         "epsilon": model_spec.precision.compute_epsilon,
          "flat_tile_index": 0,
          "num_class_chunks": tiling.num_class_chunks,
          "classes_per_chunk": classes_per_chunk,
@@ -840,12 +840,12 @@ def build_learn_plan(
         stabilize_reduce_grad_h_contract,
         {"grad_hidden_activations_permuted_soa": b_permuted_grad_h,
          "summed_grad_hidden_activations": b_summed_grad_h},
-        {"fp_max": model_spec.precision.fp_format_max,
+        {"fp_max": model_spec.precision.compute_fp_format_max,
          "policy_t_algorithmic": policy.t_algorithmic,
          "policy_lambda": policy.lambda_,
          "policy_max_k": policy.get_specialized_reduction_policy_k(
              batch_size, hardware.max_reduce_fan_in),
-         "epsilon": model_spec.precision.epsilon,
+         "epsilon": model_spec.precision.compute_epsilon,
          "total_batch_count": batch_size,
          "padded_hidden_count": model_spec.padded_hidden_dim,
          "total_modules_count": model_spec.num_modules,
@@ -957,7 +957,7 @@ def build_learn_plan(
          "clipped_partial_grad_weights_shared": b_clipped_grad_sw,
          "clipped_partial_grad_biases_shared": b_clipped_grad_sb},
         {"clipping_threshold_t_pre": policy.get_leaf_safety_threshold(),
-         "epsilon": model_spec.precision.epsilon,
+         "epsilon": model_spec.precision.compute_epsilon,
          "weights_parameter_count": shared_w_param_count,
          "biases_parameter_count": shared_b_param_count,
          "weights_write_offset_elements": 0,
@@ -1034,7 +1034,7 @@ def build_learn_plan(
         {"summed_grad": b_summed_grad_mod,
          "final_grad": b_final_grad_mod},
         {"effective_batch_size": float(batch_size),
-         "epsilon": model_spec.precision.epsilon,
+         "epsilon": model_spec.precision.compute_epsilon,
          "parameter_count": epp_mod_w},
         tile_count=1, placement_strategy="linear_generic",
     )
@@ -1048,7 +1048,7 @@ def build_learn_plan(
         {"summed_grad": b_summed_grad_temps,
          "final_grad": b_final_grad_temps},
         {"effective_batch_size": float(batch_size),
-         "epsilon": model_spec.precision.epsilon,
+         "epsilon": model_spec.precision.compute_epsilon,
          "parameter_count": epp_temps},
         tile_count=1, placement_strategy="linear_generic",
     )
@@ -1062,7 +1062,7 @@ def build_learn_plan(
         {"summed_grad": b_summed_grad_shared,
          "final_grad": b_final_grad_shared},
         {"effective_batch_size": float(batch_size),
-         "epsilon": model_spec.precision.epsilon,
+         "epsilon": model_spec.precision.compute_epsilon,
          "parameter_count": shared_w_param_count},
         tile_count=1, placement_strategy="linear_generic",
     )
@@ -1095,7 +1095,7 @@ def build_learn_plan(
         "beta2_pow_t": 0.999,
         "beta1": 0.9,
         "beta2": 0.999,
-        "epsilon": model_spec.precision.epsilon,
+        "epsilon": model_spec.precision.compute_epsilon,
     }
 
     # Adam update: shared weights

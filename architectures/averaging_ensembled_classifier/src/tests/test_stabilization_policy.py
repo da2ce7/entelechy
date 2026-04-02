@@ -22,7 +22,7 @@ def default_policy() -> StabilizationPolicy:
     return StabilizationPolicy(
         t_algorithmic=1.0,
         lambda_=1.0,
-        fp_format_max=float(np.finfo(np.float32).max),
+        compute_fp_format_max=float(np.finfo(np.float32).max),
     )
 
 
@@ -31,7 +31,7 @@ def fp16_policy() -> StabilizationPolicy:
     return StabilizationPolicy(
         t_algorithmic=1.0,
         lambda_=1.0,
-        fp_format_max=float(np.finfo(np.float16).max),
+        compute_fp_format_max=float(np.finfo(np.float16).max),
     )
 
 
