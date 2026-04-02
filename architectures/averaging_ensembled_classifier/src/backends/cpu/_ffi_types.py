@@ -3,13 +3,13 @@
 Field order MUST exactly match the C struct field order in cpu_kernels.h.
 Layout verification via _verify_layouts() catches size mismatches at load time.
 
-Multi-precision support (ADR-008, ADR-023): the CPU library exports s16x16,
-s32x32, and s16x32 variants of every kernel and struct, using the two-axis
-precision model (storage_dtype × state_dtype).  ``make_precision_types()``
+Multi-precision support (ADR-008, ADR-023, ADR-024): the CPU library exports
+11 three-axis precision variants using the suffix s{s}c{c}x{x}
+(STORAGE_T × COMPUTE_T × STATE_T).  ``make_precision_types()``
 creates the ctypes Structure classes for a given precision suffix.
 
 Module-level names (``ForwardPassArgs``, ``c_real_p``, etc.) alias the
-s32x32 variants for backward compatibility.
+s32c32x32 variants for backward compatibility.
 """
 from __future__ import annotations
 
@@ -29,15 +29,36 @@ c_float_p = POINTER(c_float)
 c_uint_p = POINTER(c_uint32)
 c_int_p = POINTER(c_int32)
 
-# New three-role precision suffixes (ADR-023 §4.2)
-PRECISION_SUFFIXES = ("s16x16", "s32x32", "s16x32")
+# Three-axis precision suffixes s{storage}c{compute}x{state} (ADR-024 §4.1)
+PRECISION_SUFFIXES = (
+    "s16c16x16", "s16c16x32", "s16c16x64",
+    "s16c32x16", "s16c32x32", "s16c32x64",
+    "s16c64x16", "s16c64x32", "s16c64x64",
+    "s32c32x32", "s32c32x64",
+    "s32c64x32", "s32c64x64",
+    "s64c64x64",
+)
 
-# (c_storage, c_storage_p, c_state, c_state_p) per precision config.
+# Two-axis aliases for backward compatibility (old suffix → new suffix).
+_SUFFIX_ALIASES = {"s16x16": "s16c32x16", "s32x32": "s32c32x32", "s16x32": "s16c32x32"}
+
+# (c_storage, c_storage_p, c_compute, c_compute_p, c_state, c_state_p) per suffix.
 # FP16 uses c_uint16 because ctypes has no _Float16; both are 2-byte types.
-PRECISION_C_TYPES: dict[str, tuple[type, type, type, type]] = {
-    "s16x16": (c_uint16, POINTER(c_uint16), c_uint16, POINTER(c_uint16)),  # FP16/FP16
-    "s32x32": (c_float, POINTER(c_float), c_float, POINTER(c_float)),      # FP32/FP32
-    "s16x32": (c_uint16, POINTER(c_uint16), c_float, POINTER(c_float)),    # FP16/FP32
+PRECISION_C_TYPES: dict[str, tuple[type, type, type, type, type, type]] = {
+    "s16c16x16": (c_uint16, POINTER(c_uint16), c_uint16, POINTER(c_uint16), c_uint16, POINTER(c_uint16)),
+    "s16c16x32": (c_uint16, POINTER(c_uint16), c_uint16, POINTER(c_uint16), c_float, POINTER(c_float)),
+    "s16c16x64": (c_uint16, POINTER(c_uint16), c_uint16, POINTER(c_uint16), c_double, POINTER(c_double)),
+    "s16c32x16": (c_uint16, POINTER(c_uint16), c_float, POINTER(c_float), c_uint16, POINTER(c_uint16)),
+    "s16c32x32": (c_uint16, POINTER(c_uint16), c_float, POINTER(c_float), c_float, POINTER(c_float)),
+    "s16c32x64": (c_uint16, POINTER(c_uint16), c_float, POINTER(c_float), c_double, POINTER(c_double)),
+    "s16c64x16": (c_uint16, POINTER(c_uint16), c_double, POINTER(c_double), c_uint16, POINTER(c_uint16)),
+    "s16c64x32": (c_uint16, POINTER(c_uint16), c_double, POINTER(c_double), c_float, POINTER(c_float)),
+    "s16c64x64": (c_uint16, POINTER(c_uint16), c_double, POINTER(c_double), c_double, POINTER(c_double)),
+    "s32c32x32": (c_float, POINTER(c_float), c_float, POINTER(c_float), c_float, POINTER(c_float)),
+    "s32c32x64": (c_float, POINTER(c_float), c_float, POINTER(c_float), c_double, POINTER(c_double)),
+    "s32c64x32": (c_float, POINTER(c_float), c_double, POINTER(c_double), c_float, POINTER(c_float)),
+    "s32c64x64": (c_float, POINTER(c_float), c_double, POINTER(c_double), c_double, POINTER(c_double)),
+    "s64c64x64": (c_double, POINTER(c_double), c_double, POINTER(c_double), c_double, POINTER(c_double)),
 }
 
 # Base names for struct-size getter exports (suffix appended per precision).
@@ -70,14 +91,14 @@ def make_precision_types(
 
     Returns ``(structs_dict, layout_checks)`` where:
       - *structs_dict*: ``{"ForwardPassArgs": <class>, ...}``
-      - *layout_checks*: ``[("get_struct_size_forward_pass_args_s32x32", <class>), ...]``
+      - *layout_checks*: ``[("get_struct_size_forward_pass_args_s32c32x32", <class>), ...]``
 
-    Uses two-axis type mapping (ADR-023):
+    Uses three-axis type mapping (ADR-024 §4):
       - c_storage_p: input, mask, activations, logits, gradients, partials
-      - c_state_p: weights, biases, temps, optimizer state
-      - c_float_p: compute outputs (summed_grad, final_grad, loss, output)
+      - c_compute_p: summed_grad, final_grad, loss, output, intermediate_grad
+      - c_state_p: weights, biases, temps, optimizer state (parameters, m1, m2)
     """
-    c_storage, c_storage_p, c_state, c_state_p = PRECISION_C_TYPES[suffix]
+    c_storage, c_storage_p, c_compute, c_compute_p, c_state, c_state_p = PRECISION_C_TYPES[suffix]
 
     def _s(name: str, fields: list) -> type:
         """Create a named Structure subclass."""
@@ -129,7 +150,7 @@ def make_precision_types(
         ("targets", c_int_p),
         ("sample_mask", c_storage_p),
         ("partial_probs", c_storage_p),
-        ("final_loss", c_float_p),  # compute output
+        ("final_loss", c_compute_p),  # compute output
         ("flat_tile_index", c_uint32),
         ("num_class_chunks", c_uint32),
         ("classes_per_chunk", c_uint32),
@@ -270,23 +291,23 @@ def make_precision_types(
         ("stage_node_counts", c_uint_p),
         ("staging_buffer_0", c_storage_p),
         ("staging_buffer_1", c_storage_p),
-        ("output", c_float_p),  # compute output
+        ("output", c_compute_p),  # compute output
         ("partial_width", c_uint32),
         ("num_stages", c_uint32),
-        ("t_algorithmic", c_float),
-        ("lambda_", c_float),
-        ("fp_max", c_float),
-        ("epsilon", c_float),
+        ("t_algorithmic", c_compute),
+        ("lambda_", c_compute),
+        ("fp_max", c_compute),
+        ("epsilon", c_compute),
     ])
 
     structs["StabilizeReduceArgs"] = _s("StabilizeReduceArgs", [
         ("grad_hidden_activations_permuted_soa", c_storage_p),
-        ("summed_grad_hidden_activations", c_float_p),  # compute output
-        ("fp_max", c_float),
-        ("policy_t_algorithmic", c_float),
-        ("policy_lambda", c_float),
+        ("summed_grad_hidden_activations", c_compute_p),  # compute output
+        ("fp_max", c_compute),
+        ("policy_t_algorithmic", c_compute),
+        ("policy_lambda", c_compute),
         ("policy_max_k", c_uint32),
-        ("epsilon", c_float),
+        ("epsilon", c_compute),
         ("total_batch_count", c_uint32),
         ("padded_hidden_count", c_uint32),
         ("total_modules_count", c_uint32),
@@ -294,9 +315,9 @@ def make_precision_types(
     ])
 
     structs["ClipIntermediateArgs"] = _s("ClipIntermediateArgs", [
-        ("intermediate_grad", c_float_p),  # compute intermediate
-        ("clipping_threshold_t_j", c_float),
-        ("epsilon", c_float),
+        ("intermediate_grad", c_compute_p),  # compute intermediate
+        ("clipping_threshold_t_j", c_compute),
+        ("epsilon", c_compute),
         ("parameter_count", c_uint32),
     ])
 
@@ -305,7 +326,7 @@ def make_precision_types(
     structs["BackpropSharedWeightsArgs"] = _s("BackpropSharedWeightsArgs", [
         ("input", c_storage_p),
         ("hidden_activations", c_storage_p),
-        ("summed_grad_hidden_activations", c_float_p),  # compute output
+        ("summed_grad_hidden_activations", c_compute_p),  # compute output
         ("sample_mask", c_storage_p),
         ("partial_grad_weights_shared", c_storage_p),
         ("batch_chunk_offset", c_uint32),
@@ -320,7 +341,7 @@ def make_precision_types(
 
     structs["BackpropSharedBiasesArgs"] = _s("BackpropSharedBiasesArgs", [
         ("hidden_activations", c_storage_p),
-        ("summed_grad_hidden_activations", c_float_p),  # compute output
+        ("summed_grad_hidden_activations", c_compute_p),  # compute output
         ("sample_mask", c_storage_p),
         ("partial_grad_biases_shared", c_storage_p),
         ("batch_chunk_offset", c_uint32),
@@ -349,31 +370,31 @@ def make_precision_types(
     # --- Update Phase ---
 
     structs["NormalizeGradientsArgs"] = _s("NormalizeGradientsArgs", [
-        ("summed_grad", c_float_p),  # compute
-        ("final_grad", c_float_p),   # compute
-        ("effective_batch_size", c_float),
-        ("epsilon", c_float),
+        ("summed_grad", c_compute_p),  # compute
+        ("final_grad", c_compute_p),   # compute
+        ("effective_batch_size", c_compute),
+        ("epsilon", c_compute),
         ("parameter_count", c_uint32),
     ])
 
     structs["AdamUpdateArgs"] = _s("AdamUpdateArgs", [
-        ("final_grad", c_float_p),   # compute
+        ("final_grad", c_compute_p),   # compute
         ("parameters", c_state_p),
         ("m1", c_state_p),
         ("m2", c_state_p),
-        ("learning_rate", c_float),
-        ("beta1_pow_t", c_float),
-        ("beta2_pow_t", c_float),
-        ("beta1", c_float),
-        ("beta2", c_float),
-        ("epsilon", c_float),
+        ("learning_rate", c_compute),
+        ("beta1_pow_t", c_compute),
+        ("beta2_pow_t", c_compute),
+        ("beta1", c_compute),
+        ("beta2", c_compute),
+        ("epsilon", c_compute),
         ("parameter_count", c_uint32),
     ])
 
     structs["ClampTemperaturesArgs"] = _s("ClampTemperaturesArgs", [
         ("temperatures", c_state_p),
-        ("min_value", c_float),
-        ("max_value", c_float),
+        ("min_value", c_compute),
+        ("max_value", c_compute),
         ("total_modules_count", c_uint32),
     ])
 
@@ -399,30 +420,38 @@ for _sfx in PRECISION_SUFFIXES:
 
 del _sfx, _structs, _checks
 
-# --- Backward-compatible module-level aliases (s32x32 = FP32) ---
+# --- Backward-compatible module-level aliases (s32c32x32 = pure FP32) ---
 
 c_real: type = c_float
 c_real_p: type = POINTER(c_float)
 REAL_SIZE_BYTES: int = ctypes.sizeof(c_float)
 
-ForwardPassArgs = PRECISION_STRUCTS["s32x32"]["ForwardPassArgs"]
-RenderLogitsArgs = PRECISION_STRUCTS["s32x32"]["RenderLogitsArgs"]
-CceChunkArgs = PRECISION_STRUCTS["s32x32"]["CceChunkArgs"]
-BceChunkArgs = PRECISION_STRUCTS["s32x32"]["BceChunkArgs"]
-ModuleParamGradsArgs = PRECISION_STRUCTS["s32x32"]["ModuleParamGradsArgs"]
-BackpropToHiddenArgs = PRECISION_STRUCTS["s32x32"]["BackpropToHiddenArgs"]
-TempGradientsArgs = PRECISION_STRUCTS["s32x32"]["TempGradientsArgs"]
-ClipPartialsArgs = PRECISION_STRUCTS["s32x32"]["ClipPartialsArgs"]
-GatherPermuteArgs = PRECISION_STRUCTS["s32x32"]["GatherPermuteArgs"]
-ReductionTreePlanFFI = PRECISION_STRUCTS["s32x32"]["ReductionTreePlanFFI"]
-StabilizeReduceArgs = PRECISION_STRUCTS["s32x32"]["StabilizeReduceArgs"]
-ClipIntermediateArgs = PRECISION_STRUCTS["s32x32"]["ClipIntermediateArgs"]
-BackpropSharedWeightsArgs = PRECISION_STRUCTS["s32x32"]["BackpropSharedWeightsArgs"]
-BackpropSharedBiasesArgs = PRECISION_STRUCTS["s32x32"]["BackpropSharedBiasesArgs"]
-ClipSharedGradsArgs = PRECISION_STRUCTS["s32x32"]["ClipSharedGradsArgs"]
-NormalizeGradientsArgs = PRECISION_STRUCTS["s32x32"]["NormalizeGradientsArgs"]
-AdamUpdateArgs = PRECISION_STRUCTS["s32x32"]["AdamUpdateArgs"]
-ClampTemperaturesArgs = PRECISION_STRUCTS["s32x32"]["ClampTemperaturesArgs"]
+_DEFAULT_SUFFIX = "s32c32x32"
 
-# Backward-compatible s32x32 layout checks
-LAYOUT_CHECKS: list[tuple[str, type]] = PRECISION_LAYOUT_CHECKS["s32x32"]
+ForwardPassArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["ForwardPassArgs"]
+RenderLogitsArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["RenderLogitsArgs"]
+CceChunkArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["CceChunkArgs"]
+BceChunkArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["BceChunkArgs"]
+ModuleParamGradsArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["ModuleParamGradsArgs"]
+BackpropToHiddenArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["BackpropToHiddenArgs"]
+TempGradientsArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["TempGradientsArgs"]
+ClipPartialsArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["ClipPartialsArgs"]
+GatherPermuteArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["GatherPermuteArgs"]
+ReductionTreePlanFFI = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["ReductionTreePlanFFI"]
+StabilizeReduceArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["StabilizeReduceArgs"]
+ClipIntermediateArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["ClipIntermediateArgs"]
+BackpropSharedWeightsArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["BackpropSharedWeightsArgs"]
+BackpropSharedBiasesArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["BackpropSharedBiasesArgs"]
+ClipSharedGradsArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["ClipSharedGradsArgs"]
+NormalizeGradientsArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["NormalizeGradientsArgs"]
+AdamUpdateArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["AdamUpdateArgs"]
+ClampTemperaturesArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["ClampTemperaturesArgs"]
+
+# Backward-compatible layout checks
+LAYOUT_CHECKS: list[tuple[str, type]] = PRECISION_LAYOUT_CHECKS[_DEFAULT_SUFFIX]
+
+# Two-axis suffix aliases for callers that haven't migrated yet
+for _old, _new in _SUFFIX_ALIASES.items():
+    PRECISION_STRUCTS[_old] = PRECISION_STRUCTS[_new]
+    PRECISION_LAYOUT_CHECKS[_old] = PRECISION_LAYOUT_CHECKS[_new]
+del _old, _new

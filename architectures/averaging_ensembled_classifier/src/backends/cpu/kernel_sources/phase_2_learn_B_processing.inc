@@ -1,6 +1,6 @@
 /* phase_2_learn_B_processing.inc — Precision-parameterized processing kernels (Nodes 9, 10, 11).
  *
- * Included by cpu_kernels.c with STORAGE_T/STATE_T/PRECISION_SUFFIX defined.
+ * Included by cpu_kernels.c with STORAGE_T/COMPUTE_T/STATE_T/PRECISION_SUFFIX defined.
  * Algorithmic reference: kernels/phase_2_learn_A_production.cl.c (Nodes 9, 10),
  *                        kernels/phase_2_learn_B_processing.cl.c (Node 11)
  *
@@ -48,7 +48,7 @@ void PREC_FN(task_backprop_to_hidden)(void* raw_args, uint task_index, uint thre
     const size_t prob_tile_base = (size_t)a->flat_tile_index
         * a->modules_per_chunk * a->total_batch_count * a->classes_per_chunk;
 
-    float grad_h_accum = 0.0f;
+    COMPUTE_T grad_h_accum = (COMPUTE_T)0.0;
     for (uint c_local = 0; c_local < a->classes_per_chunk; c_local++) {
         const uint c_global = class_offset + c_local;
         if (c_global >= a->total_output_class_count) break;
@@ -56,13 +56,13 @@ void PREC_FN(task_backprop_to_hidden)(void* raw_args, uint task_index, uint thre
         const size_t prob_idx = prob_tile_base
             + (size_t)module_local_idx * a->total_batch_count * a->classes_per_chunk
             + (size_t)batch_idx * a->classes_per_chunk + c_local;
-        const float prob = scalar_load_storage(a->partial_probs, prob_idx);
+        const COMPUTE_T prob = scalar_load_storage(a->partial_probs, prob_idx);
 
-        float d_loss_d_logit;
+        COMPUTE_T d_loss_d_logit;
         if (a->problem_type == PROBLEM_TYPE_CCE) {
             const int* targets_cce = (const int*)a->targets;
             d_loss_d_logit = ((int)c_global == targets_cce[batch_idx])
-                ? (prob - 1.0f) : prob;
+                ? (prob - (COMPUTE_T)1.0) : prob;
         } else {
             const STORAGE_T* targets_bce = (const STORAGE_T*)a->targets;
             d_loss_d_logit = prob - scalar_load_storage(targets_bce,
@@ -98,12 +98,12 @@ void PREC_FN(task_temp_gradients)(void* raw_args, uint task_index, uint thread_i
     const size_t prob_tile_base = (size_t)a->flat_tile_index
         * a->modules_per_chunk * a->total_batch_count * a->classes_per_chunk;
 
-    float p_grad_sum = 0.0f;
+    COMPUTE_T p_grad_sum = (COMPUTE_T)0.0;
 
     for (uint b = 0; b < a->total_batch_count; b++) {
         if (scalar_load_storage(a->sample_mask, b) < 0.5f) continue;
 
-        float grad_for_sample = 0.0f;
+        COMPUTE_T grad_for_sample = (COMPUTE_T)0.0;
         for (uint c_local = 0; c_local < a->classes_per_chunk; c_local++) {
             const uint c_global = class_offset + c_local;
             if (c_global >= a->total_output_class_count) break;
@@ -111,13 +111,13 @@ void PREC_FN(task_temp_gradients)(void* raw_args, uint task_index, uint thread_i
             const size_t prob_idx = prob_tile_base
                 + (size_t)module_local_idx * a->total_batch_count * a->classes_per_chunk
                 + (size_t)b * a->classes_per_chunk + c_local;
-            const float prob = scalar_load_storage(a->partial_probs, prob_idx);
+            const COMPUTE_T prob = scalar_load_storage(a->partial_probs, prob_idx);
 
-            float d_loss_d_logit;
+            COMPUTE_T d_loss_d_logit;
             if (a->problem_type == PROBLEM_TYPE_CCE) {
                 const int* targets_cce = (const int*)a->targets;
                 d_loss_d_logit = ((int)c_global == targets_cce[b])
-                    ? (prob - 1.0f) : prob;
+                    ? (prob - (COMPUTE_T)1.0) : prob;
             } else {
                 const STORAGE_T* targets_bce = (const STORAGE_T*)a->targets;
                 d_loss_d_logit = prob - scalar_load_storage(targets_bce,
@@ -133,8 +133,8 @@ void PREC_FN(task_temp_gradients)(void* raw_args, uint task_index, uint thread_i
         p_grad_sum += grad_for_sample;
     }
 
-    const float temp = scalar_load_state(a->temps, module_global_idx);
-    const float final_grad = p_grad_sum * (-1.0f / (temp * temp));
+    const COMPUTE_T temp = scalar_load_state(a->temps, module_global_idx);
+    const COMPUTE_T final_grad = p_grad_sum * (-(COMPUTE_T)1.0 / (temp * temp));
 
     const size_t out_idx = (size_t)a->flat_tile_index * a->modules_per_chunk
         + module_local_idx;
@@ -161,52 +161,52 @@ void PREC_FN(task_clip_partial_grads)(void* raw_args, uint task_index, uint thre
     const size_t t_base = (size_t)a->flat_tile_index * n_temps;
     const size_t h_base = (size_t)a->flat_tile_index * n_hidden;
 
-    float sum_sq = 0.0f;
+    COMPUTE_T sum_sq = (COMPUTE_T)0.0;
 
     for (uint i = 0; i < n_weights; i++) {
-        float v = scalar_load_storage(a->partial_grad_weights_module, w_base + i);
+        COMPUTE_T v = scalar_load_storage(a->partial_grad_weights_module, w_base + i);
         sum_sq += v * v;
     }
     for (uint i = 0; i < n_biases; i++) {
-        float v = scalar_load_storage(a->partial_grad_biases_module, b_base + i);
+        COMPUTE_T v = scalar_load_storage(a->partial_grad_biases_module, b_base + i);
         sum_sq += v * v;
     }
     for (uint i = 0; i < n_temps; i++) {
-        float v = scalar_load_storage(a->partial_grad_temps, t_base + i);
+        COMPUTE_T v = scalar_load_storage(a->partial_grad_temps, t_base + i);
         sum_sq += v * v;
     }
     for (uint i = 0; i < n_hidden; i++) {
-        float v = scalar_load_storage(a->partial_grad_hidden_activations_aos, h_base + i);
+        COMPUTE_T v = scalar_load_storage(a->partial_grad_hidden_activations_aos, h_base + i);
         sum_sq += v * v;
     }
 
-    float threshold;
+    COMPUTE_T threshold;
     if (a->use_per_item_norm == 1) {
         threshold = scalar_load_storage(a->clipping_threshold_per_item, a->flat_tile_index);
     } else {
-        threshold = a->clipping_threshold_t_pre;
+        threshold = (COMPUTE_T)a->clipping_threshold_t_pre;
     }
 
-    float norm = sqrtf(sum_sq);
-    float scale = 1.0f;
+    COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
+    COMPUTE_T scale = (COMPUTE_T)1.0;
     if (norm > threshold) {
-        scale = threshold / (norm + a->epsilon);
+        scale = threshold / (norm + (COMPUTE_T)a->epsilon);
     }
 
     for (uint i = 0; i < n_weights; i++) {
-        float v = scalar_load_storage(a->partial_grad_weights_module, w_base + i);
+        COMPUTE_T v = scalar_load_storage(a->partial_grad_weights_module, w_base + i);
         scalar_store_storage(a->clipped_partial_grad_weights_module, w_base + i, v * scale);
     }
     for (uint i = 0; i < n_biases; i++) {
-        float v = scalar_load_storage(a->partial_grad_biases_module, b_base + i);
+        COMPUTE_T v = scalar_load_storage(a->partial_grad_biases_module, b_base + i);
         scalar_store_storage(a->clipped_partial_grad_biases_module, b_base + i, v * scale);
     }
     for (uint i = 0; i < n_temps; i++) {
-        float v = scalar_load_storage(a->partial_grad_temps, t_base + i);
+        COMPUTE_T v = scalar_load_storage(a->partial_grad_temps, t_base + i);
         scalar_store_storage(a->clipped_partial_grad_temps, t_base + i, v * scale);
     }
     for (uint i = 0; i < n_hidden; i++) {
-        float v = scalar_load_storage(a->partial_grad_hidden_activations_aos, h_base + i);
+        COMPUTE_T v = scalar_load_storage(a->partial_grad_hidden_activations_aos, h_base + i);
         scalar_store_storage(a->clipped_partial_grad_hidden_activations_aos, h_base + i, v * scale);
     }
 }

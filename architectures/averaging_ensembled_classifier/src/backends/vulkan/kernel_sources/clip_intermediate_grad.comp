@@ -22,28 +22,28 @@ layout(push_constant) uniform PushConstants {
     uint  parameter_count;
 } push;
 
-layout(set = 0, binding = 0) buffer GradBuffer { float data[]; } grad;
+layout(set = 0, binding = 0) buffer GradBuffer { COMPUTE_FLOAT data[]; } grad;
 
 void main() {
     uint lid   = gl_LocalInvocationID.x;
     uint lsize = gl_WorkGroupSize.x;
 
     // ── Pass 1: Parallel reduction for sum of squares ──
-    float local_sq_sum = 0.0;
+    COMPUTE_FLOAT local_sq_sum = COMPUTE_FLOAT(0.0);
     for (uint i = lid; i < push.parameter_count; i += lsize) {
-        float val = grad.data[i];
+        COMPUTE_FLOAT val = grad.data[i];
         local_sq_sum += val * val;
     }
 
-    float total_sq = workgroup_reduce_add(local_sq_sum);
+    COMPUTE_FLOAT total_sq = workgroup_reduce_add(local_sq_sum);
 
     // ── Compute scaling factor (leader broadcasts via shared memory) ──
-    float scale_factor;
+    COMPUTE_FLOAT scale_factor;
     if (lid == 0) {
-        float norm = sqrt(total_sq);
-        scale_factor = 1.0;
-        if (norm > push.clipping_threshold) {
-            scale_factor = push.clipping_threshold / (norm + push.epsilon);
+        COMPUTE_FLOAT norm = sqrt(total_sq);
+        scale_factor = COMPUTE_FLOAT(1.0);
+        if (norm > COMPUTE_FLOAT(push.clipping_threshold)) {
+            scale_factor = COMPUTE_FLOAT(push.clipping_threshold) / (norm + COMPUTE_FLOAT(push.epsilon));
         }
         _compute_scratch[0] = scale_factor;
     }
@@ -51,7 +51,7 @@ void main() {
     scale_factor = _compute_scratch[0];
 
     // ── Early exit: no clipping needed ──
-    if (scale_factor >= 1.0) {
+    if (scale_factor >= COMPUTE_FLOAT(1.0)) {
         return;
     }
 

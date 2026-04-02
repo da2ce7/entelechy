@@ -1,11 +1,11 @@
 /* phase_3_update.inc — Precision-parameterized Update-phase kernels (Nodes 21, 24, 25)
  *                      + get_struct_size_* verification exports.
  *
- * Included by cpu_kernels.c with STORAGE_T/STATE_T/PRECISION_SUFFIX defined.
+ * Included by cpu_kernels.c with STORAGE_T/COMPUTE_T/STATE_T/PRECISION_SUFFIX defined.
  * Algorithmic reference: kernels/phase_3_update.cl.c
  *
  * Buffer role assignments (ADR-023 §2.5):
- *   - summed_grad, final_grad → compute (float*)
+ *   - summed_grad, final_grad → compute (COMPUTE_T*)
  *   - parameters, m1, m2, temperatures → state
  */
 
@@ -19,7 +19,7 @@ void PREC_FN(task_normalize_gradients)(void* raw_args, uint task_index, uint thr
     if (task_index >= a->parameter_count)
         return;
 
-    const float normalizer = 1.0f / (a->effective_batch_size + a->epsilon);
+    const COMPUTE_T normalizer = (COMPUTE_T)1.0 / (a->effective_batch_size + a->epsilon);
     a->final_grad[task_index] = a->summed_grad[task_index] * normalizer;
 }
 
@@ -33,20 +33,20 @@ void PREC_FN(task_adam_update)(void* raw_args, uint task_index, uint thread_id) 
     if (task_index >= a->parameter_count)
         return;
 
-    const float g      = a->final_grad[task_index];  /* float* compute */
-    const float m_prev = scalar_load_state(a->m1, task_index);
-    const float v_prev = scalar_load_state(a->m2, task_index);
+    const COMPUTE_T g      = a->final_grad[task_index];  /* COMPUTE_T* compute */
+    const COMPUTE_T m_prev = scalar_load_state(a->m1, task_index);
+    const COMPUTE_T v_prev = scalar_load_state(a->m2, task_index);
 
-    const float m_new = a->beta1 * m_prev + (1.0f - a->beta1) * g;
-    const float v_new = a->beta2 * v_prev + (1.0f - a->beta2) * (g * g);
+    const COMPUTE_T m_new = a->beta1 * m_prev + ((COMPUTE_T)1.0 - a->beta1) * g;
+    const COMPUTE_T v_new = a->beta2 * v_prev + ((COMPUTE_T)1.0 - a->beta2) * (g * g);
 
-    const float m_hat = m_new / (1.0f - a->beta1_pow_t);
-    const float v_hat = v_new / (1.0f - a->beta2_pow_t);
+    const COMPUTE_T m_hat = m_new / ((COMPUTE_T)1.0 - a->beta1_pow_t);
+    const COMPUTE_T v_hat = v_new / ((COMPUTE_T)1.0 - a->beta2_pow_t);
 
-    const float update = a->learning_rate * m_hat
-        / (sqrtf(v_hat) + a->epsilon);
+    const COMPUTE_T update = a->learning_rate * m_hat
+        / (COMPUTE_SQRT(v_hat) + a->epsilon);
 
-    const float param_val = scalar_load_state(a->parameters, task_index);
+    const COMPUTE_T param_val = scalar_load_state(a->parameters, task_index);
     scalar_store_state(a->parameters, task_index, param_val - update);
     scalar_store_state(a->m1, task_index, m_new);
     scalar_store_state(a->m2, task_index, v_new);
@@ -62,7 +62,7 @@ void PREC_FN(task_clamp_temperatures)(void* raw_args, uint task_index, uint thre
     if (task_index >= a->total_modules_count)
         return;
 
-    float val = scalar_load_state(a->temperatures, task_index);
+    COMPUTE_T val = scalar_load_state(a->temperatures, task_index);
     if (val < a->min_value) val = a->min_value;
     if (val > a->max_value) val = a->max_value;
     scalar_store_state(a->temperatures, task_index, val);

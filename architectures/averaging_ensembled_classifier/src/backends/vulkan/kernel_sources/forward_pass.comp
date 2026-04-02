@@ -28,7 +28,7 @@ layout(set = 0, binding = 4) writeonly buffer HiddenBuf     { STORAGE_FLOAT data
 layout(set = 0, binding = 5) writeonly buffer HiddenMaskBuf { STORAGE_FLOAT data[]; } dest_hidden_mask;
 
 // ── Shared Memory Tile (bank-conflict avoidance) ───────────────────────
-shared float simd_tile[SPEC_SIMD_WIDTH][SPEC_SIMD_WIDTH + SPEC_LOCAL_MEM_BANK_PADDING];
+shared COMPUTE_FLOAT simd_tile[SPEC_SIMD_WIDTH][SPEC_SIMD_WIDTH + SPEC_LOCAL_MEM_BANK_PADDING];
 
 void main() {
     uint b_idx = gl_WorkGroupID.x + push.batch_chunk_offset;
@@ -38,20 +38,20 @@ void main() {
     if (b_idx >= push.total_batch_count) return;
 
     uint  h_idx      = hb * SPEC_SIMD_WIDTH + lid;
-    float mask_val   = read_storage(src_sample_mask.data[b_idx]);
+    COMPUTE_FLOAT mask_val   = read_storage(src_sample_mask.data[b_idx]);
     uint  input_base = b_idx * push.padded_input_count;
     uint  w_base     = hb * push.padded_input_count * SPEC_SIMD_WIDTH;
 
     // Handle padded (masked-out) samples
-    if (mask_val < 0.5) {
+    if (mask_val < COMPUTE_FLOAT(0.5)) {
         uint out_idx = b_idx * push.padded_hidden_count + h_idx;
-        dest_hidden.data[out_idx]      = write_storage(0.0);
-        dest_hidden_mask.data[out_idx] = write_storage(0.0);
+        dest_hidden.data[out_idx]      = write_storage(COMPUTE_FLOAT(0.0));
+        dest_hidden_mask.data[out_idx] = write_storage(COMPUTE_FLOAT(0.0));
         return;
     }
 
     // Initialize accumulator with bias
-    float accum = read_state(src_biases.data[h_idx]);
+    COMPUTE_FLOAT accum = read_state(src_biases.data[h_idx]);
 
     // Tiled dot product across input dimension
     for (uint it = 0; it < push.padded_input_count; it += SPEC_SIMD_WIDTH) {
@@ -63,15 +63,15 @@ void main() {
 
         // Column-wise access → bank-conflict-free due to padding
         for (uint j = 0; j < SPEC_SIMD_WIDTH; j++) {
-            float x = read_storage(src_input.data[input_base + it + j]);
+            COMPUTE_FLOAT x = read_storage(src_input.data[input_base + it + j]);
             accum = fma(simd_tile[j][lid], x, accum);
         }
         barrier();
     }
 
     // ReLU activation + sample mask
-    float activated = max(0.0, accum) * mask_val;
-    float rmask     = (accum > 0.0) ? mask_val : 0.0;
+    COMPUTE_FLOAT activated = max(COMPUTE_FLOAT(0.0), accum) * mask_val;
+    COMPUTE_FLOAT rmask     = (accum > COMPUTE_FLOAT(0.0)) ? mask_val : COMPUTE_FLOAT(0.0);
 
     uint out_idx = b_idx * push.padded_hidden_count + h_idx;
     dest_hidden.data[out_idx]      = write_storage(activated);

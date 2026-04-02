@@ -34,9 +34,9 @@ void main() {
     uint total_elements = push.weights_parameter_count + push.biases_parameter_count;
 
     // ── Pass 1: Compute sum of squares for joint L2 norm ──
-    float local_sq_sum = 0.0;
+    COMPUTE_FLOAT local_sq_sum = COMPUTE_FLOAT(0.0);
     for (uint i = lid; i < total_elements; i += lsize) {
-        float val;
+        COMPUTE_FLOAT val;
         if (i < push.weights_parameter_count) {
             val = read_storage(src_grad_w.data[i]);
         } else {
@@ -45,15 +45,15 @@ void main() {
         local_sq_sum += val * val;
     }
 
-    float total_sq = workgroup_reduce_add(local_sq_sum);
+    COMPUTE_FLOAT total_sq = workgroup_reduce_add(local_sq_sum);
 
     // ── Compute scaling factor and broadcast ──
-    float scale_factor;
+    COMPUTE_FLOAT scale_factor;
     if (lid == 0) {
-        float norm = sqrt(total_sq);
-        scale_factor = 1.0;
-        if (norm > push.clipping_threshold) {
-            scale_factor = push.clipping_threshold / (norm + push.epsilon);
+        COMPUTE_FLOAT norm = sqrt(total_sq);
+        scale_factor = COMPUTE_FLOAT(1.0);
+        if (norm > COMPUTE_FLOAT(push.clipping_threshold)) {
+            scale_factor = COMPUTE_FLOAT(push.clipping_threshold) / (norm + COMPUTE_FLOAT(push.epsilon));
         }
         _compute_scratch[0] = scale_factor;
     }
@@ -63,11 +63,11 @@ void main() {
     // ── Pass 2: Scale and write to destination offsets ──
     for (uint i = lid; i < total_elements; i += lsize) {
         if (i < push.weights_parameter_count) {
-            float val = read_storage(src_grad_w.data[i]);
+            COMPUTE_FLOAT val = read_storage(src_grad_w.data[i]);
             dst_grad_w.data[push.weights_write_offset + i] = write_storage(val * scale_factor);
         } else {
             uint  rel = i - push.weights_parameter_count;
-            float val = read_storage(src_grad_b.data[rel]);
+            COMPUTE_FLOAT val = read_storage(src_grad_b.data[rel]);
             dst_grad_b.data[push.biases_write_offset + rel] = write_storage(val * scale_factor);
         }
     }

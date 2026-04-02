@@ -38,23 +38,22 @@ typedef uint32_t uint;
 #endif
 
 /* ================================================================
- * Multi-Precision Configuration (ADR-008, ADR-023 §2.3)
+ * Multi-Precision Configuration (ADR-008, ADR-023 §2.3, ADR-024 §4)
  *
- * Three precision variants are compiled: s32x32 (FP32 storage/FP32 state),
- * s16x16 (FP16 storage/FP16 state), and s16x32 (FP16 storage/FP32 state).
+ * Eleven precision variants are compiled using the three-axis scheme:
+ * STORAGE_T × COMPUTE_T × STATE_T, with suffix s{s}c{c}x{x}.
  * Each variant has suffixed struct types and function names.
  *
- * Computation always uses float (FP32) internally. STORAGE_T affects
- * buffer pointers for bandwidth-optimized transient data, STATE_T
- * affects persistent optimizer state (weights, biases, momentum).
+ * COMPUTE_T is a per-instantiation parameter (ADR-024 §4.2).
+ * The prior cpu_compute_t typedef is removed.
+ *
+ * STORAGE_T affects buffer pointers for bandwidth-optimized transient data,
+ * COMPUTE_T affects arithmetic precision, STATE_T affects persistent optimizer
+ * state (weights, biases, momentum).
  * ================================================================ */
 
-/* COMPUTE_TYPE is invariant on the CPU backend: always float.
- * Per ADR-023 §2.1: CPU arithmetic always executes at FP32 precision. */
-typedef float cpu_compute_t;
-
 /* --- Macro: declare all structs for one precision variant --- */
-#define DECLARE_PRECISION_STRUCTS(SUFFIX, STORAGE_T, STATE_T)                  \
+#define DECLARE_PRECISION_STRUCTS(SUFFIX, STORAGE_T, COMPUTE_T, STATE_T)       \
                                                                                \
 /* --- Act Phase --- */                                                        \
 typedef struct {                                                               \
@@ -98,7 +97,7 @@ typedef struct {                                                               \
     const int*       targets;                                                  \
     const STORAGE_T* sample_mask;                                              \
     STORAGE_T*       partial_probs;                                            \
-    float*           final_loss;                                               \
+    COMPUTE_T*       final_loss;                                               \
     uint             flat_tile_index;                                          \
     uint             num_class_chunks;                                         \
     uint             classes_per_chunk;                                        \
@@ -237,23 +236,23 @@ typedef struct {                                                               \
     const uint*      stage_node_counts;                                        \
     STORAGE_T*       staging_buffer_0;                                         \
     STORAGE_T*       staging_buffer_1;                                         \
-    float*           output;                                                   \
+    COMPUTE_T*       output;                                                   \
     uint             partial_width;                                            \
     uint             num_stages;                                               \
-    float            t_algorithmic;                                            \
-    float            lambda;                                                   \
-    float            fp_max;                                                   \
-    float            epsilon;                                                  \
+    COMPUTE_T        t_algorithmic;                                             \
+    COMPUTE_T        lambda;                                                   \
+    COMPUTE_T        fp_max;                                                   \
+    COMPUTE_T        epsilon;                                                  \
 } ReductionTreePlanC_##SUFFIX;                                                 \
                                                                                \
 typedef struct {                                                               \
     const STORAGE_T* grad_hidden_activations_permuted_soa;                     \
-    float*           summed_grad_hidden_activations;                           \
-    float            fp_max;                                                   \
-    float            policy_t_algorithmic;                                     \
-    float            policy_lambda;                                            \
+    COMPUTE_T*       summed_grad_hidden_activations;                           \
+    COMPUTE_T        fp_max;                                                   \
+    COMPUTE_T        policy_t_algorithmic;                                     \
+    COMPUTE_T        policy_lambda;                                            \
     uint             policy_max_k;                                             \
-    float            epsilon;                                                  \
+    COMPUTE_T        epsilon;                                                  \
     uint             total_batch_count;                                        \
     uint             padded_hidden_count;                                      \
     uint             total_modules_count;                                      \
@@ -261,9 +260,9 @@ typedef struct {                                                               \
 } StabilizeReduceArgs_##SUFFIX;                                                \
                                                                                \
 typedef struct {                                                               \
-    float*           intermediate_grad;                                        \
-    float            clipping_threshold_t_j;                                   \
-    float            epsilon;                                                  \
+    COMPUTE_T*       intermediate_grad;                                        \
+    COMPUTE_T        clipping_threshold_t_j;                                   \
+    COMPUTE_T        epsilon;                                                  \
     uint             parameter_count;                                          \
 } ClipIntermediateArgs_##SUFFIX;                                               \
                                                                                \
@@ -271,7 +270,7 @@ typedef struct {                                                               \
 typedef struct {                                                               \
     const STORAGE_T* input;                                                    \
     const STORAGE_T* hidden_activations;                                       \
-    const float*     summed_grad_hidden_activations;                           \
+    const COMPUTE_T* summed_grad_hidden_activations;                           \
     const STORAGE_T* sample_mask;                                              \
     STORAGE_T*       partial_grad_weights_shared;                              \
     uint             batch_chunk_offset;                                       \
@@ -286,7 +285,7 @@ typedef struct {                                                               \
                                                                                \
 typedef struct {                                                               \
     const STORAGE_T* hidden_activations;                                       \
-    const float*     summed_grad_hidden_activations;                           \
+    const COMPUTE_T* summed_grad_hidden_activations;                           \
     const STORAGE_T* sample_mask;                                              \
     STORAGE_T*       partial_grad_biases_shared;                               \
     uint             batch_chunk_offset;                                       \
@@ -314,41 +313,50 @@ typedef struct {                                                               \
                                                                                \
 /* --- Update Phase --- */                                                     \
 typedef struct {                                                               \
-    const float*     summed_grad;                                              \
-    float*           final_grad;                                               \
-    float            effective_batch_size;                                     \
-    float            epsilon;                                                  \
+    const COMPUTE_T* summed_grad;                                              \
+    COMPUTE_T*       final_grad;                                               \
+    COMPUTE_T        effective_batch_size;                                     \
+    COMPUTE_T        epsilon;                                                  \
     uint             parameter_count;                                          \
 } NormalizeGradientsArgs_##SUFFIX;                                             \
                                                                                \
 typedef struct {                                                               \
-    const float*     final_grad;                                               \
+    const COMPUTE_T* final_grad;                                               \
     STATE_T*         parameters;                                               \
     STATE_T*         m1;                                                       \
     STATE_T*         m2;                                                       \
-    float            learning_rate;                                            \
-    float            beta1_pow_t;                                              \
-    float            beta2_pow_t;                                              \
-    float            beta1;                                                    \
-    float            beta2;                                                    \
-    float            epsilon;                                                  \
+    COMPUTE_T        learning_rate;                                            \
+    COMPUTE_T        beta1_pow_t;                                              \
+    COMPUTE_T        beta2_pow_t;                                              \
+    COMPUTE_T        beta1;                                                    \
+    COMPUTE_T        beta2;                                                    \
+    COMPUTE_T        epsilon;                                                  \
     uint             parameter_count;                                          \
 } AdamUpdateArgs_##SUFFIX;                                                     \
                                                                                \
 typedef struct {                                                               \
     STATE_T*         temperatures;                                             \
-    float            min_value;                                                \
-    float            max_value;                                                \
+    COMPUTE_T        min_value;                                                \
+    COMPUTE_T        max_value;                                                \
     uint             total_modules_count;                                      \
 } ClampTemperaturesArgs_##SUFFIX;
 
-/* Instantiate structs for the three precision configurations (ADR-023 §2.4):
- *   s32x32: FP32 storage, FP32 state (uniform FP32)
- *   s16x16: FP16 storage, FP16 state (uniform FP16)
- *   s16x32: FP16 storage, FP32 state (mixed precision) */
-DECLARE_PRECISION_STRUCTS(s16x16, _Float16, _Float16)
-DECLARE_PRECISION_STRUCTS(s32x32, float, float)
-DECLARE_PRECISION_STRUCTS(s16x32, _Float16, float)
+/* Instantiate structs for all 14 three-axis precision combinations (ADR-024 §4.1):
+ *   s{storage}c{compute}x{state}                                               */
+DECLARE_PRECISION_STRUCTS(s16c16x16, _Float16, _Float16, _Float16)
+DECLARE_PRECISION_STRUCTS(s16c16x32, _Float16, _Float16, float)
+DECLARE_PRECISION_STRUCTS(s16c16x64, _Float16, _Float16, double)
+DECLARE_PRECISION_STRUCTS(s16c32x16, _Float16, float,  _Float16)
+DECLARE_PRECISION_STRUCTS(s16c32x32, _Float16, float,  float)
+DECLARE_PRECISION_STRUCTS(s16c32x64, _Float16, float,  double)
+DECLARE_PRECISION_STRUCTS(s16c64x16, _Float16, double, _Float16)
+DECLARE_PRECISION_STRUCTS(s16c64x32, _Float16, double, float)
+DECLARE_PRECISION_STRUCTS(s16c64x64, _Float16, double, double)
+DECLARE_PRECISION_STRUCTS(s32c32x32, float,    float,  float)
+DECLARE_PRECISION_STRUCTS(s32c32x64, float,    float,  double)
+DECLARE_PRECISION_STRUCTS(s32c64x32, float,    double, float)
+DECLARE_PRECISION_STRUCTS(s32c64x64, float,    double, double)
+DECLARE_PRECISION_STRUCTS(s64c64x64, double,   double, double)
 
 /* ================================================================
  * Task Function Declarations — macro-generated per precision
@@ -419,84 +427,21 @@ CPU_KERNELS_EXPORT size_t get_struct_size_normalize_gradients_args_##SUFFIX(void
 CPU_KERNELS_EXPORT size_t get_struct_size_adam_update_args_##SUFFIX(void);     \
 CPU_KERNELS_EXPORT size_t get_struct_size_clamp_temperatures_args_##SUFFIX(void);
 
-/* Declare for all three precision configurations */
-DECLARE_PRECISION_FUNCTIONS(s16x16)
-DECLARE_PRECISION_FUNCTIONS(s32x32)
-DECLARE_PRECISION_FUNCTIONS(s16x32)
-
-/* Transitional function name aliases (removed when FFI layer is updated) */
-#define task_forward_pass_fp32        task_forward_pass_s32x32
-#define task_forward_pass_fp16        task_forward_pass_s16x16
-#define task_render_logits_fp32       task_render_logits_s32x32
-#define task_render_logits_fp16       task_render_logits_s16x16
-#define task_cce_probs_loss_fp32      task_cce_probs_loss_s32x32
-#define task_cce_probs_loss_fp16      task_cce_probs_loss_s16x16
-#define task_bce_probs_loss_fp32      task_bce_probs_loss_s32x32
-#define task_bce_probs_loss_fp16      task_bce_probs_loss_s16x16
-#define task_module_param_grads_fp32  task_module_param_grads_s32x32
-#define task_module_param_grads_fp16  task_module_param_grads_s16x16
-#define task_backprop_to_hidden_fp32  task_backprop_to_hidden_s32x32
-#define task_backprop_to_hidden_fp16  task_backprop_to_hidden_s16x16
-#define task_temp_gradients_fp32      task_temp_gradients_s32x32
-#define task_temp_gradients_fp16      task_temp_gradients_s16x16
-#define task_clip_partial_grads_fp32  task_clip_partial_grads_s32x32
-#define task_clip_partial_grads_fp16  task_clip_partial_grads_s16x16
-#define task_gather_permute_grad_h_fp32  task_gather_permute_grad_h_s32x32
-#define task_gather_permute_grad_h_fp16  task_gather_permute_grad_h_s16x16
-#define task_stabilize_reduce_grad_h_fp32 task_stabilize_reduce_grad_h_s32x32
-#define task_stabilize_reduce_grad_h_fp16 task_stabilize_reduce_grad_h_s16x16
-#define task_clip_intermediate_fp32   task_clip_intermediate_s32x32
-#define task_clip_intermediate_fp16   task_clip_intermediate_s16x16
-#define task_backprop_shared_weights_fp32 task_backprop_shared_weights_s32x32
-#define task_backprop_shared_weights_fp16 task_backprop_shared_weights_s16x16
-#define task_backprop_shared_biases_fp32  task_backprop_shared_biases_s32x32
-#define task_backprop_shared_biases_fp16  task_backprop_shared_biases_s16x16
-#define task_clip_shared_grads_fp32   task_clip_shared_grads_s32x32
-#define task_clip_shared_grads_fp16   task_clip_shared_grads_s16x16
-#define task_normalize_gradients_fp32 task_normalize_gradients_s32x32
-#define task_normalize_gradients_fp16 task_normalize_gradients_s16x16
-#define task_adam_update_fp32         task_adam_update_s32x32
-#define task_adam_update_fp16         task_adam_update_s16x16
-#define task_clamp_temperatures_fp32  task_clamp_temperatures_s32x32
-#define task_clamp_temperatures_fp16  task_clamp_temperatures_s16x16
-#define execute_reduction_tree_fp32   execute_reduction_tree_s32x32
-#define execute_reduction_tree_fp16   execute_reduction_tree_s16x16
-#define get_struct_size_forward_pass_args_fp32  get_struct_size_forward_pass_args_s32x32
-#define get_struct_size_forward_pass_args_fp16  get_struct_size_forward_pass_args_s16x16
-#define get_struct_size_render_logits_args_fp32 get_struct_size_render_logits_args_s32x32
-#define get_struct_size_render_logits_args_fp16 get_struct_size_render_logits_args_s16x16
-#define get_struct_size_cce_chunk_args_fp32     get_struct_size_cce_chunk_args_s32x32
-#define get_struct_size_cce_chunk_args_fp16     get_struct_size_cce_chunk_args_s16x16
-#define get_struct_size_bce_chunk_args_fp32     get_struct_size_bce_chunk_args_s32x32
-#define get_struct_size_bce_chunk_args_fp16     get_struct_size_bce_chunk_args_s16x16
-#define get_struct_size_module_param_grads_args_fp32 get_struct_size_module_param_grads_args_s32x32
-#define get_struct_size_module_param_grads_args_fp16 get_struct_size_module_param_grads_args_s16x16
-#define get_struct_size_backprop_to_hidden_args_fp32 get_struct_size_backprop_to_hidden_args_s32x32
-#define get_struct_size_backprop_to_hidden_args_fp16 get_struct_size_backprop_to_hidden_args_s16x16
-#define get_struct_size_temp_gradients_args_fp32 get_struct_size_temp_gradients_args_s32x32
-#define get_struct_size_temp_gradients_args_fp16 get_struct_size_temp_gradients_args_s16x16
-#define get_struct_size_clip_partials_args_fp32 get_struct_size_clip_partials_args_s32x32
-#define get_struct_size_clip_partials_args_fp16 get_struct_size_clip_partials_args_s16x16
-#define get_struct_size_gather_permute_args_fp32 get_struct_size_gather_permute_args_s32x32
-#define get_struct_size_gather_permute_args_fp16 get_struct_size_gather_permute_args_s16x16
-#define get_struct_size_reduction_tree_plan_fp32 get_struct_size_reduction_tree_plan_s32x32
-#define get_struct_size_reduction_tree_plan_fp16 get_struct_size_reduction_tree_plan_s16x16
-#define get_struct_size_stabilize_reduce_args_fp32 get_struct_size_stabilize_reduce_args_s32x32
-#define get_struct_size_stabilize_reduce_args_fp16 get_struct_size_stabilize_reduce_args_s16x16
-#define get_struct_size_clip_intermediate_args_fp32 get_struct_size_clip_intermediate_args_s32x32
-#define get_struct_size_clip_intermediate_args_fp16 get_struct_size_clip_intermediate_args_s16x16
-#define get_struct_size_backprop_shared_weights_args_fp32 get_struct_size_backprop_shared_weights_args_s32x32
-#define get_struct_size_backprop_shared_weights_args_fp16 get_struct_size_backprop_shared_weights_args_s16x16
-#define get_struct_size_backprop_shared_biases_args_fp32 get_struct_size_backprop_shared_biases_args_s32x32
-#define get_struct_size_backprop_shared_biases_args_fp16 get_struct_size_backprop_shared_biases_args_s16x16
-#define get_struct_size_clip_shared_grads_args_fp32 get_struct_size_clip_shared_grads_args_s32x32
-#define get_struct_size_clip_shared_grads_args_fp16 get_struct_size_clip_shared_grads_args_s16x16
-#define get_struct_size_normalize_gradients_args_fp32 get_struct_size_normalize_gradients_args_s32x32
-#define get_struct_size_normalize_gradients_args_fp16 get_struct_size_normalize_gradients_args_s16x16
-#define get_struct_size_adam_update_args_fp32 get_struct_size_adam_update_args_s32x32
-#define get_struct_size_adam_update_args_fp16 get_struct_size_adam_update_args_s16x16
-#define get_struct_size_clamp_temperatures_args_fp32 get_struct_size_clamp_temperatures_args_s32x32
-#define get_struct_size_clamp_temperatures_args_fp16 get_struct_size_clamp_temperatures_args_s16x16
+/* Declare for all 14 three-axis precision configurations (ADR-024 §4.1) */
+DECLARE_PRECISION_FUNCTIONS(s16c16x16)
+DECLARE_PRECISION_FUNCTIONS(s16c16x32)
+DECLARE_PRECISION_FUNCTIONS(s16c16x64)
+DECLARE_PRECISION_FUNCTIONS(s16c32x16)
+DECLARE_PRECISION_FUNCTIONS(s16c32x32)
+DECLARE_PRECISION_FUNCTIONS(s16c32x64)
+DECLARE_PRECISION_FUNCTIONS(s16c64x16)
+DECLARE_PRECISION_FUNCTIONS(s16c64x32)
+DECLARE_PRECISION_FUNCTIONS(s16c64x64)
+DECLARE_PRECISION_FUNCTIONS(s32c32x32)
+DECLARE_PRECISION_FUNCTIONS(s32c32x64)
+DECLARE_PRECISION_FUNCTIONS(s32c64x32)
+DECLARE_PRECISION_FUNCTIONS(s32c64x64)
+DECLARE_PRECISION_FUNCTIONS(s64c64x64)
 
 /* ================================================================
  * Precision-agnostic exports

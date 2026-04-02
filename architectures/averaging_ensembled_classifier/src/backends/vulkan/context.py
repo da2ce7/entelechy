@@ -52,8 +52,11 @@ class VulkanContext:
         self._queue_family_index: int = -1
         self._vkCmdPushDescriptorSetKHR: object = None
 
+        self._device_features: object = None
+
         self._init_instance()
         self._select_physical_device()
+        self._query_device_features()
         self._create_logical_device()
         self._create_command_pool()
 
@@ -152,6 +155,17 @@ class VulkanContext:
                 return i
         return -1
 
+    def _query_device_features(self) -> None:
+        self._device_features = vk.vkGetPhysicalDeviceFeatures(
+            self._physical_device
+        )
+
+    def supports_float64(self) -> bool:
+        """Check if the Vulkan device supports FP64 shader operations."""
+        if self._device_features is None:
+            return False
+        return bool(self._device_features.shaderFloat64)
+
     def _create_logical_device(self) -> None:
         queue_create = vk.VkDeviceQueueCreateInfo(
             queueFamilyIndex=self._queue_family_index,
@@ -171,11 +185,17 @@ class VulkanContext:
         if self._has_push_descriptors:
             extensions.append("VK_KHR_push_descriptor")
 
+        # Enable device features, including shaderFloat64 if available
+        enabled_features = vk.VkPhysicalDeviceFeatures(
+            shaderFloat64=self.supports_float64(),
+        )
+
         device_create = vk.VkDeviceCreateInfo(
             queueCreateInfoCount=1,
             pQueueCreateInfos=[queue_create],
             enabledExtensionCount=len(extensions),
             ppEnabledExtensionNames=extensions,
+            pEnabledFeatures=[enabled_features],
         )
         self._device = vk.vkCreateDevice(
             self._physical_device, device_create, None

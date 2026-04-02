@@ -56,19 +56,19 @@ void main() {
                  + class_global_idx;
 
     // Initialize with bias
-    float logit = read_state(src_biases.data[module_global_idx * push.padded_total_output_class_count + class_global_idx]);
+    COMPUTE_FLOAT logit = read_state(src_biases.data[module_global_idx * push.padded_total_output_class_count + class_global_idx]);
 
     // Sparse dot product over hidden dimension
     for (uint h = 0; h < push.hidden_count; ++h) {
         uint  hidden_base = batch_global_idx * push.padded_hidden_count;
-        float h_mask = read_storage(src_hidden_mask.data[hidden_base + h]);
+        COMPUTE_FLOAT h_mask = read_storage(src_hidden_mask.data[hidden_base + h]);
 
-        if (h_mask > 0.5) {
-            float h_val = read_storage(src_hidden.data[hidden_base + h]);
+        if (h_mask > COMPUTE_FLOAT(0.5)) {
+            COMPUTE_FLOAT h_val = read_storage(src_hidden.data[hidden_base + h]);
             uint  w_idx = module_global_idx * push.padded_hidden_count * push.padded_total_output_class_count
                         + h * push.padded_total_output_class_count
                         + class_global_idx;
-            float w_val = read_state(src_weights.data[w_idx]);
+            COMPUTE_FLOAT w_val = read_state(src_weights.data[w_idx]);
             logit += h_val * w_val;
         }
     }

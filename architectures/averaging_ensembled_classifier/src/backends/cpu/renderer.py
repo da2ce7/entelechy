@@ -31,25 +31,57 @@ c_uint_p = POINTER(c_uint32)
 c_int_p = POINTER(c_int32)
 
 
-def _get_precision_suffix(storage_dtype: np.dtype, state_dtype: np.dtype) -> str:
-    """Map two-axis precision configuration to kernel suffix (ADR-023 §4.2).
+def _to_compute_scalar(value: float, suffix: str) -> float | int:
+    """Convert a Python float to the appropriate scalar for a compute-type field.
 
-    Returns one of: s16x16, s32x32, s16x32
+    For FP16 compute variants (s16c16*), ctypes uses c_uint16 because there
+    is no native c_float16. We convert the float to its IEEE 754 binary16
+    representation as an integer. For FP32/FP64 compute variants, return
+    the float unchanged.
     """
-    storage_is_f16 = storage_dtype == np.dtype(np.float16)
-    state_is_f16 = state_dtype == np.dtype(np.float16)
+    # FP16 compute suffixes start with s16c16 or s32c16 (hypothetically)
+    # In practice, only s16c16* exists — check the middle part (compute axis).
+    compute_axis = suffix.split("c")[1].split("x")[0]  # e.g., "16" from "s16c16x32"
+    if compute_axis == "16":
+        # Convert to FP16 bits: float -> np.float16 -> view as uint16
+        return int(np.float16(value).view(np.uint16))
+    return value
 
-    if storage_is_f16 and state_is_f16:
-        return "s16x16"
-    elif not storage_is_f16 and not state_is_f16:
-        return "s32x32"
-    elif storage_is_f16 and not state_is_f16:
-        return "s16x32"
-    else:
-        # s32x16 not supported (storage >= state is invariant)
+
+def _get_precision_suffix(
+    storage_dtype: np.dtype,
+    compute_dtype: np.dtype,
+    state_dtype: np.dtype,
+) -> str:
+    """Map three-axis precision configuration to kernel suffix (ADR-024 §4.1).
+
+    Returns one of the 11 valid s{s}c{c}x{x} suffixes.
+    """
+    _SUFFIX_MAP: dict[tuple[type, type, type], str] = {
+        (np.float16, np.float16, np.float16): "s16c16x16",
+        (np.float16, np.float16, np.float32): "s16c16x32",
+        (np.float16, np.float16, np.float64): "s16c16x64",
+        (np.float16, np.float32, np.float16): "s16c32x16",
+        (np.float16, np.float32, np.float32): "s16c32x32",
+        (np.float16, np.float32, np.float64): "s16c32x64",
+        (np.float16, np.float64, np.float16): "s16c64x16",
+        (np.float16, np.float64, np.float32): "s16c64x32",
+        (np.float16, np.float64, np.float64): "s16c64x64",
+        (np.float32, np.float32, np.float32): "s32c32x32",
+        (np.float32, np.float32, np.float64): "s32c32x64",
+        (np.float32, np.float64, np.float32): "s32c64x32",
+        (np.float32, np.float64, np.float64): "s32c64x64",
+        (np.float64, np.float64, np.float64): "s64c64x64",
+    }
+    key = (storage_dtype.type, compute_dtype.type, state_dtype.type)
+    suffix = _SUFFIX_MAP.get(key)
+    if suffix is None:
         raise ValueError(
-            f"Unsupported precision config: storage={storage_dtype}, state={state_dtype}"
+            f"No CPU kernel instantiation for "
+            f"storage={storage_dtype}, compute={compute_dtype}, "
+            f"state={state_dtype}"
         )
+    return suffix
 
 
 class CPUPlanRenderer:
@@ -85,13 +117,15 @@ class CPUPlanRenderer:
         topological order, and dispatches each node type.
         """
         suffix = _get_precision_suffix(
-            plan.precision.storage_dtype, plan.precision.state_dtype
+            plan.precision.storage_dtype,
+            plan.precision.compute_dtype,
+            plan.precision.state_dtype,
         )
         allocator = CPUBufferAllocator(
             simd_alignment=plan.hardware.cache_line_bytes,
             role_dtypes={
                 "storage": plan.precision.storage_dtype,
-                "compute": np.dtype(np.float32),  # CPU invariant (ADR-023 §2.1)
+                "compute": plan.precision.compute_dtype,
                 "state": plan.precision.state_dtype,
             },
         )
@@ -158,7 +192,7 @@ class CPUPlanRenderer:
         """Dispatch a KernelDispatchNode via pool_dispatch_and_wait."""
         fn_addr, struct_cls = self._dispatch_tables[suffix][node.kernel_name]
 
-        args = self._marshal_args(struct_cls, node, allocator)
+        args = self._marshal_args(struct_cls, node, allocator, suffix)
 
         self._lib.pool_dispatch_and_wait(
             self._pool,
@@ -175,8 +209,7 @@ class CPUPlanRenderer:
         suffix: str,
     ) -> None:
         """Render a ReductionTreeNode via execute_reduction_tree."""
-        _, c_storage_p, _, _ = PRECISION_C_TYPES[suffix]
-        c_float_p = ctypes.POINTER(ctypes.c_float)  # compute buffers always float
+        _, c_storage_p, _, c_compute_p, _, _ = PRECISION_C_TYPES[suffix]
         ReductionTreePlanFFI = PRECISION_STRUCTS[suffix]["ReductionTreePlanFFI"]
 
         rtp = node.reduction_plan
@@ -249,21 +282,24 @@ class CPUPlanRenderer:
         c_plan.staging_buffer_1 = staging_1.ctypes.data_as(c_storage_p)
         c_plan.output = ctypes.cast(
             allocator.get_data_pointer(rtp.destination_buffer),
-            c_float_p,
+            c_compute_p,
         )
         c_plan.partial_width = pw
         c_plan.num_stages = num_stages
 
-        # Threshold schedule
+        # Threshold schedule — convert to compute-type representation
         t_alg = rtp.threshold_schedule[0] if rtp.threshold_schedule else 0.0
-        c_plan.t_algorithmic = t_alg if t_alg is not None else 0.0
-        c_plan.lambda_ = (
+        c_plan.t_algorithmic = _to_compute_scalar(
+            t_alg if t_alg is not None else 0.0, suffix
+        )
+        lambda_val = (
             rtp.threshold_schedule[1]
             if len(rtp.threshold_schedule) > 1 and rtp.threshold_schedule[1] is not None
             else 0.0
         )
-        c_plan.fp_max = plan.precision.compute_fp_format_max
-        c_plan.epsilon = plan.precision.compute_epsilon
+        c_plan.lambda_ = _to_compute_scalar(lambda_val, suffix)
+        c_plan.fp_max = _to_compute_scalar(plan.precision.compute_fp_format_max, suffix)
+        c_plan.epsilon = _to_compute_scalar(plan.precision.compute_epsilon, suffix)
 
         getattr(self._lib, f"execute_reduction_tree_{suffix}")(
             self._pool, ctypes.byref(c_plan)
@@ -294,7 +330,8 @@ class CPUPlanRenderer:
 
     _POINTER_TYPES = (
         *(ct[1] for ct in PRECISION_C_TYPES.values()),  # storage pointers
-        *(ct[3] for ct in PRECISION_C_TYPES.values()),  # state pointers
+        *(ct[3] for ct in PRECISION_C_TYPES.values()),  # compute pointers
+        *(ct[5] for ct in PRECISION_C_TYPES.values()),  # state pointers
         c_uint_p, c_int_p, c_void_p,
     )
 
@@ -303,6 +340,7 @@ class CPUPlanRenderer:
         struct_cls: type[ctypes.Structure],
         node: KernelDispatchNode,
         allocator: CPUBufferAllocator,
+        suffix: str,
     ) -> ctypes.Structure:
         """Construct a ctypes argument struct from plan node parameters."""
         args = struct_cls()
@@ -322,9 +360,19 @@ class CPUPlanRenderer:
                         ctypes.cast(ptr, pointer_fields[field_name]))
 
         # Set scalar fields from scalar_params
+        # For FP16 compute variants, float scalars that map to c_uint16 fields
+        # (i.e., c_compute for FP16) must be converted to FP16 binary representation.
+        # We detect these by inspecting the struct field type.
+        field_type_map = {name: ftype for name, ftype in struct_cls._fields_}  # type: ignore
         for param_name, value in node.scalar_params.items():
             field_name = self._param_to_field(param_name)
             if hasattr(args, field_name):
+                # If value is float and field is c_uint16 (FP16 binary representation),
+                # convert the float to FP16 bits
+                if isinstance(value, float):
+                    ftype = field_type_map.get(field_name)
+                    if ftype is ctypes.c_uint16:
+                        value = _to_compute_scalar(value, suffix)
                 setattr(args, field_name, value)
 
         return args

@@ -51,21 +51,21 @@ void main() {
     uint loss_idx       = loss_tile_base + module_local_idx * push.total_batch_count + batch_idx;
 
     // Handle padded samples
-    if (read_storage(src_sample_mask.data[batch_idx]) < 0.5) {
-        dest_loss.data[loss_idx] = write_storage(0.0);
+    if (read_storage(src_sample_mask.data[batch_idx]) < COMPUTE_FLOAT(0.5)) {
+        dest_loss.data[loss_idx] = write_storage(COMPUTE_FLOAT(0.0));
         uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
         for (uint c_local = 0; c_local < push.classes_per_chunk; ++c_local) {
             uint prob_idx = prob_tile_base
                           + module_local_idx * push.total_batch_count * push.classes_per_chunk
                           + batch_idx * push.classes_per_chunk + c_local;
-            dest_probs.data[prob_idx] = write_storage(0.0);
+            dest_probs.data[prob_idx] = write_storage(COMPUTE_FLOAT(0.0));
         }
         return;
     }
 
     // Fused sigmoid probability + BCE loss accumulation
-    float temp_inv = 1.0 / read_state(src_temps.data[module_global_idx]);
-    float partial_loss_accum = 0.0;
+    COMPUTE_FLOAT temp_inv = COMPUTE_FLOAT(1.0) / read_state(src_temps.data[module_global_idx]);
+    COMPUTE_FLOAT partial_loss_accum = COMPUTE_FLOAT(0.0);
 
     uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
 
@@ -74,17 +74,17 @@ void main() {
         if (c_global < push.total_output_class_count) {
             uint base_read = module_global_idx * push.total_batch_count * push.padded_total_output_class_count
                            + batch_idx * push.padded_total_output_class_count + c_global;
-            float logit = read_storage(src_logits.data[base_read]);
-            float scaled_logit = logit * temp_inv;
+            COMPUTE_FLOAT logit = read_storage(src_logits.data[base_read]);
+            COMPUTE_FLOAT scaled_logit = logit * temp_inv;
 
             // Numerically stable sigmoid (two-branch form)
-            float prob;
-            if (scaled_logit >= 0.0) {
-                float e = exp(-scaled_logit);
-                prob = 1.0 / (1.0 + e);
+            COMPUTE_FLOAT prob;
+            if (scaled_logit >= COMPUTE_FLOAT(0.0)) {
+                COMPUTE_FLOAT e = COMPUTE_EXP(-scaled_logit);
+                prob = COMPUTE_FLOAT(1.0) / (COMPUTE_FLOAT(1.0) + e);
             } else {
-                float e = exp(scaled_logit);
-                prob = e / (1.0 + e);
+                COMPUTE_FLOAT e = COMPUTE_EXP(scaled_logit);
+                prob = e / (COMPUTE_FLOAT(1.0) + e);
             }
 
             uint prob_idx = prob_tile_base
@@ -93,9 +93,9 @@ void main() {
             dest_probs.data[prob_idx] = write_storage(prob);
 
             // BCE loss accumulation
-            float target_val = read_storage(src_targets.data[batch_idx * push.padded_total_output_class_count + c_global]);
-            float term1 = target_val * log(max(prob, NUMERICAL_STABILITY_EPSILON));
-            float term2 = (1.0 - target_val) * log(max(1.0 - prob, NUMERICAL_STABILITY_EPSILON));
+            COMPUTE_FLOAT target_val = read_storage(src_targets.data[batch_idx * push.padded_total_output_class_count + c_global]);
+            COMPUTE_FLOAT term1 = target_val * COMPUTE_LOG(max(prob, NUMERICAL_STABILITY_EPSILON));
+            COMPUTE_FLOAT term2 = (COMPUTE_FLOAT(1.0) - target_val) * COMPUTE_LOG(max(COMPUTE_FLOAT(1.0) - prob, NUMERICAL_STABILITY_EPSILON));
             partial_loss_accum += term1 + term2;
         }
     }

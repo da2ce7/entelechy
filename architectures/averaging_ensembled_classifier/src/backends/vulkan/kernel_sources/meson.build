@@ -30,10 +30,28 @@ compute_only_shaders = [
 ]
 
 # Precision variant definitions: [suffix, extra glslc flags]
+# Three-axis: STORAGE_FLOAT × COMPUTE_FLOAT × STATE_FLOAT (ADR-024 §5.5)
 precision_variants = [
-    ['_fp32',    []],
-    ['_s16fp32', ['-DSTORAGE_FLOAT=float16_t', '-DSTATE_FLOAT=float', '-DENABLE_FP16_EXTENSION=1']],
-    ['_fp16',    ['-DSTORAGE_FLOAT=float16_t', '-DSTATE_FLOAT=float16_t', '-DENABLE_FP16_EXTENSION=1']],
+    # storage=16, compute=16
+    ['_s16c16x16', ['-DSTORAGE_FLOAT=float16_t', '-DCOMPUTE_FLOAT=float16_t', '-DSTATE_FLOAT=float16_t', '-DENABLE_FP16_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-3']],
+    ['_s16c16x32', ['-DSTORAGE_FLOAT=float16_t', '-DCOMPUTE_FLOAT=float16_t', '-DSTATE_FLOAT=float', '-DENABLE_FP16_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-3']],
+    ['_s16c16x64', ['-DSTORAGE_FLOAT=float16_t', '-DCOMPUTE_FLOAT=float16_t', '-DSTATE_FLOAT=double', '-DENABLE_FP16_EXTENSION=1', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-3']],
+    # storage=16, compute=32
+    ['_s16c32x16', ['-DSTORAGE_FLOAT=float16_t', '-DCOMPUTE_FLOAT=float', '-DSTATE_FLOAT=float16_t', '-DENABLE_FP16_EXTENSION=1']],
+    ['_s16c32x32', ['-DSTORAGE_FLOAT=float16_t', '-DCOMPUTE_FLOAT=float', '-DSTATE_FLOAT=float', '-DENABLE_FP16_EXTENSION=1']],
+    ['_s16c32x64', ['-DSTORAGE_FLOAT=float16_t', '-DCOMPUTE_FLOAT=float', '-DSTATE_FLOAT=double', '-DENABLE_FP16_EXTENSION=1', '-DENABLE_FP64_EXTENSION=1']],
+    # storage=16, compute=64
+    ['_s16c64x16', ['-DSTORAGE_FLOAT=float16_t', '-DCOMPUTE_FLOAT=double', '-DSTATE_FLOAT=float16_t', '-DENABLE_FP16_EXTENSION=1', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
+    ['_s16c64x32', ['-DSTORAGE_FLOAT=float16_t', '-DCOMPUTE_FLOAT=double', '-DSTATE_FLOAT=float', '-DENABLE_FP16_EXTENSION=1', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
+    ['_s16c64x64', ['-DSTORAGE_FLOAT=float16_t', '-DCOMPUTE_FLOAT=double', '-DSTATE_FLOAT=double', '-DENABLE_FP16_EXTENSION=1', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
+    # storage=32, compute=32
+    ['_s32c32x32', []],
+    ['_s32c32x64', ['-DSTATE_FLOAT=double', '-DENABLE_FP64_EXTENSION=1']],
+    # storage=32, compute=64
+    ['_s32c64x32', ['-DCOMPUTE_FLOAT=double', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
+    ['_s32c64x64', ['-DCOMPUTE_FLOAT=double', '-DSTATE_FLOAT=double', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
+    # storage=64
+    ['_s64c64x64', ['-DSTORAGE_FLOAT=double', '-DCOMPUTE_FLOAT=double', '-DSTATE_FLOAT=double', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
 ]
 
 spirv_targets = []
@@ -60,21 +78,33 @@ foreach variant : precision_variants
     endforeach
 endforeach
 
+# Compute-only variant definitions: [suffix, extra glslc flags]
+compute_only_variants = [
+    ['_c16', ['-DCOMPUTE_FLOAT=float16_t', '-DENABLE_FP16_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-3']],
+    ['_c32', []],
+    ['_c64', ['-DCOMPUTE_FLOAT=double', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
+]
+
 # Single-variant compilation for compute-only shaders.
-foreach shader : compute_only_shaders
-    stem = shader.replace('.comp', '')
-    spirv_targets += custom_target(
-        stem + '_fp32.spv',
-        input: shader,
-        output: stem + '_fp32.spv',
-        command: [glslc,
-                  '--target-env=vulkan1.1',
-                  '-I', meson.current_source_dir(),
-                  '-o', '@OUTPUT@',
-                  '@INPUT@'],
-        install: true,
-        install_dir: py.get_install_dir() / 'averaging_ensembled_classifier' / 'backends' / 'vulkan' / 'kernel_sources',
-    )
+foreach variant : compute_only_variants
+    suffix = variant[0]
+    extra_flags = variant[1]
+    foreach shader : compute_only_shaders
+        stem = shader.replace('.comp', '')
+        spirv_targets += custom_target(
+            stem + suffix + '.spv',
+            input: shader,
+            output: stem + suffix + '.spv',
+            command: [glslc,
+                      '--target-env=vulkan1.1',
+                      '-I', meson.current_source_dir(),
+                      extra_flags,
+                      '-o', '@OUTPUT@',
+                      '@INPUT@'],
+            install: true,
+            install_dir: py.get_install_dir() / 'averaging_ensembled_classifier' / 'backends' / 'vulkan' / 'kernel_sources',
+        )
+    endforeach
 endforeach
 
 # Install the package marker and GLSL source for reference.

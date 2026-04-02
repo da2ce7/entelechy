@@ -1,11 +1,11 @@
 /* phase_2_learn_C_reduction.inc — Precision-parameterized reduction kernels (Nodes 13-16, 20).
  *
- * Included by cpu_kernels.c with STORAGE_T/STATE_T/PRECISION_SUFFIX defined.
+ * Included by cpu_kernels.c with STORAGE_T/COMPUTE_T/STATE_T/PRECISION_SUFFIX defined.
  * Algorithmic reference: kernels/phase_2_learn_C_reduction.cl.c
  *
  * Buffer role assignments (ADR-023 §2.5):
  *   - clipped_partial_grad_*, grad_*_permuted, partial_collection, staging → storage
- *   - summed_grad_*, output → compute (float)
+ *   - summed_grad_*, output → compute (COMPUTE_T)
  */
 
 /* ================================================================
@@ -28,7 +28,7 @@ void PREC_FN(task_gather_permute_grad_h)(void* raw_args, uint task_index, uint t
     const uint module_chunk_idx = module_global_idx / a->modules_per_chunk;
     const uint module_local_idx = module_global_idx % a->modules_per_chunk;
 
-    float accum = 0.0f;
+    COMPUTE_T accum = (COMPUTE_T)0.0;
     for (uint cc = 0; cc < a->num_class_chunks; cc++) {
         const uint flat_tile_idx = module_chunk_idx * a->num_class_chunks + cc;
         if (flat_tile_idx >= a->total_tile_count) break;
@@ -65,9 +65,9 @@ void PREC_FN(task_stabilize_reduce_grad_h)(void* raw_args, uint task_index, uint
     const uint M = a->total_modules_count;
 
     if (M <= 1) {
-        float val = (M == 1)
+        COMPUTE_T val = (M == 1)
             ? scalar_load_storage(a->grad_hidden_activations_permuted_soa, row_offset)
-            : 0.0f;
+            : (COMPUTE_T)0.0;
         a->summed_grad_hidden_activations[row_idx] = val;
         return;
     }
@@ -82,30 +82,30 @@ void PREC_FN(task_stabilize_reduce_grad_h)(void* raw_args, uint task_index, uint
         num_stages++;
     }
 
-    float stack_a[1024];
-    float stack_b[1024];
-    float* heap_a = NULL;
-    float* heap_b = NULL;
-    float* current;
-    float* next;
+    COMPUTE_T stack_a[1024];
+    COMPUTE_T stack_b[1024];
+    COMPUTE_T* heap_a = NULL;
+    COMPUTE_T* heap_b = NULL;
+    COMPUTE_T* current;
+    COMPUTE_T* next;
 
     if (M <= 1024) {
         current = stack_a;
         next    = stack_b;
     } else {
-        heap_a = (float*)malloc(M * sizeof(float));
-        heap_b = (float*)malloc(M * sizeof(float));
+        heap_a = (COMPUTE_T*)malloc(M * sizeof(COMPUTE_T));
+        heap_b = (COMPUTE_T*)malloc(M * sizeof(COMPUTE_T));
         if (!heap_a || !heap_b) {
             free(heap_a);
             free(heap_b);
-            a->summed_grad_hidden_activations[row_idx] = 0.0f;
+            a->summed_grad_hidden_activations[row_idx] = (COMPUTE_T)0.0;
             return;
         }
         current = heap_a;
         next    = heap_b;
     }
 
-    /* Load initial values (STORAGE_T → float conversion) */
+    /* Load initial values (STORAGE_T → COMPUTE_T conversion) */
     for (uint i = 0; i < M; i++) {
         current[i] = scalar_load_storage(a->grad_hidden_activations_permuted_soa,
                                          row_offset + i);
@@ -114,11 +114,11 @@ void PREC_FN(task_stabilize_reduce_grad_h)(void* raw_args, uint task_index, uint
     uint num_items = M;
     for (uint s = 0; s < num_stages; s++) {
         uint j = num_stages - 1 - s;
-        float T_policy = a->policy_t_algorithmic + a->policy_lambda * (float)(j * j);
+        COMPUTE_T T_policy = a->policy_t_algorithmic + a->policy_lambda * (COMPUTE_T)(j * j);
         uint K_actual = (K < num_items) ? K : num_items;
-        float T_safety = (K_actual > 0)
-            ? (a->fp_max / (float)K_actual) : a->fp_max;
-        float threshold = (T_policy < T_safety) ? T_policy : T_safety;
+        COMPUTE_T T_safety = (K_actual > 0)
+            ? (a->fp_max / (COMPUTE_T)K_actual) : a->fp_max;
+        COMPUTE_T threshold = (T_policy < T_safety) ? T_policy : T_safety;
 
         uint new_count = (num_items + K - 1) / K;
         for (uint g = 0; g < new_count; g++) {
@@ -126,19 +126,19 @@ void PREC_FN(task_stabilize_reduce_grad_h)(void* raw_args, uint task_index, uint
             uint end = start + K;
             if (end > num_items) end = num_items;
 
-            float sum = 0.0f;
+            COMPUTE_T sum = (COMPUTE_T)0.0;
             for (uint i = start; i < end; i++) {
                 sum += current[i];
             }
 
-            float norm = fabsf(sum);
+            COMPUTE_T norm = COMPUTE_FABS(sum);
             if (norm > threshold) {
                 sum *= threshold / (norm + a->epsilon);
             }
             next[g] = sum;
         }
 
-        float* tmp = current;
+        COMPUTE_T* tmp = current;
         current = next;
         next = tmp;
         num_items = new_count;
@@ -157,17 +157,17 @@ void PREC_FN(task_clip_intermediate)(void* raw_args, uint task_index, uint threa
     (void)task_index;
     PREC_TY(ClipIntermediateArgs)* a = (PREC_TY(ClipIntermediateArgs)*)raw_args;
 
-    float sum_sq = 0.0f;
+    COMPUTE_T sum_sq = (COMPUTE_T)0.0;
     for (uint i = 0; i < a->parameter_count; i++) {
-        float v = a->intermediate_grad[i];
+        COMPUTE_T v = a->intermediate_grad[i];
         sum_sq += v * v;
     }
 
-    float norm = sqrtf(sum_sq);
+    COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
     if (norm <= a->clipping_threshold_t_j)
         return;
 
-    float scale = a->clipping_threshold_t_j / (norm + a->epsilon);
+    COMPUTE_T scale = a->clipping_threshold_t_j / (norm + a->epsilon);
 
     for (uint i = 0; i < a->parameter_count; i++) {
         a->intermediate_grad[i] *= scale;
@@ -178,7 +178,7 @@ void PREC_FN(task_clip_intermediate)(void* raw_args, uint task_index, uint threa
  * Internal: per-precision ReduceNodeArgs and helpers
  *
  * The reduction tree uses STORAGE_T* for intermediate staging buffers
- * but writes the final result to float* output (compute role).
+ * but writes the final result to COMPUTE_T* output (compute role).
  * ================================================================ */
 typedef struct {
     const STORAGE_T* source;
@@ -186,8 +186,8 @@ typedef struct {
     uint             fan_in;
     uint             partial_width;
     STORAGE_T*       staging_dest;   /* Intermediate stages write here */
-    float            threshold;
-    float            epsilon;
+    COMPUTE_T        threshold;
+    COMPUTE_T        epsilon;
 } PREC_TY(ReduceNodeStagingArgs);
 
 typedef struct {
@@ -195,9 +195,9 @@ typedef struct {
     const uint*      offset_list;
     uint             fan_in;
     uint             partial_width;
-    float*           float_dest;     /* Final stage writes here */
-    float            threshold;
-    float            epsilon;
+    COMPUTE_T*       compute_dest;   /* Final stage writes here */
+    COMPUTE_T        threshold;
+    COMPUTE_T        epsilon;
 } PREC_TY(ReduceNodeFinalArgs);
 
 static void PREC_FN(task_reduce_staging)(void* raw_args, uint task_index, uint thread_id) {
@@ -214,8 +214,8 @@ static void PREC_FN(task_reduce_staging)(void* raw_args, uint task_index, uint t
 
     /* Accumulate from sources */
     const uint* offsets = a->offset_list + (size_t)task_index * a->fan_in;
-    float* accum = (float*)alloca(pw * sizeof(float));
-    for (uint e = 0; e < pw; e++) accum[e] = 0.0f;
+    COMPUTE_T* accum = (COMPUTE_T*)alloca(pw * sizeof(COMPUTE_T));
+    for (uint e = 0; e < pw; e++) accum[e] = (COMPUTE_T)0.0;
 
     for (uint k = 0; k < a->fan_in; k++) {
         uint off = offsets[k];
@@ -227,13 +227,13 @@ static void PREC_FN(task_reduce_staging)(void* raw_args, uint task_index, uint t
     }
 
     /* Clip and store to staging */
-    float sum_sq = 0.0f;
+    COMPUTE_T sum_sq = (COMPUTE_T)0.0;
     for (uint e = 0; e < pw; e++) {
         sum_sq += accum[e] * accum[e];
     }
-    float norm = sqrtf(sum_sq);
+    COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
     if (norm > a->threshold) {
-        float scale = a->threshold / (norm + a->epsilon);
+        COMPUTE_T scale = a->threshold / (norm + a->epsilon);
         for (uint e = 0; e < pw; e++) {
             accum[e] *= scale;
         }
@@ -248,11 +248,11 @@ static void PREC_FN(task_reduce_final)(void* raw_args, uint task_index, uint thr
     PREC_TY(ReduceNodeFinalArgs)* a = (PREC_TY(ReduceNodeFinalArgs)*)raw_args;
 
     const uint pw = a->partial_width;
-    float* dest = a->float_dest + (size_t)task_index * pw;
+    COMPUTE_T* dest = a->compute_dest + (size_t)task_index * pw;
 
-    /* Zero destination (float output) */
+    /* Zero destination (COMPUTE_T output) */
     for (uint e = 0; e < pw; e++) {
-        dest[e] = 0.0f;
+        dest[e] = (COMPUTE_T)0.0;
     }
 
     /* Accumulate from sources */
@@ -267,13 +267,13 @@ static void PREC_FN(task_reduce_final)(void* raw_args, uint task_index, uint thr
     }
 
     /* Clip */
-    float sum_sq = 0.0f;
+    COMPUTE_T sum_sq = (COMPUTE_T)0.0;
     for (uint e = 0; e < pw; e++) {
         sum_sq += dest[e] * dest[e];
     }
-    float norm = sqrtf(sum_sq);
+    COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
     if (norm > a->threshold) {
-        float scale = a->threshold / (norm + a->epsilon);
+        COMPUTE_T scale = a->threshold / (norm + a->epsilon);
         for (uint e = 0; e < pw; e++) {
             dest[e] *= scale;
         }
@@ -294,22 +294,22 @@ void PREC_FN(execute_reduction_tree)(ThreadPool* pool, PREC_TY(ReductionTreePlan
 
     for (uint s = 0; s < plan->num_stages; s++) {
         uint j = plan->num_stages - 1 - s;
-        float T_policy = plan->t_algorithmic + plan->lambda * (float)(j * j);
+        COMPUTE_T T_policy = plan->t_algorithmic + plan->lambda * (COMPUTE_T)(j * j);
         uint K = plan->stage_fan_in[s];
-        float T_safety = (K > 0) ? (plan->fp_max / (float)K) : plan->fp_max;
-        float threshold = (T_policy < T_safety) ? T_policy : T_safety;
+        COMPUTE_T T_safety = (K > 0) ? (plan->fp_max / (COMPUTE_T)K) : plan->fp_max;
+        COMPUTE_T threshold = (T_policy < T_safety) ? T_policy : T_safety;
 
         uint node_count = plan->stage_node_counts[s];
         const uint* offsets = plan->offset_lists_flat + plan->stage_offsets_into_list[s];
 
         if (s == plan->num_stages - 1) {
-            /* Final stage: write to float* output */
+            /* Final stage: write to COMPUTE_T* output */
             PREC_TY(ReduceNodeFinalArgs) args;
             args.source = current_src;
             args.offset_list = offsets;
             args.fan_in = K;
             args.partial_width = plan->partial_width;
-            args.float_dest = plan->output;
+            args.compute_dest = plan->output;
             args.threshold = threshold;
             args.epsilon = plan->epsilon;
 

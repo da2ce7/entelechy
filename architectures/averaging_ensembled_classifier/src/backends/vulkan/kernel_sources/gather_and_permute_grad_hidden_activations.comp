@@ -42,7 +42,7 @@ void main() {
     uint module_chunk_idx = module_global_idx / push.modules_per_chunk;
     uint module_local_idx = module_global_idx % push.modules_per_chunk;
 
-    float accum = 0.0;
+    COMPUTE_FLOAT accum = COMPUTE_FLOAT(0.0);
     for (uint class_chunk_idx = 0; class_chunk_idx < push.num_class_chunks; ++class_chunk_idx) {
         uint flat_tile_idx = module_chunk_idx * push.num_class_chunks + class_chunk_idx;
         if (flat_tile_idx < push.total_tile_count) {

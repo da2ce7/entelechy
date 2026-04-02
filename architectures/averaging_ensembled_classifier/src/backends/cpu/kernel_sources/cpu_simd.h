@@ -343,11 +343,11 @@ static inline void simd_store_real_fp64(double* p, simd_float v) {
 }
 #endif
 
-static inline float scalar_load_real_fp64(const double* p) {
-    return (float)*p;
+static inline double scalar_load_real_fp64(const double* p) {
+    return *p;
 }
-static inline void scalar_store_real_fp64(double* p, float v) {
-    *p = (double)v;
+static inline void scalar_store_real_fp64(double* p, double v) {
+    *p = v;
 }
 
 #endif /* CPU_SIMD_H */

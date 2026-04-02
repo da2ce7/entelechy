@@ -18,22 +18,51 @@ import numpy as np
 from ...shared.precision_config import PrecisionConfig
 from .context import VulkanContext
 
-# Shaders with only compute-role buffers — always use the _fp32 variant.
+# Shaders with only compute-role buffers — use compute-only suffix.
 _COMPUTE_ONLY_SHADERS = frozenset({"normalize_gradients"})
+
+# Three-axis suffix map: (storage_dtype.type, compute_dtype.type, state_dtype.type) → suffix
+_SUFFIX_MAP: dict[tuple[type, type, type], str] = {
+    (np.float16, np.float16, np.float16): "_s16c16x16",
+    (np.float16, np.float16, np.float32): "_s16c16x32",
+    (np.float16, np.float16, np.float64): "_s16c16x64",
+    (np.float16, np.float32, np.float16): "_s16c32x16",
+    (np.float16, np.float32, np.float32): "_s16c32x32",
+    (np.float16, np.float32, np.float64): "_s16c32x64",
+    (np.float16, np.float64, np.float16): "_s16c64x16",
+    (np.float16, np.float64, np.float32): "_s16c64x32",
+    (np.float16, np.float64, np.float64): "_s16c64x64",
+    (np.float32, np.float32, np.float32): "_s32c32x32",
+    (np.float32, np.float32, np.float64): "_s32c32x64",
+    (np.float32, np.float64, np.float32): "_s32c64x32",
+    (np.float32, np.float64, np.float64): "_s32c64x64",
+    (np.float64, np.float64, np.float64): "_s64c64x64",
+}
 
 
 def _spv_variant_suffix(precision: PrecisionConfig) -> str:
-    """Map a PrecisionConfig to the SPIR-V variant suffix (ADR-023 §4.1)."""
-    s = precision.storage_dtype
-    t = precision.state_dtype
-    if s == np.dtype(np.float32) and t == np.dtype(np.float32):
-        return "_fp32"
-    elif s == np.dtype(np.float16) and t == np.dtype(np.float32):
-        return "_s16fp32"
-    elif s == np.dtype(np.float16) and t == np.dtype(np.float16):
-        return "_fp16"
-    else:
-        raise ValueError(f"No Vulkan SPIR-V variant for storage={s}, state={t}")
+    """Map a PrecisionConfig to the SPIR-V variant suffix (ADR-024 §5.5)."""
+    key = (
+        precision.storage_dtype.type,
+        precision.compute_dtype.type,
+        precision.state_dtype.type,
+    )
+    suffix = _SUFFIX_MAP.get(key)
+    if suffix is None:
+        raise ValueError(
+            f"No Vulkan SPIR-V variant for storage={precision.storage_dtype}, "
+            f"compute={precision.compute_dtype}, state={precision.state_dtype}"
+        )
+    return suffix
+
+
+def _compute_only_suffix(precision: PrecisionConfig) -> str:
+    """Map a PrecisionConfig to the compute-only SPIR-V variant suffix."""
+    if precision.compute_dtype == np.dtype(np.float64):
+        return "_c64"
+    if precision.compute_dtype == np.dtype(np.float16):
+        return "_c16"
+    return "_c32"
 
 
 if TYPE_CHECKING:
@@ -85,8 +114,10 @@ class VulkanPipelineCache:
         Returns a cached pipeline if one already exists for the given
         (shader_name, problem_type, variant_suffix) key.
         """
-        if shader_name in _COMPUTE_ONLY_SHADERS or precision is None:
-            variant_suffix = "_fp32"
+        if shader_name in _COMPUTE_ONLY_SHADERS:
+            variant_suffix = _compute_only_suffix(precision) if precision is not None else "_c32"
+        elif precision is None:
+            variant_suffix = "_s32c32x32"
         else:
             variant_suffix = _spv_variant_suffix(precision)
 
@@ -190,7 +221,7 @@ class VulkanPipelineCache:
     # ── Internal helpers ──
 
     @staticmethod
-    def _load_spirv(shader_name: str, variant_suffix: str = "_fp32") -> bytes:
+    def _load_spirv(shader_name: str, variant_suffix: str = "_s32c32x32") -> bytes:
         """Load a .spv file from the kernel_sources package.
 
         Discovery order:
@@ -213,6 +244,7 @@ class VulkanPipelineCache:
         this_dir = pathlib.Path(__file__).resolve().parent
         arch_root = this_dir.parent.parent.parent  # src/backends/vulkan -> arch root
         candidates = [
+            arch_root / "builddir-vulkan" / "src" / "backends" / "vulkan" / "kernel_sources" / spv_name,
             arch_root / "builddir" / "src" / "backends" / "vulkan" / "kernel_sources" / spv_name,
         ]
         build_dir = arch_root / "build"

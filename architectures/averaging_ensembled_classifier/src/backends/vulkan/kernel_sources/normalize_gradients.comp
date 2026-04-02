@@ -17,13 +17,13 @@ layout(push_constant) uniform PushConstants {
     uint  parameter_count;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer SrcGrad  { float data[]; } src_grad;
-layout(set = 0, binding = 1) writeonly buffer DstGrad  { float data[]; } dst_grad;
+layout(set = 0, binding = 0) readonly buffer SrcGrad  { COMPUTE_FLOAT data[]; } src_grad;
+layout(set = 0, binding = 1) writeonly buffer DstGrad  { COMPUTE_FLOAT data[]; } dst_grad;
 
 void main() {
     uint i = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
     if (i >= push.parameter_count) return;
 
-    float normalizer = 1.0 / (push.effective_batch_size + push.epsilon);
+    COMPUTE_FLOAT normalizer = COMPUTE_FLOAT(1.0) / (COMPUTE_FLOAT(push.effective_batch_size) + COMPUTE_FLOAT(push.epsilon));
     dst_grad.data[i] = src_grad.data[i] * normalizer;
 }

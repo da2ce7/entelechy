@@ -19,7 +19,7 @@ from src.shared.stabilization_policy import StabilizationPolicy
 from src.shared.plan_builder import build_act_plan
 from src.shared.problem_type_strategy import PlanCceStrategy
 
-from .conftest import IRIS, HYDRA, PRECISION_CONFIGS, MODEL_SPEC_FACTORIES
+from .conftest import IRIS, HYDRA, PRECISION_CONFIGS, MODEL_SPEC_FACTORIES, ALL_PRECISION_CONFIGS, FP64_PRECISION_CONFIGS, ALL_MODEL_SPEC_FACTORIES, FP64_MODEL_SPEC_FACTORIES
 
 
 def _make_hw(simd_width: int = 8) -> HardwareProfile:
@@ -485,20 +485,21 @@ class TestVulkanTypeMappingMultiPrecision:
 
 class TestVulkanPipelineVariantSelection:
 
-    def test_fp32_selects_fp32_variant(self) -> None:
+    def test_fp32_selects_s32c32x32_variant(self) -> None:
         from src.backends.vulkan._pipeline_cache import _spv_variant_suffix
 
-        assert _spv_variant_suffix(PrecisionConfig.float32()) == "_fp32"
+        assert _spv_variant_suffix(PrecisionConfig.float32()) == "_s32c32x32"
 
-    def test_mixed_selects_s16fp32_variant(self) -> None:
+    def test_mixed_selects_s16c32x32_variant(self) -> None:
         from src.backends.vulkan._pipeline_cache import _spv_variant_suffix
 
-        assert _spv_variant_suffix(PrecisionConfig.mixed_f16_f32()) == "_s16fp32"
+        assert _spv_variant_suffix(PrecisionConfig.mixed_f16_f32()) == "_s16c32x32"
 
-    def test_fp16_selects_fp16_variant(self) -> None:
+    def test_fp16_selects_s16c16x16_variant(self) -> None:
+        """Uniform FP16 (compute=float16) selects the s16c16x16 variant."""
         from src.backends.vulkan._pipeline_cache import _spv_variant_suffix
 
-        assert _spv_variant_suffix(PrecisionConfig.float16()) == "_fp16"
+        assert _spv_variant_suffix(PrecisionConfig.float16()) == "_s16c16x16"
 
     def test_fp32_and_mixed_select_different_variants(self) -> None:
         from src.backends.vulkan._pipeline_cache import _spv_variant_suffix
@@ -516,24 +517,23 @@ class TestVulkanPipelineVariantSelection:
 class TestCPUDispatchSuffix:
 
     @pytest.mark.parametrize("factory,expected_suffix", [
-        (PrecisionConfig.float32, "s32x32"),
-        (PrecisionConfig.float16, "s16x16"),
-        (PrecisionConfig.mixed_f16_f32, "s16x32"),
+        (PrecisionConfig.float32, "s32c32x32"),
+        (PrecisionConfig.mixed_f16_f32, "s16c32x32"),
     ])
     def test_suffix_selection(self, factory, expected_suffix) -> None:
         from src.backends.cpu._ffi_types import PRECISION_SUFFIXES
 
         pc = factory()
-        s = pc.storage_dtype
-        t = pc.state_dtype
-        if s == np.dtype(np.float32) and t == np.dtype(np.float32):
-            result = "s32x32"
-        elif s == np.dtype(np.float16) and t == np.dtype(np.float16):
-            result = "s16x16"
-        elif s == np.dtype(np.float16) and t == np.dtype(np.float32):
-            result = "s16x32"
-        else:
-            pytest.fail(f"No suffix for storage={s}, state={t}")
+        from src.backends.cpu.renderer import _get_precision_suffix
+        result = _get_precision_suffix(pc.storage_dtype, pc.compute_dtype, pc.state_dtype)
 
         assert result == expected_suffix
         assert result in PRECISION_SUFFIXES
+
+    def test_float16_uniform_selects_s16c16x16(self) -> None:
+        """Uniform FP16 (compute=float16) selects the s16c16x16 suffix."""
+        from src.backends.cpu.renderer import _get_precision_suffix
+
+        pc = PrecisionConfig.float16()
+        result = _get_precision_suffix(pc.storage_dtype, pc.compute_dtype, pc.state_dtype)
+        assert result == "s16c16x16"

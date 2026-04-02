@@ -1,6 +1,6 @@
 /* phase_1_act.inc — Precision-parameterized Act-phase kernels (Nodes 4, 5).
  *
- * Included by cpu_kernels.c with STORAGE_T/STATE_T/PRECISION_SUFFIX defined.
+ * Included by cpu_kernels.c with STORAGE_T/COMPUTE_T/STATE_T/PRECISION_SUFFIX defined.
  * Algorithmic reference: kernels/phase_1_act.cl.c
  *
  * Buffer role assignments (ADR-023 §2.5):
@@ -110,15 +110,15 @@ void PREC_FN(task_render_logits)(void* raw_args, uint task_index, uint thread_id
                          + class_global;
 
     /* Initialize with bias (state-role buffer) */
-    float logit = scalar_load_state(a->biases_module,
+    COMPUTE_T logit = scalar_load_state(a->biases_module,
                       (size_t)module_global * a->padded_total_output_class_count + class_global);
 
     /* Sparse dot product over hidden dimension */
     const size_t h_base = (size_t)batch_global * a->padded_hidden_count;
     for (uint h = 0; h < a->hidden_count; h++) {
-        const float h_mask = scalar_load_storage(a->hidden_mask, h_base + h);
-        if (h_mask > 0.5f) {
-            const float h_val = scalar_load_storage(a->hidden_activations, h_base + h);
+        const COMPUTE_T h_mask = scalar_load_storage(a->hidden_mask, h_base + h);
+        if (h_mask > (COMPUTE_T)0.5) {
+            const COMPUTE_T h_val = scalar_load_storage(a->hidden_activations, h_base + h);
             const size_t w_idx = (size_t)module_global * a->padded_hidden_count
                                    * a->padded_total_output_class_count
                                + (size_t)h * a->padded_total_output_class_count

@@ -88,3 +88,19 @@ class ModelSpec:
     @classmethod
     def mixed_f16_f32(cls, **kwargs: Any) -> "ModelSpec":
         return cls(precision=PrecisionConfig.mixed_f16_f32(), **kwargs)
+
+    @classmethod
+    def float64(cls, **kwargs: Any) -> "ModelSpec":
+        return cls(precision=PrecisionConfig.float64(), **kwargs)
+
+    @classmethod
+    def mixed_f32_f64_state(cls, **kwargs: Any) -> "ModelSpec":
+        return cls(precision=PrecisionConfig.mixed_f32_f64_state(), **kwargs)
+
+    @classmethod
+    def mixed_f16_f64_state(cls, **kwargs: Any) -> "ModelSpec":
+        return cls(precision=PrecisionConfig.mixed_f16_f64_state(), **kwargs)
+
+    @classmethod
+    def mixed_f32_f64(cls, **kwargs: Any) -> "ModelSpec":
+        return cls(precision=PrecisionConfig.mixed_f32_f64(), **kwargs)

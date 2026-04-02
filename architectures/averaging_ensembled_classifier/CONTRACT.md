@@ -151,7 +151,7 @@ This article defines fixed, system-wide constants that are contractually binding
 
 - `LOCAL_MEM_BANK_PADDING`: Defined with a mandatory value of **`1`**.
 
-`PrecisionConfig` is a frozen dataclass with three independent dtype fields — `storage_dtype`, `compute_dtype`, `state_dtype` — and three derived scalar constants: `storage_fp_format_max`, `compute_fp_format_max`, and `compute_epsilon`. The invariant `storage_dtype.itemsize ≤ compute_dtype.itemsize` and `storage_dtype.itemsize ≤ state_dtype.itemsize` is enforced by `__post_init__`. Three factory classmethods are defined: `float32()` (all FP32), `float16()` (all FP16), `mixed_f16_f32()` (FP16 storage, FP32 compute, FP32 state). The retired fields `numpy_dtype`, `fp_format_max`, and `epsilon` do not exist in this type.
+`PrecisionConfig` is a frozen dataclass with three independent dtype fields — `storage_dtype`, `compute_dtype`, `state_dtype` — and three derived scalar constants: `storage_fp_format_max`, `compute_fp_format_max`, and `compute_epsilon`. The invariant `storage_dtype.itemsize ≤ compute_dtype.itemsize` and `storage_dtype.itemsize ≤ state_dtype.itemsize` is enforced by `__post_init__`. Seven factory classmethods are defined: `float32()` (all FP32), `float16()` (all FP16), `mixed_f16_f32()` (FP16 storage, FP32 compute, FP32 state), `float64()` (all FP64), `mixed_f32_f64_state()` (FP32 storage, FP32 compute, FP64 state), `mixed_f16_f64_state()` (FP16 storage, FP32 compute, FP64 state), `mixed_f32_f64()` (FP32 storage, FP64 compute, FP64 state). The state role has no ordering constraint relative to compute — `state_dtype.itemsize` may be greater than, equal to, or (when storage is narrower than state) less than `compute_dtype.itemsize`. The retired fields `numpy_dtype`, `fp_format_max`, and `epsilon` do not exist in this type.
 
 ### **Article 6: Mandatory Build-Time Symbols**
 
@@ -164,11 +164,15 @@ This article defines symbols that must be provided by the host build environment
 | `STATE_TYPE` | OpenCL/C type name | Element type for state-role buffers |
 | `STORAGE_TYPE_IS_HALF` | `int` (0 or 1) | 1 when `STORAGE_TYPE == half`; gates `cl_khr_fp16` extension and `vload_half`/`vstore_half` |
 | `COMPUTE_TYPE_IS_HALF` | `int` (0 or 1) | 1 when `COMPUTE_TYPE == half`; enables FP16 arithmetic extension if required |
+| `COMPUTE_TYPE_IS_DOUBLE` | `int` (0 or 1) | 1 when `COMPUTE_TYPE == double`; gates `cl_khr_fp64` extension and FP64 arithmetic paths |
+| `STATE_TYPE_IS_DOUBLE` | `int` (0 or 1) | 1 when `STATE_TYPE == double`; gates FP64 load/store mechanics for state buffers |
 | `SIMD_WIDTH` | `int` | Hardware SIMD lane count from `HardwareProfile` |
 | `C_TILE_SIZE` | `int` | Column tile size for the module-chunking strategy |
 | `NUMERICAL_STABILITY_EPSILON` | float literal | Epsilon for numerical stability guards; derived from `compute_epsilon` |
 
 The symbols `SCALAR_TYPE` and `SCALAR_IS_HALF` are **retired**. They do not appear in any kernel source file; all kernel signatures use the three-role precision model (`STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE`).
+
+The `_IS_HALF` and `_IS_DOUBLE` flags are mutually exclusive for the same role type. When `COMPUTE_TYPE = float`, both `COMPUTE_TYPE_IS_HALF = 0` and `COMPUTE_TYPE_IS_DOUBLE = 0`. A `_IS_HALF = 1` and `_IS_DOUBLE = 1` combination for the same role is a build-system error.
 
 ### **Article 7: Canonical Interface Instantiation**
 

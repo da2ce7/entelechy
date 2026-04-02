@@ -56,6 +56,12 @@
 #ifndef COMPUTE_TYPE_IS_HALF
 #error "System Contract Violation: COMPUTE_TYPE_IS_HALF must be defined by the host build system."
 #endif
+#ifndef COMPUTE_TYPE_IS_DOUBLE
+#error "System Contract Violation: COMPUTE_TYPE_IS_DOUBLE must be defined by the host build system."
+#endif
+#ifndef STATE_TYPE_IS_DOUBLE
+#error "System Contract Violation: STATE_TYPE_IS_DOUBLE must be defined by the host build system."
+#endif
 #ifndef SIMD_WIDTH
 #error "System Contract Violation: SIMD_WIDTH must be defined by the host build system."
 #endif
@@ -80,8 +86,18 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #endif
 
+// Enable FP64 extension if using double precision in compute or state roles.
+#if COMPUTE_TYPE_IS_DOUBLE || STATE_TYPE_IS_DOUBLE
+#if !defined(cl_khr_fp64)
+#error "FP64 extension (cl_khr_fp64) required for double precision but not supported by device"
+#endif
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#endif
+
 // Compute-role zero literal
-#if COMPUTE_TYPE_IS_HALF
+#if COMPUTE_TYPE_IS_DOUBLE
+#define COMPUTE_ZERO 0.0
+#elif COMPUTE_TYPE_IS_HALF
 #define COMPUTE_ZERO ((COMPUTE_TYPE)0.0h)
 #else
 #define COMPUTE_ZERO ((COMPUTE_TYPE)0.0f)
@@ -123,6 +139,15 @@ static inline void store_storage(
     buf[idx] = (STORAGE_TYPE)val;
 #endif
 }
+
+// FP64 Precision Boundary Notes (ADR-024 §3.2):
+// When STATE_TYPE = double and COMPUTE_TYPE = float:
+//   load_state: double → float narrowing (precision loss accepted;
+//               the value is about to enter lower-precision arithmetic)
+//   store_state_update: float → double widening (no precision loss;
+//                       the narrower compute value preserves all its bits)
+// When STATE_TYPE = double and COMPUTE_TYPE = double:
+//   Both casts are identity operations, eliminated by the compiler.
 
 static inline COMPUTE_TYPE load_state(
     __global const STATE_TYPE *buf, size_t idx)
@@ -182,6 +207,12 @@ static inline void store_state_update(
 #endif
 #ifndef COMPUTE_TYPE_IS_HALF
 #define COMPUTE_TYPE_IS_HALF 0
+#endif
+#ifndef COMPUTE_TYPE_IS_DOUBLE
+#define COMPUTE_TYPE_IS_DOUBLE 0
+#endif
+#ifndef STATE_TYPE_IS_DOUBLE
+#define STATE_TYPE_IS_DOUBLE 0
 #endif
 #ifndef COMPUTE_ZERO
 #define COMPUTE_ZERO 0.0f

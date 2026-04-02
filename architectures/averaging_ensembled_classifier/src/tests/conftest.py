@@ -28,7 +28,7 @@ from src.shared.workload_primitives import TilingScheme
 from src.shared.stabilization_policy import StabilizationPolicy
 
 
-# ── Multi-precision configuration (ADR-020 §4.6, Phase 7C §15) ──
+# ── Multi-precision configuration (ADR-020 §4.6, Phase 7C §15, ADR-024 §8) ──
 
 PRECISION_CONFIGS = [
     pytest.param(PrecisionConfig.float32, id="fp32"),
@@ -36,11 +36,29 @@ PRECISION_CONFIGS = [
     pytest.param(PrecisionConfig.mixed_f16_f32, id="mixed_f16_f32"),
 ]
 
+FP64_PRECISION_CONFIGS = [
+    pytest.param(PrecisionConfig.float64, id="float64"),
+    pytest.param(PrecisionConfig.mixed_f32_f64_state, id="mixed_f32_f64_state"),
+    pytest.param(PrecisionConfig.mixed_f16_f64_state, id="mixed_f16_f64_state"),
+    pytest.param(PrecisionConfig.mixed_f32_f64, id="mixed_f32_f64"),
+]
+
+ALL_PRECISION_CONFIGS = PRECISION_CONFIGS + FP64_PRECISION_CONFIGS
+
 MODEL_SPEC_FACTORIES = [
     pytest.param(ModelSpec.float32, id="fp32"),
     pytest.param(ModelSpec.float16, id="fp16"),
     pytest.param(ModelSpec.mixed_f16_f32, id="mixed_f16_f32"),
 ]
+
+FP64_MODEL_SPEC_FACTORIES = [
+    pytest.param(ModelSpec.float64, id="float64"),
+    pytest.param(ModelSpec.mixed_f32_f64_state, id="mixed_f32_f64_state"),
+    pytest.param(ModelSpec.mixed_f16_f64_state, id="mixed_f16_f64_state"),
+    pytest.param(ModelSpec.mixed_f32_f64, id="mixed_f32_f64"),
+]
+
+ALL_MODEL_SPEC_FACTORIES = MODEL_SPEC_FACTORIES + FP64_MODEL_SPEC_FACTORIES
 
 
 @pytest.fixture(params=PRECISION_CONFIGS)

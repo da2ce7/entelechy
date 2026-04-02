@@ -56,8 +56,8 @@ void main() {
     uint out_idx = tile_base + local_offset;
 
     // Padded sample early exit
-    if (read_storage(src_sample_mask.data[batch_idx]) < 0.5) {
-        dest_grad_h.data[out_idx] = write_storage(0.0);
+    if (read_storage(src_sample_mask.data[batch_idx]) < COMPUTE_FLOAT(0.5)) {
+        dest_grad_h.data[out_idx] = write_storage(COMPUTE_FLOAT(0.0));
         return;
     }
 
@@ -70,27 +70,27 @@ void main() {
     uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
 
     // Reduction over class chunk
-    float grad_h_accum = 0.0;
+    COMPUTE_FLOAT grad_h_accum = COMPUTE_FLOAT(0.0);
     for (uint c_local = 0; c_local < push.classes_per_chunk; ++c_local) {
         uint c_global = class_offset + c_local;
         if (c_global < push.total_output_class_count) {
             uint prob_idx = prob_tile_base
                           + module_local_idx * push.total_batch_count * push.classes_per_chunk
                           + batch_idx * push.classes_per_chunk + c_local;
-            float prob = read_storage(src_probs.data[prob_idx]);
+            COMPUTE_FLOAT prob = read_storage(src_probs.data[prob_idx]);
 
-            float d_loss_d_logit;
+            COMPUTE_FLOAT d_loss_d_logit;
             if (SPEC_PROBLEM_TYPE == PROBLEM_TYPE_CCE) {
                 int target = src_targets_cce.data[batch_idx];
-                d_loss_d_logit = (c_global == target) ? (prob - 1.0) : prob;
+                d_loss_d_logit = (c_global == target) ? (prob - COMPUTE_FLOAT(1.0)) : prob;
             } else {
-                float target = read_storage(src_targets_bce.data[batch_idx * push.padded_total_output_class_count + c_global]);
+                COMPUTE_FLOAT target = read_storage(src_targets_bce.data[batch_idx * push.padded_total_output_class_count + c_global]);
                 d_loss_d_logit = prob - target;
             }
 
             uint w_idx = module_global_idx * push.padded_hidden_count * push.padded_total_output_class_count
                        + h_idx * push.padded_total_output_class_count + c_global;
-            float w_val = read_state(src_weights.data[w_idx]);
+            COMPUTE_FLOAT w_val = read_state(src_weights.data[w_idx]);
             grad_h_accum += d_loss_d_logit * w_val;
         }
     }

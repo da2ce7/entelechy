@@ -58,6 +58,10 @@ class StabilizationPolicy:
     # The maximum representable value of the compute precision format. Governs
     # overflow safety during reduction tree summation. Under the three-role model,
     # the safety ceiling is bounded by arithmetic precision, not storage precision.
+    # At FP64 compute precision, the safety ceiling (~1.8e+308 / K_j) makes
+    # overflow a non-practical concern for any realistic fan-in K. The
+    # stabilization machinery remains active (it costs nothing when not
+    # triggered) but will never fire under FP64 compute.
     compute_fp_format_max: float
 
     # WHY: This parameter is a mandatory system-level safeguard. It establishes

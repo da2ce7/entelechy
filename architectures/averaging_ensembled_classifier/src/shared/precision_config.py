@@ -65,3 +65,47 @@ class PrecisionConfig:
             compute_fp_format_max=float(np.finfo(np.float32).max),
             compute_epsilon=float(np.finfo(np.float32).eps),
         )
+
+    @classmethod
+    def float64(cls) -> "PrecisionConfig":
+        return cls(
+            storage_dtype=np.dtype(np.float64),
+            compute_dtype=np.dtype(np.float64),
+            state_dtype=np.dtype(np.float64),
+            storage_fp_format_max=float(np.finfo(np.float64).max),
+            compute_fp_format_max=float(np.finfo(np.float64).max),
+            compute_epsilon=1e-15,
+        )
+
+    @classmethod
+    def mixed_f32_f64_state(cls) -> "PrecisionConfig":
+        return cls(
+            storage_dtype=np.dtype(np.float32),
+            compute_dtype=np.dtype(np.float32),
+            state_dtype=np.dtype(np.float64),
+            storage_fp_format_max=float(np.finfo(np.float32).max),
+            compute_fp_format_max=float(np.finfo(np.float32).max),
+            compute_epsilon=float(np.finfo(np.float32).eps),
+        )
+
+    @classmethod
+    def mixed_f16_f64_state(cls) -> "PrecisionConfig":
+        return cls(
+            storage_dtype=np.dtype(np.float16),
+            compute_dtype=np.dtype(np.float32),
+            state_dtype=np.dtype(np.float64),
+            storage_fp_format_max=float(np.finfo(np.float16).max),
+            compute_fp_format_max=float(np.finfo(np.float32).max),
+            compute_epsilon=float(np.finfo(np.float32).eps),
+        )
+
+    @classmethod
+    def mixed_f32_f64(cls) -> "PrecisionConfig":
+        return cls(
+            storage_dtype=np.dtype(np.float32),
+            compute_dtype=np.dtype(np.float64),
+            state_dtype=np.dtype(np.float64),
+            storage_fp_format_max=float(np.finfo(np.float32).max),
+            compute_fp_format_max=float(np.finfo(np.float64).max),
+            compute_epsilon=1e-15,
+        )
