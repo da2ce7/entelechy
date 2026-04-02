@@ -1,7 +1,7 @@
 # Design Document: Averaging Ensembled Classifier
 
-**Revision:** 2.1 — Post-Phase 3  
-**Last Updated:** 2026-03-29  
+**Revision:** 2.2 — Post-Phase 6  
+**Last Updated:** 2026-04-01  
 **Scope:** Implementation design for the multi-backend averaging ensembled classifier architecture.
 
 ---
@@ -21,7 +21,7 @@
 | 9 | [Test Strategy](#9-test-strategy-adr-016) | Three-tier framework, fixtures, tolerances, oracle model |
 | 10 | [User-Facing API](#10-user-facing-api-adr-018) | WorkTicket lifecycle, design decisions |
 | 11 | [Migration Path](#11-migration-path-adr-017) | Phase sequencing, dependency graph, rollback |
-| 12 | [ADR Index](#12-adr-index) | Complete decision record reference |
+| 12 | [ADR Index](#12-adr-index) | Complete decision record reference (ADR-001 through ADR-020) |
 
 ---
 
@@ -80,7 +80,7 @@ The plan is a directed acyclic graph of typed, immutable node descriptors with e
 
 No additional node types may be introduced without a formal ADR. Dependency edges are the concurrency specification — nodes with no dependency relationship may execute in parallel at the backend's discretion.
 
-### 3.2 ReductionTreePlan (ADR-003)
+### 3.2 ReductionTreePlan (ADR-003, ADR-019)
 
 A parametric header consumed atomically by the backend's renderer. The Policy tier pre-computes the full threshold schedule; the backend selects kernel tiers (identity, register-reduce, local-reduce) per stage.
 
@@ -100,6 +100,8 @@ class ReductionTreePlan:
 ```
 
 The threshold schedule follows the Quadratic Scaling Policy: $T_j = T_{\text{algorithmic}} + \lambda \cdot j^2$, clamped by $T_{\text{safety},\,j} = \text{FP\_FORMAT\_MAX} / K_j$.
+
+**Multi-stage trees (ADR-019):** When `num_stages > 1`, each stage produces `ceil(current_N / K)` intermediate nodes. The renderer dispatches `reduce_k_fan_in_and_clip` — a fused K-fan-in sum with per-node L2 clip — at each stage. Single-stage trees (`num_stages == 1`) use the existing all-to-one aggregate kernels followed by `clip_intermediate_grad`.
 
 ### 3.3 StreamingLoopPlan (ADR-004)
 
@@ -133,7 +135,7 @@ class HardwareProfile:
 
 Each backend computes `max_reduce_fan_in` from its native constraints. The Policy tier uses this value to determine the reduction batch size $K$.
 
-### 3.5 PrecisionConfig (ADR-008)
+### 3.5 PrecisionConfig (ADR-008, ADR-020)
 
 Replaces the former `PrecisionContext` ABC hierarchy with a single frozen dataclass:
 
@@ -146,6 +148,8 @@ class PrecisionConfig:
 ```
 
 Constructed via `PrecisionConfig.float32()` and `PrecisionConfig.float16()` classmethods. `ModelSpec` consumes `PrecisionConfig` via composition; backward-compatible properties (`SCALAR_NP_TYPE`, `SCALAR_C_TYPE_NAME`) delegate to `self.precision`. Factory classmethods `ModelSpec.float32()` / `ModelSpec.float16()` are the sole construction API (deprecated `Float32ModelSpec()` / `Float16ModelSpec()` module-level functions were removed in Phase 6).
+
+**Future extension (ADR-020):** `MixedPrecisionConfig` is proposed to decompose precision into three independent roles — storage (bandwidth), compute (arithmetic fidelity), and state (optimizer stability) — enabling FP16-storage/FP32-compute pipelines. This remains PROPOSED status pending implementation.
 
 ### 3.6 Buffer Lifecycle (ADR-009)
 
@@ -250,6 +254,7 @@ averaging_ensembled_classifier/
 │   │   ├── __init__.py
 │   │   ├── plan_types.py                    # Five node types (ADR-002)
 │   │   ├── plan_builder.py                  # Plan construction logic
+│   │   ├── plan_renderer.py                 # PlanRenderer Protocol (ADR-001)
 │   │   ├── buffer_lifecycle.py              # BufferHandle, BufferRole, BufferDescriptor (ADR-009)
 │   │   ├── reduction_tree_plan.py           # ReductionTreePlan (ADR-003)
 │   │   ├── streaming_loop_plan.py           # StreamingLoopPlan (ADR-004)
@@ -262,8 +267,6 @@ averaging_ensembled_classifier/
 │   │   ├── stabilization_policy.py          # Threshold scheduling
 │   │   ├── workload_primitives.py           # Tiling and chunk decomposition
 │   │   ├── problem_type_strategy.py         # CCE/BCE strategy delegation (ADR-011)
-│   │   ├── work_ticket.py                   # WorkTicket + LearnHandle (ADR-018)
-│   │   ├── engine.py                        # Engine: user-facing entry point (ADR-018)
 │   │   └── kernel_contracts/                # KernelContract frozen dataclasses (ADR-007)
 │   │       ├── __init__.py
 │   │       ├── phase_1_act.py
@@ -290,7 +293,9 @@ averaging_ensembled_classifier/
 │   │   │   ├── context.py
 │   │   │   ├── discovery.py
 │   │   │   ├── type_mapping.py
-│   │   │   ├── kernel_bindings/
+│   │   │   ├── _descriptor_manager.py       # Descriptor set allocation and management
+│   │   │   ├── _pipeline_cache.py           # Compute pipeline creation and caching
+│   │   │   ├── _push_constants.py           # Push constant struct packing
 │   │   │   └── kernel_sources/              # GLSL compute shaders (*.comp)
 │   │   │       └── common.glsl              # Shared specialization constant declarations
 │   │   │
@@ -304,18 +309,21 @@ averaging_ensembled_classifier/
 │   │       ├── _ffi_types.py                # ctypes struct definitions mirroring cpu_kernels.h (ADR-015)
 │   │       ├── _loader.py                   # Library loading via importlib.resources + _verify_layouts()
 │   │       ├── _dispatch_table.py           # kernel_name → (task_fn_ptr, args_struct_class) map
+│   │       ├── _compiler.py                 # JIT compiler for on-the-fly shared library builds
 │   │       └── kernel_sources/              # C implementations (compiled to libcpu_kernels.so)
 │   │           ├── cpu_simd.h               # SIMD abstraction (AVX-512/AVX2/SSE2/NEON/scalar)
 │   │           ├── cpu_threads.h            # Thread pool interface
 │   │           ├── cpu_threads.c            # Thread pool implementation (C11/pthreads)
 │   │           ├── cpu_kernels.h            # Public ABI: task prototypes, argument structs, get_struct_size_*
+│   │           ├── cpu_kernels.c            # Master compilation unit (includes phase .inc files)
+│   │           ├── cpu_precision.h          # Precision-dependent typedefs (REAL_T, EPSILON)
 │   │           ├── cpu_export.h             # Symbol visibility macros
-│   │           ├── phase_1_act.c            # forward_pass, render_logits, cce/bce loss
-│   │           ├── phase_2_learn_A_production.c  # module grads, backprop to hidden, temp grads
-│   │           ├── phase_2_learn_B_processing.c  # clip partials, gather_and_permute
-│   │           ├── phase_2_learn_C_reduction.c   # aggregate, clip intermediate, reduction tree, stabilize
-│   │           ├── phase_2_learn_D_backprop.c    # shared weight/bias backprop, clip shared grads
-│   │           └── phase_3_update.c              # normalize, adam_update, clamp_temperatures
+│   │           ├── phase_1_act.inc          # forward_pass, render_logits, cce/bce loss
+│   │           ├── phase_2_learn_A_production.inc  # module grads, backprop to hidden, temp grads
+│   │           ├── phase_2_learn_B_processing.inc  # clip partials, gather_and_permute
+│   │           ├── phase_2_learn_C_reduction.inc   # aggregate, clip intermediate, reduction tree, stabilize
+│   │           ├── phase_2_learn_D_backprop.inc    # shared weight/bias backprop, clip shared grads
+│   │           └── phase_3_update.inc              # normalize, adam_update, clamp_temperatures
 │   │
 │   ├── _build_config.py                     # Generated: BACKEND_OPENCL, BACKEND_VULKAN, BACKEND_CPU booleans
 │   └── main_orchestrator.py                 # Training orchestration (migrating to Engine)
@@ -368,15 +376,18 @@ The following legacy service modules are dissolved into stateless plan primitive
 - **Dispatch model:** Per-tile imperative `clEnqueueNDRange` with `cl.Event` synchronization.
 - **Tile index:** Host-provided `flat_tile_index` scalar per dispatch.
 - **Local memory:** Runtime-sized via `cl.LocalMemory()`.
+- **Status:** ✅ **Implemented** (Phase 2 complete). 6 OpenCL kernel source files. 8 Python modules. 16 Tier 2 test modules.
 
 ### 7.2 Vulkan Backend
 
 - **Interop:** `vulkan-python` (optional dependency: `vulkan = ["vulkan-python>=0.2.0"]`).
 - **Kernel compilation:** GLSL compute shaders compiled to SPIR-V at build time via `glslc --target-env=vulkan1.1`.
-- **Dispatch model:** Single-dispatch parallelism — `vkCmdDispatch(N, 1, 1)` for N-tile kernels. Command buffers with `vkCmdPipelineBarrier` for sequencing.
+- **Dispatch model:** Single-dispatch parallelism — `vkCmdDispatch(N, 1, 1)` for N-tile kernels. Command buffers with `vkCmdPipelineBarrier` for sequencing. Pipeline creation managed by `_pipeline_cache.py`; descriptor sets by `_descriptor_manager.py`.
 - **Tile index:** Implicit via `gl_WorkGroupID.x`.
 - **Local memory:** `shared` qualifier, compile-time sized via specialization constants.
 - **Build-time constants:** Vulkan specialization constants replace `-D` preprocessor flags.
+- **Parameter passing:** Push constants via `_push_constants.py` for scalar parameters; descriptor sets for buffer bindings.
+- **Status:** ✅ **Implemented** (Phase 5 complete). 20 GLSL compute shaders. 11 Python modules. 16 Tier 2 test modules.
 
 ### 7.3 CPU Backend (ADR-015)
 
@@ -386,8 +397,8 @@ The following legacy service modules are dissolved into stateless plan primitive
 - **ABI surface:** 18 `task_<kernel_name>` functions + `execute_reduction_tree` + `pool_create`/`pool_destroy`/`pool_dispatch_and_wait` + `get_simd_width` + 18 `get_struct_size_*` verification exports. Uniform task function signature: `void task_<kernel_name>(void* args, uint task_index, uint thread_id)`.
 - **FFI types:** `src/backends/cpu/_ffi_types.py` — ctypes `Structure` subclasses mirroring `cpu_kernels.h` structs. `_loader.py` handles library discovery and `_verify_layouts()` at load time. `_dispatch_table.py` builds the `kernel_name → (task_fn_ptr, args_struct_class)` map.
 - **Layout verification:** `_verify_layouts()` at library load time asserts Python-side struct sizes match C-side `get_struct_size_*()` exports. Catches struct drift before any dispatch. Same-size field reorderings caught by Tier 2 behavioral tests.
-- **Library discovery:** `importlib.resources.files('averaging_ensembled_classifier.backends.cpu')` with platform-specific filename resolution.
-- **Status:** ✅ **Implemented** (Phase 3A + 3B + 3C complete). 6 C source files + 4 headers. 9 Python FFI modules. 16 Tier 2 test modules.
+- **Library discovery:** `importlib.resources.files('averaging_ensembled_classifier.backends.cpu')` with platform-specific filename resolution. Falls back to JIT compilation via `_compiler.py` when pre-built library is unavailable (Linux/macOS only).
+- **Status:** ✅ **Implemented** (Phase 3 complete). 2 C source files (`cpu_kernels.c`, `cpu_threads.c`) + 5 headers + 6 phase `.inc` files. 10 Python FFI modules. 17 Tier 2 test modules.
 
 ---
 
@@ -403,13 +414,12 @@ py = import('python').find_installation()
 
 backend_vulkan = get_option('aec_backend_vulkan')
 backend_cpu    = get_option('aec_backend_cpu')
-glslc = find_program('glslc', required: backend_vulkan)
+backend_opencl = get_option('aec_backend_opencl')
 
 subdir('src/shared')                          # Pure Python install
-subdir('src/backends/opencl')                 # Always enabled — runtime compilation only
-subdir('kernels')                             # Install OpenCL kernel sources as package data
+subdir('src/backends/opencl')                 # Runtime compilation only
 
-if backend_vulkan.allowed() and glslc.found()
+if backend_vulkan.allowed() and find_program('glslc', required: false).found()
   subdir('src/backends/vulkan')               # SPIR-V compilation
 endif
 
@@ -422,12 +432,16 @@ endif
 
 ```meson
 # meson.options
-option('aec_backend_vulkan', type: 'feature', value: 'auto',
+option('aec_backend_vulkan', type: 'feature', value: 'enabled',
        description: 'Build Vulkan SPIR-V compute shaders (requires glslc)')
-option('aec_backend_cpu', type: 'feature', value: 'auto',
+option('aec_backend_cpu', type: 'feature', value: 'enabled',
        description: 'Build CPU SIMD kernel shared library')
+option('aec_backend_opencl', type: 'feature', value: 'enabled',
+       description: 'OpenCL backend via PyOpenCL (runtime kernel compilation)')
 option('aec_cpu_isa_flags', type: 'array', value: [],
-       description: 'C compiler ISA flags (e.g., [\'\-mavx2\']. Empty = -march=native)')
+       description: 'C compiler ISA flags (e.g., [\'-mavx2\']. Empty = -march=native)')
+option('aec_cpu_debug_asserts', type: 'boolean', value: false,
+       description: 'Enable CPU kernel runtime assertions (bounds checks, NaN guards)')
 ```
 
 Option names use the `aec_` prefix to namespace them within the Meson subproject.
@@ -454,8 +468,8 @@ Option names use the `aec_` prefix to namespace them within the Meson subproject
 
 | Tier | Scope | Execution Requirement | Gate |
 | :--- | :--- | :--- | :--- |
-| **Tier 1** | Host-side plan correctness: plan construction, contract validation, buffer lifecycle, reduction tree plan, streaming loop plan, strategy delegation, memory layout, precision config, hardware profile | None — pure Python | Always runs (140 tests) |
-| **Tier 2** | Per-backend kernel correctness against reference fixtures | Per-backend: `_build_config.BACKEND_<NAME> is True` | Per enabled backend (CPU: 16 test modules) |
+| **Tier 1** | Host-side plan correctness: plan construction, contract validation, buffer lifecycle, reduction tree plan, streaming loop plan, strategy delegation, memory layout, precision config, hardware profile | None — pure Python | Always runs (12 test modules) |
+| **Tier 2** | Per-backend kernel correctness against reference fixtures | Per-backend: `_build_config.BACKEND_<NAME> is True` | Per enabled backend (CPU: 17, Vulkan: 16, OpenCL: 16 test modules) |
 | **Tier 3** | Cross-backend parity with CPU as reference oracle | CPU + ≥1 other backend | Falls back to GPU-vs-GPU if CPU unavailable |
 
 ### 9.2 Tier 2 Fixtures
@@ -590,3 +604,5 @@ If a phase's tier gate regresses: revert the feature flag to `auto`, diagnose us
 | [016](adr/ADR-016-test-strategy.md) | Test Strategy | Three-tier pytest framework; CPU oracle; analytical + numpy fixtures |
 | [017](adr/ADR-017-incremental-migration-path.md) | Incremental Migration | Feature-flag gated phases; tier-based rollback gates |
 | [018](adr/ADR-018-user-facing-api.md) | User-Facing API | `WorkTicket` lifecycle; future-based concurrency; explicit batch; recompute; ephemeral |
+| [019](adr/ADR-019-k-fan-in-reduction-kernel-primitive.md) | K-Fan-In Reduction Kernel | `reduce_k_fan_in_and_clip` primitive for multi-stage reduction trees; fused sum+clip |
+| [020](adr/ADR-020-mixed-precision-execution-model.md) | Mixed-Precision Execution Model | Three-role precision (storage/compute/state); `MixedPrecisionConfig`; FP16/FP32 mixed pipelines |
