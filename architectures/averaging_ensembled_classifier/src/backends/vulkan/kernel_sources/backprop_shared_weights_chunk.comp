@@ -25,11 +25,11 @@ layout(push_constant) uniform PushConstants {
     uint final_grad_hidden_total_element_count;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer InputBuf      { float data[]; } input_buf;
-layout(set = 0, binding = 1) readonly buffer HiddenBuf     { float data[]; } hidden_acts;
-layout(set = 0, binding = 2) readonly buffer GradHBuf      { float data[]; } grad_h;
-layout(set = 0, binding = 3) readonly buffer SampleMaskBuf { float data[]; } sample_mask;
-layout(set = 0, binding = 4) writeonly buffer GradSWOut    { float data[]; } grad_sw_out;
+layout(set = 0, binding = 0) readonly buffer InputBuf      { STORAGE_FLOAT data[]; } input_buf;
+layout(set = 0, binding = 1) readonly buffer HiddenBuf     { STORAGE_FLOAT data[]; } hidden_acts;
+layout(set = 0, binding = 2) readonly buffer GradHBuf      { float         data[]; } grad_h;
+layout(set = 0, binding = 3) readonly buffer SampleMaskBuf { STORAGE_FLOAT data[]; } sample_mask;
+layout(set = 0, binding = 4) writeonly buffer GradSWOut    { STORAGE_FLOAT data[]; } grad_sw_out;
 
 void main() {
     uint i_idx = gl_WorkGroupID.x;  // input dimension
@@ -46,19 +46,19 @@ void main() {
         uint b_global = push.batch_chunk_offset + b_local;
 
         // Skip padded samples.
-        if (sample_mask.data[b_global] < 0.5) continue;
+        if (read_storage(sample_mask.data[b_global]) < 0.5) continue;
 
         // Chain rule: dL/dW_ij = (dL/dA_j) * (dA_j/dZ_j) * (dZ_j/dW_ij)
         uint  hidden_offset = b_global * push.padded_hidden_count + j_idx;
-        float grad_h_val    = grad_h.data[hidden_offset];       // dL/dA_j
-        float hidden_val    = hidden_acts.data[hidden_offset];
+        float grad_h_val    = grad_h.data[hidden_offset];       // dL/dA_j (compute-role)
+        float hidden_val    = read_storage(hidden_acts.data[hidden_offset]);
 
         // ReLU derivative: dA_j/dZ_j
         float d_activation = (hidden_val > 0.0) ? 1.0 : 0.0;
         float dL_dZ_j      = grad_h_val * d_activation;
 
         // dZ_j/dW_ij = input value
-        float input_val = input_buf.data[b_global * push.padded_input_count + i_idx];
+        float input_val = read_storage(input_buf.data[b_global * push.padded_input_count + i_idx]);
         p_grad_sw += dL_dZ_j * input_val;
     }
 
@@ -70,6 +70,6 @@ void main() {
     if (lid == 0) {
         uint chunk_base = push.batch_chunk_index * push.padded_input_count * push.padded_hidden_count;
         uint grad_w_idx = chunk_base + j_idx * push.padded_input_count + i_idx;
-        grad_sw_out.data[grad_w_idx] = total;
+        grad_sw_out.data[grad_w_idx] = write_storage(total);
     }
 }

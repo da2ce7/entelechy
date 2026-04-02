@@ -29,6 +29,7 @@ class TestBufferDescriptor:
         d = BufferDescriptor(
             handle=h, logical_name="test", padded_shape=(4, 16),
             element_size_bytes=4, size_bytes=256, role=BufferRole.BATCH_INTERMEDIATE,
+            precision_role="compute",
             producing_node="n1", consumers=frozenset({"n2"}), last_consumer="n2",
         )
         assert d.size_bytes == 256
@@ -41,6 +42,7 @@ class TestBufferDescriptor:
             handle=h, logical_name="weights", padded_shape=(128, 64),
             element_size_bytes=4, size_bytes=128 * 64 * 4,
             role=BufferRole.MODEL_STATE,
+            precision_role="state",
             producing_node=None, consumers=frozenset(), last_consumer=None,
         )
         assert d.producing_node is None

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 
 @dataclass(frozen=True)
 class TolerancePair:
@@ -13,6 +15,7 @@ class TolerancePair:
 
 FP32_DEFAULT = TolerancePair(atol=1e-5, rtol=1e-5)
 FP16_DEFAULT = TolerancePair(atol=1e-2, rtol=1e-2)
+MIXED_DEFAULT = TolerancePair(atol=1e-5, rtol=1e-5)  # compute is FP32
 
 KERNEL_TOLERANCES: dict[str, dict[str, TolerancePair]] = {
     "compute_probs_loss_cce_chunk": {
@@ -100,7 +103,14 @@ def get_tolerance(kernel_name: str, precision_label: str = "fp32") -> ToleranceP
         overrides = KERNEL_TOLERANCES[kernel_name]
         if precision_label in overrides:
             return overrides[precision_label]
-    return FP32_DEFAULT if precision_label == "fp32" else FP16_DEFAULT
+        # mixed_f16_f32 computes in FP32, so fall back to fp32 overrides
+        if precision_label == "mixed" and "fp32" in overrides:
+            return overrides["fp32"]
+    if precision_label == "fp16":
+        return FP16_DEFAULT
+    if precision_label == "mixed":
+        return MIXED_DEFAULT
+    return FP32_DEFAULT
 
 
 def get_cpu_tolerance(kernel_name: str, precision_label: str = "fp32") -> TolerancePair:
@@ -228,3 +238,16 @@ def get_tier3_tolerance(kernel_name: str, precision_label: str = "fp32") -> Tole
         if precision_label in overrides:
             return overrides[precision_label]
     return TIER3_FP32_DEFAULT if precision_label == "fp32" else TIER3_FP16_DEFAULT
+
+
+def precision_label_from_config(precision) -> str:
+    """Derive the tolerance label from a PrecisionConfig instance.
+
+    Returns "fp32", "fp16", or "mixed" based on the three-role dtype
+    configuration.  Mixed = FP16 storage with FP32 compute/state.
+    """
+    if precision.storage_dtype == np.dtype(np.float16):
+        if precision.compute_dtype == np.dtype(np.float32):
+            return "mixed"
+        return "fp16"
+    return "fp32"

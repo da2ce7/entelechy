@@ -57,11 +57,3 @@ def _epsilon_literal(epsilon: float, is_half: int) -> str:
         return str(epsilon)  # No 'f' suffix for half literals
     return f"{epsilon}f"
 
-
-def numpy_dtype_to_cl_type_name(precision: PrecisionConfig) -> str:
-    """Map PrecisionConfig.compute_dtype to OpenCL C type name.
-    
-    Deprecated: Use _dtype_to_cl_type(precision.compute_dtype) directly.
-    Retained for backward compatibility during Phase 7B migration.
-    """
-    return _dtype_to_cl_type(precision.compute_dtype)

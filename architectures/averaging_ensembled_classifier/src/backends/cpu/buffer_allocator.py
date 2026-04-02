@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import POINTER, c_float
+from typing import Literal
 
 import numpy as np
 
@@ -16,11 +17,21 @@ class CPUBufferAllocator:
 
     On CPU, device memory IS host memory. The critical requirement is
     SIMD alignment so simd_load/simd_store use aligned operations.
+
+    Each buffer is allocated with the dtype matching its precision_role
+    (ADR-023 §2.1):
+      - "storage" → storage_dtype  (bandwidth lever)
+      - "state"   → state_dtype    (optimizer stability lever)
+      - "compute" → always float32 (CPU arithmetic invariant)
     """
 
-    def __init__(self, simd_alignment: int, dtype: np.dtype) -> None:
+    def __init__(
+        self,
+        simd_alignment: int,
+        role_dtypes: dict[Literal["storage", "compute", "state"], np.dtype],
+    ) -> None:
         self._alignment = simd_alignment
-        self._dtype = dtype
+        self._role_dtypes = role_dtypes
         self._buffers: dict[BufferHandle, np.ndarray] = {}
 
     def allocate(self, descriptor: BufferDescriptor) -> None:
@@ -29,7 +40,8 @@ class CPUBufferAllocator:
         for dim in descriptor.padded_shape:
             total_elements *= dim
 
-        buf = self._allocate_aligned(total_elements)
+        dtype = self._role_dtypes[descriptor.precision_role]
+        buf = self._allocate_aligned(total_elements, dtype)
         self._buffers[descriptor.handle] = buf
 
     def get_buffer(self, handle: BufferHandle) -> np.ndarray:
@@ -49,17 +61,17 @@ class CPUBufferAllocator:
         """Release all buffers."""
         self._buffers.clear()
 
-    def _allocate_aligned(self, num_elements: int) -> np.ndarray:
+    def _allocate_aligned(self, num_elements: int, dtype: np.dtype) -> np.ndarray:
         """Allocate a numpy array with guaranteed SIMD alignment.
 
         Modern numpy (≥1.20) typically aligns to 64 bytes by default.
         Verify and fall back to over-allocation + slicing if needed.
         """
-        arr = np.zeros(num_elements, dtype=self._dtype)
+        arr = np.zeros(num_elements, dtype=dtype)
 
         if self._alignment > 0 and arr.ctypes.data % self._alignment != 0:
             extra = self._alignment // arr.itemsize
-            padded = np.zeros(num_elements + extra, dtype=self._dtype)
+            padded = np.zeros(num_elements + extra, dtype=dtype)
             offset = (
                 (self._alignment - padded.ctypes.data % self._alignment)
                 // arr.itemsize

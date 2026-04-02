@@ -37,9 +37,7 @@ class BufferDescriptor:
     element_size_bytes: int
     size_bytes: int
     role: BufferRole
-    # Transitional default "compute" will be removed in Phase 7B once all
-    # BufferDescriptor construction sites in plan_builder.py are updated.
-    precision_role: Literal["storage", "compute", "state"] = "compute"
+    precision_role: Literal["storage", "compute", "state"]
     producing_node: str | None = None
     consumers: frozenset[str] = frozenset()
     last_consumer: str | None = None

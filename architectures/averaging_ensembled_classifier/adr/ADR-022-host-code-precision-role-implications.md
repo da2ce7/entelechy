@@ -1,6 +1,6 @@
 # ADR-022: Host Code Implications of the Three-Role Precision Model
 
-**Status:** PROPOSED
+**Status:** ACCEPTED
 **Date:** 2026-04-02
 **Deciders:** —
 **Triggered by:** ADR-020 (Three-Role Precision Model) §4 and ADR-021 (Kernel Precision-Role Migration) §5

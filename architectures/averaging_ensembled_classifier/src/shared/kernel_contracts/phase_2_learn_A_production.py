@@ -60,6 +60,7 @@ compute_probs_loss_cce_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_modules_count", "total_batch_count"),
             validation_preconditions=("host zero-initialize",),
+            precision_role="compute",
         ),
     ),
     scalar_params=(

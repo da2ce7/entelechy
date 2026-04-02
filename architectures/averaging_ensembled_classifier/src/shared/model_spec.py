@@ -84,3 +84,7 @@ class ModelSpec:
     @classmethod
     def float16(cls, **kwargs: Any) -> "ModelSpec":
         return cls(precision=PrecisionConfig.float16(), **kwargs)
+
+    @classmethod
+    def mixed_f16_f32(cls, **kwargs: Any) -> "ModelSpec":
+        return cls(precision=PrecisionConfig.mixed_f16_f32(), **kwargs)

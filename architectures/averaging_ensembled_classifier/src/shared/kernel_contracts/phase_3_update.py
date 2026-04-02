@@ -23,6 +23,7 @@ normalize_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("parameter_count",),
             validation_preconditions=("complete aggregated gradients",),
+            precision_role="compute",
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_final_grad", flow="dest", memory_scope="GLOBAL",
@@ -30,6 +31,7 @@ normalize_gradients_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("parameter_count",),
             validation_preconditions=("identical to src",),
+            precision_role="compute",
         ),
     ),
     scalar_params=(
@@ -59,6 +61,7 @@ adam_update_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("parameter_count",),
             validation_preconditions=("exact allocation size",),
+            precision_role="compute",
         ),
         BufferParamSpec(
             name="update_buffer_GLOBAL_parameters", flow="update", memory_scope="GLOBAL",

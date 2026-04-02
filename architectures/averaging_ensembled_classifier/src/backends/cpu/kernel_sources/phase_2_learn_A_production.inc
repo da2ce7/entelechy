@@ -1,7 +1,13 @@
 /* phase_2_learn_A_production.inc — Precision-parameterized production kernels (Nodes 6, 7, 8).
  *
- * Included by phase_2_learn_A_production.c with REAL_T / PRECISION_SUFFIX defined.
+ * Included by cpu_kernels.c with STORAGE_T/STATE_T/PRECISION_SUFFIX defined.
  * Algorithmic reference: kernels/phase_2_learn_A_production.cl.c
+ *
+ * Buffer role assignments (ADR-023 §2.5):
+ *   - logits, sample_mask, partial_probs, partial_loss, hidden_activations,
+ *     partial_grad_*, targets (BCE float) → storage
+ *   - temps → state
+ *   - final_loss (CCE) → compute (float*)
  */
 
 /* ================================================================
@@ -24,19 +30,19 @@ void PREC_FN(task_cce_probs_loss)(void* raw_args, uint task_index, uint thread_i
 
     const size_t loss_out_idx = (size_t)module_global_idx * a->total_batch_count + batch_idx;
 
-    if (a->sample_mask[batch_idx] < 0.5f) {
-        a->final_loss[loss_out_idx] = 0.0f;
+    if (scalar_load_storage(a->sample_mask, batch_idx) < 0.5f) {
+        a->final_loss[loss_out_idx] = 0.0f;  /* compute-role: direct write */
         const size_t prob_tile_base = (size_t)a->flat_tile_index
             * a->modules_per_chunk * a->total_batch_count * a->classes_per_chunk;
         const size_t prob_base = prob_tile_base
             + (size_t)module_local_idx * a->total_batch_count * a->classes_per_chunk
             + (size_t)batch_idx * a->classes_per_chunk;
         for (uint c = 0; c < a->classes_per_chunk; c++)
-            a->partial_probs[prob_base + c] = 0.0f;
+            scalar_store_storage(a->partial_probs, prob_base + c, 0.0f);
         return;
     }
 
-    const float temp     = a->temps[module_global_idx];
+    const float temp     = scalar_load_state(a->temps, module_global_idx);
     const float inv_temp = 1.0f / temp;
     const size_t base_logits_idx = (size_t)module_global_idx * a->total_batch_count
         * a->padded_total_output_class_count
@@ -44,14 +50,14 @@ void PREC_FN(task_cce_probs_loss)(void* raw_args, uint task_index, uint thread_i
 
     float max_scaled_logit = -3.402823466e+38f;
     for (uint c = 0; c < a->total_output_class_count; c++) {
-        float scaled = a->logits[base_logits_idx + c] * inv_temp;
+        float scaled = scalar_load_storage(a->logits, base_logits_idx + c) * inv_temp;
         if (scaled > max_scaled_logit) max_scaled_logit = scaled;
     }
     if (max_scaled_logit == -3.402823466e+38f) max_scaled_logit = 0.0f;
 
     float sum_exp = 0.0f;
     for (uint c = 0; c < a->total_output_class_count; c++) {
-        sum_exp += expf(a->logits[base_logits_idx + c] * inv_temp - max_scaled_logit);
+        sum_exp += expf(scalar_load_storage(a->logits, base_logits_idx + c) * inv_temp - max_scaled_logit);
     }
     const float inv_sum_exp = (sum_exp > NUMERICAL_STABILITY_EPSILON)
         ? (1.0f / sum_exp) : 0.0f;
@@ -65,18 +71,18 @@ void PREC_FN(task_cce_probs_loss)(void* raw_args, uint task_index, uint thread_i
     for (uint c_local = 0; c_local < a->classes_per_chunk; c_local++) {
         const uint c_global = class_offset + c_local;
         if (c_global < a->total_output_class_count) {
-            float prob = expf(a->logits[base_logits_idx + c_global] * inv_temp
+            float prob = expf(scalar_load_storage(a->logits, base_logits_idx + c_global) * inv_temp
                              - max_scaled_logit) * inv_sum_exp;
-            a->partial_probs[prob_base + c_local] = prob;
+            scalar_store_storage(a->partial_probs, prob_base + c_local, prob);
         } else {
-            a->partial_probs[prob_base + c_local] = 0.0f;
+            scalar_store_storage(a->partial_probs, prob_base + c_local, 0.0f);
         }
     }
 
     const int   true_class_idx = a->targets[batch_idx];
-    const float logit_true     = a->logits[base_logits_idx + (uint)true_class_idx];
+    const float logit_true     = scalar_load_storage(a->logits, base_logits_idx + (uint)true_class_idx);
     const float prob_true      = expf(logit_true * inv_temp - max_scaled_logit) * inv_sum_exp;
-    a->final_loss[loss_out_idx] = -logf(fmaxf(prob_true, NUMERICAL_STABILITY_EPSILON));
+    a->final_loss[loss_out_idx] = -logf(fmaxf(prob_true, NUMERICAL_STABILITY_EPSILON));  /* compute-role */
 }
 
 /* ================================================================
@@ -103,26 +109,26 @@ void PREC_FN(task_bce_probs_loss)(void* raw_args, uint task_index, uint thread_i
         + (size_t)module_local_idx * a->total_batch_count * a->classes_per_chunk
         + (size_t)batch_idx * a->classes_per_chunk;
 
-    if (a->sample_mask[batch_idx] < 0.5f) {
+    if (scalar_load_storage(a->sample_mask, batch_idx) < 0.5f) {
         for (uint c = 0; c < a->classes_per_chunk; c++)
-            a->partial_probs[prob_base + c] = 0.0f;
+            scalar_store_storage(a->partial_probs, prob_base + c, 0.0f);
         if (a->partial_loss != NULL) {
             const size_t loss_idx = (size_t)a->flat_tile_index
                 * a->modules_per_chunk * a->total_batch_count
                 + (size_t)module_local_idx * a->total_batch_count + batch_idx;
-            a->partial_loss[loss_idx] = 0.0f;
+            scalar_store_storage(a->partial_loss, loss_idx, 0.0f);
         }
         return;
     }
 
-    const float temp = a->temps[module_global_idx];
+    const float temp = scalar_load_state(a->temps, module_global_idx);
     const float inv_temp = 1.0f / temp;
     float loss_sum = 0.0f;
 
     for (uint c_local = 0; c_local < a->classes_per_chunk; c_local++) {
         const uint c_global = class_offset + c_local;
         if (c_global >= a->total_output_class_count) {
-            a->partial_probs[prob_base + c_local] = 0.0f;
+            scalar_store_storage(a->partial_probs, prob_base + c_local, 0.0f);
             continue;
         }
 
@@ -130,7 +136,7 @@ void PREC_FN(task_bce_probs_loss)(void* raw_args, uint task_index, uint thread_i
             * a->padded_total_output_class_count
             + (size_t)batch_idx * a->padded_total_output_class_count
             + c_global;
-        float scaled_logit = a->logits[logit_idx] * inv_temp;
+        float scaled_logit = scalar_load_storage(a->logits, logit_idx) * inv_temp;
 
         float prob;
         if (scaled_logit >= 0.0f) {
@@ -140,11 +146,11 @@ void PREC_FN(task_bce_probs_loss)(void* raw_args, uint task_index, uint thread_i
             float e = expf(scaled_logit);
             prob = e / (1.0f + e);
         }
-        a->partial_probs[prob_base + c_local] = prob;
+        scalar_store_storage(a->partial_probs, prob_base + c_local, prob);
 
         const size_t target_idx = (size_t)batch_idx
             * a->padded_total_output_class_count + c_global;
-        float y = a->targets[target_idx];
+        float y = scalar_load_storage(a->targets, target_idx);
         float log_p   = logf(fmaxf(prob, NUMERICAL_STABILITY_EPSILON));
         float log_1mp = logf(fmaxf(1.0f - prob, NUMERICAL_STABILITY_EPSILON));
         loss_sum += -(y * log_p + (1.0f - y) * log_1mp);
@@ -154,7 +160,7 @@ void PREC_FN(task_bce_probs_loss)(void* raw_args, uint task_index, uint thread_i
         const size_t loss_idx = (size_t)a->flat_tile_index
             * a->modules_per_chunk * a->total_batch_count
             + (size_t)module_local_idx * a->total_batch_count + batch_idx;
-        a->partial_loss[loss_idx] = loss_sum;
+        scalar_store_storage(a->partial_loss, loss_idx, loss_sum);
     }
 }
 
@@ -185,12 +191,12 @@ void PREC_FN(task_module_param_grads)(void* raw_args, uint task_index, uint thre
         float grad_b = 0.0f;
 
         for (uint b = 0; b < a->total_batch_count; b++) {
-            if (a->sample_mask[b] < 0.5f) continue;
+            if (scalar_load_storage(a->sample_mask, b) < 0.5f) continue;
 
             const size_t prob_idx = prob_tile_base
                 + (size_t)module_local_idx * a->total_batch_count * a->classes_per_chunk
                 + (size_t)b * a->classes_per_chunk + c_local;
-            const float prob = a->partial_probs[prob_idx];
+            const float prob = scalar_load_storage(a->partial_probs, prob_idx);
 
             float d_loss_d_logit;
             if (a->problem_type == PROBLEM_TYPE_CCE) {
@@ -198,13 +204,13 @@ void PREC_FN(task_module_param_grads)(void* raw_args, uint task_index, uint thre
                 d_loss_d_logit = ((int)c_global == targets_cce[b])
                     ? (prob - 1.0f) : prob;
             } else {
-                const REAL_T* targets_bce = (const REAL_T*)a->targets;
-                d_loss_d_logit = prob - targets_bce[
-                    (size_t)b * a->padded_total_output_class_count + c_global];
+                const STORAGE_T* targets_bce = (const STORAGE_T*)a->targets;
+                d_loss_d_logit = prob - scalar_load_storage(targets_bce,
+                    (size_t)b * a->padded_total_output_class_count + c_global);
             }
 
-            const float h_val = a->hidden_activations[
-                (size_t)b * a->padded_hidden_count + h_idx];
+            const float h_val = scalar_load_storage(a->hidden_activations,
+                (size_t)b * a->padded_hidden_count + h_idx);
             grad_w += d_loss_d_logit * h_val;
 
             if (h_idx == 0) {
@@ -220,7 +226,7 @@ void PREC_FN(task_module_param_grads)(void* raw_args, uint task_index, uint thre
                 * a->padded_total_output_class_count
             + (size_t)h_idx * a->padded_total_output_class_count
             + c_global;
-        a->partial_grad_weights_module[w_idx] = grad_w;
+        scalar_store_storage(a->partial_grad_weights_module, w_idx, grad_w);
 
         if (h_idx == 0) {
             const size_t b_base = (size_t)a->flat_tile_index
@@ -228,7 +234,7 @@ void PREC_FN(task_module_param_grads)(void* raw_args, uint task_index, uint thre
             const size_t b_idx = b_base
                 + (size_t)module_local_idx * a->padded_total_output_class_count
                 + c_global;
-            a->partial_grad_biases_module[b_idx] = grad_b;
+            scalar_store_storage(a->partial_grad_biases_module, b_idx, grad_b);
         }
     }
 }

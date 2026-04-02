@@ -23,10 +23,10 @@ layout(push_constant) uniform PushConstants {
     uint  num_batch_chunks;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer SrcGradW  { float data[]; } src_grad_w;
-layout(set = 0, binding = 1) readonly buffer SrcGradB  { float data[]; } src_grad_b;
-layout(set = 0, binding = 2) writeonly buffer DstGradW { float data[]; } dst_grad_w;
-layout(set = 0, binding = 3) writeonly buffer DstGradB { float data[]; } dst_grad_b;
+layout(set = 0, binding = 0) readonly buffer SrcGradW  { STORAGE_FLOAT data[]; } src_grad_w;
+layout(set = 0, binding = 1) readonly buffer SrcGradB  { STORAGE_FLOAT data[]; } src_grad_b;
+layout(set = 0, binding = 2) writeonly buffer DstGradW { STORAGE_FLOAT data[]; } dst_grad_w;
+layout(set = 0, binding = 3) writeonly buffer DstGradB { STORAGE_FLOAT data[]; } dst_grad_b;
 
 void main() {
     uint lid   = gl_LocalInvocationID.x;
@@ -38,9 +38,9 @@ void main() {
     for (uint i = lid; i < total_elements; i += lsize) {
         float val;
         if (i < push.weights_parameter_count) {
-            val = src_grad_w.data[i];
+            val = read_storage(src_grad_w.data[i]);
         } else {
-            val = src_grad_b.data[i - push.weights_parameter_count];
+            val = read_storage(src_grad_b.data[i - push.weights_parameter_count]);
         }
         local_sq_sum += val * val;
     }
@@ -55,20 +55,20 @@ void main() {
         if (norm > push.clipping_threshold) {
             scale_factor = push.clipping_threshold / (norm + push.epsilon);
         }
-        _cross_subgroup_scratch[0] = scale_factor;
+        _compute_scratch[0] = scale_factor;
     }
     barrier();
-    scale_factor = _cross_subgroup_scratch[0];
+    scale_factor = _compute_scratch[0];
 
     // ── Pass 2: Scale and write to destination offsets ──
     for (uint i = lid; i < total_elements; i += lsize) {
         if (i < push.weights_parameter_count) {
-            float val = src_grad_w.data[i];
-            dst_grad_w.data[push.weights_write_offset + i] = val * scale_factor;
+            float val = read_storage(src_grad_w.data[i]);
+            dst_grad_w.data[push.weights_write_offset + i] = write_storage(val * scale_factor);
         } else {
             uint  rel = i - push.weights_parameter_count;
-            float val = src_grad_b.data[rel];
-            dst_grad_b.data[push.biases_write_offset + rel] = val * scale_factor;
+            float val = read_storage(src_grad_b.data[rel]);
+            dst_grad_b.data[push.biases_write_offset + rel] = write_storage(val * scale_factor);
         }
     }
 }

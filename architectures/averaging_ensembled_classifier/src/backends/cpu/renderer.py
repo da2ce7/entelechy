@@ -30,11 +30,26 @@ from .retrieval import CPURetrievalFuture
 c_uint_p = POINTER(c_uint32)
 c_int_p = POINTER(c_int32)
 
-_DTYPE_TO_SUFFIX: dict[np.dtype, str] = {
-    np.dtype(np.float16): "fp16",
-    np.dtype(np.float32): "fp32",
-    np.dtype(np.float64): "fp64",
-}
+
+def _get_precision_suffix(storage_dtype: np.dtype, state_dtype: np.dtype) -> str:
+    """Map two-axis precision configuration to kernel suffix (ADR-023 §4.2).
+
+    Returns one of: s16x16, s32x32, s16x32
+    """
+    storage_is_f16 = storage_dtype == np.dtype(np.float16)
+    state_is_f16 = state_dtype == np.dtype(np.float16)
+
+    if storage_is_f16 and state_is_f16:
+        return "s16x16"
+    elif not storage_is_f16 and not state_is_f16:
+        return "s32x32"
+    elif storage_is_f16 and not state_is_f16:
+        return "s16x32"
+    else:
+        # s32x16 not supported (storage >= state is invariant)
+        raise ValueError(
+            f"Unsupported precision config: storage={storage_dtype}, state={state_dtype}"
+        )
 
 
 class CPUPlanRenderer:
@@ -69,10 +84,16 @@ class CPUPlanRenderer:
         Allocates SIMD-aligned numpy buffers, traverses the plan's
         topological order, and dispatches each node type.
         """
-        suffix = _DTYPE_TO_SUFFIX[plan.precision.storage_dtype]
+        suffix = _get_precision_suffix(
+            plan.precision.storage_dtype, plan.precision.state_dtype
+        )
         allocator = CPUBufferAllocator(
             simd_alignment=plan.hardware.cache_line_bytes,
-            dtype=plan.precision.storage_dtype,
+            role_dtypes={
+                "storage": plan.precision.storage_dtype,
+                "compute": np.dtype(np.float32),  # CPU invariant (ADR-023 §2.1)
+                "state": plan.precision.state_dtype,
+            },
         )
         for descriptor in plan.buffers.values():
             allocator.allocate(descriptor)
@@ -154,7 +175,8 @@ class CPUPlanRenderer:
         suffix: str,
     ) -> None:
         """Render a ReductionTreeNode via execute_reduction_tree."""
-        _, c_real_p, _ = PRECISION_C_TYPES[suffix]
+        _, c_storage_p, _, _ = PRECISION_C_TYPES[suffix]
+        c_float_p = ctypes.POINTER(ctypes.c_float)  # compute buffers always float
         ReductionTreePlanFFI = PRECISION_STRUCTS[suffix]["ReductionTreePlanFFI"]
 
         rtp = node.reduction_plan
@@ -209,7 +231,7 @@ class CPUPlanRenderer:
         c_plan = ReductionTreePlanFFI()
         c_plan.partial_collection = ctypes.cast(
             allocator.get_data_pointer(rtp.source_buffer),
-            c_real_p,
+            c_storage_p,
         )
         c_plan.offset_lists_flat = ctypes.cast(
             offsets_array, ctypes.POINTER(ctypes.c_uint32)
@@ -223,11 +245,11 @@ class CPUPlanRenderer:
         c_plan.stage_node_counts = ctypes.cast(
             stage_node_counts, ctypes.POINTER(ctypes.c_uint32)
         )
-        c_plan.staging_buffer_0 = staging_0.ctypes.data_as(c_real_p)
-        c_plan.staging_buffer_1 = staging_1.ctypes.data_as(c_real_p)
+        c_plan.staging_buffer_0 = staging_0.ctypes.data_as(c_storage_p)
+        c_plan.staging_buffer_1 = staging_1.ctypes.data_as(c_storage_p)
         c_plan.output = ctypes.cast(
             allocator.get_data_pointer(rtp.destination_buffer),
-            c_real_p,
+            c_float_p,
         )
         c_plan.partial_width = pw
         c_plan.num_stages = num_stages
@@ -271,7 +293,8 @@ class CPUPlanRenderer:
     # -----------------------------------------------------------
 
     _POINTER_TYPES = (
-        *(ct[1] for ct in PRECISION_C_TYPES.values()),
+        *(ct[1] for ct in PRECISION_C_TYPES.values()),  # storage pointers
+        *(ct[3] for ct in PRECISION_C_TYPES.values()),  # state pointers
         c_uint_p, c_int_p, c_void_p,
     )
 

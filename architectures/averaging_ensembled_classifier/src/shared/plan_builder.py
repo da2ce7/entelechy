@@ -6,13 +6,14 @@ StabilizationPolicy, and PlanProblemTypeStrategy inputs.
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 import numpy as np
 
 from .buffer_lifecycle import BufferDescriptor, BufferHandle, BufferRole
 from .hardware_profile import HardwareProfile
 from .kernel_contracts import KernelContract
+from .precision_config import PrecisionConfig
 from .kernel_contracts.phase_1_act import (
     forward_pass_contract,
     render_logits_chunk_contract,
@@ -75,6 +76,7 @@ class _BufferAllocator:
         padded_shape: tuple[int, ...],
         element_size_bytes: int,
         role: BufferRole,
+        precision_role: Optional[Literal["storage", "compute", "state"]] = "compute",
     ) -> BufferHandle:
         handle = BufferHandle(self._next_id)
         self._next_id += 1
@@ -86,6 +88,7 @@ class _BufferAllocator:
             element_size_bytes=element_size_bytes,
             size_bytes=size_bytes,
             role=role,
+            precision_role=precision_role or "compute",
             producing_node=None,
             consumers=frozenset(),
             last_consumer=None,
@@ -116,6 +119,7 @@ class _BufferAllocator:
                 element_size_bytes=desc.element_size_bytes,
                 size_bytes=desc.size_bytes,
                 role=desc.role,
+                precision_role=desc.precision_role,
                 producing_node=self._producers[handle],
                 consumers=consumers,
                 last_consumer=last,
@@ -213,7 +217,9 @@ def build_act_plan(
 ) -> ExecutionPlan:
     """Construct an Act-phase (forward pass + inference retrieval) plan."""
     alloc = _BufferAllocator()
-    elem = model_spec.precision.storage_dtype.itemsize
+    elem_storage = model_spec.precision.storage_dtype.itemsize
+    elem_compute = model_spec.precision.compute_dtype.itemsize
+    elem_state = model_spec.precision.state_dtype.itemsize
     tiling = _make_tiling(model_spec)
     tile_count = tiling.total_tiles
 
@@ -221,78 +227,78 @@ def build_act_plan(
     b_shared_weights = alloc.allocate(
         "shared_weights",
         (model_spec.padded_input_dim, model_spec.padded_hidden_dim),
-        elem, BufferRole.MODEL_STATE,
+        elem_state, BufferRole.MODEL_STATE, "state",
     )
     b_module_weights = alloc.allocate(
         "module_weights",
         (model_spec.num_modules, model_spec.padded_hidden_dim, model_spec.padded_class_dim),
-        elem, BufferRole.MODEL_STATE,
+        elem_state, BufferRole.MODEL_STATE, "state",
     )
     b_module_biases = alloc.allocate(
         "module_biases",
         (model_spec.num_modules, model_spec.padded_class_dim),
-        elem, BufferRole.MODEL_STATE,
+        elem_state, BufferRole.MODEL_STATE, "state",
     )
     b_temperatures = alloc.allocate(
         "temperatures",
         (model_spec.padded_module_dim,),
-        elem, BufferRole.MODEL_STATE,
+        elem_state, BufferRole.MODEL_STATE, "state",
     )
     b_biases_shared = alloc.allocate(
         "biases_shared",
         (model_spec.padded_hidden_dim,),
-        elem, BufferRole.MODEL_STATE,
+        elem_state, BufferRole.MODEL_STATE, "state",
     )
 
     # BATCH_INPUT buffers
     b_input_data = alloc.allocate(
         "input_data",
         (batch_size, model_spec.padded_input_dim),
-        elem, BufferRole.BATCH_INPUT,
+        elem_storage, BufferRole.BATCH_INPUT, "storage",
     )
     b_sample_mask = alloc.allocate(
         "sample_mask",
         (batch_size,),
-        elem, BufferRole.BATCH_INPUT,
+        elem_storage, BufferRole.BATCH_INPUT, "storage",
     )
     b_targets = alloc.allocate(
         strategy.required_targets_buffer_name,
         (batch_size, model_spec.output_classes),
-        elem, BufferRole.BATCH_INPUT,
+        4, BufferRole.BATCH_INPUT, "compute",  # int32 targets
     )
 
     # BATCH_INTERMEDIATE
     b_hidden = alloc.allocate(
         "hidden_activations",
         (batch_size, model_spec.padded_hidden_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_hidden_mask = alloc.allocate(
         "hidden_mask",
         (batch_size, model_spec.padded_hidden_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_logits = alloc.allocate(
         "full_logits",
         (tile_count, batch_size, model_spec.padded_class_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_partial_probs = alloc.allocate(
         "partial_probs",
         (tile_count, batch_size, model_spec.padded_class_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_loss_output = alloc.allocate(
         "loss_output",
         (model_spec.num_modules, batch_size),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_compute, BufferRole.BATCH_INTERMEDIATE, "compute",
     )
 
-    # BATCH_OUTPUT
+    # BATCH_OUTPUT — reduction tree outputs float* (compute precision)
     b_final_probs = alloc.allocate(
         "final_probs",
         (batch_size, model_spec.padded_class_dim),
-        elem, BufferRole.BATCH_OUTPUT,
+        elem_compute, BufferRole.BATCH_OUTPUT, "compute",
     )
 
     # --- Nodes ---
@@ -443,7 +449,9 @@ def build_learn_plan(
 ) -> ExecutionPlan:
     """Construct a Learn-phase (gradient production → update) plan."""
     alloc = _BufferAllocator()
-    elem = model_spec.precision.storage_dtype.itemsize
+    elem_storage = model_spec.precision.storage_dtype.itemsize
+    elem_compute = model_spec.precision.compute_dtype.itemsize
+    elem_state = model_spec.precision.state_dtype.itemsize
     tiling = _make_tiling(model_spec)
     tile_count = tiling.total_tiles
     nodes: dict[str, PlanNode] = {}
@@ -470,66 +478,66 @@ def build_learn_plan(
     b_shared_weights = alloc.allocate(
         "shared_weights",
         (model_spec.padded_input_dim, model_spec.padded_hidden_dim),
-        elem, BufferRole.MODEL_STATE,
+        elem_state, BufferRole.MODEL_STATE, "state",
     )
     b_module_weights = alloc.allocate(
         "module_weights",
         (model_spec.num_modules, model_spec.padded_hidden_dim,
          model_spec.padded_class_dim),
-        elem, BufferRole.MODEL_STATE,
+        elem_state, BufferRole.MODEL_STATE, "state",
     )
     b_module_biases = alloc.allocate(
         "module_biases",
         (model_spec.num_modules, model_spec.padded_class_dim),
-        elem, BufferRole.MODEL_STATE,
+        elem_state, BufferRole.MODEL_STATE, "state",
     )
     b_temperatures = alloc.allocate(
         "temperatures", (model_spec.num_modules,),
-        elem, BufferRole.MODEL_STATE,
+        elem_state, BufferRole.MODEL_STATE, "state",
     )
 
     # Adam optimizer state (m1, m2 per parameter group)
     b_m1_module = alloc.allocate(
-        "m1_module", (epp_mod_w,), elem, BufferRole.MODEL_STATE)
+        "m1_module", (epp_mod_w,), elem_state, BufferRole.MODEL_STATE, "state")
     b_m2_module = alloc.allocate(
-        "m2_module", (epp_mod_w,), elem, BufferRole.MODEL_STATE)
+        "m2_module", (epp_mod_w,), elem_state, BufferRole.MODEL_STATE, "state")
     b_m1_temps = alloc.allocate(
-        "m1_temps", (epp_temps,), elem, BufferRole.MODEL_STATE)
+        "m1_temps", (epp_temps,), elem_state, BufferRole.MODEL_STATE, "state")
     b_m2_temps = alloc.allocate(
-        "m2_temps", (epp_temps,), elem, BufferRole.MODEL_STATE)
+        "m2_temps", (epp_temps,), elem_state, BufferRole.MODEL_STATE, "state")
     b_m1_shared = alloc.allocate(
-        "m1_shared", (shared_w_param_count,), elem, BufferRole.MODEL_STATE)
+        "m1_shared", (shared_w_param_count,), elem_state, BufferRole.MODEL_STATE, "state")
     b_m2_shared = alloc.allocate(
-        "m2_shared", (shared_w_param_count,), elem, BufferRole.MODEL_STATE)
+        "m2_shared", (shared_w_param_count,), elem_state, BufferRole.MODEL_STATE, "state")
 
     # --- BATCH_INPUT buffers ---
     b_input_data = alloc.allocate(
         "input_data", (batch_size, model_spec.padded_input_dim),
-        elem, BufferRole.BATCH_INPUT,
+        elem_storage, BufferRole.BATCH_INPUT, "storage",
     )
     b_sample_mask = alloc.allocate(
-        "sample_mask", (batch_size,), elem, BufferRole.BATCH_INPUT,
+        "sample_mask", (batch_size,), elem_storage, BufferRole.BATCH_INPUT, "storage",
     )
     b_targets = alloc.allocate(
         strategy.required_targets_buffer_name,
         (batch_size, model_spec.output_classes),
-        elem, BufferRole.BATCH_INPUT,
+        4, BufferRole.BATCH_INPUT, "compute",  # int32 targets
     )
 
     # --- Upstream intermediate buffers (from Act) ---
     b_hidden = alloc.allocate(
         "hidden_activations", (batch_size, model_spec.padded_hidden_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_logits = alloc.allocate(
         "full_logits",
         (tile_count, batch_size, model_spec.padded_class_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_partial_probs = alloc.allocate(
         "partial_probs",
         (tile_count, modules_per_chunk, batch_size, classes_per_chunk),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
 
     # --- Phase I intermediate buffers ---
@@ -537,23 +545,23 @@ def build_learn_plan(
         "partial_grad_weights_module",
         (tile_count, modules_per_chunk,
          model_spec.padded_hidden_dim, model_spec.padded_class_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_partial_grad_biases_module = alloc.allocate(
         "partial_grad_biases_module",
         (tile_count, modules_per_chunk, model_spec.padded_class_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_partial_grad_hidden = alloc.allocate(
         "partial_grad_hidden_activations_aos",
         (tile_count, modules_per_chunk,
          batch_size, model_spec.padded_hidden_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_partial_grad_temps = alloc.allocate(
         "partial_grad_temps",
         (tile_count, modules_per_chunk),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
 
     # Clipped partials
@@ -561,23 +569,23 @@ def build_learn_plan(
         "clipped_partial_grad_weights_module",
         (tile_count, modules_per_chunk,
          model_spec.padded_hidden_dim, model_spec.padded_class_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_clipped_grad_biases_module = alloc.allocate(
         "clipped_partial_grad_biases_module",
         (tile_count, modules_per_chunk, model_spec.padded_class_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_clipped_grad_hidden = alloc.allocate(
         "clipped_partial_grad_hidden_activations_aos",
         (tile_count, modules_per_chunk,
          batch_size, model_spec.padded_hidden_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_clipped_grad_temps = alloc.allocate(
         "clipped_partial_grad_temps",
         (tile_count, modules_per_chunk),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
 
     # Phase II outputs
@@ -585,20 +593,20 @@ def build_learn_plan(
         "clipped_grad_hidden_activations_permuted_soa",
         (batch_size * model_spec.padded_hidden_dim,
          model_spec.padded_module_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_summed_grad_h = alloc.allocate(
         "summed_grad_hidden_activations",
         (grad_h_total,),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_compute, BufferRole.BATCH_INTERMEDIATE, "compute",
     )
     b_summed_grad_mod = alloc.allocate(
         "summed_grad_mod", (epp_mod_w,),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_compute, BufferRole.BATCH_INTERMEDIATE, "compute",
     )
     b_summed_grad_temps = alloc.allocate(
         "summed_grad_temps", (epp_temps,),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_compute, BufferRole.BATCH_INTERMEDIATE, "compute",
     )
 
     # Phase III intermediates
@@ -606,45 +614,45 @@ def build_learn_plan(
         "partial_grad_weights_shared",
         (batch_size, model_spec.padded_input_dim,
          model_spec.padded_hidden_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_partial_grad_sb = alloc.allocate(
         "partial_grad_biases_shared",
         (batch_size, model_spec.padded_hidden_dim),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_clipped_grad_sw = alloc.allocate(
         "clipped_partial_grad_weights_shared",
         (batch_size, shared_w_param_count),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_clipped_grad_sb = alloc.allocate(
         "clipped_partial_grad_biases_shared",
         (batch_size, shared_b_param_count),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
 
     # Phase IV outputs
     b_summed_grad_shared = alloc.allocate(
         "summed_grad_shared", (shared_w_param_count,),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_compute, BufferRole.BATCH_INTERMEDIATE, "compute",
     )
     b_final_grad_mod = alloc.allocate(
         "final_grad_mod", (epp_mod_w,),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_compute, BufferRole.BATCH_INTERMEDIATE, "compute",
     )
     b_final_grad_temps = alloc.allocate(
         "final_grad_temps", (epp_temps,),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_compute, BufferRole.BATCH_INTERMEDIATE, "compute",
     )
     b_final_grad_shared = alloc.allocate(
         "final_grad_shared", (shared_w_param_count,),
-        elem, BufferRole.BATCH_INTERMEDIATE,
+        elem_compute, BufferRole.BATCH_INTERMEDIATE, "compute",
     )
 
     # BATCH_OUTPUT
     b_final_output = alloc.allocate(
-        "final_batch_output", (1,), elem, BufferRole.BATCH_OUTPUT,
+        "final_batch_output", (1,), elem_compute, BufferRole.BATCH_OUTPUT, "compute",
     )
 
     # =====================================================================

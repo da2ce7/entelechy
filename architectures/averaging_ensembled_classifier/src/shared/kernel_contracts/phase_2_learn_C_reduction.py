@@ -192,6 +192,7 @@ stabilize_reduce_grad_h_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("total_batch_count", "padded_hidden_count"),
             validation_preconditions=("exact allocation size",),
+            precision_role="compute",
         ),
     ),
     scalar_params=(

@@ -45,10 +45,10 @@ void main() {
         if (norm > push.clipping_threshold) {
             scale_factor = push.clipping_threshold / (norm + push.epsilon);
         }
-        _cross_subgroup_scratch[0] = scale_factor;
+        _compute_scratch[0] = scale_factor;
     }
     barrier();
-    scale_factor = _cross_subgroup_scratch[0];
+    scale_factor = _compute_scratch[0];
 
     // ── Early exit: no clipping needed ──
     if (scale_factor >= 1.0) {

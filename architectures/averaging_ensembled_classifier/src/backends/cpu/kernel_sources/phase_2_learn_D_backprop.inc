@@ -1,7 +1,11 @@
 /* phase_2_learn_D_backprop.inc — Precision-parameterized backprop kernels (Nodes 17, 18, 19).
  *
- * Included by phase_2_learn_D_backprop.c with REAL_T / PRECISION_SUFFIX defined.
+ * Included by cpu_kernels.c with STORAGE_T/STATE_T/PRECISION_SUFFIX defined.
  * Algorithmic reference: kernels/phase_2_learn_D_backprop.cl.c
+ *
+ * Buffer role assignments (ADR-023 §2.5):
+ *   - sample_mask, hidden_activations, input, partial_grad_*, clipped_partial_grad_* → storage
+ *   - summed_grad_hidden_activations → compute (float*)
  */
 
 /* ================================================================
@@ -21,18 +25,18 @@ void PREC_FN(task_backprop_shared_weights)(void* raw_args, uint task_index, uint
     for (uint b_local = 0; b_local < a->batch_chunk_count; b_local++) {
         const uint b_global = a->batch_chunk_offset + b_local;
 
-        if (a->sample_mask[b_global] < 0.5f)
+        if (scalar_load_storage(a->sample_mask, b_global) < 0.5f)
             continue;
 
         const size_t h_off = (size_t)b_global * a->padded_hidden_count + j_idx;
-        const float grad_h    = a->summed_grad_hidden_activations[h_off];
-        const float hidden_val = a->hidden_activations[h_off];
+        const float grad_h    = a->summed_grad_hidden_activations[h_off];  /* float* compute */
+        const float hidden_val = scalar_load_storage(a->hidden_activations, h_off);
 
         const float d_act = (hidden_val > 0.0f) ? 1.0f : 0.0f;
         const float dL_dZ = grad_h * d_act;
 
-        const float input_val = a->input[
-            (size_t)b_global * a->padded_input_count + i_idx];
+        const float input_val = scalar_load_storage(a->input,
+            (size_t)b_global * a->padded_input_count + i_idx);
         grad_sw += dL_dZ * input_val;
     }
 
@@ -40,7 +44,7 @@ void PREC_FN(task_backprop_shared_weights)(void* raw_args, uint task_index, uint
         * a->padded_input_count * a->padded_hidden_count;
     const size_t out_idx = chunk_base
         + (size_t)j_idx * a->padded_input_count + i_idx;
-    a->partial_grad_weights_shared[out_idx] = grad_sw;
+    scalar_store_storage(a->partial_grad_weights_shared, out_idx, grad_sw);
 }
 
 /* ================================================================
@@ -58,19 +62,19 @@ void PREC_FN(task_backprop_shared_biases)(void* raw_args, uint task_index, uint 
     for (uint b_local = 0; b_local < a->batch_chunk_count; b_local++) {
         const uint b_global = a->batch_chunk_offset + b_local;
 
-        if (a->sample_mask[b_global] < 0.5f)
+        if (scalar_load_storage(a->sample_mask, b_global) < 0.5f)
             continue;
 
         const size_t h_off = (size_t)b_global * a->padded_hidden_count + j_idx;
-        const float grad_h    = a->summed_grad_hidden_activations[h_off];
-        const float hidden_val = a->hidden_activations[h_off];
+        const float grad_h    = a->summed_grad_hidden_activations[h_off];  /* float* compute */
+        const float hidden_val = scalar_load_storage(a->hidden_activations, h_off);
 
         const float d_act = (hidden_val > 0.0f) ? 1.0f : 0.0f;
         grad_sb += grad_h * d_act;
     }
 
     const size_t chunk_base = (size_t)a->batch_chunk_index * a->padded_hidden_count;
-    a->partial_grad_biases_shared[chunk_base + j_idx] = grad_sb;
+    scalar_store_storage(a->partial_grad_biases_shared, chunk_base + j_idx, grad_sb);
 }
 
 /* ================================================================
@@ -86,11 +90,11 @@ void PREC_FN(task_clip_shared_grads)(void* raw_args, uint task_index, uint threa
 
     float sum_sq = 0.0f;
     for (uint i = 0; i < n_w; i++) {
-        float v = a->partial_grad_weights_shared[i];
+        float v = scalar_load_storage(a->partial_grad_weights_shared, i);
         sum_sq += v * v;
     }
     for (uint i = 0; i < n_b; i++) {
-        float v = a->partial_grad_biases_shared[i];
+        float v = scalar_load_storage(a->partial_grad_biases_shared, i);
         sum_sq += v * v;
     }
 
@@ -101,13 +105,13 @@ void PREC_FN(task_clip_shared_grads)(void* raw_args, uint task_index, uint threa
     }
 
     for (uint i = 0; i < n_w; i++) {
-        a->clipped_partial_grad_weights_shared[
-            a->weights_write_offset_elements + i] =
-            a->partial_grad_weights_shared[i] * scale;
+        float v = scalar_load_storage(a->partial_grad_weights_shared, i);
+        scalar_store_storage(a->clipped_partial_grad_weights_shared,
+            a->weights_write_offset_elements + i, v * scale);
     }
     for (uint i = 0; i < n_b; i++) {
-        a->clipped_partial_grad_biases_shared[
-            a->biases_write_offset_elements + i] =
-            a->partial_grad_biases_shared[i] * scale;
+        float v = scalar_load_storage(a->partial_grad_biases_shared, i);
+        scalar_store_storage(a->clipped_partial_grad_biases_shared,
+            a->biases_write_offset_elements + i, v * scale);
     }
 }

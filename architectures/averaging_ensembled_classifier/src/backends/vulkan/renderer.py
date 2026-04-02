@@ -206,7 +206,7 @@ class VulkanPlanRenderer:
 
             push_size = ctypes.sizeof(PUSH_CONSTANT_STRUCTS[name])
             pipeline = self._pipeline_cache.create_pipeline(
-                name, layout, push_size, spec
+                name, layout, push_size, spec, plan.precision
             )
             self._pipelines[name] = pipeline
 
@@ -345,7 +345,8 @@ class VulkanPlanRenderer:
         # Allocate ping-pong scratch buffers for intermediate stages
         pw = rtp.partial_width
         max_intermediates = rtp.num_partials
-        ping_size = max_intermediates * pw * 4  # float32
+        compute_elem = plan.precision.compute_dtype.itemsize
+        ping_size = max_intermediates * pw * compute_elem
         pong_size = ping_size
 
         from ...shared.buffer_lifecycle import BufferDescriptor
@@ -359,9 +360,10 @@ class VulkanPlanRenderer:
             handle=ping_handle,
             logical_name="_reduction_ping",
             padded_shape=(max_intermediates * pw,),
-            element_size_bytes=4,
+            element_size_bytes=compute_elem,
             size_bytes=ping_size,
             role=BufferRole.BATCH_INTERMEDIATE,
+            precision_role="compute",
             producing_node=None,
             consumers=frozenset(),
             last_consumer=None,
@@ -370,9 +372,10 @@ class VulkanPlanRenderer:
             handle=pong_handle,
             logical_name="_reduction_pong",
             padded_shape=(max_intermediates * pw,),
-            element_size_bytes=4,
+            element_size_bytes=compute_elem,
             size_bytes=pong_size,
             role=BufferRole.BATCH_INTERMEDIATE,
+            precision_role="compute",
             producing_node=None,
             consumers=frozenset(),
             last_consumer=None,
@@ -389,6 +392,7 @@ class VulkanPlanRenderer:
             element_size_bytes=4,
             size_bytes=offsets.nbytes,
             role=BufferRole.BATCH_INTERMEDIATE,
+            precision_role="compute",
             producing_node=None,
             consumers=frozenset(),
             last_consumer=None,

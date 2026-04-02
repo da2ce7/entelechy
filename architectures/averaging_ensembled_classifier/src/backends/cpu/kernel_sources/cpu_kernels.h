@@ -38,310 +38,317 @@ typedef uint32_t uint;
 #endif
 
 /* ================================================================
- * Multi-Precision Configuration (ADR-008)
+ * Multi-Precision Configuration (ADR-008, ADR-023 §2.3)
  *
- * All three precision variants (fp16, fp32, fp64) are compiled into
- * a single shared library.  Each variant has suffixed struct types
- * and function names.  The Python FFI layer selects the variant at
- * runtime based on PrecisionConfig.
+ * Three precision variants are compiled: s32x32 (FP32 storage/FP32 state),
+ * s16x16 (FP16 storage/FP16 state), and s16x32 (FP16 storage/FP32 state).
+ * Each variant has suffixed struct types and function names.
  *
- * Computation always uses float (FP32) internally; the storage type
- * only affects buffer pointers and scalar ABI layout.
+ * Computation always uses float (FP32) internally. STORAGE_T affects
+ * buffer pointers for bandwidth-optimized transient data, STATE_T
+ * affects persistent optimizer state (weights, biases, momentum).
  * ================================================================ */
 
+/* COMPUTE_TYPE is invariant on the CPU backend: always float.
+ * Per ADR-023 §2.1: CPU arithmetic always executes at FP32 precision. */
+typedef float cpu_compute_t;
+
 /* --- Macro: declare all structs for one precision variant --- */
-#define DECLARE_PRECISION_STRUCTS(SUFFIX, REAL_T)                              \
+#define DECLARE_PRECISION_STRUCTS(SUFFIX, STORAGE_T, STATE_T)                  \
                                                                                \
 /* --- Act Phase --- */                                                        \
 typedef struct {                                                               \
-    const REAL_T* input;                                                       \
-    const REAL_T* sample_mask;                                                 \
-    const REAL_T* weights_shared_simd_major;                                   \
-    const REAL_T* biases_shared;                                               \
-    REAL_T*       hidden_activations;                                          \
-    REAL_T*       hidden_mask;                                                 \
-    uint          batch_chunk_offset;                                          \
-    uint          batch_chunk_count;                                           \
-    uint          total_batch_count;                                           \
-    uint          padded_input_count;                                          \
-    uint          padded_hidden_count;                                         \
+    const STORAGE_T* input;                                                    \
+    const STORAGE_T* sample_mask;                                              \
+    const STATE_T*   weights_shared_simd_major;                                \
+    const STATE_T*   biases_shared;                                            \
+    STORAGE_T*       hidden_activations;                                       \
+    STORAGE_T*       hidden_mask;                                              \
+    uint             batch_chunk_offset;                                       \
+    uint             batch_chunk_count;                                        \
+    uint             total_batch_count;                                        \
+    uint             padded_input_count;                                       \
+    uint             padded_hidden_count;                                      \
 } ForwardPassArgs_##SUFFIX;                                                    \
                                                                                \
 typedef struct {                                                               \
-    const REAL_T* hidden_activations;                                          \
-    const REAL_T* hidden_mask;                                                 \
-    const REAL_T* weights_module;                                              \
-    const REAL_T* biases_module;                                               \
-    REAL_T*       logits;                                                      \
-    uint          batch_chunk_offset;                                          \
-    uint          batch_chunk_count;                                           \
-    uint          module_chunk_offset;                                         \
-    uint          module_chunk_count;                                          \
-    uint          class_chunk_offset;                                          \
-    uint          class_chunk_count;                                           \
-    uint          total_batch_count;                                           \
-    uint          hidden_count;                                                \
-    uint          padded_hidden_count;                                         \
-    uint          total_output_class_count;                                    \
-    uint          padded_total_output_class_count;                             \
-    uint          total_modules_count;                                         \
+    const STORAGE_T* hidden_activations;                                       \
+    const STORAGE_T* hidden_mask;                                              \
+    const STATE_T*   weights_module;                                           \
+    const STATE_T*   biases_module;                                            \
+    STORAGE_T*       logits;                                                   \
+    uint             batch_chunk_offset;                                       \
+    uint             batch_chunk_count;                                        \
+    uint             module_chunk_offset;                                      \
+    uint             module_chunk_count;                                       \
+    uint             class_chunk_offset;                                       \
+    uint             class_chunk_count;                                        \
+    uint             total_batch_count;                                        \
+    uint             hidden_count;                                             \
+    uint             padded_hidden_count;                                      \
+    uint             total_output_class_count;                                 \
+    uint             padded_total_output_class_count;                          \
+    uint             total_modules_count;                                      \
 } RenderLogitsArgs_##SUFFIX;                                                   \
                                                                                \
 /* --- Learn Phase A: Loss & Gradient Production --- */                        \
 typedef struct {                                                               \
-    const REAL_T* logits;                                                      \
-    const REAL_T* temps;                                                       \
-    const int*    targets;                                                     \
-    const REAL_T* sample_mask;                                                 \
-    REAL_T*       partial_probs;                                               \
-    REAL_T*       final_loss;                                                  \
-    uint          flat_tile_index;                                             \
-    uint          num_class_chunks;                                            \
-    uint          classes_per_chunk;                                           \
-    uint          modules_per_chunk;                                           \
-    uint          total_batch_count;                                           \
-    uint          total_output_class_count;                                    \
-    uint          padded_total_output_class_count;                             \
-    uint          total_modules_count;                                         \
-    uint          total_tile_count;                                            \
+    const STORAGE_T* logits;                                                   \
+    const STATE_T*   temps;                                                    \
+    const int*       targets;                                                  \
+    const STORAGE_T* sample_mask;                                              \
+    STORAGE_T*       partial_probs;                                            \
+    float*           final_loss;                                               \
+    uint             flat_tile_index;                                          \
+    uint             num_class_chunks;                                         \
+    uint             classes_per_chunk;                                        \
+    uint             modules_per_chunk;                                        \
+    uint             total_batch_count;                                        \
+    uint             total_output_class_count;                                 \
+    uint             padded_total_output_class_count;                          \
+    uint             total_modules_count;                                      \
+    uint             total_tile_count;                                         \
 } CceChunkArgs_##SUFFIX;                                                       \
                                                                                \
 typedef struct {                                                               \
-    const REAL_T* logits;                                                      \
-    const REAL_T* temps;                                                       \
-    const REAL_T* targets;                                                     \
-    const REAL_T* sample_mask;                                                 \
-    REAL_T*       partial_probs;                                               \
-    REAL_T*       partial_loss;                                                \
-    uint          flat_tile_index;                                             \
-    uint          num_class_chunks;                                            \
-    uint          classes_per_chunk;                                           \
-    uint          modules_per_chunk;                                           \
-    uint          total_batch_count;                                           \
-    uint          total_output_class_count;                                    \
-    uint          padded_total_output_class_count;                             \
-    uint          total_modules_count;                                         \
-    uint          total_tile_count;                                            \
+    const STORAGE_T* logits;                                                   \
+    const STATE_T*   temps;                                                    \
+    const STORAGE_T* targets;                                                  \
+    const STORAGE_T* sample_mask;                                              \
+    STORAGE_T*       partial_probs;                                            \
+    STORAGE_T*       partial_loss;                                             \
+    uint             flat_tile_index;                                          \
+    uint             num_class_chunks;                                         \
+    uint             classes_per_chunk;                                        \
+    uint             modules_per_chunk;                                        \
+    uint             total_batch_count;                                        \
+    uint             total_output_class_count;                                 \
+    uint             padded_total_output_class_count;                          \
+    uint             total_modules_count;                                      \
+    uint             total_tile_count;                                         \
 } BceChunkArgs_##SUFFIX;                                                       \
                                                                                \
 typedef struct {                                                               \
-    const REAL_T* hidden_activations;                                          \
-    const REAL_T* partial_probs;                                               \
-    const void*   targets;                                                     \
-    const REAL_T* sample_mask;                                                 \
-    REAL_T*       partial_grad_weights_module;                                 \
-    REAL_T*       partial_grad_biases_module;                                  \
-    uint          problem_type;                                                \
-    uint          flat_tile_index;                                             \
-    uint          batch_chunk_offset;                                          \
-    uint          batch_chunk_count;                                           \
-    uint          num_class_chunks;                                            \
-    uint          classes_per_chunk;                                           \
-    uint          modules_per_chunk;                                           \
-    uint          total_batch_count;                                           \
-    uint          hidden_count;                                                \
-    uint          padded_hidden_count;                                         \
-    uint          total_output_class_count;                                    \
-    uint          padded_total_output_class_count;                             \
-    uint          total_modules_count;                                         \
-    uint          total_tile_count;                                            \
+    const STORAGE_T* hidden_activations;                                       \
+    const STORAGE_T* partial_probs;                                            \
+    const void*      targets;                                                  \
+    const STORAGE_T* sample_mask;                                              \
+    STORAGE_T*       partial_grad_weights_module;                              \
+    STORAGE_T*       partial_grad_biases_module;                               \
+    uint             problem_type;                                             \
+    uint             flat_tile_index;                                          \
+    uint             batch_chunk_offset;                                       \
+    uint             batch_chunk_count;                                        \
+    uint             num_class_chunks;                                         \
+    uint             classes_per_chunk;                                        \
+    uint             modules_per_chunk;                                        \
+    uint             total_batch_count;                                        \
+    uint             hidden_count;                                             \
+    uint             padded_hidden_count;                                      \
+    uint             total_output_class_count;                                 \
+    uint             padded_total_output_class_count;                          \
+    uint             total_modules_count;                                      \
+    uint             total_tile_count;                                         \
 } ModuleParamGradsArgs_##SUFFIX;                                               \
                                                                                \
 /* --- Learn Phase B: Processing --- */                                        \
 typedef struct {                                                               \
-    const REAL_T* partial_probs;                                               \
-    const void*   targets;                                                     \
-    const REAL_T* sample_mask;                                                 \
-    const REAL_T* weights_module;                                              \
-    REAL_T*       partial_grad_hidden_activations_aos;                         \
-    uint          problem_type;                                                \
-    uint          flat_tile_index;                                             \
-    uint          num_class_chunks;                                            \
-    uint          classes_per_chunk;                                           \
-    uint          modules_per_chunk;                                           \
-    uint          total_batch_count;                                           \
-    uint          hidden_count;                                                \
-    uint          padded_hidden_count;                                         \
-    uint          total_output_class_count;                                    \
-    uint          padded_total_output_class_count;                             \
-    uint          total_modules_count;                                         \
-    uint          total_tile_count;                                            \
+    const STORAGE_T* partial_probs;                                            \
+    const void*      targets;                                                  \
+    const STORAGE_T* sample_mask;                                              \
+    const STATE_T*   weights_module;                                           \
+    STORAGE_T*       partial_grad_hidden_activations_aos;                      \
+    uint             problem_type;                                             \
+    uint             flat_tile_index;                                          \
+    uint             num_class_chunks;                                         \
+    uint             classes_per_chunk;                                        \
+    uint             modules_per_chunk;                                        \
+    uint             total_batch_count;                                        \
+    uint             hidden_count;                                             \
+    uint             padded_hidden_count;                                      \
+    uint             total_output_class_count;                                 \
+    uint             padded_total_output_class_count;                          \
+    uint             total_modules_count;                                      \
+    uint             total_tile_count;                                         \
 } BackpropToHiddenArgs_##SUFFIX;                                               \
                                                                                \
 typedef struct {                                                               \
-    const REAL_T* logits;                                                      \
-    const REAL_T* partial_probs;                                               \
-    const void*   targets;                                                     \
-    const REAL_T* sample_mask;                                                 \
-    const REAL_T* temps;                                                       \
-    REAL_T*       partial_grad_temps;                                          \
-    uint          problem_type;                                                \
-    uint          flat_tile_index;                                             \
-    uint          num_class_chunks;                                            \
-    uint          classes_per_chunk;                                           \
-    uint          modules_per_chunk;                                           \
-    uint          total_batch_count;                                           \
-    uint          total_output_class_count;                                    \
-    uint          padded_total_output_class_count;                             \
-    uint          total_modules_count;                                         \
-    uint          total_tile_count;                                            \
+    const STORAGE_T* logits;                                                   \
+    const STORAGE_T* partial_probs;                                            \
+    const void*      targets;                                                  \
+    const STORAGE_T* sample_mask;                                              \
+    const STATE_T*   temps;                                                    \
+    STORAGE_T*       partial_grad_temps;                                       \
+    uint             problem_type;                                             \
+    uint             flat_tile_index;                                          \
+    uint             num_class_chunks;                                         \
+    uint             classes_per_chunk;                                        \
+    uint             modules_per_chunk;                                        \
+    uint             total_batch_count;                                        \
+    uint             total_output_class_count;                                 \
+    uint             padded_total_output_class_count;                          \
+    uint             total_modules_count;                                      \
+    uint             total_tile_count;                                         \
 } TempGradientsArgs_##SUFFIX;                                                  \
                                                                                \
 typedef struct {                                                               \
-    const REAL_T* partial_grad_weights_module;                                 \
-    const REAL_T* partial_grad_biases_module;                                  \
-    const REAL_T* partial_grad_temps;                                          \
-    const REAL_T* partial_grad_hidden_activations_aos;                         \
-    const REAL_T* clipping_threshold_per_item;                                 \
-    REAL_T*       clipped_partial_grad_weights_module;                         \
-    REAL_T*       clipped_partial_grad_biases_module;                          \
-    REAL_T*       clipped_partial_grad_temps;                                  \
-    REAL_T*       clipped_partial_grad_hidden_activations_aos;                 \
-    uint          use_per_item_norm;                                           \
-    REAL_T        clipping_threshold_t_pre;                                    \
-    REAL_T        epsilon;                                                     \
-    uint          flat_tile_index;                                             \
-    uint          num_class_chunks;                                            \
-    uint          classes_per_chunk;                                           \
-    uint          modules_per_chunk;                                           \
-    uint          total_batch_count;                                           \
-    uint          padded_hidden_count;                                         \
-    uint          padded_total_output_class_count;                             \
-    uint          total_tile_count;                                            \
+    const STORAGE_T* partial_grad_weights_module;                              \
+    const STORAGE_T* partial_grad_biases_module;                               \
+    const STORAGE_T* partial_grad_temps;                                       \
+    const STORAGE_T* partial_grad_hidden_activations_aos;                      \
+    const STORAGE_T* clipping_threshold_per_item;                              \
+    STORAGE_T*       clipped_partial_grad_weights_module;                      \
+    STORAGE_T*       clipped_partial_grad_biases_module;                       \
+    STORAGE_T*       clipped_partial_grad_temps;                               \
+    STORAGE_T*       clipped_partial_grad_hidden_activations_aos;              \
+    uint             use_per_item_norm;                                        \
+    float            clipping_threshold_t_pre;                                 \
+    float            epsilon;                                                  \
+    uint             flat_tile_index;                                          \
+    uint             num_class_chunks;                                         \
+    uint             classes_per_chunk;                                        \
+    uint             modules_per_chunk;                                        \
+    uint             total_batch_count;                                        \
+    uint             padded_hidden_count;                                      \
+    uint             padded_total_output_class_count;                          \
+    uint             total_tile_count;                                         \
 } ClipPartialsArgs_##SUFFIX;                                                   \
                                                                                \
 /* --- Learn Phase C: Reduction --- */                                         \
 typedef struct {                                                               \
-    const REAL_T* clipped_partial_grad_hidden_activations_aos;                 \
-    REAL_T*       clipped_grad_hidden_activations_permuted_soa;                \
-    uint          total_batch_count;                                           \
-    uint          hidden_count;                                                \
-    uint          padded_hidden_count;                                         \
-    uint          total_modules_count;                                         \
-    uint          padded_total_modules_count;                                  \
-    uint          num_module_chunks;                                           \
-    uint          modules_per_chunk;                                           \
-    uint          num_class_chunks;                                            \
-    uint          total_tile_count;                                            \
+    const STORAGE_T* clipped_partial_grad_hidden_activations_aos;              \
+    STORAGE_T*       clipped_grad_hidden_activations_permuted_soa;             \
+    uint             total_batch_count;                                        \
+    uint             hidden_count;                                             \
+    uint             padded_hidden_count;                                      \
+    uint             total_modules_count;                                      \
+    uint             padded_total_modules_count;                               \
+    uint             num_module_chunks;                                        \
+    uint             modules_per_chunk;                                        \
+    uint             num_class_chunks;                                         \
+    uint             total_tile_count;                                         \
 } GatherPermuteArgs_##SUFFIX;                                                  \
                                                                                \
 typedef struct {                                                               \
-    const REAL_T* partial_collection;                                          \
-    const uint*   offset_lists_flat;                                           \
-    const uint*   stage_offsets_into_list;                                     \
-    const uint*   stage_fan_in;                                                \
-    const uint*   stage_node_counts;                                           \
-    REAL_T*       staging_buffer_0;                                            \
-    REAL_T*       staging_buffer_1;                                            \
-    REAL_T*       output;                                                      \
-    uint          partial_width;                                               \
-    uint          num_stages;                                                  \
-    REAL_T        t_algorithmic;                                               \
-    REAL_T        lambda;                                                      \
-    REAL_T        fp_max;                                                      \
-    REAL_T        epsilon;                                                     \
+    const STORAGE_T* partial_collection;                                       \
+    const uint*      offset_lists_flat;                                        \
+    const uint*      stage_offsets_into_list;                                  \
+    const uint*      stage_fan_in;                                             \
+    const uint*      stage_node_counts;                                        \
+    STORAGE_T*       staging_buffer_0;                                         \
+    STORAGE_T*       staging_buffer_1;                                         \
+    float*           output;                                                   \
+    uint             partial_width;                                            \
+    uint             num_stages;                                               \
+    float            t_algorithmic;                                            \
+    float            lambda;                                                   \
+    float            fp_max;                                                   \
+    float            epsilon;                                                  \
 } ReductionTreePlanC_##SUFFIX;                                                 \
                                                                                \
 typedef struct {                                                               \
-    const REAL_T* grad_hidden_activations_permuted_soa;                        \
-    REAL_T*       summed_grad_hidden_activations;                              \
-    REAL_T        fp_max;                                                      \
-    REAL_T        policy_t_algorithmic;                                        \
-    REAL_T        policy_lambda;                                               \
-    uint          policy_max_k;                                                \
-    REAL_T        epsilon;                                                     \
-    uint          total_batch_count;                                           \
-    uint          padded_hidden_count;                                         \
-    uint          total_modules_count;                                         \
-    uint          padded_total_modules_count;                                  \
+    const STORAGE_T* grad_hidden_activations_permuted_soa;                     \
+    float*           summed_grad_hidden_activations;                           \
+    float            fp_max;                                                   \
+    float            policy_t_algorithmic;                                     \
+    float            policy_lambda;                                            \
+    uint             policy_max_k;                                             \
+    float            epsilon;                                                  \
+    uint             total_batch_count;                                        \
+    uint             padded_hidden_count;                                      \
+    uint             total_modules_count;                                      \
+    uint             padded_total_modules_count;                               \
 } StabilizeReduceArgs_##SUFFIX;                                                \
                                                                                \
 typedef struct {                                                               \
-    REAL_T* intermediate_grad;                                                 \
-    REAL_T  clipping_threshold_t_j;                                            \
-    REAL_T  epsilon;                                                           \
-    uint    parameter_count;                                                   \
+    float*           intermediate_grad;                                        \
+    float            clipping_threshold_t_j;                                   \
+    float            epsilon;                                                  \
+    uint             parameter_count;                                          \
 } ClipIntermediateArgs_##SUFFIX;                                               \
                                                                                \
 /* --- Learn Phase D: Streaming Backprop --- */                                \
 typedef struct {                                                               \
-    const REAL_T* input;                                                       \
-    const REAL_T* hidden_activations;                                          \
-    const REAL_T* summed_grad_hidden_activations;                              \
-    const REAL_T* sample_mask;                                                 \
-    REAL_T*       partial_grad_weights_shared;                                 \
-    uint          batch_chunk_offset;                                          \
-    uint          batch_chunk_count;                                           \
-    uint          batch_chunk_index;                                           \
-    uint          total_batch_count;                                           \
-    uint          num_batch_chunks_count;                                      \
-    uint          padded_input_count;                                          \
-    uint          padded_hidden_count;                                         \
-    uint          final_grad_hidden_total_element_count;                       \
+    const STORAGE_T* input;                                                    \
+    const STORAGE_T* hidden_activations;                                       \
+    const float*     summed_grad_hidden_activations;                           \
+    const STORAGE_T* sample_mask;                                              \
+    STORAGE_T*       partial_grad_weights_shared;                              \
+    uint             batch_chunk_offset;                                       \
+    uint             batch_chunk_count;                                        \
+    uint             batch_chunk_index;                                        \
+    uint             total_batch_count;                                        \
+    uint             num_batch_chunks_count;                                   \
+    uint             padded_input_count;                                       \
+    uint             padded_hidden_count;                                      \
+    uint             final_grad_hidden_total_element_count;                    \
 } BackpropSharedWeightsArgs_##SUFFIX;                                          \
                                                                                \
 typedef struct {                                                               \
-    const REAL_T* hidden_activations;                                          \
-    const REAL_T* summed_grad_hidden_activations;                              \
-    const REAL_T* sample_mask;                                                 \
-    REAL_T*       partial_grad_biases_shared;                                  \
-    uint          batch_chunk_offset;                                          \
-    uint          batch_chunk_count;                                           \
-    uint          batch_chunk_index;                                           \
-    uint          total_batch_count;                                           \
-    uint          num_batch_chunks_count;                                      \
-    uint          padded_hidden_count;                                         \
-    uint          final_grad_hidden_total_element_count;                       \
+    const STORAGE_T* hidden_activations;                                       \
+    const float*     summed_grad_hidden_activations;                           \
+    const STORAGE_T* sample_mask;                                              \
+    STORAGE_T*       partial_grad_biases_shared;                               \
+    uint             batch_chunk_offset;                                       \
+    uint             batch_chunk_count;                                        \
+    uint             batch_chunk_index;                                        \
+    uint             total_batch_count;                                        \
+    uint             num_batch_chunks_count;                                   \
+    uint             padded_hidden_count;                                      \
+    uint             final_grad_hidden_total_element_count;                    \
 } BackpropSharedBiasesArgs_##SUFFIX;                                           \
                                                                                \
 typedef struct {                                                               \
-    const REAL_T* partial_grad_weights_shared;                                 \
-    const REAL_T* partial_grad_biases_shared;                                  \
-    REAL_T*       clipped_partial_grad_weights_shared;                         \
-    REAL_T*       clipped_partial_grad_biases_shared;                          \
-    REAL_T        clipping_threshold_t_pre;                                    \
-    REAL_T        epsilon;                                                     \
-    uint          weights_parameter_count;                                     \
-    uint          biases_parameter_count;                                      \
-    uint          weights_write_offset_elements;                               \
-    uint          biases_write_offset_elements;                                \
-    uint          num_batch_chunks;                                            \
+    const STORAGE_T* partial_grad_weights_shared;                              \
+    const STORAGE_T* partial_grad_biases_shared;                               \
+    STORAGE_T*       clipped_partial_grad_weights_shared;                      \
+    STORAGE_T*       clipped_partial_grad_biases_shared;                       \
+    float            clipping_threshold_t_pre;                                 \
+    float            epsilon;                                                  \
+    uint             weights_parameter_count;                                  \
+    uint             biases_parameter_count;                                   \
+    uint             weights_write_offset_elements;                            \
+    uint             biases_write_offset_elements;                             \
+    uint             num_batch_chunks;                                         \
 } ClipSharedGradsArgs_##SUFFIX;                                                \
                                                                                \
 /* --- Update Phase --- */                                                     \
 typedef struct {                                                               \
-    const REAL_T* summed_grad;                                                 \
-    REAL_T*       final_grad;                                                  \
-    REAL_T        effective_batch_size;                                        \
-    REAL_T        epsilon;                                                     \
-    uint          parameter_count;                                             \
+    const float*     summed_grad;                                              \
+    float*           final_grad;                                               \
+    float            effective_batch_size;                                     \
+    float            epsilon;                                                  \
+    uint             parameter_count;                                          \
 } NormalizeGradientsArgs_##SUFFIX;                                             \
                                                                                \
 typedef struct {                                                               \
-    const REAL_T* final_grad;                                                  \
-    REAL_T*       parameters;                                                  \
-    REAL_T*       m1;                                                          \
-    REAL_T*       m2;                                                          \
-    REAL_T        learning_rate;                                               \
-    REAL_T        beta1_pow_t;                                                 \
-    REAL_T        beta2_pow_t;                                                 \
-    REAL_T        beta1;                                                       \
-    REAL_T        beta2;                                                       \
-    REAL_T        epsilon;                                                     \
-    uint          parameter_count;                                             \
+    const float*     final_grad;                                               \
+    STATE_T*         parameters;                                               \
+    STATE_T*         m1;                                                       \
+    STATE_T*         m2;                                                       \
+    float            learning_rate;                                            \
+    float            beta1_pow_t;                                              \
+    float            beta2_pow_t;                                              \
+    float            beta1;                                                    \
+    float            beta2;                                                    \
+    float            epsilon;                                                  \
+    uint             parameter_count;                                          \
 } AdamUpdateArgs_##SUFFIX;                                                     \
                                                                                \
 typedef struct {                                                               \
-    REAL_T* temperatures;                                                      \
-    REAL_T  min_value;                                                         \
-    REAL_T  max_value;                                                         \
-    uint    total_modules_count;                                               \
+    STATE_T*         temperatures;                                             \
+    float            min_value;                                                \
+    float            max_value;                                                \
+    uint             total_modules_count;                                      \
 } ClampTemperaturesArgs_##SUFFIX;
 
-/* Instantiate structs for all three precisions */
-DECLARE_PRECISION_STRUCTS(fp16, _Float16)
-DECLARE_PRECISION_STRUCTS(fp32, float)
-DECLARE_PRECISION_STRUCTS(fp64, double)
+/* Instantiate structs for the three precision configurations (ADR-023 §2.4):
+ *   s32x32: FP32 storage, FP32 state (uniform FP32)
+ *   s16x16: FP16 storage, FP16 state (uniform FP16)
+ *   s16x32: FP16 storage, FP32 state (mixed precision) */
+DECLARE_PRECISION_STRUCTS(s16x16, _Float16, _Float16)
+DECLARE_PRECISION_STRUCTS(s32x32, float, float)
+DECLARE_PRECISION_STRUCTS(s16x32, _Float16, float)
 
 /* ================================================================
  * Task Function Declarations — macro-generated per precision
@@ -412,9 +419,84 @@ CPU_KERNELS_EXPORT size_t get_struct_size_normalize_gradients_args_##SUFFIX(void
 CPU_KERNELS_EXPORT size_t get_struct_size_adam_update_args_##SUFFIX(void);     \
 CPU_KERNELS_EXPORT size_t get_struct_size_clamp_temperatures_args_##SUFFIX(void);
 
-DECLARE_PRECISION_FUNCTIONS(fp16)
-DECLARE_PRECISION_FUNCTIONS(fp32)
-DECLARE_PRECISION_FUNCTIONS(fp64)
+/* Declare for all three precision configurations */
+DECLARE_PRECISION_FUNCTIONS(s16x16)
+DECLARE_PRECISION_FUNCTIONS(s32x32)
+DECLARE_PRECISION_FUNCTIONS(s16x32)
+
+/* Transitional function name aliases (removed when FFI layer is updated) */
+#define task_forward_pass_fp32        task_forward_pass_s32x32
+#define task_forward_pass_fp16        task_forward_pass_s16x16
+#define task_render_logits_fp32       task_render_logits_s32x32
+#define task_render_logits_fp16       task_render_logits_s16x16
+#define task_cce_probs_loss_fp32      task_cce_probs_loss_s32x32
+#define task_cce_probs_loss_fp16      task_cce_probs_loss_s16x16
+#define task_bce_probs_loss_fp32      task_bce_probs_loss_s32x32
+#define task_bce_probs_loss_fp16      task_bce_probs_loss_s16x16
+#define task_module_param_grads_fp32  task_module_param_grads_s32x32
+#define task_module_param_grads_fp16  task_module_param_grads_s16x16
+#define task_backprop_to_hidden_fp32  task_backprop_to_hidden_s32x32
+#define task_backprop_to_hidden_fp16  task_backprop_to_hidden_s16x16
+#define task_temp_gradients_fp32      task_temp_gradients_s32x32
+#define task_temp_gradients_fp16      task_temp_gradients_s16x16
+#define task_clip_partial_grads_fp32  task_clip_partial_grads_s32x32
+#define task_clip_partial_grads_fp16  task_clip_partial_grads_s16x16
+#define task_gather_permute_grad_h_fp32  task_gather_permute_grad_h_s32x32
+#define task_gather_permute_grad_h_fp16  task_gather_permute_grad_h_s16x16
+#define task_stabilize_reduce_grad_h_fp32 task_stabilize_reduce_grad_h_s32x32
+#define task_stabilize_reduce_grad_h_fp16 task_stabilize_reduce_grad_h_s16x16
+#define task_clip_intermediate_fp32   task_clip_intermediate_s32x32
+#define task_clip_intermediate_fp16   task_clip_intermediate_s16x16
+#define task_backprop_shared_weights_fp32 task_backprop_shared_weights_s32x32
+#define task_backprop_shared_weights_fp16 task_backprop_shared_weights_s16x16
+#define task_backprop_shared_biases_fp32  task_backprop_shared_biases_s32x32
+#define task_backprop_shared_biases_fp16  task_backprop_shared_biases_s16x16
+#define task_clip_shared_grads_fp32   task_clip_shared_grads_s32x32
+#define task_clip_shared_grads_fp16   task_clip_shared_grads_s16x16
+#define task_normalize_gradients_fp32 task_normalize_gradients_s32x32
+#define task_normalize_gradients_fp16 task_normalize_gradients_s16x16
+#define task_adam_update_fp32         task_adam_update_s32x32
+#define task_adam_update_fp16         task_adam_update_s16x16
+#define task_clamp_temperatures_fp32  task_clamp_temperatures_s32x32
+#define task_clamp_temperatures_fp16  task_clamp_temperatures_s16x16
+#define execute_reduction_tree_fp32   execute_reduction_tree_s32x32
+#define execute_reduction_tree_fp16   execute_reduction_tree_s16x16
+#define get_struct_size_forward_pass_args_fp32  get_struct_size_forward_pass_args_s32x32
+#define get_struct_size_forward_pass_args_fp16  get_struct_size_forward_pass_args_s16x16
+#define get_struct_size_render_logits_args_fp32 get_struct_size_render_logits_args_s32x32
+#define get_struct_size_render_logits_args_fp16 get_struct_size_render_logits_args_s16x16
+#define get_struct_size_cce_chunk_args_fp32     get_struct_size_cce_chunk_args_s32x32
+#define get_struct_size_cce_chunk_args_fp16     get_struct_size_cce_chunk_args_s16x16
+#define get_struct_size_bce_chunk_args_fp32     get_struct_size_bce_chunk_args_s32x32
+#define get_struct_size_bce_chunk_args_fp16     get_struct_size_bce_chunk_args_s16x16
+#define get_struct_size_module_param_grads_args_fp32 get_struct_size_module_param_grads_args_s32x32
+#define get_struct_size_module_param_grads_args_fp16 get_struct_size_module_param_grads_args_s16x16
+#define get_struct_size_backprop_to_hidden_args_fp32 get_struct_size_backprop_to_hidden_args_s32x32
+#define get_struct_size_backprop_to_hidden_args_fp16 get_struct_size_backprop_to_hidden_args_s16x16
+#define get_struct_size_temp_gradients_args_fp32 get_struct_size_temp_gradients_args_s32x32
+#define get_struct_size_temp_gradients_args_fp16 get_struct_size_temp_gradients_args_s16x16
+#define get_struct_size_clip_partials_args_fp32 get_struct_size_clip_partials_args_s32x32
+#define get_struct_size_clip_partials_args_fp16 get_struct_size_clip_partials_args_s16x16
+#define get_struct_size_gather_permute_args_fp32 get_struct_size_gather_permute_args_s32x32
+#define get_struct_size_gather_permute_args_fp16 get_struct_size_gather_permute_args_s16x16
+#define get_struct_size_reduction_tree_plan_fp32 get_struct_size_reduction_tree_plan_s32x32
+#define get_struct_size_reduction_tree_plan_fp16 get_struct_size_reduction_tree_plan_s16x16
+#define get_struct_size_stabilize_reduce_args_fp32 get_struct_size_stabilize_reduce_args_s32x32
+#define get_struct_size_stabilize_reduce_args_fp16 get_struct_size_stabilize_reduce_args_s16x16
+#define get_struct_size_clip_intermediate_args_fp32 get_struct_size_clip_intermediate_args_s32x32
+#define get_struct_size_clip_intermediate_args_fp16 get_struct_size_clip_intermediate_args_s16x16
+#define get_struct_size_backprop_shared_weights_args_fp32 get_struct_size_backprop_shared_weights_args_s32x32
+#define get_struct_size_backprop_shared_weights_args_fp16 get_struct_size_backprop_shared_weights_args_s16x16
+#define get_struct_size_backprop_shared_biases_args_fp32 get_struct_size_backprop_shared_biases_args_s32x32
+#define get_struct_size_backprop_shared_biases_args_fp16 get_struct_size_backprop_shared_biases_args_s16x16
+#define get_struct_size_clip_shared_grads_args_fp32 get_struct_size_clip_shared_grads_args_s32x32
+#define get_struct_size_clip_shared_grads_args_fp16 get_struct_size_clip_shared_grads_args_s16x16
+#define get_struct_size_normalize_gradients_args_fp32 get_struct_size_normalize_gradients_args_s32x32
+#define get_struct_size_normalize_gradients_args_fp16 get_struct_size_normalize_gradients_args_s16x16
+#define get_struct_size_adam_update_args_fp32 get_struct_size_adam_update_args_s32x32
+#define get_struct_size_adam_update_args_fp16 get_struct_size_adam_update_args_s16x16
+#define get_struct_size_clamp_temperatures_args_fp32 get_struct_size_clamp_temperatures_args_s32x32
+#define get_struct_size_clamp_temperatures_args_fp16 get_struct_size_clamp_temperatures_args_s16x16
 
 /* ================================================================
  * Precision-agnostic exports

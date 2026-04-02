@@ -1,8 +1,8 @@
-"""SPIR-V shader loading and Vulkan compute pipeline creation (ADR-014).
+"""SPIR-V shader loading and Vulkan compute pipeline creation (ADR-014, ADR-023 §4.1).
 
 Loads compiled .spv modules via importlib.resources, creates VkShaderModule
 objects, and builds compute pipelines with specialization constants.
-Caches pipelines keyed by (shader_name, problem_type).
+Caches pipelines keyed by (shader_name, problem_type, variant_suffix).
 """
 from __future__ import annotations
 
@@ -13,7 +13,28 @@ import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
+from ...shared.precision_config import PrecisionConfig
 from .context import VulkanContext
+
+# Shaders with only compute-role buffers — always use the _fp32 variant.
+_COMPUTE_ONLY_SHADERS = frozenset({"normalize_gradients"})
+
+
+def _spv_variant_suffix(precision: PrecisionConfig) -> str:
+    """Map a PrecisionConfig to the SPIR-V variant suffix (ADR-023 §4.1)."""
+    s = precision.storage_dtype
+    t = precision.state_dtype
+    if s == np.dtype(np.float32) and t == np.dtype(np.float32):
+        return "_fp32"
+    elif s == np.dtype(np.float16) and t == np.dtype(np.float32):
+        return "_s16fp32"
+    elif s == np.dtype(np.float16) and t == np.dtype(np.float16):
+        return "_fp16"
+    else:
+        raise ValueError(f"No Vulkan SPIR-V variant for storage={s}, state={t}")
+
 
 if TYPE_CHECKING:
     import vulkan as vk  # type: ignore[import-untyped]
@@ -48,7 +69,7 @@ class VulkanPipelineCache:
     def __init__(self, context: VulkanContext) -> None:
         self._ctx = context
         self._device = context.device
-        self._pipelines: dict[tuple[str, int], ComputePipeline] = {}
+        self._pipelines: dict[tuple[str, int, str], ComputePipeline] = {}
         self._layouts: list[Any] = []  # Track for cleanup
 
     def create_pipeline(
@@ -57,18 +78,24 @@ class VulkanPipelineCache:
         descriptor_layout: Any,  # VkDescriptorSetLayout
         push_constant_size: int,
         spec: SpecConstants,
+        precision: PrecisionConfig | None = None,
     ) -> ComputePipeline:
         """Create a compute pipeline from a compiled SPIR-V module.
 
         Returns a cached pipeline if one already exists for the given
-        (shader_name, problem_type) key.
+        (shader_name, problem_type, variant_suffix) key.
         """
-        cache_key = (shader_name, spec.problem_type)
+        if shader_name in _COMPUTE_ONLY_SHADERS or precision is None:
+            variant_suffix = "_fp32"
+        else:
+            variant_suffix = _spv_variant_suffix(precision)
+
+        cache_key = (shader_name, spec.problem_type, variant_suffix)
         if cache_key in self._pipelines:
             return self._pipelines[cache_key]
 
         # Load SPIR-V bytecode
-        spv_bytes = self._load_spirv(shader_name)
+        spv_bytes = self._load_spirv(shader_name, variant_suffix)
 
         # Create shader module (transient — destroyed after pipeline creation)
         module_info = vk.VkShaderModuleCreateInfo(
@@ -145,10 +172,10 @@ class VulkanPipelineCache:
         return result
 
     def get_pipeline(
-        self, shader_name: str, problem_type: int = 0
+        self, shader_name: str, problem_type: int = 0, variant_suffix: str = "_fp32",
     ) -> ComputePipeline:
         """Retrieve a cached pipeline."""
-        return self._pipelines[(shader_name, problem_type)]
+        return self._pipelines[(shader_name, problem_type, variant_suffix)]
 
     def destroy(self) -> None:
         """Destroy all pipelines and layouts."""
@@ -163,14 +190,14 @@ class VulkanPipelineCache:
     # ── Internal helpers ──
 
     @staticmethod
-    def _load_spirv(shader_name: str) -> bytes:
+    def _load_spirv(shader_name: str, variant_suffix: str = "_fp32") -> bytes:
         """Load a .spv file from the kernel_sources package.
 
         Discovery order:
         1. importlib.resources (installed package)
         2. Meson builddir adjacent to the source tree (development)
         """
-        spv_name = f"{shader_name}.spv"
+        spv_name = f"{shader_name}{variant_suffix}.spv"
 
         # Strategy 1: importlib.resources (installed package)
         try:

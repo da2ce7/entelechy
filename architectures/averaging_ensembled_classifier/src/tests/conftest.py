@@ -23,8 +23,30 @@ if "src" not in sys.modules:
 
 from src.shared.model_spec import ModelSpec
 from src.shared.parameter_space import ParameterSpace
+from src.shared.precision_config import PrecisionConfig
 from src.shared.workload_primitives import TilingScheme
 from src.shared.stabilization_policy import StabilizationPolicy
+
+
+# ── Multi-precision configuration (ADR-020 §4.6, Phase 7C §15) ──
+
+PRECISION_CONFIGS = [
+    pytest.param(PrecisionConfig.float32, id="fp32"),
+    pytest.param(PrecisionConfig.float16, id="fp16"),
+    pytest.param(PrecisionConfig.mixed_f16_f32, id="mixed_f16_f32"),
+]
+
+MODEL_SPEC_FACTORIES = [
+    pytest.param(ModelSpec.float32, id="fp32"),
+    pytest.param(ModelSpec.float16, id="fp16"),
+    pytest.param(ModelSpec.mixed_f16_f32, id="mixed_f16_f32"),
+]
+
+
+@pytest.fixture(params=PRECISION_CONFIGS)
+def precision_config(request) -> PrecisionConfig:
+    """Parameterized fixture yielding all three PrecisionConfig factories."""
+    return request.param()
 
 
 # ── Canonical small model (Iris-like) ──
@@ -42,6 +64,12 @@ IRIS = dict(
 @pytest.fixture
 def iris_spec() -> ModelSpec:
     return ModelSpec.float32(**IRIS)
+
+
+@pytest.fixture(params=MODEL_SPEC_FACTORIES)
+def iris_spec_all_precisions(request) -> ModelSpec:
+    """Iris model parameterized over all three precision configs."""
+    return request.param(**IRIS)
 
 
 @pytest.fixture
@@ -77,6 +105,12 @@ def hydra_spec() -> ModelSpec:
     return ModelSpec.float32(**HYDRA)
 
 
+@pytest.fixture(params=MODEL_SPEC_FACTORIES)
+def hydra_spec_all_precisions(request) -> ModelSpec:
+    """Hydra model parameterized over all three precision configs."""
+    return request.param(**HYDRA)
+
+
 # ── Stress model (Lexicon — huge output_classes) ──
 
 LEXICON = dict(
@@ -92,3 +126,9 @@ LEXICON = dict(
 @pytest.fixture
 def lexicon_spec() -> ModelSpec:
     return ModelSpec.float32(**LEXICON)
+
+
+@pytest.fixture(params=MODEL_SPEC_FACTORIES)
+def lexicon_spec_all_precisions(request) -> ModelSpec:
+    """Lexicon model parameterized over all three precision configs."""
+    return request.param(**LEXICON)

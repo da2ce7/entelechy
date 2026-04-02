@@ -34,8 +34,8 @@ layout(push_constant) uniform PushConstants {
     uint  padded_total_modules_count;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer SrcGradH  { float data[]; } src_grad_h;
-layout(set = 0, binding = 1) writeonly buffer DestGradH { float data[]; } dest_grad_h;
+layout(set = 0, binding = 0) readonly buffer SrcGradH  { STORAGE_FLOAT data[]; } src_grad_h;
+layout(set = 0, binding = 1) writeonly buffer DestGradH { float         data[]; } dest_grad_h;
 
 // Local scratch for the staged reduction. Must accommodate full workgroup size.
 shared float reduction_tile[1024];
@@ -53,7 +53,7 @@ void main() {
     float thread_accum = 0.0;
     uint row_offset = row_idx * push.padded_total_modules_count;
     for (uint i = lid; i < push.total_modules_count; i += lsize) {
-        thread_accum += src_grad_h.data[row_offset + i];
+        thread_accum += read_storage(src_grad_h.data[row_offset + i]);
     }
     reduction_tile[lid] = thread_accum;
     barrier();

@@ -26,6 +26,7 @@ def _buf(handle_id: int, name: str, role: BufferRole = BufferRole.BATCH_INTERMED
     return h, BufferDescriptor(
         handle=h, logical_name=name, padded_shape=(1,),
         element_size_bytes=4, size_bytes=4, role=role,
+        precision_role="compute",
         producing_node=None, consumers=frozenset(), last_consumer=None,
     )
 

@@ -17,8 +17,8 @@ def build_dispatch_table(
 ) -> dict[str, tuple[Any, type[ctypes.Structure]]]:
     """Build the kernel_name → (task_fn_ptr, args_struct_class) mapping.
 
-    *suffix* selects the precision variant (``"fp16"``, ``"fp32"``, or
-    ``"fp64"``).  C function names and struct classes are resolved
+    *suffix* selects the precision variant (``"s32x32"``, ``"s16x16"``,
+    or ``"s16x32"``).  C function names and struct classes are resolved
     accordingly.
 
     Strategy A kernels (Nodes 8, 9, 10): CCE and BCE variants map to

@@ -1,6 +1,6 @@
 # ADR-023: Precision-Role Implications for Backend-Native Kernel Code
 
-**Status:** PROPOSED
+**Status:** ACCEPTED
 **Date:** 2026-04-02
 **Deciders:** —
 **Triggered by:** ADR-020 (Three-Role Precision Model), ADR-021 (Kernel Spec Migration), ADR-022 (Host Code Implications)

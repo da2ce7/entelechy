@@ -75,7 +75,7 @@ def _build_learn_plan(problem_type: str) -> Any:
     strategy = PlanCceStrategy() if problem_type == "CCE" else PlanBceStrategy()
     policy = StabilizationPolicy(
         t_algorithmic=1.0, lambda_=1.0,
-        fp_format_max=float(np.finfo(np.float32).max),
+        compute_fp_format_max=float(np.finfo(np.float32).max),
     )
     return build_learn_plan(spec, hw, strategy, _BATCH_SIZE, policy)
 

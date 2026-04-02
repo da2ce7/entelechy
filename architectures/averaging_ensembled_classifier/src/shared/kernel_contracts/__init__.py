@@ -25,10 +25,8 @@ class BufferParamSpec:
     padding_contract: PaddingContract
     calculability_proof: tuple[str, ...]
     validation_preconditions: tuple[str, ...]
-    # Transitional default "compute" will be removed in Phase 7B once all
-    # existing call sites in the contract files carry explicit role values.
     # None is reserved for integer-typed buffers (e.g. CCE/BCE targets).
-    precision_role: Optional[Literal["storage", "compute", "state"]] = "compute"
+    precision_role: Optional[Literal["storage", "compute", "state"]]
 
 
 @dataclass(frozen=True)

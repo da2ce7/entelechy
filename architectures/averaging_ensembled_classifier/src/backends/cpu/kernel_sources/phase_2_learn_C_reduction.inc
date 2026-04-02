@@ -1,7 +1,11 @@
 /* phase_2_learn_C_reduction.inc — Precision-parameterized reduction kernels (Nodes 13-16, 20).
  *
- * Included by phase_2_learn_C_reduction.c with REAL_T / PRECISION_SUFFIX defined.
+ * Included by cpu_kernels.c with STORAGE_T/STATE_T/PRECISION_SUFFIX defined.
  * Algorithmic reference: kernels/phase_2_learn_C_reduction.cl.c
+ *
+ * Buffer role assignments (ADR-023 §2.5):
+ *   - clipped_partial_grad_*, grad_*_permuted, partial_collection, staging → storage
+ *   - summed_grad_*, output → compute (float)
  */
 
 /* ================================================================
@@ -35,12 +39,13 @@ void PREC_FN(task_gather_permute_grad_h)(void* raw_args, uint task_index, uint t
         const size_t local_off = (size_t)module_local_idx
             * a->total_batch_count * a->padded_hidden_count
             + (size_t)batch_idx * a->padded_hidden_count + h_idx;
-        accum += a->clipped_partial_grad_hidden_activations_aos[tile_base + local_off];
+        accum += scalar_load_storage(a->clipped_partial_grad_hidden_activations_aos,
+                                     tile_base + local_off);
     }
 
     const size_t write_idx = (size_t)bh_flat_idx * a->padded_total_modules_count
         + module_global_idx;
-    a->clipped_grad_hidden_activations_permuted_soa[write_idx] = accum;
+    scalar_store_storage(a->clipped_grad_hidden_activations_permuted_soa, write_idx, accum);
 }
 
 /* ================================================================
@@ -61,7 +66,7 @@ void PREC_FN(task_stabilize_reduce_grad_h)(void* raw_args, uint task_index, uint
 
     if (M <= 1) {
         float val = (M == 1)
-            ? a->grad_hidden_activations_permuted_soa[row_offset]
+            ? scalar_load_storage(a->grad_hidden_activations_permuted_soa, row_offset)
             : 0.0f;
         a->summed_grad_hidden_activations[row_idx] = val;
         return;
@@ -100,9 +105,10 @@ void PREC_FN(task_stabilize_reduce_grad_h)(void* raw_args, uint task_index, uint
         next    = heap_b;
     }
 
-    /* Load initial values (REAL_T → float conversion) */
+    /* Load initial values (STORAGE_T → float conversion) */
     for (uint i = 0; i < M; i++) {
-        current[i] = a->grad_hidden_activations_permuted_soa[row_offset + i];
+        current[i] = scalar_load_storage(a->grad_hidden_activations_permuted_soa,
+                                         row_offset + i);
     }
 
     uint num_items = M;
@@ -169,40 +175,98 @@ void PREC_FN(task_clip_intermediate)(void* raw_args, uint task_index, uint threa
 }
 
 /* ================================================================
- * Internal: per-precision ReduceNodeArgs and helper
+ * Internal: per-precision ReduceNodeArgs and helpers
+ *
+ * The reduction tree uses STORAGE_T* for intermediate staging buffers
+ * but writes the final result to float* output (compute role).
  * ================================================================ */
 typedef struct {
-    const REAL_T* source;
-    const uint*   offset_list;
-    uint          fan_in;
-    uint          partial_width;
-    REAL_T*       dest;
-    uint          dest_offset;
-    float         threshold;
-    float         epsilon;
-} PREC_TY(ReduceNodeArgs);
+    const STORAGE_T* source;
+    const uint*      offset_list;
+    uint             fan_in;
+    uint             partial_width;
+    STORAGE_T*       staging_dest;   /* Intermediate stages write here */
+    float            threshold;
+    float            epsilon;
+} PREC_TY(ReduceNodeStagingArgs);
 
-static void PREC_FN(task_reduce_and_clip_node)(void* raw_args, uint task_index, uint thread_id) {
+typedef struct {
+    const STORAGE_T* source;
+    const uint*      offset_list;
+    uint             fan_in;
+    uint             partial_width;
+    float*           float_dest;     /* Final stage writes here */
+    float            threshold;
+    float            epsilon;
+} PREC_TY(ReduceNodeFinalArgs);
+
+static void PREC_FN(task_reduce_staging)(void* raw_args, uint task_index, uint thread_id) {
     (void)thread_id;
-    PREC_TY(ReduceNodeArgs)* a = (PREC_TY(ReduceNodeArgs)*)raw_args;
+    PREC_TY(ReduceNodeStagingArgs)* a = (PREC_TY(ReduceNodeStagingArgs)*)raw_args;
 
     const uint pw = a->partial_width;
-    REAL_T* dest = a->dest + (size_t)task_index * pw;
+    const size_t dest_base = (size_t)task_index * pw;
 
+    /* Zero destination (staging buffer) */
+    for (uint e = 0; e < pw; e++) {
+        scalar_store_storage(a->staging_dest, dest_base + e, 0.0f);
+    }
+
+    /* Accumulate from sources */
+    const uint* offsets = a->offset_list + (size_t)task_index * a->fan_in;
+    float* accum = (float*)alloca(pw * sizeof(float));
+    for (uint e = 0; e < pw; e++) accum[e] = 0.0f;
+
+    for (uint k = 0; k < a->fan_in; k++) {
+        uint off = offsets[k];
+        if (off == 0xFFFFFFFF) continue;
+        const size_t src_base = (size_t)off;
+        for (uint e = 0; e < pw; e++) {
+            accum[e] += scalar_load_storage(a->source, src_base + e);
+        }
+    }
+
+    /* Clip and store to staging */
+    float sum_sq = 0.0f;
+    for (uint e = 0; e < pw; e++) {
+        sum_sq += accum[e] * accum[e];
+    }
+    float norm = sqrtf(sum_sq);
+    if (norm > a->threshold) {
+        float scale = a->threshold / (norm + a->epsilon);
+        for (uint e = 0; e < pw; e++) {
+            accum[e] *= scale;
+        }
+    }
+    for (uint e = 0; e < pw; e++) {
+        scalar_store_storage(a->staging_dest, dest_base + e, accum[e]);
+    }
+}
+
+static void PREC_FN(task_reduce_final)(void* raw_args, uint task_index, uint thread_id) {
+    (void)thread_id;
+    PREC_TY(ReduceNodeFinalArgs)* a = (PREC_TY(ReduceNodeFinalArgs)*)raw_args;
+
+    const uint pw = a->partial_width;
+    float* dest = a->float_dest + (size_t)task_index * pw;
+
+    /* Zero destination (float output) */
     for (uint e = 0; e < pw; e++) {
         dest[e] = 0.0f;
     }
 
+    /* Accumulate from sources */
     const uint* offsets = a->offset_list + (size_t)task_index * a->fan_in;
     for (uint k = 0; k < a->fan_in; k++) {
         uint off = offsets[k];
         if (off == 0xFFFFFFFF) continue;
-        const REAL_T* src = a->source + (size_t)off;
+        const size_t src_base = (size_t)off;
         for (uint e = 0; e < pw; e++) {
-            dest[e] += src[e];
+            dest[e] += scalar_load_storage(a->source, src_base + e);
         }
     }
 
+    /* Clip */
     float sum_sq = 0.0f;
     for (uint e = 0; e < pw; e++) {
         sum_sq += dest[e] * dest[e];
@@ -222,8 +286,8 @@ static void PREC_FN(task_reduce_and_clip_node)(void* raw_args, uint task_index, 
 void PREC_FN(execute_reduction_tree)(ThreadPool* pool, PREC_TY(ReductionTreePlanC)* plan) {
     if (plan->num_stages == 0) return;
 
-    const REAL_T* current_src = plan->partial_collection;
-    REAL_T* staging[2];
+    const STORAGE_T* current_src = plan->partial_collection;
+    STORAGE_T* staging[2];
     staging[0] = plan->staging_buffer_0;
     staging[1] = plan->staging_buffer_1;
     uint dst_idx = 0;
@@ -236,31 +300,38 @@ void PREC_FN(execute_reduction_tree)(ThreadPool* pool, PREC_TY(ReductionTreePlan
         float threshold = (T_policy < T_safety) ? T_policy : T_safety;
 
         uint node_count = plan->stage_node_counts[s];
+        const uint* offsets = plan->offset_lists_flat + plan->stage_offsets_into_list[s];
 
-        REAL_T* dest;
         if (s == plan->num_stages - 1) {
-            dest = plan->output;
+            /* Final stage: write to float* output */
+            PREC_TY(ReduceNodeFinalArgs) args;
+            args.source = current_src;
+            args.offset_list = offsets;
+            args.fan_in = K;
+            args.partial_width = plan->partial_width;
+            args.float_dest = plan->output;
+            args.threshold = threshold;
+            args.epsilon = plan->epsilon;
+
+            pool_dispatch_and_wait(pool,
+                (void (*)(void*, uint, uint))PREC_FN(task_reduce_final),
+                &args, node_count);
         } else {
-            dest = staging[dst_idx];
-        }
+            /* Intermediate stage: write to STORAGE_T* staging */
+            PREC_TY(ReduceNodeStagingArgs) args;
+            args.source = current_src;
+            args.offset_list = offsets;
+            args.fan_in = K;
+            args.partial_width = plan->partial_width;
+            args.staging_dest = staging[dst_idx];
+            args.threshold = threshold;
+            args.epsilon = plan->epsilon;
 
-        PREC_TY(ReduceNodeArgs) args;
-        args.source = current_src;
-        args.offset_list = plan->offset_lists_flat
-            + plan->stage_offsets_into_list[s];
-        args.fan_in = K;
-        args.partial_width = plan->partial_width;
-        args.dest = dest;
-        args.dest_offset = 0;
-        args.threshold = threshold;
-        args.epsilon = plan->epsilon;
+            pool_dispatch_and_wait(pool,
+                (void (*)(void*, uint, uint))PREC_FN(task_reduce_staging),
+                &args, node_count);
 
-        pool_dispatch_and_wait(pool,
-            (void (*)(void*, uint, uint))PREC_FN(task_reduce_and_clip_node),
-            &args, node_count);
-
-        if (s < plan->num_stages - 1) {
-            current_src = dest;
+            current_src = staging[dst_idx];
             dst_idx = 1 - dst_idx;
         }
     }

@@ -96,33 +96,28 @@ def _fp16_aggressive_policy() -> StabilizationPolicy:
 
 
 class TestLexiconCrashRegression:
-    """Crash: output_classes=10_000 causes heap corruption in CPU renderer."""
+    """Regression: output_classes=10_000 formerly caused heap corruption in CPU renderer."""
 
-    @pytest.mark.xfail(reason="SIGSEGV: class-dim tiling overflow in CPU backend", strict=False)
     def test_lexicon_act_cce(self, hw: HardwareProfile, renderer: CPUPlanRenderer) -> None:
         spec = _lexicon_spec(hw)
         plan = build_act_plan(spec, hw, PlanCceStrategy(), 16)
         renderer.render(plan)
 
-    @pytest.mark.xfail(reason="SIGSEGV: class-dim tiling overflow in CPU backend", strict=False)
     def test_lexicon_act_cce_bs64(self, hw: HardwareProfile, renderer: CPUPlanRenderer) -> None:
         spec = _lexicon_spec(hw)
         plan = build_act_plan(spec, hw, PlanCceStrategy(), 64)
         renderer.render(plan)
 
-    @pytest.mark.xfail(reason="SIGSEGV: class-dim tiling overflow in CPU backend", strict=False)
     def test_lexicon_learn_cce(self, hw: HardwareProfile, renderer: CPUPlanRenderer) -> None:
         spec = _lexicon_spec(hw)
         plan = build_learn_plan(spec, hw, PlanCceStrategy(), 16, _fp32_policy())
         renderer.render(plan)
 
-    @pytest.mark.xfail(reason="SIGSEGV: class-dim tiling overflow in CPU backend", strict=False)
     def test_lexicon_learn_cce_bs64(self, hw: HardwareProfile, renderer: CPUPlanRenderer) -> None:
         spec = _lexicon_spec(hw)
         plan = build_learn_plan(spec, hw, PlanCceStrategy(), 64, _fp32_policy())
         renderer.render(plan)
 
-    @pytest.mark.xfail(reason="SIGSEGV: class-dim tiling overflow in CPU backend", strict=False)
     def test_lexicon_learn_bce(self, hw: HardwareProfile, renderer: CPUPlanRenderer) -> None:
         spec = _lexicon_spec(hw)
         plan = build_learn_plan(spec, hw, PlanBceStrategy(), 16, _fp32_policy())
@@ -130,26 +125,23 @@ class TestLexiconCrashRegression:
 
 
 # =========================================================================
-# Category 2: Rodeo — FP16 precision (SIGSEGV / SIGABRT)
+# Category 2: Rodeo — FP16 precision (formerly SIGSEGV / SIGABRT)
 # =========================================================================
 
 
 class TestRodeoCrashRegression:
-    """Crash: FP16 precision causes struct mismatch / missing half-float in CPU backend."""
+    """Regression: FP16 precision formerly caused buffer overflow in CPU renderer."""
 
-    @pytest.mark.xfail(reason="SIGABRT: FP16 struct layout mismatch in CPU backend", strict=False)
     def test_rodeo_act_fp16(self, hw: HardwareProfile, renderer: CPUPlanRenderer) -> None:
         spec = _rodeo_spec(hw)
         plan = build_act_plan(spec, hw, PlanCceStrategy(), 64)
         renderer.render(plan)
 
-    @pytest.mark.xfail(reason="SIGSEGV: FP16 in CPU backend Learn path", strict=False)
     def test_rodeo_learn_fp16_cce(self, hw: HardwareProfile, renderer: CPUPlanRenderer) -> None:
         spec = _rodeo_spec(hw)
         plan = build_learn_plan(spec, hw, PlanCceStrategy(), 64, _fp16_aggressive_policy())
         renderer.render(plan)
 
-    @pytest.mark.xfail(reason="SIGABRT: FP16 in CPU backend Learn BCE path", strict=False)
     def test_rodeo_learn_fp16_bce(self, hw: HardwareProfile, renderer: CPUPlanRenderer) -> None:
         spec = _rodeo_spec(hw)
         plan = build_learn_plan(spec, hw, PlanBceStrategy(), 64, _fp16_aggressive_policy())

@@ -20,12 +20,12 @@ layout(push_constant) uniform PushConstants {
 } push;
 
 // ── Descriptor Bindings ────────────────────────────────────────────────
-layout(set = 0, binding = 0) readonly buffer InputBuf       { float data[]; } src_input;
-layout(set = 0, binding = 1) readonly buffer MaskBuf        { float data[]; } src_sample_mask;
-layout(set = 0, binding = 2) readonly buffer WeightsBuf     { float data[]; } src_weights;
-layout(set = 0, binding = 3) readonly buffer BiasesBuf      { float data[]; } src_biases;
-layout(set = 0, binding = 4) writeonly buffer HiddenBuf     { float data[]; } dest_hidden;
-layout(set = 0, binding = 5) writeonly buffer HiddenMaskBuf { float data[]; } dest_hidden_mask;
+layout(set = 0, binding = 0) readonly buffer InputBuf       { STORAGE_FLOAT data[]; } src_input;
+layout(set = 0, binding = 1) readonly buffer MaskBuf        { STORAGE_FLOAT data[]; } src_sample_mask;
+layout(set = 0, binding = 2) readonly buffer WeightsBuf     { STATE_FLOAT   data[]; } src_weights;
+layout(set = 0, binding = 3) readonly buffer BiasesBuf      { STATE_FLOAT   data[]; } src_biases;
+layout(set = 0, binding = 4) writeonly buffer HiddenBuf     { STORAGE_FLOAT data[]; } dest_hidden;
+layout(set = 0, binding = 5) writeonly buffer HiddenMaskBuf { STORAGE_FLOAT data[]; } dest_hidden_mask;
 
 // ── Shared Memory Tile (bank-conflict avoidance) ───────────────────────
 shared float simd_tile[SPEC_SIMD_WIDTH][SPEC_SIMD_WIDTH + SPEC_LOCAL_MEM_BANK_PADDING];
@@ -38,32 +38,32 @@ void main() {
     if (b_idx >= push.total_batch_count) return;
 
     uint  h_idx      = hb * SPEC_SIMD_WIDTH + lid;
-    float mask_val   = src_sample_mask.data[b_idx];
+    float mask_val   = read_storage(src_sample_mask.data[b_idx]);
     uint  input_base = b_idx * push.padded_input_count;
     uint  w_base     = hb * push.padded_input_count * SPEC_SIMD_WIDTH;
 
     // Handle padded (masked-out) samples
     if (mask_val < 0.5) {
         uint out_idx = b_idx * push.padded_hidden_count + h_idx;
-        dest_hidden.data[out_idx]      = 0.0;
-        dest_hidden_mask.data[out_idx] = 0.0;
+        dest_hidden.data[out_idx]      = write_storage(0.0);
+        dest_hidden_mask.data[out_idx] = write_storage(0.0);
         return;
     }
 
     // Initialize accumulator with bias
-    float accum = src_biases.data[h_idx];
+    float accum = read_state(src_biases.data[h_idx]);
 
     // Tiled dot product across input dimension
     for (uint it = 0; it < push.padded_input_count; it += SPEC_SIMD_WIDTH) {
         // Cooperatively load weight tile into shared memory
         for (uint k = 0; k < SPEC_SIMD_WIDTH; k++) {
-            simd_tile[lid][k] = src_weights.data[w_base + (it + lid) * SPEC_SIMD_WIDTH + k];
+            simd_tile[lid][k] = read_state(src_weights.data[w_base + (it + lid) * SPEC_SIMD_WIDTH + k]);
         }
         barrier();
 
         // Column-wise access → bank-conflict-free due to padding
         for (uint j = 0; j < SPEC_SIMD_WIDTH; j++) {
-            float x = src_input.data[input_base + it + j];
+            float x = read_storage(src_input.data[input_base + it + j]);
             accum = fma(simd_tile[j][lid], x, accum);
         }
         barrier();
@@ -74,6 +74,6 @@ void main() {
     float rmask     = (accum > 0.0) ? mask_val : 0.0;
 
     uint out_idx = b_idx * push.padded_hidden_count + h_idx;
-    dest_hidden.data[out_idx]      = activated;
-    dest_hidden_mask.data[out_idx] = rmask;
+    dest_hidden.data[out_idx]      = write_storage(activated);
+    dest_hidden_mask.data[out_idx] = write_storage(rmask);
 }

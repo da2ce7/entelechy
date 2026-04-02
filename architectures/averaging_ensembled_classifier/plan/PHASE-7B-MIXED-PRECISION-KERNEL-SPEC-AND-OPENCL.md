@@ -1,6 +1,6 @@
 # Phase 7B: Mixed Precision — Kernel Specification & OpenCL Pipeline
 
-**Status: 📋 PLANNED**  
+**Status: ✅ COMPLETED**  
 **Phase:** 7B of 7  
 **Prerequisite:** Phase 7A complete and rollback gate passed.  
 **Objective:** Migrate the kernel specification document (`kernels.cl.h`) and all OpenCL implementation files (`phase_*.cl.c`) to the three-role symbol set. Implement the precision boundary abstraction bodies in `kernels.cl.h`. Update the OpenCL type-mapping and compiler-flag generation. Wire the `precision_role`-aware `BufferDescriptor` construction into the plan builder and Vulkan renderer. Inject transitional aliases for unmigrated files. The phase ends when `PrecisionConfig.float32()` produces identical Tier 2 test results to those produced before Phase 7A, with no transitional alias removed yet.  

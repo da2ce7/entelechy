@@ -28,9 +28,9 @@ layout(push_constant) uniform PushConstants {
     uint use_local_reduce;          // 0=register tier, 1=local tier
 } push;
 
-layout(set = 0, binding = 0) readonly buffer SrcCollection { float data[]; } src_collection;
-layout(set = 0, binding = 1) readonly buffer OffsetList    { uint  data[]; } src_offsets;
-layout(set = 0, binding = 2) writeonly buffer DestPartial  { float data[]; } dest;
+layout(set = 0, binding = 0) readonly buffer SrcCollection { STORAGE_FLOAT data[]; } src_collection;
+layout(set = 0, binding = 1) readonly buffer OffsetList    { uint          data[]; } src_offsets;
+layout(set = 0, binding = 2) writeonly buffer DestPartial  { STORAGE_FLOAT data[]; } dest;
 
 void main() {
     uint lid   = gl_LocalInvocationID.x;
@@ -46,14 +46,14 @@ void main() {
         float accum = 0.0;
         for (uint k = 0; k < push.partial_offset_list_count; ++k) {
             uint offset = src_offsets.data[k];
-            accum += src_collection.data[offset + elem];
+            accum += read_storage(src_collection.data[offset + elem]);
         }
 
         if (push.operation_type == AGG_MODE_AVERAGE && push.partial_offset_list_count > 0) {
             accum /= float(push.partial_offset_list_count);
         }
 
-        dest.data[elem] = accum;
+        dest.data[elem] = write_storage(accum);
 
     } else {
         // ── Local Tier ──
@@ -65,7 +65,7 @@ void main() {
         float accum = 0.0;
         for (uint k = lid; k < push.partial_offset_list_count; k += lsize) {
             uint offset = src_offsets.data[k];
-            accum += src_collection.data[offset + elem];
+            accum += read_storage(src_collection.data[offset + elem]);
         }
 
         // Subgroup-accelerated workgroup reduction.
@@ -75,7 +75,7 @@ void main() {
             if (push.operation_type == AGG_MODE_AVERAGE && push.partial_offset_list_count > 0) {
                 total /= float(push.partial_offset_list_count);
             }
-            dest.data[elem] = total;
+            dest.data[elem] = write_storage(total);
         }
     }
 }

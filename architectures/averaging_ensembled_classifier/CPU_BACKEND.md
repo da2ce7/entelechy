@@ -1,6 +1,6 @@
 # CPU Back-End: Architecture for SIMD + Multi-Core
 
-> **Implementation Status: ✅ Complete** — Phase 3 implemented. All components described in this document have been realized in `src/backends/cpu/` (9 Python modules, 6 C source files, 4 C headers) with a full Tier 2 test suite (16 test modules in `tests/tier2/cpu/`). The Meson `shared_library('cpu_kernels', ...)` build target produces `libcpu_kernels.so`. See [PHASE-3A](plan/PHASE-3A-CPU-KERNEL-LIBRARY-AND-BUILD.md), [PHASE-3B](plan/PHASE-3B-CPU-FFI-AND-RENDERER.md), [PHASE-3C](plan/PHASE-3C-CPU-TIER2-TESTS.md) for implementation details.
+> **Implementation Status: ✅ Complete** — Phase 3 implemented; Phase 7 mixed-precision migration complete. All components described in this document have been realized in `src/backends/cpu/` (10 Python modules, 6 C source files, 5 C headers) with a full Tier 2 test suite (17 test modules in `tests/tier2/cpu/`). The Meson `shared_library('cpu_kernels', ...)` build target produces `libcpu_kernels.so` with three precision-variant instantiations (`s32x32`, `s16x16`, `s16x32`) via the two-axis `STORAGE_T`/`STATE_T` macro system (ADR-023). See [PHASE-3A](plan/PHASE-3A-CPU-KERNEL-LIBRARY-AND-BUILD.md), [PHASE-3B](plan/PHASE-3B-CPU-FFI-AND-RENDERER.md), [PHASE-3C](plan/PHASE-3C-CPU-TIER2-TESTS.md) for base implementation and [PHASE-7C](plan/PHASE-7C-MIXED-PRECISION-CPU-VULKAN-AND-FINAL.md) for the precision migration.
 
 ## Design Constraints
 

@@ -24,8 +24,8 @@ layout(push_constant) uniform PushConstants {
     uint total_tile_count;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer GradHAoS  { float data[]; } src_grad_h_aos;
-layout(set = 0, binding = 1) writeonly buffer GradHSoA  { float data[]; } dest_grad_h_soa;
+layout(set = 0, binding = 0) readonly buffer GradHAoS  { STORAGE_FLOAT data[]; } src_grad_h_aos;
+layout(set = 0, binding = 1) writeonly buffer GradHSoA  { STORAGE_FLOAT data[]; } dest_grad_h_soa;
 
 void main() {
     // Each invocation computes one element of the SoA output
@@ -50,11 +50,11 @@ void main() {
             uint tile_base = flat_tile_idx * tile_size;
             uint local_off = module_local_idx * push.total_batch_count * push.padded_hidden_count
                            + batch_idx * push.padded_hidden_count + h_idx;
-            accum += src_grad_h_aos.data[tile_base + local_off];
+            accum += read_storage(src_grad_h_aos.data[tile_base + local_off]);
         }
     }
 
     // Write to SoA layout: [bh_flat_idx][module]
     uint write_idx = bh_flat_idx * push.padded_total_modules_count + module_global_idx;
-    dest_grad_h_soa.data[write_idx] = accum;
+    dest_grad_h_soa.data[write_idx] = write_storage(accum);
 }

@@ -348,7 +348,7 @@ class _SingleKernelPlanBuilder:
         )
         policy = StabilizationPolicy(
             t_algorithmic=1.0, lambda_=1.0,
-            fp_format_max=float(np_.finfo(np_.float32).max),
+            compute_fp_format_max=float(np_.finfo(np_.float32).max),
         )
 
         cce = PlanCceStrategy()

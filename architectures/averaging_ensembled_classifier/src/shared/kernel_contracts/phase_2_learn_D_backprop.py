@@ -36,6 +36,7 @@ backprop_shared_weights_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("final_grad_hidden_total_element_count",),
             validation_preconditions=("logical shape matches physical size",),
+            precision_role="compute",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_sample_mask", flow="src", memory_scope="GLOBAL",
@@ -93,6 +94,7 @@ backprop_shared_biases_contract = KernelContract(
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("final_grad_hidden_total_element_count",),
             validation_preconditions=("logical shape matches physical size",),
+            precision_role="compute",
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_sample_mask", flow="src", memory_scope="GLOBAL",

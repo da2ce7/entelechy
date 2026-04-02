@@ -136,6 +136,19 @@ def fp16_iris_spec() -> ModelSpec:
     )
 
 
+@pytest.fixture
+def mixed_iris_spec() -> ModelSpec:
+    """A small mixed FP16-storage / FP32-compute model spec (Iris scenario)."""
+    return ModelSpec.mixed_f16_f32(
+        input_dim=IRIS_INPUT_DIM,
+        hidden_dim=IRIS_HIDDEN_DIM,
+        output_classes=IRIS_OUTPUT_CLASSES,
+        num_modules=IRIS_NUM_MODULES,
+        simd_width=IRIS_SIMD_WIDTH,
+        cache_line_bytes=IRIS_CACHE_LINE_BYTES,
+    )
+
+
 # =========================================================================
 # Stress-Test "Hydra" Model Configuration (Massive num_heads)
 # =========================================================================
@@ -210,7 +223,7 @@ def default_stabilization_policy() -> StabilizationPolicy:
     return StabilizationPolicy(
         t_algorithmic=1.0,
         lambda_=1.0,
-        fp_format_max=float(np.finfo(np.float32).max),
+        compute_fp_format_max=float(np.finfo(np.float32).max),
     )
 
 
@@ -220,5 +233,5 @@ def fp16_stabilization_policy() -> StabilizationPolicy:
     return StabilizationPolicy(
         t_algorithmic=1.0,
         lambda_=1.0,
-        fp_format_max=float(np.finfo(np.float16).max),
+        compute_fp_format_max=float(np.finfo(np.float16).max),
     )

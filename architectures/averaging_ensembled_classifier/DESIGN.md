@@ -1,7 +1,7 @@
 # Design Document: Averaging Ensembled Classifier
 
-**Revision:** 2.2 — Post-Phase 6  
-**Last Updated:** 2026-04-01  
+**Revision:** 2.3 — Post-Phase 7  
+**Last Updated:** 2026-04-02  
 **Scope:** Implementation design for the multi-backend averaging ensembled classifier architecture.
 
 ---
@@ -21,7 +21,7 @@
 | 9 | [Test Strategy](#9-test-strategy-adr-016) | Three-tier framework, fixtures, tolerances, oracle model |
 | 10 | [User-Facing API](#10-user-facing-api-adr-018) | WorkTicket lifecycle, design decisions |
 | 11 | [Migration Path](#11-migration-path-adr-017) | Phase sequencing, dependency graph, rollback |
-| 12 | [ADR Index](#12-adr-index) | Complete decision record reference (ADR-001 through ADR-020) |
+| 12 | [ADR Index](#12-adr-index) | Complete decision record reference (ADR-001 through ADR-023) |
 
 ---
 
@@ -380,7 +380,7 @@ The following legacy service modules are dissolved into stateless plan primitive
 - **Dispatch model:** Per-tile imperative `clEnqueueNDRange` with `cl.Event` synchronization.
 - **Tile index:** Host-provided `flat_tile_index` scalar per dispatch.
 - **Local memory:** Runtime-sized via `cl.LocalMemory()`.
-- **Status:** ✅ **Implemented** (Phase 2 complete). 6 OpenCL kernel source files. 8 Python modules. 16 Tier 2 test modules.
+- **Status:** ✅ **Implemented** (Phase 2 complete; Phase 7 precision migration complete). 6 OpenCL kernel source files. 8 Python modules. 16 Tier 2 test modules.
 
 ### 7.2 Vulkan Backend
 
@@ -391,7 +391,7 @@ The following legacy service modules are dissolved into stateless plan primitive
 - **Local memory:** `shared` qualifier, compile-time sized via specialization constants.
 - **Build-time constants:** Vulkan specialization constants replace `-D` preprocessor flags.
 - **Parameter passing:** Push constants via `_push_constants.py` for scalar parameters; descriptor sets for buffer bindings.
-- **Status:** ✅ **Implemented** (Phase 5 complete). 20 GLSL compute shaders. 11 Python modules. 16 Tier 2 test modules.
+- **Status:** ✅ **Implemented** (Phase 5 complete; Phase 7 precision migration complete). 20 GLSL compute shaders (three SPIR-V variants each for storage/state-role-bearing shaders). 11 Python modules. 16 Tier 2 test modules.
 
 ### 7.3 CPU Backend (ADR-015)
 
@@ -402,7 +402,7 @@ The following legacy service modules are dissolved into stateless plan primitive
 - **FFI types:** `src/backends/cpu/_ffi_types.py` — ctypes `Structure` subclasses mirroring `cpu_kernels.h` structs. `_loader.py` handles library discovery and `_verify_layouts()` at load time. `_dispatch_table.py` builds the `kernel_name → (task_fn_ptr, args_struct_class)` map.
 - **Layout verification:** `_verify_layouts()` at library load time asserts Python-side struct sizes match C-side `get_struct_size_*()` exports. Catches struct drift before any dispatch. Same-size field reorderings caught by Tier 2 behavioral tests.
 - **Library discovery:** `importlib.resources.files('averaging_ensembled_classifier.backends.cpu')` with platform-specific filename resolution. Falls back to JIT compilation via `_compiler.py` when pre-built library is unavailable (Linux/macOS only).
-- **Status:** ✅ **Implemented** (Phase 3 complete). 2 C source files (`cpu_kernels.c`, `cpu_threads.c`) + 5 headers + 6 phase `.inc` files. 10 Python FFI modules. 17 Tier 2 test modules.
+- **Status:** ✅ **Implemented** (Phase 3 complete; Phase 7 precision migration complete). 2 C source files (`cpu_kernels.c`, `cpu_threads.c`) + 5 headers + 6 phase `.inc` files. Three precision-variant instantiations (`s32x32`, `s16x16`, `s16x32`). 10 Python FFI modules. 17 Tier 2 test modules.
 
 ---
 
@@ -547,6 +547,7 @@ All phases proceed in parallel behind `_build_config.py` feature flags. Each pha
 | **5: Vulkan Backend** | GLSL shaders, SPIR-V compilation, vulkan-python `PlanRenderer`; write Vulkan Tier 2 tests | Tier 1 + Vulkan Tier 2 + Tier 3 parity green | **Complete** |
 | **User-Facing API** | `WorkTicket`, `LearnHandle`, `Engine`; parallel with Phase 4 | Tier 1 (ticket) + integration green | Not started |
 | **6: Legacy Removal** | Delete dissolved modules; system operates exclusively through plan-model dispatch | Tier 3 parity green, all backends, FP32 + FP16 | **✅ Complete** |
+| **7: Mixed Precision** | Three-role precision model (storage/compute/state); kernel spec, OpenCL, CPU, Vulkan migration; alias removal; multi-config tests | All Tier 2 tests pass for all three `PrecisionConfig` factories; zero `SCALAR_TYPE` references; Alchemist validation | **✅ Complete** |
 
 ### 11.3 Phase Dependency Graph
 
@@ -566,9 +567,15 @@ Phase 1 (Plan Model) ──────────── ✅ Complete (332 test
   ▼
 Phase 6 (Legacy Removal) ───── ✅ Complete
   [all prerequisite phases passed their gates]
+  │
+  ▼
+Phase 7 (Mixed Precision) ──── ✅ Complete (180 tests green)
+  ├──▶ Phase 7A (Authority & Config) ─── ✅ Complete
+  ├──▶ Phase 7B (Kernel Spec & OpenCL) ── ✅ Complete
+  └──▶ Phase 7C (CPU, Vulkan & Final) ─── ✅ Complete
 ```
 
-Phases 2, 3, and 5 are independent workstreams. Phase 4 has no hard dependency. Phase 6 is a join point requiring all preceding phases.
+Phases 2, 3, and 5 are independent workstreams. Phase 4 has no hard dependency. Phase 6 is a join point requiring all preceding phases. Phase 7 depends on Phase 6 and is a three-sub-phase sequential chain (7A → 7B → 7C).
 
 ### 11.4 Feature-Flag Lifecycle
 
@@ -579,6 +586,8 @@ Phases 2, 3, and 5 are independent workstreams. Phase 4 has no hard dependency. 
 | **Mandatory** | **`enabled` (enforced)** | **Phase 6 complete; all three backends are required components** |
 
 As of Phase 6 completion, all three backend flags (`aec_backend_cpu`, `aec_backend_vulkan`, `aec_backend_opencl`) are at the **Mandatory** stage (`value: 'enabled'` in `meson.options`). The build fails if any backend's toolchain is absent.
+
+As of Phase 7 completion, all three backends support the full three-role precision model (`PrecisionConfig.float32()`, `PrecisionConfig.float16()`, `PrecisionConfig.mixed_f16_f32()`). The retired `SCALAR_TYPE`/`SCALAR_IS_HALF` aliases have been removed from all kernel sources and build systems.
 
 ### 11.5 Rollback Protocol
 
@@ -609,4 +618,7 @@ If a phase's tier gate regresses: revert the feature flag to `auto`, diagnose us
 | [017](adr/ADR-017-incremental-migration-path.md) | Incremental Migration | Feature-flag gated phases; tier-based rollback gates |
 | [018](adr/ADR-018-user-facing-api.md) | User-Facing API | `WorkTicket` lifecycle; future-based concurrency; explicit batch; recompute; ephemeral |
 | [019](adr/ADR-019-k-fan-in-reduction-kernel-primitive.md) | K-Fan-In Reduction Kernel | `reduce_k_fan_in_and_clip` primitive for multi-stage reduction trees; fused sum+clip |
-| [020](adr/ADR-020-mixed-precision-execution-model.md) | Mixed-Precision Execution Model | Three-role precision (storage/compute/state); `MixedPrecisionConfig`; FP16/FP32 mixed pipelines |
+| [020](adr/ADR-020-mixed-precision-execution-model.md) | Mixed-Precision Execution Model | Three-role precision (storage/compute/state); `PrecisionConfig` factories; FP16/FP32 mixed pipelines |
+| [021](adr/ADR-021-kernels-precision-role-migration.md) | Kernel Precision-Role Migration | `SCALAR_TYPE` → `STORAGE_TYPE`/`COMPUTE_TYPE`/`STATE_TYPE`; precision boundary abstractions |
+| [022](adr/ADR-022-host-code-precision-role-implications.md) | Host Code Precision-Role Implications | `PrecisionConfig` three-role cascade through plan builder, type mapping, buffer lifecycle |
+| [023](adr/ADR-023-backend-kernel-precision-role-implications.md) | Backend Kernel Precision-Role Implications | CPU two-axis `STORAGE_T`/`STATE_T`; Vulkan `STORAGE_FLOAT`/`STATE_FLOAT`; multi-variant SPIR-V |

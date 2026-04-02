@@ -18,11 +18,12 @@ layout(push_constant) uniform PushConstants {
     uint  total_modules_count;
 } push;
 
-layout(set = 0, binding = 0) buffer TempsBuf { float data[]; } temps;
+layout(set = 0, binding = 0) buffer TempsBuf { STATE_FLOAT data[]; } temps;
 
 void main() {
     uint idx = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
     if (idx >= push.total_modules_count) return;
 
-    temps.data[idx] = clamp(temps.data[idx], push.min_value, push.max_value);
+    float val = read_state(temps.data[idx]);
+    temps.data[idx] = write_state(clamp(val, push.min_value, push.max_value));
 }

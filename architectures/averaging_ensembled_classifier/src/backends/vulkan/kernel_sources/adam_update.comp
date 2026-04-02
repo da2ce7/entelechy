@@ -25,10 +25,10 @@ layout(push_constant) uniform PushConstants {
     uint  parameter_count;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer GradBuf   { float data[]; } grads;
-layout(set = 0, binding = 1) buffer ParamBuf            { float data[]; } params;
-layout(set = 0, binding = 2) buffer M1Buf               { float data[]; } m1;
-layout(set = 0, binding = 3) buffer M2Buf               { float data[]; } m2;
+layout(set = 0, binding = 0) readonly buffer GradBuf   { float       data[]; } grads;
+layout(set = 0, binding = 1) buffer ParamBuf            { STATE_FLOAT data[]; } params;
+layout(set = 0, binding = 2) buffer M1Buf               { STATE_FLOAT data[]; } m1;
+layout(set = 0, binding = 3) buffer M2Buf               { STATE_FLOAT data[]; } m2;
 
 void main() {
     uint i = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
@@ -36,8 +36,8 @@ void main() {
 
     // Load current state.
     float g      = grads.data[i];
-    float m_prev = m1.data[i];
-    float v_prev = m2.data[i];
+    float m_prev = read_state(m1.data[i]);
+    float v_prev = read_state(m2.data[i]);
 
     // Update biased moment estimates.
     float m_new = push.beta1 * m_prev + (1.0 - push.beta1) * g;
@@ -51,7 +51,7 @@ void main() {
     float update = push.learning_rate * m_hat / (sqrt(v_hat) + push.epsilon);
 
     // Write back.
-    params.data[i] -= update;
-    m1.data[i] = m_new;
-    m2.data[i] = v_new;
+    params.data[i] = write_state(read_state(params.data[i]) - update);
+    m1.data[i] = write_state(m_new);
+    m2.data[i] = write_state(v_new);
 }

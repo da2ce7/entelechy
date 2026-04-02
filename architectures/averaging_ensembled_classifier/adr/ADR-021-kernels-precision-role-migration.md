@@ -1,6 +1,6 @@
 # ADR-021: Precision-Role Migration of the Kernel Reference Corpus
 
-**Status:** PROPOSED
+**Status:** ACCEPTED
 **Date:** 2026-04-02
 **Deciders:** —
 **Triggered by:** ADR-020 (Three-Role Precision Model) §4.4 and §3.6
