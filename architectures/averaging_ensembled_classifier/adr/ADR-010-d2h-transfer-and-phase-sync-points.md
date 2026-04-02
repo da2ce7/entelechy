@@ -421,7 +421,7 @@ class RetrievalFuture(Protocol):
 
         Returns:
             numpy.ndarray with shape == RetrievalNode.logical_shape
-            and dtype matching the plan's PrecisionConfig.numpy_dtype.
+            and dtype matching the plan's PrecisionConfig.storage_dtype.
         """
         ...
 
@@ -740,7 +740,7 @@ Per ADR-002's migration path and ADR-012's structure:
 - [ADR-001: Backend Abstraction Boundary](ADR-001-backend-abstraction-boundary.md) — plan-as-data-structure principle; Policy/Orchestration boundary; three-tier jurisdictional model
 - [ADR-002: Plan Node Types & Synchronization Structure](ADR-002-plan-node-types-and-synchronization-structure.md) — `RetrievalNode` definition; named synchronization points (`inference_event`, `final_batch_event`); renderer signals host-side availability
 - [ADR-009: Buffer Lifecycle in the Plan Model](ADR-009-buffer-lifecycle-in-the-plan-model.md) — `BufferDescriptor` with `BATCH_OUTPUT` role; `last_consumer` semantics; `BufferHandle` as shared-layer token; backend rendering contract
-- [ADR-008: Precision Configuration](ADR-008-precision-configuration.md) — `PrecisionConfig.numpy_dtype` governs the dtype of the returned numpy array
+- [ADR-008: Precision Configuration](ADR-008-precision-configuration.md) — `PrecisionConfig.storage_dtype` governs the dtype of the returned numpy array (retrieval buffers are storage-role under ADR-020)
 - [ADR-012: Module Factoring & Services Dissolution](ADR-012-module-factoring-and-services-dissolution.md) — `shared/` directory structure where `RetrievalFuture` and `RetrievalNode` live
 - [CONCEPT.md](../CONCEPT.md) — §4 Asynchronous Host Interaction (`inference_event`, `final_batch_event`); §5 Unified Execution Model (Sequential vs. Event-Triggered); §2 Primacy of Memory Strategy (CPU zero-copy)
 - [CONTRACT.md](../CONTRACT.md) — Article 1.4 Collaborative Interface Verifiability (pre-dispatch validation in the shared layer)

@@ -16,12 +16,14 @@ py.install_sources(opencl_sources,
 # kernel_bindings sub-package
 kernel_binding_sources = files(
   'kernel_bindings/__init__.py',
-  'kernel_bindings/phase_1_act.py',
-  'kernel_bindings/phase_2_learn_A_production.py',
-  'kernel_bindings/phase_2_learn_B_processing.py',
-  'kernel_bindings/phase_2_learn_C_reduction.py',
-  'kernel_bindings/phase_2_learn_D_backprop.py',
-  'kernel_bindings/phase_3_update.py',
+  'kernel_bindings/base.py',
+  'kernel_bindings/binding_phase_1_act.py',
+  'kernel_bindings/binding_phase_2_learn_A.py',
+  'kernel_bindings/binding_phase_2_learn_B.py',
+  'kernel_bindings/binding_phase_2_learn_C.py',
+  'kernel_bindings/binding_phase_2_learn_D.py',
+  'kernel_bindings/binding_phase_3_update.py',
+  'kernel_bindings/dispatch_table.py',
 )
 
 py.install_sources(kernel_binding_sources,

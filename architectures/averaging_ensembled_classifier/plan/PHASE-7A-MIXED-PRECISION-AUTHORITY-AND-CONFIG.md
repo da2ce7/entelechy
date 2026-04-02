@@ -1,6 +1,6 @@
 # Phase 7A: Mixed Precision — Authority Documents & Shared Configuration
 
-**Status: 📋 PLANNED**  
+**Status: ✅ COMPLETED**  
 **Phase:** 7A of 7  
 **Objective:** Amend the authority documents (CONCEPT.md, CONTRACT.md), redesign `PrecisionConfig` with three roles, and cascade the role-aware types through the shared configuration, plan, and host layers. No kernel sources or backend-native code are touched. The phase ends when all existing tests pass against the new `PrecisionConfig` interface and the `compute_fp_format_max` rename is live throughout.  
 **Governing ADRs:** ADR-020 (authority amendments §§2–3; design-layer §4.1–4.3, 4.7), ADR-022 (§§1–6, §§3–4, §9.1–9.2)  

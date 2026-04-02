@@ -24,7 +24,7 @@ A survey of the kernel inventory reveals a principled split between Strategy A a
 
 | Kernel (Node) | Strategy | Mechanism | Rationale |
 | :--- | :--- | :--- | :--- |
-| `compute_probs_loss_cce_chunk` (6) | **B — Separate** | Distinct kernel name | Incompatible type signatures (`int*` vs. `SCALAR_TYPE*` targets), different output topologies (scatter-write vs. partial-render for loss), different math (Softmax vs. Sigmoid) |
+| `compute_probs_loss_cce_chunk` (6) | **B — Separate** | Distinct kernel name | Incompatible type signatures (`int*` vs. `STORAGE_TYPE*` targets), different output topologies (scatter-write vs. partial-render for loss), different math (Softmax vs. Sigmoid) |
 | `compute_probs_loss_bce_chunk` (7) | **B — Separate** | Distinct kernel name | (Same — counterpart to Node 6) |
 | `calculate_module_param_grads_chunk` (8) | **A — Flag** | `src_scalar_FLAG_problem_type` | Branch is a 4-line `d_loss_d_logit` divergence; shared memory layout, shared reduction, shared placement |
 | `backprop_error_to_hidden_chunk` (9) | **A — Flag** | `src_scalar_FLAG_problem_type` | Identical structure and justification to Node 8 |
@@ -50,7 +50,7 @@ The reason the current implementation uses different strategies for different ke
 
 **Nodes 6 and 7 (loss computation) require Strategy B** because:
 
-- **Type-incompatible interfaces.** CCE targets are `int*` (class indices); BCE targets are `SCALAR_TYPE*` (per-class floats). The `src_buffer_GLOBAL_targets` parameter has fundamentally different tensor shapes, padding contracts, and calculability proofs between the two kernels. A single `KernelContract` cannot express both without type-punning the buffer specification — violating CONTRACT.md Article 1.4 (Collaborative Interface Verifiability), which requires the contract to be a closed logical system for validation.
+- **Type-incompatible interfaces.** CCE targets are `int*` (class indices); BCE targets are `STORAGE_TYPE*` (per-class floats). The `src_buffer_GLOBAL_targets` parameter has fundamentally different tensor shapes, padding contracts, and calculability proofs between the two kernels. A single `KernelContract` cannot express both without type-punning the buffer specification — violating CONTRACT.md Article 1.4 (Collaborative Interface Verifiability), which requires the contract to be a closed logical system for validation.
 - **Topologically distinct DAG outputs.** CCE loss is a scalar per (module, sample) pair, written via direct scatter-write to `dest_buffer_GLOBAL_final_loss` — no reduction required. BCE loss is a partial sum per (module, sample, class_chunk), written to `dest_buffer_GLOBAL_partial_loss` — requiring subsequent aggregation through the Recursive Clip-Aggregation Engine (Node 14). This changes the downstream DAG structure: the BCE path has a reduction sub-tree that the CCE path lacks entirely.
 - **Different math.** Softmax + log-loss (CCE) vs. Sigmoid + binary log-loss (BCE). The internal computation structure is sufficiently different that a flag-based branch would create a complex, non-"dumb" kernel.
 
@@ -118,7 +118,7 @@ Express all CCE/BCE divergence through a single `kernel_name` per node with a `s
 - Reduces the plan's kernel inventory.
 
 **Disadvantages:**
-- **Violates CONCEPT.md §3 Strategy B mandate for Nodes 6/7.** The divergence between CCE and BCE loss computation is not "manageable" — it involves incompatible type signatures (`int*` vs. `SCALAR_TYPE*`), incompatible output topologies (scatter-write vs. partial-render), incompatible DAG structures (no reduction vs. reduction tree), and fundamentally different mathematics (Softmax vs. Sigmoid). A unified kernel would be precisely the kind of "smart," complex-branching kernel that CONCEPT.md §3 prohibits.
+- **Violates CONCEPT.md §3 Strategy B mandate for Nodes 6/7.** The divergence between CCE and BCE loss computation is not "manageable" — it involves incompatible type signatures (`int*` vs. `STORAGE_TYPE*`), incompatible output topologies (scatter-write vs. partial-render), incompatible DAG structures (no reduction vs. reduction tree), and fundamentally different mathematics (Softmax vs. Sigmoid). A unified kernel would be precisely the kind of "smart," complex-branching kernel that CONCEPT.md §3 prohibits.
 - **Violates CONTRACT.md Article 1.4.** A single `KernelContract` for a unified loss kernel cannot express closed calculability proofs for both target buffer types simultaneously. The targets buffer's tensor shape, element type, and padding contract are all flag-dependent.
 - **Topological impossibility.** The CCE and BCE paths produce structurally different DAG sub-trees. CCE's loss output (`dest_buffer_GLOBAL_final_loss`) is a final result with no downstream reduction. BCE's loss output (`dest_buffer_GLOBAL_partial_loss`) feeds into Node 14's reduction tree. A single kernel cannot produce both output topologies — the plan would need conditional downstream edges, which violates ADR-002's typed DAG model.
 
@@ -153,7 +153,7 @@ Option B is eliminated on three independent grounds:
 
 1. **Topological impossibility.** CCE and BCE loss paths produce structurally different DAG sub-trees. A single plan node cannot conditionally introduce or omit downstream reduction nodes — the DAG structure must be statically determined at plan-construction time (ADR-002).
 
-2. **Contract impossibility.** A single `KernelContract` for a unified loss kernel would require the targets buffer's element type to be flag-dependent (`int` for CCE, `SCALAR_TYPE` for BCE). CONTRACT.md Article 1.4 requires that calculability proofs reference parameters in the contract's closed manifest — a proof that says "if FLAG=0, shape is (B); if FLAG=1, shape is (B, padded_C)" is not a closed system.
+2. **Contract impossibility.** A single `KernelContract` for a unified loss kernel would require the targets buffer's element type to be flag-dependent (`int` for CCE, `STORAGE_TYPE` for BCE). CONTRACT.md Article 1.4 requires that calculability proofs reference parameters in the contract's closed manifest — a proof that says "if FLAG=0, shape is (B); if FLAG=1, shape is (B, padded_C)" is not a closed system.
 
 3. **Principle violation.** CONCEPT.md §3 explicitly reserves Strategy B for "complex or conflicting memory patterns." The CCE/BCE loss divergence is the canonical example cited by the principle itself.
 
@@ -181,7 +181,7 @@ The `KernelDispatchNode` for the loss computation step carries a `kernel_name` t
 
 - **CCE module:** `kernel_name = "compute_probs_loss_cce_chunk"`. The contract specifies `src_buffer_GLOBAL_targets` with tensor shape `(total_batch_count)` and element type `int`. The loss output `dest_buffer_GLOBAL_final_loss` has placement semantics of a direct scatter-write — no downstream reduction node for loss.
 
-- **BCE module:** `kernel_name = "compute_probs_loss_bce_chunk"`. The contract specifies `src_buffer_GLOBAL_targets` with tensor shape `(total_batch_count, padded_total_output_class_count)` and element type `SCALAR_TYPE`. The loss output `dest_buffer_GLOBAL_partial_loss` is governed by a `PlacementContract` and requires downstream aggregation via the Recursive Clip-Aggregation Engine (Node 14).
+- **BCE module:** `kernel_name = "compute_probs_loss_bce_chunk"`. The contract specifies `src_buffer_GLOBAL_targets` with tensor shape `(total_batch_count, padded_total_output_class_count)` and element type `STORAGE_TYPE`. The loss output `dest_buffer_GLOBAL_partial_loss` is governed by a `PlacementContract` and requires downstream aggregation via the Recursive Clip-Aggregation Engine (Node 14).
 
 Each variant has its own `KernelContract` with a fully self-consistent, closed parameter manifest. Plan-time validation verifies each contract independently. The plan builder (via `ProblemTypeStrategy.get_loss_signature()`) selects the correct variant at plan-construction time based on the module's Operating Mode.
 
@@ -212,7 +212,7 @@ BufferParamSpec(
         "Host is contractually obligated to provide the correct target buffer "
         "whose layout, type, and total size correspond to the value of "
         "src_scalar_FLAG_problem_type. CCE (0): int* with shape "
-        "(total_batch_count). BCE (1): SCALAR_TYPE* with shape "
+        "(total_batch_count). BCE (1): STORAGE_TYPE* with shape "
         "(total_batch_count, padded_total_output_class_count).",
     ),
 )

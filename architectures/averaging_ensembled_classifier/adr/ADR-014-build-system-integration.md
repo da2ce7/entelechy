@@ -738,7 +738,7 @@ Per ADR-017's phasing:
 - [ADR-016: Test Strategy](ADR-016-test-strategy.md) — Tier 1/2/3 test structure; conditional test execution based on enabled backends
 - [ADR-017: Incremental Migration Path](ADR-017-incremental-migration-path.md) — per-phase build system evolution
 - [CONCEPT.md](../CONCEPT.md) — §1 Architectural Elegance Feedback (formalize build abstractions, don't hack around them)
-- [CONTRACT.md](../CONTRACT.md) — Article 6 Mandatory Build-Time Symbols (`SCALAR_TYPE`, `SIMD_WIDTH`, `C_TILE_SIZE`, `NUMERICAL_STABILITY_EPSILON`)
+- [CONTRACT.md](../CONTRACT.md) — Article 6 Mandatory Build-Time Symbols (`STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE`, `SIMD_WIDTH`, `C_TILE_SIZE`, `NUMERICAL_STABILITY_EPSILON`)
 - [STRUCTURE.md](../../STRUCTURE.md) — §2 Architectural Autonomy; §3 Declarative Interaction; §4 Build-Time System Guarantees
 - [CPU_BACKEND.md](../CPU_BACKEND.md) — `cpu_simd.h` ISA detection cascade; `task_<kernel_name>` function signature; thread pool; `cpu_kernels.h` ABI surface
 - [VULKAN_BACKEND.md](../VULKAN_BACKEND.md) — SPIR-V compilation requirement; specialization constants; `--target-env=vulkan1.1`

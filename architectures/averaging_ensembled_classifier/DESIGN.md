@@ -137,19 +137,22 @@ Each backend computes `max_reduce_fan_in` from its native constraints. The Polic
 
 ### 3.5 PrecisionConfig (ADR-008, ADR-020)
 
-Replaces the former `PrecisionContext` ABC hierarchy with a single frozen dataclass:
+Implements the three-role precision model (ADR-020) as a frozen dataclass:
 
 ```python
 @dataclass(frozen=True)
 class PrecisionConfig:
-    numpy_dtype: np.dtype
-    fp_format_max: float
-    epsilon: float
+    storage_dtype: np.dtype      # bandwidth-optimized format for transient DAG data
+    compute_dtype: np.dtype      # arithmetic precision for reductions/accumulation
+    state_dtype: np.dtype        # optimizer state and learnable parameters
+    storage_fp_format_max: float
+    compute_fp_format_max: float
+    compute_epsilon: float
 ```
 
-Constructed via `PrecisionConfig.float32()` and `PrecisionConfig.float16()` classmethods. `ModelSpec` consumes `PrecisionConfig` via composition; backward-compatible properties (`SCALAR_NP_TYPE`, `SCALAR_C_TYPE_NAME`) delegate to `self.precision`. Factory classmethods `ModelSpec.float32()` / `ModelSpec.float16()` are the sole construction API (deprecated `Float32ModelSpec()` / `Float16ModelSpec()` module-level functions were removed in Phase 6).
+Constructed via `PrecisionConfig.float32()`, `PrecisionConfig.float16()`, and `PrecisionConfig.mixed_f16_f32()` classmethods. The invariant `storage_dtype.itemsize ≤ compute_dtype.itemsize` and `storage_dtype.itemsize ≤ state_dtype.itemsize` is enforced at construction. `ModelSpec` consumes `PrecisionConfig` via composition; factory classmethods `ModelSpec.float32()` / `ModelSpec.float16()` are the sole construction API.
 
-**Future extension (ADR-020):** `MixedPrecisionConfig` is proposed to decompose precision into three independent roles — storage (bandwidth), compute (arithmetic fidelity), and state (optimizer stability) — enabling FP16-storage/FP32-compute pipelines. This remains PROPOSED status pending implementation.
+The three-role decomposition enables FP16-storage/FP32-compute pipelines without mode flags or conditional compilation — a configuration where all roles share a type is a parameterization, not a distinct mode.
 
 ### 3.6 Buffer Lifecycle (ADR-009)
 
@@ -164,6 +167,7 @@ class BufferDescriptor:
     element_size_bytes: int                        # bytes per element
     size_bytes: int                                # total allocation size
     role: BufferRole                               # MODEL_STATE | BATCH_INPUT | BATCH_INTERMEDIATE | BATCH_OUTPUT
+    precision_role: Literal["storage", "compute", "state"]  # determines dtype from PrecisionConfig
     producing_node: str | None                     # None for MODEL_STATE / BATCH_INPUT
     consumers: frozenset[str]
     last_consumer: str | None

@@ -168,7 +168,7 @@ This article defines symbols that must be provided by the host build environment
 | `C_TILE_SIZE` | `int` | Column tile size for the module-chunking strategy |
 | `NUMERICAL_STABILITY_EPSILON` | float literal | Epsilon for numerical stability guards; derived from `compute_epsilon` |
 
-The symbols `SCALAR_TYPE` and `SCALAR_IS_HALF` are **retired**. They must not appear in any kernel source file after Phase 7B migration is complete (transitional aliases exist during Phase 7B).
+The symbols `SCALAR_TYPE` and `SCALAR_IS_HALF` are **retired**. They do not appear in any kernel source file; all kernel signatures use the three-role precision model (`STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE`).
 
 ### **Article 7: Canonical Interface Instantiation**
 
@@ -189,7 +189,7 @@ __kernel void illustrative_kernel_name(
     *        - Calculability Proof: [src_scalar_NATURAL_total_item_count]
     *        - Validation Preconditions: [src_scalar_NATURAL_item_offset + src_scalar_NATURAL_item_count <= src_scalar_NATURAL_total_item_count]
     */
-    __global const SCALAR_TYPE* src_buffer_GLOBAL_input_stream,
+    __global const STORAGE_TYPE* src_buffer_GLOBAL_input_stream,
 
     /**
     * @param src_buffer_DEVICE_CONST_lookup_table A read-only, device-constant memory resource.
@@ -198,7 +198,7 @@ __kernel void illustrative_kernel_name(
     *        - Calculability Proof: [Compile-time constant: LUT_CAPACITY]
     *        - Validation Preconditions: None.
     */
-    __constant const SCALAR_TYPE* src_buffer_DEVICE_CONST_lookup_table,
+    __constant const COMPUTE_TYPE* src_buffer_DEVICE_CONST_lookup_table,
 
     /**
     * @param dest_buffer_GLOBAL_partial_results The sole collection resource for this unit's partial output.
@@ -207,7 +207,7 @@ __kernel void illustrative_kernel_name(
     *        - Calculability Proof: [dest_scalar_NATURAL_total_chunks, Compile-time constant: RESULT_ELEMENTS_PER_CHUNK]
     *        - Validation Preconditions: Host shall zero-initialize this buffer prior to dispatch.
     */
-    __global SCALAR_TYPE* dest_buffer_GLOBAL_partial_results,
+    __global STORAGE_TYPE* dest_buffer_GLOBAL_partial_results,
 
     /**
     * @param update_buffer_LOCAL_transpose_tile A work-group exclusive memory resource for a tiled matrix transpose.
@@ -215,7 +215,7 @@ __kernel void illustrative_kernel_name(
     *        - Padding Contract: {Type: BANK_CONFLICT_AVOIDANCE, Formula: "Pad row stride to (TILE_DIM + LOCAL_MEM_BANK_PADDING) elements"}
     *        - Validation Preconditions: Host shall allocate size according to the formula derived from this contract, using the value of `LOCAL_MEM_BANK_PADDING` defined in System Contract Article 5.
     */
-    __local SCALAR_TYPE* update_buffer_LOCAL_transpose_tile,
+    __local COMPUTE_TYPE* update_buffer_LOCAL_transpose_tile,
 
     /**
     * @param sync_buffer_GLOBAL_atomic_counter A global resource for cross-group atomic synchronization. This buffer makes the kernel stateful.

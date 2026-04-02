@@ -249,15 +249,15 @@ If $T_j = 0$ (sentinel for diagnostic trees), skip the clip entirely.
  *        - Synchronization Model: "Reduction Engine Stage"
  */
 __kernel void reduce_k_fan_in_and_clip(
-    __local  SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_collection,
+    __local  COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_collection,
     __global const uint        *src_buffer_GLOBAL_CONST_offset_list_flat,
-    __global SCALAR_TYPE       *dest_buffer_GLOBAL_stage_output,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_stage_output,
     uint src_scalar_NATURAL_fan_in_K,
     uint src_scalar_NATURAL_node_count,
     uint src_scalar_NATURAL_partial_width,
-    SCALAR_TYPE src_scalar_REAL_clipping_threshold,
-    SCALAR_TYPE src_scalar_REAL_epsilon);
+    COMPUTE_TYPE src_scalar_REAL_clipping_threshold,
+    COMPUTE_TYPE src_scalar_REAL_epsilon);
 ```
 
 **Buffer contracts:**
@@ -385,7 +385,7 @@ reduce_k_fan_in_and_clip_contract = KernelContract(
     local_memory=(
         LocalMemorySpec(
             "reduction_tile",
-            "get_local_size(0) * sizeof(SCALAR_TYPE)",
+            "get_local_size(0) * sizeof(COMPUTE_TYPE)",
         ),
     ),
     placement=None,

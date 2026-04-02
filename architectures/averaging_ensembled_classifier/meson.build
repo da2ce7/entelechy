@@ -53,20 +53,8 @@ if backend_cpu.allowed()
   subdir('src/backends/cpu')
 endif
 
-# --- OpenCL kernel data files ---
-cl_kernels = files(
-  'kernels/phase_1_act.cl.c',
-  'kernels/phase_2_learn_A_production.cl.c',
-  'kernels/phase_2_learn_B_processing.cl.c',
-  'kernels/phase_2_learn_C_reduction.cl.c',
-  'kernels/phase_2_learn_D_backprop.cl.c',
-  'kernels/phase_3_update.cl.c',
-)
-
-install_data(
-  cl_kernels,
-  install_dir: py.get_install_dir() / 'averaging_ensembled_classifier' / 'kernels',
-)
+# --- OpenCL kernel sources and host-mode validation ---
+subdir('kernels')
 
 # This tells meson-python about your project's Python dependencies.
 py_dep = py.dependency()

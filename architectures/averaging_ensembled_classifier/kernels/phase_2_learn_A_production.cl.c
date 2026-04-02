@@ -12,27 +12,27 @@
 // entire batch dimension. This model is highly efficient as it maximizes parallelism and
 // correctly utilizes the local memory hierarchy for the final reduction step.
 __kernel void calculate_module_param_grads_chunk(
-    __local SCALAR_TYPE        *update_buffer_LOCAL_reduction_tile,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_hidden_activations,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_probs,
-    __global const void        *src_buffer_GLOBAL_targets,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_sample_mask,
-    __global SCALAR_TYPE       *dest_buffer_GLOBAL_partial_grad_weights_module,
-    __global SCALAR_TYPE       *dest_buffer_GLOBAL_partial_grad_biases_module,
-    uint                        src_scalar_FLAG_problem_type,
-    uint                        src_scalar_NATURAL_flat_tile_index,
-    uint                        src_scalar_NATURAL_batch_chunk_offset,
-    uint                        src_scalar_NATURAL_batch_chunk_count,
-    uint                        src_scalar_NATURAL_num_class_chunks,
-    uint                        src_scalar_NATURAL_classes_per_chunk,
-    uint                        src_scalar_NATURAL_modules_per_chunk,
-    uint                        src_scalar_NATURAL_total_batch_count,
-    uint                        src_scalar_NATURAL_hidden_count,
-    uint                        src_scalar_NATURAL_padded_hidden_count,
-    uint                        src_scalar_NATURAL_total_output_class_count,
-    uint                        src_scalar_NATURAL_padded_total_output_class_count,
-    uint                        src_scalar_NATURAL_total_modules_count,
-    uint                        src_scalar_NATURAL_total_tile_count) {
+    __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_activations,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_probs,
+    __global const void         *src_buffer_GLOBAL_targets,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_weights_module,
+    __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_biases_module,
+    uint                         src_scalar_FLAG_problem_type,
+    uint                         src_scalar_NATURAL_flat_tile_index,
+    uint                         src_scalar_NATURAL_batch_chunk_offset,
+    uint                         src_scalar_NATURAL_batch_chunk_count,
+    uint                         src_scalar_NATURAL_num_class_chunks,
+    uint                         src_scalar_NATURAL_classes_per_chunk,
+    uint                         src_scalar_NATURAL_modules_per_chunk,
+    uint                         src_scalar_NATURAL_total_batch_count,
+    uint                         src_scalar_NATURAL_hidden_count,
+    uint                         src_scalar_NATURAL_padded_hidden_count,
+    uint                         src_scalar_NATURAL_total_output_class_count,
+    uint                         src_scalar_NATURAL_padded_total_output_class_count,
+    uint                         src_scalar_NATURAL_total_modules_count,
+    uint                         src_scalar_NATURAL_total_tile_count) {
 
     // --- 1. Work-Group to Gradient Component Mapping ---
     // The 3D work-group ID maps directly to a coordinate in the gradient tensor space.
@@ -55,34 +55,34 @@ __kernel void calculate_module_param_grads_chunk(
     const uint class_global_idx  = class_chunk_idx * src_scalar_NATURAL_classes_per_chunk + class_local_idx;
 
     // --- 3. Parallel Reduction over Batch Dimension ---
-    SCALAR_TYPE p_grad_w = SCALAR_ZERO;
-    SCALAR_TYPE p_grad_b = SCALAR_ZERO;
+    COMPUTE_TYPE p_grad_w = COMPUTE_ZERO;
+    COMPUTE_TYPE p_grad_b = COMPUTE_ZERO;
 
     // Use the flat_tile_index to find the correct slice of the partial probabilities produced by the upstream kernel.
     const long prob_tile_base_offset = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk;
 
     // Each thread sums a strided slice of the batch dimension.
     for (uint b = lid; b < src_scalar_NATURAL_total_batch_count; b += lsize) {
-        if (src_buffer_GLOBAL_sample_mask[b] < (SCALAR_TYPE)0.5f) {
+        if (load_storage(src_buffer_GLOBAL_sample_mask, b) < (COMPUTE_TYPE)0.5f) {
             continue;
         }
 
         // --- Calculate d_loss_d_logit (upstream gradient from the loss function) ---
         const long prob_read_idx = prob_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk
                                    + (long)b * src_scalar_NATURAL_classes_per_chunk + class_local_idx;
-        const SCALAR_TYPE prob = src_buffer_GLOBAL_partial_probs[prob_read_idx];
+        const COMPUTE_TYPE prob = load_storage(src_buffer_GLOBAL_partial_probs, prob_read_idx);
 
-        SCALAR_TYPE d_loss_d_logit;
+        COMPUTE_TYPE d_loss_d_logit;
         if (src_scalar_FLAG_problem_type == PROBLEM_TYPE_CCE) {
             const __global int *targets_cce = (const __global int *)src_buffer_GLOBAL_targets;
             d_loss_d_logit                  = select(prob, prob - 1.0f, class_global_idx == targets_cce[b]);
         } else { // PROBLEM_TYPE_BCE
-            const __global SCALAR_TYPE *targets_bce = (const __global SCALAR_TYPE *)src_buffer_GLOBAL_targets;
-            d_loss_d_logit                          = prob - targets_bce[(long)b * src_scalar_NATURAL_padded_total_output_class_count + class_global_idx];
+            const __global STORAGE_TYPE *targets_bce = (const __global STORAGE_TYPE *)src_buffer_GLOBAL_targets;
+            d_loss_d_logit                           = prob - load_storage(targets_bce, (long)b * src_scalar_NATURAL_padded_total_output_class_count + class_global_idx);
         }
 
         // --- Accumulate Weight and Bias Gradients ---
-        const SCALAR_TYPE h_val = src_buffer_GLOBAL_hidden_activations[(long)b * src_scalar_NATURAL_padded_hidden_count + h_idx];
+        const COMPUTE_TYPE h_val = load_storage(src_buffer_GLOBAL_hidden_activations, (long)b * src_scalar_NATURAL_padded_hidden_count + h_idx);
         p_grad_w += d_loss_d_logit * h_val; // dL/dW = (dL/dLogit) * h_val
 
         // Optimization: The bias gradient (dL/dB) is simply dL/dLogit and does not depend on `h_idx`.
@@ -105,9 +105,9 @@ __kernel void calculate_module_param_grads_chunk(
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         if (lid == 0) {
-            const long bias_tile_base_offset                       = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_padded_total_output_class_count;
-            const long out_idx                                     = bias_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_padded_total_output_class_count + class_global_idx;
-            dest_buffer_GLOBAL_partial_grad_biases_module[out_idx] = update_buffer_LOCAL_reduction_tile[0];
+            const long bias_tile_base_offset = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_padded_total_output_class_count;
+            const long out_idx               = bias_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_padded_total_output_class_count + class_global_idx;
+            store_storage(dest_buffer_GLOBAL_partial_grad_biases_module, out_idx, update_buffer_LOCAL_reduction_tile[0]);
         }
     }
 
@@ -123,7 +123,7 @@ __kernel void calculate_module_param_grads_chunk(
         const long weight_tile_base_offset = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_total_output_class_count;
         const long out_idx                 = weight_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_total_output_class_count
                              + (long)h_idx * src_scalar_NATURAL_padded_total_output_class_count + class_global_idx;
-        dest_buffer_GLOBAL_partial_grad_weights_module[out_idx] = update_buffer_LOCAL_reduction_tile[0];
+        store_storage(dest_buffer_GLOBAL_partial_grad_weights_module, out_idx, update_buffer_LOCAL_reduction_tile[0]);
     }
 }
 
@@ -134,23 +134,23 @@ __kernel void calculate_module_param_grads_chunk(
 // class dimension. This structure effectively parallelizes what is mathematically a
 // matrix-vector multiplication, mapping it efficiently to the GPU architecture.
 __kernel void backprop_error_to_hidden_chunk(
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_probs,
-    __global const void        *src_buffer_GLOBAL_targets,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_sample_mask,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_CONST_weights_module,
-    __global SCALAR_TYPE       *dest_buffer_GLOBAL_partial_grad_hidden_activations_aos,
-    uint                        src_scalar_FLAG_problem_type,
-    uint                        src_scalar_NATURAL_flat_tile_index,
-    uint                        src_scalar_NATURAL_num_class_chunks,
-    uint                        src_scalar_NATURAL_classes_per_chunk,
-    uint                        src_scalar_NATURAL_modules_per_chunk,
-    uint                        src_scalar_NATURAL_total_batch_count,
-    uint                        src_scalar_NATURAL_hidden_count,
-    uint                        src_scalar_NATURAL_padded_hidden_count,
-    uint                        src_scalar_NATURAL_total_output_class_count,
-    uint                        src_scalar_NATURAL_padded_total_output_class_count,
-    uint                        src_scalar_NATURAL_total_modules_count,
-    uint                        src_scalar_NATURAL_total_tile_count) {
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_probs,
+    __global const void         *src_buffer_GLOBAL_targets,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_weights_module,
+    __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_hidden_activations_aos,
+    uint                         src_scalar_FLAG_problem_type,
+    uint                         src_scalar_NATURAL_flat_tile_index,
+    uint                         src_scalar_NATURAL_num_class_chunks,
+    uint                         src_scalar_NATURAL_classes_per_chunk,
+    uint                         src_scalar_NATURAL_modules_per_chunk,
+    uint                         src_scalar_NATURAL_total_batch_count,
+    uint                         src_scalar_NATURAL_hidden_count,
+    uint                         src_scalar_NATURAL_padded_hidden_count,
+    uint                         src_scalar_NATURAL_total_output_class_count,
+    uint                         src_scalar_NATURAL_padded_total_output_class_count,
+    uint                         src_scalar_NATURAL_total_modules_count,
+    uint                         src_scalar_NATURAL_total_tile_count) {
 
     // --- 1. Work-Item to Output Coordinate Mapping ---
     // The 3D dispatch grid maps directly to the (module, batch, hidden) coordinates
@@ -173,16 +173,16 @@ __kernel void backprop_error_to_hidden_chunk(
     const long out_idx      = tile_base_offset + local_offset;
 
     // Early exit for padded samples, writing zero to the output to maintain correctness.
-    if (src_buffer_GLOBAL_sample_mask[batch_idx] < (SCALAR_TYPE)0.5f) {
-        dest_buffer_GLOBAL_partial_grad_hidden_activations_aos[out_idx] = SCALAR_ZERO;
+    if (load_storage(src_buffer_GLOBAL_sample_mask, batch_idx) < (COMPUTE_TYPE)0.5f) {
+        store_storage(dest_buffer_GLOBAL_partial_grad_hidden_activations_aos, out_idx, COMPUTE_ZERO);
         return;
     }
 
     // --- 3. Reduction over Class Dimension ---
     // Each thread accumulates the gradient contributions from its assigned chunk of the class dimension.
-    const uint  module_chunk_idx  = src_scalar_NATURAL_flat_tile_index / src_scalar_NATURAL_num_class_chunks;
-    const uint  module_global_idx = module_chunk_idx * src_scalar_NATURAL_modules_per_chunk + module_local_idx;
-    SCALAR_TYPE grad_h_accum      = SCALAR_ZERO;
+    const uint   module_chunk_idx  = src_scalar_NATURAL_flat_tile_index / src_scalar_NATURAL_num_class_chunks;
+    const uint   module_global_idx = module_chunk_idx * src_scalar_NATURAL_modules_per_chunk + module_local_idx;
+    COMPUTE_TYPE grad_h_accum      = COMPUTE_ZERO;
 
     // Decompose the flat index to find the correct chunk of classes and probabilities.
     const uint class_chunk_idx       = src_scalar_NATURAL_flat_tile_index % src_scalar_NATURAL_num_class_chunks;
@@ -198,29 +198,29 @@ __kernel void backprop_error_to_hidden_chunk(
             // Read the pre-computed probability for this class from the correct tile-local slice.
             const long prob_read_idx = prob_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk
                                        + (long)batch_idx * src_scalar_NATURAL_classes_per_chunk + c_local;
-            const SCALAR_TYPE prob = src_buffer_GLOBAL_partial_probs[prob_read_idx];
+            const COMPUTE_TYPE prob = load_storage(src_buffer_GLOBAL_partial_probs, prob_read_idx);
 
             // Compute the upstream gradient from the loss function (d_loss_d_logit) for this specific class.
-            SCALAR_TYPE d_loss_d_logit;
+            COMPUTE_TYPE d_loss_d_logit;
             if (src_scalar_FLAG_problem_type == PROBLEM_TYPE_CCE) {
                 const __global int *targets_cce = (const __global int *)src_buffer_GLOBAL_targets;
                 d_loss_d_logit                  = select(prob, prob - 1.0f, c_global == targets_cce[batch_idx]);
             } else { // PROBLEM_TYPE_BCE
-                const __global SCALAR_TYPE *targets_bce = (const __global SCALAR_TYPE *)src_buffer_GLOBAL_targets;
-                d_loss_d_logit                          = prob - targets_bce[(long)batch_idx * src_scalar_NATURAL_padded_total_output_class_count + c_global];
+                const __global STORAGE_TYPE *targets_bce = (const __global STORAGE_TYPE *)src_buffer_GLOBAL_targets;
+                d_loss_d_logit                           = prob - load_storage(targets_bce, (long)batch_idx * src_scalar_NATURAL_padded_total_output_class_count + c_global);
             }
 
             // Read the corresponding weight and accumulate the gradient contribution.
             const long weight_idx = (long)module_global_idx * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_total_output_class_count
                                     + (long)h_idx * src_scalar_NATURAL_padded_total_output_class_count + c_global;
 
-            const SCALAR_TYPE weight_val = src_buffer_GLOBAL_CONST_weights_module[weight_idx];
+            const COMPUTE_TYPE weight_val = load_state(src_buffer_GLOBAL_CONST_weights_module, weight_idx);
             grad_h_accum += d_loss_d_logit * weight_val;
         }
     }
 
     // Write the final, reduced gradient value to its unique destination.
-    dest_buffer_GLOBAL_partial_grad_hidden_activations_aos[out_idx] = grad_h_accum;
+    store_storage(dest_buffer_GLOBAL_partial_grad_hidden_activations_aos, out_idx, grad_h_accum);
 }
 
 // --- Implementation: calculate_chunk_temp_gradients (Node 10) ---
@@ -229,23 +229,23 @@ __kernel void backprop_error_to_hidden_chunk(
 // reduction to achieve this. Crucially, it only computes the gradient contribution from its
 // single, assigned chunk of classes, making it a "partial-partial" renderer.
 __kernel void calculate_chunk_temp_gradients(
-    __local SCALAR_TYPE        *update_buffer_LOCAL_reduction_tile,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_logits,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_probs,
-    __global const void        *src_buffer_GLOBAL_targets,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_sample_mask,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_CONST_temps,
-    __global SCALAR_TYPE       *dest_buffer_GLOBAL_partial_grad_temps,
-    uint                        src_scalar_FLAG_problem_type,
-    uint                        src_scalar_NATURAL_flat_tile_index,
-    uint                        src_scalar_NATURAL_num_class_chunks,
-    uint                        src_scalar_NATURAL_classes_per_chunk,
-    uint                        src_scalar_NATURAL_modules_per_chunk,
-    uint                        src_scalar_NATURAL_total_batch_count,
-    uint                        src_scalar_NATURAL_total_output_class_count,
-    uint                        src_scalar_NATURAL_padded_total_output_class_count,
-    uint                        src_scalar_NATURAL_total_modules_count,
-    uint                        src_scalar_NATURAL_total_tile_count) {
+    __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_logits,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_probs,
+    __global const void         *src_buffer_GLOBAL_targets,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_temps,
+    __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_temps,
+    uint                         src_scalar_FLAG_problem_type,
+    uint                         src_scalar_NATURAL_flat_tile_index,
+    uint                         src_scalar_NATURAL_num_class_chunks,
+    uint                         src_scalar_NATURAL_classes_per_chunk,
+    uint                         src_scalar_NATURAL_modules_per_chunk,
+    uint                         src_scalar_NATURAL_total_batch_count,
+    uint                         src_scalar_NATURAL_total_output_class_count,
+    uint                         src_scalar_NATURAL_padded_total_output_class_count,
+    uint                         src_scalar_NATURAL_total_modules_count,
+    uint                         src_scalar_NATURAL_total_tile_count) {
 
     // --- 1. Work-Group to Module Mapping ---
     // A 1D dispatch is used, where each work-group computes the gradient for one module.
@@ -267,20 +267,20 @@ __kernel void calculate_chunk_temp_gradients(
     const uint class_offset      = class_chunk_idx * src_scalar_NATURAL_classes_per_chunk;
 
     // --- 3. Hierarchical Three-Level Reduction ---
-    SCALAR_TYPE p_grad_sum = SCALAR_ZERO; // This thread's partial sum over its slice of the batch.
+    COMPUTE_TYPE p_grad_sum = COMPUTE_ZERO; // This thread's partial sum over its slice of the batch.
 
     // Calculate the base offset to read from the correct slice of the upstream partial probability buffer.
     const long prob_tile_base_offset = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk;
 
     // Level 1 Reduction (over batch): Each thread sums contributions from a strided slice of the batch.
     for (uint b = lid; b < src_scalar_NATURAL_total_batch_count; b += lsize) {
-        if (src_buffer_GLOBAL_sample_mask[b] < (SCALAR_TYPE)0.5f) {
+        if (load_storage(src_buffer_GLOBAL_sample_mask, b) < (COMPUTE_TYPE)0.5f) {
             continue;
         }
 
         // Level 2 Reduction (over class chunk): For each sample, we sum the gradient
         // contributions from this tile's assigned chunk of classes.
-        SCALAR_TYPE grad_contribution_for_sample = SCALAR_ZERO;
+        COMPUTE_TYPE grad_contribution_for_sample = COMPUTE_ZERO;
         for (uint c_local = 0; c_local < src_scalar_NATURAL_classes_per_chunk; c_local++) {
             const uint c_global = class_offset + c_local;
 
@@ -288,21 +288,21 @@ __kernel void calculate_chunk_temp_gradients(
                 // Calculate dL/dLogit for this specific class.
                 const long prob_read_idx = prob_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk
                                            + (long)b * src_scalar_NATURAL_classes_per_chunk + c_local;
-                const SCALAR_TYPE prob = src_buffer_GLOBAL_partial_probs[prob_read_idx];
+                const COMPUTE_TYPE prob = load_storage(src_buffer_GLOBAL_partial_probs, prob_read_idx);
 
-                SCALAR_TYPE d_loss_d_logit;
+                COMPUTE_TYPE d_loss_d_logit;
                 if (src_scalar_FLAG_problem_type == PROBLEM_TYPE_CCE) {
                     const __global int *targets_cce = (const __global int *)src_buffer_GLOBAL_targets;
                     d_loss_d_logit                  = select(prob, prob - 1.0f, c_global == targets_cce[b]);
                 } else {
-                    const __global SCALAR_TYPE *targets_bce = (const __global SCALAR_TYPE *)src_buffer_GLOBAL_targets;
-                    d_loss_d_logit                          = prob - targets_bce[(long)b * src_scalar_NATURAL_padded_total_output_class_count + c_global];
+                    const __global STORAGE_TYPE *targets_bce = (const __global STORAGE_TYPE *)src_buffer_GLOBAL_targets;
+                    d_loss_d_logit                           = prob - load_storage(targets_bce, (long)b * src_scalar_NATURAL_padded_total_output_class_count + c_global);
                 }
 
                 // Accumulate the gradient contribution: (dL/dLogit) * Logit.
                 const long logit_read_idx = (long)module_global_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_total_output_class_count
                                             + (long)b * src_scalar_NATURAL_padded_total_output_class_count + c_global;
-                grad_contribution_for_sample += d_loss_d_logit * src_buffer_GLOBAL_logits[logit_read_idx];
+                grad_contribution_for_sample += d_loss_d_logit * load_storage(src_buffer_GLOBAL_logits, logit_read_idx);
             }
         }
         p_grad_sum += grad_contribution_for_sample;
@@ -321,16 +321,16 @@ __kernel void calculate_chunk_temp_gradients(
 
     // First thread applies the final chain rule step and writes the result.
     if (lid == 0) {
-        const SCALAR_TYPE total_sum_for_chunk = update_buffer_LOCAL_reduction_tile[0];
-        const SCALAR_TYPE temp                = src_buffer_GLOBAL_CONST_temps[module_global_idx];
+        const COMPUTE_TYPE total_sum_for_chunk = update_buffer_LOCAL_reduction_tile[0];
+        const COMPUTE_TYPE temp                = load_state(src_buffer_GLOBAL_CONST_temps, module_global_idx);
 
         // Apply final step of the chain rule: dL/dTemp = (dL/dScaledLogit) * (-Logit / Temp^2)
         // The loop calculated sum[(dL/dLogit) * Logit]. This final multiplication completes the gradient.
-        const SCALAR_TYPE final_partial_grad = total_sum_for_chunk * (-1.0f / (temp * temp));
+        const COMPUTE_TYPE final_partial_grad = total_sum_for_chunk * (-1.0f / (temp * temp));
 
         // Write to the unique slot for this tile in the collection buffer.
-        const long tile_base_offset                    = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk;
-        const uint out_idx                             = tile_base_offset + module_local_idx;
-        dest_buffer_GLOBAL_partial_grad_temps[out_idx] = final_partial_grad;
+        const long tile_base_offset = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk;
+        const uint out_idx          = tile_base_offset + module_local_idx;
+        store_storage(dest_buffer_GLOBAL_partial_grad_temps, out_idx, final_partial_grad);
     }
 }

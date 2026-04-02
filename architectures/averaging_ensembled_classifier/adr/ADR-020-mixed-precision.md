@@ -1,6 +1,6 @@
 # ADR-020: Three-Role Precision Model
 
-**Status:** PROPOSED
+**Status:** ACCEPTED
 **Date:** 2026-04-01
 **Deciders:** —
 **Supersedes:** ADR-008 PrecisionConfig design (§3.5 of DESIGN.md)
@@ -397,6 +397,8 @@ The `#if STORAGE_IS_NARROW` conditional compilation pattern is **not used**. The
 The build configuration provides `STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE`, and the derived `_IS_HALF` flags to every kernel compilation unit. The specific Meson option structure — whether a single `aec_precision` option expands to three type assignments, or factory-named presets are used — is a build-system design concern resolved during implementation within the constraints of this ADR.
 
 During the `SCALAR_TYPE` migration period, the build system may provide `SCALAR_TYPE` and `SCALAR_IS_HALF` as transitional aliases (mapped to `COMPUTE_TYPE` and `COMPUTE_TYPE_IS_HALF` respectively). These aliases are removed when the migration completes.
+
+**Host-mode stubs.** The kernel header's host/C++ mode stub definitions (`#else` branch when `__OPENCL_VERSION__` is not defined) also define `SCALAR_TYPE` as a transitional alias for `COMPUTE_TYPE`. This enables the host-mode validation build (`libkernel_host_validate.a`) to compile kernel signatures that have not yet been migrated to the three-role model. The host stubs mirror the build-system alias for consistency.
 
 #### §4.6: Test Strategy Implications (extends ADR-016)
 

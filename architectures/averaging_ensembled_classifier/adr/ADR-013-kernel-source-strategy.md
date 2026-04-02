@@ -50,7 +50,7 @@ Three upstream ADRs constrain this decision:
 
 `kernels.cl.h` currently serves two distinct functions:
 
-**Function A — Compile-time infrastructure.** Platform detection (`__OPENCL_VERSION__`), extension enablement (`cl_khr_fp16`), mandatory build-time symbols (CONTRACT.md Article 6: `SCALAR_TYPE`, `SIMD_WIDTH`, `C_TILE_SIZE`, `NUMERICAL_STABILITY_EPSILON`), architectural constants (Article 5: `LOCAL_MEM_BANK_PADDING`), and math configuration (`USE_FAST_MATH`). This function is inherently OpenCL-specific — GLSL uses specialization constants, C uses `#define` from the build system.
+**Function A — Compile-time infrastructure.** Platform detection (`__OPENCL_VERSION__`), extension enablement (`cl_khr_fp16`), mandatory build-time symbols (CONTRACT.md Article 6: `STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE`, `SIMD_WIDTH`, `C_TILE_SIZE`, `NUMERICAL_STABILITY_EPSILON`), architectural constants (Article 5: `LOCAL_MEM_BANK_PADDING`), and math configuration (`USE_FAST_MATH`). This function is inherently OpenCL-specific — GLSL uses specialization constants, C uses `#define` from the build system.
 
 **Function B — Algorithmic specification.** The `@kernel_contract` blocks, `@param` commentary with `Tensor Shape`, `Padding Contract`, `Calculability Proof`, and `Validation Preconditions` — these document the kernel's complete interface and algorithmic intent in a language-neutral notation embedded in C-style comments. This function is language-neutral in *substance*: the mathematical operations (Softmax, ReLU, L2 norm, tiled matmul, Adam update), data access patterns (scatter-write, placement-governed partial rendering), and synchronization roles (Streamable, Partial Renderer, Global Barrier) apply identically to all backends.
 
@@ -525,7 +525,7 @@ When a parity test failure occurs, the diagnostic path is:
 
 - **`kernels.cl.h` dual identity persists.** The file serves as both algorithmic specification and OpenCL compile infrastructure. A reader must distinguish specification-content (comments) from infrastructure (preprocessor directives). This is the status quo, not a new burden, and the `#ifdef` structure provides clear internal boundaries.
 
-- **OpenCL-centric specification notation.** The algorithmic specification uses OpenCL C function signatures and parameter names as its notation. A Vulkan or CPU developer must translate `__global const SCALAR_TYPE*` to `layout(binding=N) readonly buffer` or `const float*` conceptually. This translation is straightforward for experienced systems programmers and is documented in the dispatch-mapping tables in VULKAN_BACKEND.md and CPU_BACKEND.md.
+- **OpenCL-centric specification notation.** The algorithmic specification uses OpenCL C function signatures and parameter names as its notation. A Vulkan or CPU developer must translate `__global const STORAGE_TYPE*` to `layout(binding=N) readonly buffer` or `const float*` conceptually. This translation is straightforward for experienced systems programmers and is documented in the dispatch-mapping tables in VULKAN_BACKEND.md and CPU_BACKEND.md.
 
 - **Cross-boundary build reference for OpenCL.** The OpenCL backend references source files outside the `src/backends/` tree. This is a build-system concern (ADR-014), not a Python import concern — the `src/shared/` import boundary invariant is unaffected. The Meson build system handles cross-directory source references natively.
 

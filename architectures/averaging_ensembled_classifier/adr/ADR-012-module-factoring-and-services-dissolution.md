@@ -458,7 +458,7 @@ Each backend's module set follows a canonical structure. The responsibilities ar
 
 **`discovery.py`** — Populates `HardwareProfile` (ADR-006) from the backend's native hardware query mechanism. The `max_reduce_fan_in` derivation is backend-owned per ADR-006's decision: OpenCL derives it from `min(256, device.max_work_group_size)`; Vulkan from `maxComputeWorkGroupSize[0]`; CPU from L1 cache capacity.
 
-**`type_mapping.py`** — Maps `PrecisionConfig.numpy_dtype` (ADR-008) to the backend's native type vocabulary. OpenCL: `np.float32` → `"float"`, `np.float16` → `"half"` (for `-D SCALAR_TYPE=...` compiler flags). Vulkan: `np.float32` → `float` (GLSL), `np.float16` → `float16_t`. CPU: `np.float32` → `float` (C), `np.float16` → `_Float16` or emulated.
+**`type_mapping.py`** — Maps `PrecisionConfig` (ADR-008, ADR-020) to the backend's native type vocabulary. OpenCL: generates `-D STORAGE_TYPE=...`, `-D COMPUTE_TYPE=...`, `-D STATE_TYPE=...` compiler flags. Vulkan: `np.float32` → `float` (GLSL), `np.float16` → `float16_t`. CPU: role-specific dtype accessors for struct instantiation.
 
 **`buffer_allocator.py`** — Consumes the plan's `Tuple[BufferDescriptor, ...]` (ADR-009). Allocates physical memory from `size_bytes`, builds the `BufferHandle` → physical map, and optionally uses `role`, `producing_node`, and `last_consumer` annotations to optimize memory reuse. Vulkan uses lifetime intervals for suballocation packing; OpenCL allocates discrete `cl.Buffer`s; CPU uses `malloc` or arena allocation.
 

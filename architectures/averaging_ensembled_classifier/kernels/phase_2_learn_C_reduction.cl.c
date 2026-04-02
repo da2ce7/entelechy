@@ -11,12 +11,12 @@
 // final output tensor. It performs the entire reduction for that element serially in its
 // own private registers, avoiding all local memory and synchronization overhead.
 __kernel void aggregate_register_reduce(
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_collection,
-    __global const uint        *src_buffer_GLOBAL_CONST_partial_offset_list,
-    __global SCALAR_TYPE       *dest_buffer_GLOBAL_partial,
-    uint                        src_scalar_NATURAL_partial_offset_list_count,
-    uint                        src_scalar_NATURAL_partial_width,
-    uint                        src_scalar_FLAG_operation_type) {
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_collection,
+    __global const uint         *src_buffer_GLOBAL_CONST_partial_offset_list,
+    __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial,
+    uint                         src_scalar_NATURAL_partial_offset_list_count,
+    uint                         src_scalar_NATURAL_partial_width,
+    uint                         src_scalar_FLAG_operation_type) {
 
     // --- 1. Work-Item to Output Element Mapping ---
     // Each thread is assigned to compute one final value in the destination buffer.
@@ -28,23 +28,23 @@ __kernel void aggregate_register_reduce(
 
     // --- 2. Register-Based Reduction via Indirection ---
     // The accumulator is a private register, the fastest memory available.
-    SCALAR_TYPE accum = SCALAR_ZERO;
+    COMPUTE_TYPE accum = COMPUTE_ZERO;
     // This loop iterates through the "map" provided by the host.
     for (uint i = 0; i < src_scalar_NATURAL_partial_offset_list_count; ++i) {
         // Read the memory offset for the i-th partial result.
         const uint offset = src_buffer_GLOBAL_CONST_partial_offset_list[i];
         // Gather the scattered data: use the offset to find the start of the i-th partial
         // buffer and add our specific element's value to the accumulator.
-        accum += src_buffer_GLOBAL_partial_collection[offset + element_idx];
+        accum += load_storage(src_buffer_GLOBAL_partial_collection, offset + element_idx);
     }
 
     // --- 3. Final Output Calculation ---
     // Optionally compute the average if requested by the host.
     if (src_scalar_FLAG_operation_type == AGG_MODE_AVERAGE && src_scalar_NATURAL_partial_offset_list_count > 0) {
-        accum /= (SCALAR_TYPE)src_scalar_NATURAL_partial_offset_list_count;
+        accum /= (COMPUTE_TYPE)src_scalar_NATURAL_partial_offset_list_count;
     }
 
-    dest_buffer_GLOBAL_partial[element_idx] = accum;
+    store_storage(dest_buffer_GLOBAL_partial, element_idx, accum);
 }
 
 // --- Implementation: aggregate_local_reduce (Node 14, 15a, 20a) ---
@@ -53,13 +53,13 @@ __kernel void aggregate_register_reduce(
 // element of the output tensor. Threads first reduce a slice of the inputs into private
 // registers, then perform a final, fast reduction using __local memory.
 __kernel void aggregate_local_reduce(
-    __local SCALAR_TYPE        *update_buffer_LOCAL_reduction_tile,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_collection,
-    __global const uint        *src_buffer_GLOBAL_CONST_partial_offset_list,
-    __global SCALAR_TYPE       *dest_buffer_GLOBAL_partial,
-    uint                        src_scalar_NATURAL_partial_offset_list_count,
-    uint                        src_scalar_NATURAL_partial_width,
-    uint                        src_scalar_FLAG_operation_type) {
+    __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_collection,
+    __global const uint         *src_buffer_GLOBAL_CONST_partial_offset_list,
+    __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial,
+    uint                         src_scalar_NATURAL_partial_offset_list_count,
+    uint                         src_scalar_NATURAL_partial_width,
+    uint                         src_scalar_FLAG_operation_type) {
 
     // --- 1. Work-Group to Output Element Mapping ---
     // The work-group ID determines which output element this entire work-group will compute.
@@ -74,11 +74,11 @@ __kernel void aggregate_local_reduce(
 
     // --- 2. Parallel Gather-and-Sum from Indirection List ---
     // Each thread accumulates a partial sum for the work-group's assigned element.
-    SCALAR_TYPE accum = SCALAR_ZERO;
+    COMPUTE_TYPE accum = COMPUTE_ZERO;
     // The work-group's threads collaborate by processing the offset list in a strided manner.
     for (uint i = lid; i < src_scalar_NATURAL_partial_offset_list_count; i += lsize) {
         const uint offset = src_buffer_GLOBAL_CONST_partial_offset_list[i];
-        accum += src_buffer_GLOBAL_partial_collection[offset + element_idx];
+        accum += load_storage(src_buffer_GLOBAL_partial_collection, offset + element_idx);
     }
 
     // --- 3. Intra-Work-Group Reduction using Local Memory ---
@@ -97,11 +97,11 @@ __kernel void aggregate_local_reduce(
     // --- 4. Final Output Calculation and Write ---
     // The leader thread (lid=0) now holds the final sum for this element.
     if (lid == 0) {
-        SCALAR_TYPE result = update_buffer_LOCAL_reduction_tile[0];
+        COMPUTE_TYPE result = update_buffer_LOCAL_reduction_tile[0];
         if (src_scalar_FLAG_operation_type == AGG_MODE_AVERAGE && src_scalar_NATURAL_partial_offset_list_count > 0) {
-            result /= (SCALAR_TYPE)src_scalar_NATURAL_partial_offset_list_count;
+            result /= (COMPUTE_TYPE)src_scalar_NATURAL_partial_offset_list_count;
         }
-        dest_buffer_GLOBAL_partial[element_idx] = result;
+        store_storage(dest_buffer_GLOBAL_partial, element_idx, result);
     }
 }
 
@@ -112,21 +112,21 @@ __kernel void aggregate_local_reduce(
 // bypass the expensive second pass if no clipping is required, making it a
 // lightweight primitive ideal for repeated use within a reduction tree.
 __kernel void clip_intermediate_grad(
-    __local SCALAR_TYPE  *update_buffer_LOCAL_reduction_tile,
-    __global SCALAR_TYPE *update_buffer_GLOBAL_intermediate_grad,
-    SCALAR_TYPE           src_scalar_REAL_clipping_threshold_t_j,
-    SCALAR_TYPE           src_scalar_REAL_epsilon,
-    uint                  src_scalar_NATURAL_parameter_count) {
+    __local COMPUTE_TYPE  *update_buffer_LOCAL_reduction_tile,
+    __global STORAGE_TYPE *update_buffer_GLOBAL_intermediate_grad,
+    COMPUTE_TYPE           src_scalar_REAL_clipping_threshold_t_j,
+    COMPUTE_TYPE           src_scalar_REAL_epsilon,
+    uint                   src_scalar_NATURAL_parameter_count) {
 
     const uint lid   = get_local_id(0);
     const uint lsize = get_local_size(0);
     // This kernel assumes a 1D work-group dispatch.
 
     // --- 1. Pass 1: Parallel Reduction to find Sum of Squares ---
-    SCALAR_TYPE local_sq_sum = SCALAR_ZERO;
+    COMPUTE_TYPE local_sq_sum = COMPUTE_ZERO;
     // Each thread in the work-group sums the squares from a strided slice of the input buffer.
     for (uint i = lid; i < src_scalar_NATURAL_parameter_count; i += lsize) {
-        SCALAR_TYPE val = update_buffer_GLOBAL_intermediate_grad[i];
+        COMPUTE_TYPE val = load_storage(update_buffer_GLOBAL_intermediate_grad, i);
         local_sq_sum += val * val;
     }
 
@@ -144,10 +144,10 @@ __kernel void clip_intermediate_grad(
     // --- 2. Determine Scaling Factor and Broadcast via Local Memory ---
     // The leader thread (lid=0) computes the final norm and the required scaling factor.
     if (lid == 0) {
-        const SCALAR_TYPE total_sum_sq = update_buffer_LOCAL_reduction_tile[0];
-        const SCALAR_TYPE norm         = MATH_FN sqrt(total_sum_sq);
+        const COMPUTE_TYPE total_sum_sq = update_buffer_LOCAL_reduction_tile[0];
+        const COMPUTE_TYPE norm         = MATH_FN sqrt(total_sum_sq);
 
-        SCALAR_TYPE scale_factor = 1.0f;
+        COMPUTE_TYPE scale_factor = 1.0f;
         // Only trigger scaling if the norm exceeds the threshold for this reduction stage.
         if (norm > src_scalar_REAL_clipping_threshold_t_j) {
             scale_factor = src_scalar_REAL_clipping_threshold_t_j / (norm + src_scalar_REAL_epsilon);
@@ -158,7 +158,7 @@ __kernel void clip_intermediate_grad(
 
     // Synchronize to ensure all threads see the single, authoritative scale_factor.
     barrier(CLK_LOCAL_MEM_FENCE);
-    const SCALAR_TYPE scale_factor = update_buffer_LOCAL_reduction_tile[0];
+    const COMPUTE_TYPE scale_factor = update_buffer_LOCAL_reduction_tile[0];
 
     // --- 3. Performance Optimization: Early Exit ---
     // If the scaling factor is 1.0, no clipping is needed. The entire work-group can
@@ -170,7 +170,8 @@ __kernel void clip_intermediate_grad(
     // --- 4. Pass 2: Conditional In-Place Scaling ---
     // This second pass only executes if clipping is required.
     for (uint i = lid; i < src_scalar_NATURAL_parameter_count; i += lsize) {
-        update_buffer_GLOBAL_intermediate_grad[i] *= scale_factor;
+        COMPUTE_TYPE val = load_storage(update_buffer_GLOBAL_intermediate_grad, i);
+        store_storage(update_buffer_GLOBAL_intermediate_grad, i, val * scale_factor);
     }
 }
 
@@ -182,18 +183,18 @@ __kernel void clip_intermediate_grad(
 // context. Finally, it executes this plan, performing a series of `sum-then-clip`
 // operations where the clipping threshold is dynamically recalculated at every stage.
 __kernel void stabilize_and_reduce_grad_hidden_activations(
-    __local SCALAR_TYPE        *update_buffer_LOCAL_reduction_tile,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_grad_hidden_activations_permuted_soa,
-    __global SCALAR_TYPE       *dest_buffer_GLOBAL_summed_grad_hidden_activations,
-    SCALAR_TYPE                 src_scalar_REAL_fp_max,
-    SCALAR_TYPE                 src_scalar_REAL_policy_t_algorithmic,
-    SCALAR_TYPE                 src_scalar_REAL_policy_lambda,
-    uint                        src_scalar_NATURAL_policy_max_k,
-    SCALAR_TYPE                 src_scalar_REAL_epsilon,
-    uint                        src_scalar_NATURAL_total_batch_count,
-    uint                        src_scalar_NATURAL_padded_hidden_count,
-    uint                        src_scalar_NATURAL_total_modules_count,
-    uint                        src_scalar_NATURAL_padded_total_modules_count) {
+    __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_grad_hidden_activations_permuted_soa,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_summed_grad_hidden_activations,
+    COMPUTE_TYPE                 src_scalar_REAL_fp_max,
+    COMPUTE_TYPE                 src_scalar_REAL_policy_t_algorithmic,
+    COMPUTE_TYPE                 src_scalar_REAL_policy_lambda,
+    uint                         src_scalar_NATURAL_policy_max_k,
+    COMPUTE_TYPE                 src_scalar_REAL_epsilon,
+    uint                         src_scalar_NATURAL_total_batch_count,
+    uint                         src_scalar_NATURAL_padded_hidden_count,
+    uint                         src_scalar_NATURAL_total_modules_count,
+    uint                         src_scalar_NATURAL_padded_total_modules_count) {
 
     // --- Phase 0: Setup ---
     // Each work-group is responsible for reducing one full row of the SoA buffer.
@@ -209,10 +210,10 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
     // --- Phase 1: Unified Data Ingress & Initial Reduction ---
     // This single, universal path reduces the global input row into `lsize` partial
     // sums stored in local memory, creating a consistent starting state for the main reduction.
-    SCALAR_TYPE thread_accumulator = SCALAR_ZERO;
-    const long  row_offset         = (long)row_idx * src_scalar_NATURAL_padded_total_modules_count;
+    COMPUTE_TYPE thread_accumulator = COMPUTE_ZERO;
+    const long   row_offset         = (long)row_idx * src_scalar_NATURAL_padded_total_modules_count;
     for (uint i = lid; i < src_scalar_NATURAL_total_modules_count; i += lsize) {
-        thread_accumulator += src_buffer_GLOBAL_grad_hidden_activations_permuted_soa[row_offset + i];
+        thread_accumulator += load_storage(src_buffer_GLOBAL_grad_hidden_activations_permuted_soa, row_offset + i);
     }
     update_buffer_LOCAL_reduction_tile[lid] = thread_accumulator;
 
@@ -256,11 +257,11 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
     for (uint s = 0; s < num_stages_total; ++s) {
         // --- 3a. Synthesize Stage-Specific Threshold (Contract Compliant) ---
         // This is the core of the policy-driven stabilization.
-        const uint        j                         = num_stages_total - 1 - s; // Reverse index, j=0 is the final stage.
-        const SCALAR_TYPE T_policy                  = src_scalar_REAL_policy_t_algorithmic + src_scalar_REAL_policy_lambda * (SCALAR_TYPE)(j * j);
-        const uint        K_actual                  = min((uint)K_plan, num_items_in_stage);
-        const SCALAR_TYPE T_safety                  = (K_actual > 0) ? (src_scalar_REAL_fp_max / (SCALAR_TYPE)K_actual) : src_scalar_REAL_fp_max;
-        const SCALAR_TYPE final_threshold_for_stage = min(T_policy, T_safety); // Clamp policy by hardware safety.
+        const uint         j                         = num_stages_total - 1 - s; // Reverse index, j=0 is the final stage.
+        const COMPUTE_TYPE T_policy                  = src_scalar_REAL_policy_t_algorithmic + src_scalar_REAL_policy_lambda * (COMPUTE_TYPE)(j * j);
+        const uint         K_actual                  = min((uint)K_plan, num_items_in_stage);
+        const COMPUTE_TYPE T_safety                  = (K_actual > 0) ? (src_scalar_REAL_fp_max / (COMPUTE_TYPE)K_actual) : src_scalar_REAL_fp_max;
+        const COMPUTE_TYPE final_threshold_for_stage = min(T_policy, T_safety); // Clamp policy by hardware safety.
 
         // --- 3b. Perform One Level of `sum-then-clip` Reduction ---
         // Each thread `lid` becomes a "sub-group leader" for a block of up to `K_plan` items.
@@ -268,13 +269,13 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
             const uint start_idx = lid * K_plan;
             const uint end_idx   = min(start_idx + K_plan, num_items_in_stage);
 
-            SCALAR_TYPE sum_vec = SCALAR_ZERO;
+            COMPUTE_TYPE sum_vec = COMPUTE_ZERO;
             for (uint i = start_idx; i < end_idx; ++i) {
                 sum_vec += update_buffer_LOCAL_reduction_tile[i];
             }
 
             // For a scalar sum, the L2 norm is just its absolute value.
-            SCALAR_TYPE norm = fabs(sum_vec);
+            COMPUTE_TYPE norm = fabs(sum_vec);
             if (norm > final_threshold_for_stage) {
                 sum_vec *= final_threshold_for_stage / (norm + src_scalar_REAL_epsilon);
             }
@@ -300,15 +301,15 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
 // conditionally clip and write (Phase 3).  This fuses the reduce+clip into a
 // single dispatch, eliminating intermediate global memory traffic.
 __kernel void reduce_k_fan_in_and_clip(
-    __local  SCALAR_TYPE *update_buffer_LOCAL_reduction_tile,
-    __global const SCALAR_TYPE *src_buffer_GLOBAL_partial_collection,
-    __global const uint        *src_buffer_GLOBAL_CONST_offset_list_flat,
-    __global SCALAR_TYPE       *dest_buffer_GLOBAL_stage_output,
-    uint src_scalar_NATURAL_fan_in_K,
-    uint src_scalar_NATURAL_node_count,
-    uint src_scalar_NATURAL_partial_width,
-    SCALAR_TYPE src_scalar_REAL_clipping_threshold,
-    SCALAR_TYPE src_scalar_REAL_epsilon) {
+    __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_collection,
+    __global const uint         *src_buffer_GLOBAL_CONST_offset_list_flat,
+    __global STORAGE_TYPE       *dest_buffer_GLOBAL_stage_output,
+    uint                         src_scalar_NATURAL_fan_in_K,
+    uint                         src_scalar_NATURAL_node_count,
+    uint                         src_scalar_NATURAL_partial_width,
+    COMPUTE_TYPE                 src_scalar_REAL_clipping_threshold,
+    COMPUTE_TYPE                 src_scalar_REAL_epsilon) {
 
     // --- 0. Work-Group to Reduction Node Mapping ---
     const uint node_id = get_group_id(0);
@@ -326,21 +327,21 @@ __kernel void reduce_k_fan_in_and_clip(
     // Each thread strides across the partial_width dimension, accumulating
     // element-wise sums across all K input partials for this node.
     // We accumulate the sum of squares simultaneously for the L2 norm.
-    SCALAR_TYPE local_sq_sum = SCALAR_ZERO;
+    COMPUTE_TYPE local_sq_sum = COMPUTE_ZERO;
 
     for (uint elem = lid; elem < src_scalar_NATURAL_partial_width; elem += lsize) {
-        SCALAR_TYPE accum = SCALAR_ZERO;
+        COMPUTE_TYPE accum = COMPUTE_ZERO;
 
         for (uint k = 0; k < src_scalar_NATURAL_fan_in_K; ++k) {
             const uint offset = src_buffer_GLOBAL_CONST_offset_list_flat[offset_base + k];
             if (offset != SENTINEL_ABSENT_PARTIAL) {
-                accum += src_buffer_GLOBAL_partial_collection[offset + elem];
+                accum += load_storage(src_buffer_GLOBAL_partial_collection, offset + elem);
             }
         }
 
         // Store the accumulated sum in the destination, to be potentially
         // scaled in-place during Phase 3.
-        dest_buffer_GLOBAL_stage_output[dest_base + elem] = accum;
+        store_storage(dest_buffer_GLOBAL_stage_output, dest_base + elem, accum);
 
         // Accumulate the square for this thread's L2 norm contribution.
         local_sq_sum += accum * accum;
@@ -348,7 +349,7 @@ __kernel void reduce_k_fan_in_and_clip(
 
     // --- Phase 2: Per-Node L2 Norm via Local Memory Parallel Reduction ---
     // Skip the norm/clip entirely if threshold == 0 (diagnostic mode).
-    if (src_scalar_REAL_clipping_threshold > SCALAR_ZERO) {
+    if (src_scalar_REAL_clipping_threshold > COMPUTE_ZERO) {
         update_buffer_LOCAL_reduction_tile[lid] = local_sq_sum;
         barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -361,22 +362,23 @@ __kernel void reduce_k_fan_in_and_clip(
 
         // --- Compute scaling factor and broadcast ---
         if (lid == 0) {
-            const SCALAR_TYPE total_sum_sq = update_buffer_LOCAL_reduction_tile[0];
-            const SCALAR_TYPE norm = MATH_FN sqrt(total_sum_sq);
+            const COMPUTE_TYPE total_sum_sq = update_buffer_LOCAL_reduction_tile[0];
+            const COMPUTE_TYPE norm         = MATH_FN sqrt(total_sum_sq);
 
-            SCALAR_TYPE scale_factor = (SCALAR_TYPE)1.0f;
+            COMPUTE_TYPE scale_factor = (COMPUTE_TYPE)1.0f;
             if (norm > src_scalar_REAL_clipping_threshold) {
                 scale_factor = src_scalar_REAL_clipping_threshold / (norm + src_scalar_REAL_epsilon);
             }
             update_buffer_LOCAL_reduction_tile[0] = scale_factor;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
-        const SCALAR_TYPE scale_factor = update_buffer_LOCAL_reduction_tile[0];
+        const COMPUTE_TYPE scale_factor = update_buffer_LOCAL_reduction_tile[0];
 
         // --- Phase 3: Conditional In-Place Scaling ---
-        if (scale_factor < (SCALAR_TYPE)1.0f) {
+        if (scale_factor < (COMPUTE_TYPE)1.0f) {
             for (uint elem = lid; elem < src_scalar_NATURAL_partial_width; elem += lsize) {
-                dest_buffer_GLOBAL_stage_output[dest_base + elem] *= scale_factor;
+                COMPUTE_TYPE val = load_storage(dest_buffer_GLOBAL_stage_output, dest_base + elem);
+                store_storage(dest_buffer_GLOBAL_stage_output, dest_base + elem, val * scale_factor);
             }
         }
     }

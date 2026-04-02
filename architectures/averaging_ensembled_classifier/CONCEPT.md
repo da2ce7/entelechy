@@ -56,7 +56,7 @@ The system observes a strict tripartite authority structure to prevent circular 
   - _Example Enforcement:_ `adam_update` kernel's `KernelContract` requires `src_scalar_REAL_beta1_pow_t` parameter
 
 - **3. Design (Implementations):** Subordinate authority implementing **how** to fulfill superior layers. Never influences higher layers.
-  - _Example Execution:_ Host computes `beta1**t` using FP64 regardless of `SCALAR_TYPE`
+  - _Example Execution:_ Host computes `beta1**t` using FP64 regardless of `COMPUTE_TYPE`
 
 #### 7. **No Silent Monoliths**
 

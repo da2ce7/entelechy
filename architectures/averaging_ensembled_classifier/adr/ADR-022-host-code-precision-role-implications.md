@@ -13,7 +13,7 @@
 
 ADR-020 established the three-role precision model as a sovereign-authority primitive and specified the architectural implications at the design layer (§4). ADR-021 specified the complete migration of the kernel source corpus. Neither ADR provided an exhaustive enumeration of the host-code artifacts that must change, nor the exact scope of each change. This ADR provides that enumeration.
 
-The host orchestration layer is the consumer of `PrecisionConfig` and the producer of everything downstream: `StabilizationPolicy` initialisation, build-time compiler flag generation, buffer allocation sizing, kernel contract validation, and test fixtures. Under the single-axis `SCALAR_TYPE` model, a single `numpy_dtype` flowed everywhere unchanged. Under the three-role model, three independent dtypes must flow to the right destinations — storage buffers, arithmetic boundaries, and persistent state — and must not be conflated.
+The host orchestration layer is the consumer of `PrecisionConfig` and the producer of everything downstream: `StabilizationPolicy` initialisation, build-time compiler flag generation, buffer allocation sizing, kernel contract validation, and test fixtures. Under the former single-axis `SCALAR_TYPE` model, a single `numpy_dtype` flowed everywhere unchanged. Under the three-role model, three independent dtypes flow to the right destinations — storage buffers, arithmetic boundaries, and persistent state — and must not be conflated.
 
 The affected artifacts fall into five categories:
 
@@ -168,18 +168,7 @@ The role assigned to each buffer parameter is given by the per-kernel role assig
 
 #### §6.2: `LocalMemorySpec` — `sizeof(SCALAR_TYPE)` → `sizeof(COMPUTE_TYPE)`
 
-Every `LocalMemorySpec` string in the six kernel contract modules currently contains `sizeof(SCALAR_TYPE)`. Per ADR-021 §1.4, `__local` scratch buffers are always `COMPUTE_TYPE`. All occurrences are updated:
-
-| Module | Count of `sizeof(SCALAR_TYPE)` occurrences |
-|:---|:---|
-| `phase_1_act.py` | 1 |
-| `phase_2_learn_A_production.py` | 1 |
-| `phase_2_learn_B_processing.py` | 2 |
-| `phase_2_learn_C_reduction.py` | 4 |
-| `phase_2_learn_D_backprop.py` | 3 |
-| `phase_3_update.py` | 0 |
-
-Each occurrence is replaced with `sizeof(COMPUTE_TYPE)`.
+Per ADR-021 §1.4, `__local` scratch buffers are always `COMPUTE_TYPE`. All `sizeof(SCALAR_TYPE)` occurrences in `LocalMemorySpec` strings have been updated to `sizeof(COMPUTE_TYPE)`.
 
 ---
 
@@ -187,7 +176,7 @@ Each occurrence is replaced with `sizeof(COMPUTE_TYPE)`.
 
 #### §7.1: `src/backends/opencl/type_mapping.py` (ADR-020 §4.5, §3.6)
 
-`build_compiler_flags()` currently generates `SCALAR_TYPE` and `SCALAR_IS_HALF`. It is replaced with generation of the full Article 6 symbol set:
+`build_compiler_flags()` generates the full Article 6 symbol set:
 
 ```python
 def build_compiler_flags(
@@ -212,18 +201,12 @@ def build_compiler_flags(
         f"-DNUMERICAL_STABILITY_EPSILON={eps}",
         "-DLOCAL_MEM_BANK_PADDING=1",
     ]
-    # Transitional aliases (ADR-021 §3) — removed when kernel migration completes.
-    flags += [
-        "-DSCALAR_TYPE=COMPUTE_TYPE",
-        "-DSCALAR_IS_HALF=COMPUTE_TYPE_IS_HALF",
-        "-DSCALAR_ZERO=COMPUTE_ZERO",
-    ]
     return flags
 ```
 
 `numpy_dtype_to_cl_type_name(precision)` is replaced by the internal `_dtype_to_cl_type(dtype)` helper that accepts an `np.dtype` directly, removing the coupling to a single-dtype `PrecisionConfig`.
 
-The transitional alias block is removed in the same commit that migrates the last `.cl.c` file (per ADR-021 §3 completion criterion).
+The transitional `SCALAR_TYPE` alias block (previously present during Phase 7B migration) has been removed — all kernel signatures now use the three-role precision model exclusively.
 
 #### §7.2: `src/backends/cpu/type_mapping.py` (ADR-020 §4.2)
 
