@@ -144,6 +144,16 @@ This boundary, `T_safety`, is not a static value. It is a **dynamic budget** det
 - **`COMPUTE_FP_FORMAT_MAX`**: The maximum representable value of the **compute precision** format (e.g., `~3.4e38` for FP32 compute, `~6.5e4` for FP16 compute). The safety ceiling reflects the arithmetic precision that performs the summation, not the storage precision of the values being summed. In a configuration where all precision roles share a format, `COMPUTE_FP_FORMAT_MAX` equals that format's maximum.
 - **`K_j`**: The number of partial results being summed by the `aggregate_*` kernel at stage `j`.
 
+**Pre-Summation Amplification Factor.** The formula above assumes each input element to stage `j` has magnitude bounded by the prior stage's clipping threshold. However, some reduction stages receive inputs that have already undergone implicit summation. Node 16's stage 0 inputs, for example, are the output of Node 13, which performs an implicit summation across `num_class_chunks` class-chunk tiles. After Node 11 clips each tile to `T_pre` and Node 13 sums `C` class chunks, the per-element bound entering Node 16 is `C × T_pre`. The generalized safety ceiling formula that accounts for upstream summation fan-in is:
+
+**`T_safety_j = COMPUTE_FP_FORMAT_MAX / (K_j × A_j)`**
+
+where `A_j` is the **pre-summation amplification factor**: `1` when inputs are raw clipped partials (Nodes 14, 15, 20), and `num_class_chunks` for Node 16's first stage. The Host Orchestrator must incorporate Node 13's amplification when calculating `T_pre`:
+
+**`T_pre ≤ COMPUTE_FP_FORMAT_MAX / num_class_chunks`**
+
+**Execution-Tier Internal Amplification.** GPU backends (OpenCL, Vulkan) implement Node 16 using a "work-group per row" strategy where each thread first accumulates `⌈total_modules/workgroup_size⌉` elements before the staged reduction begins. This internal amplification factor is handled at the execution tier via a **Phase 1 safety clip** within the kernel, ensuring the workgroup size remains opaque to the host orchestrator (ADR-005). The kernel clips each thread's partial accumulator to `FP_MAX / workgroup_size` before writing to local memory, guaranteeing overflow safety regardless of the module count or workgroup configuration.
+
 The Host Orchestrator implements this separation with a clean, two-step logic for each layer `j`:
 
 1.  **Calculate Policy Threshold:** `policy_threshold = T_algorithmic + λ * j²`
@@ -390,8 +400,11 @@ graph TD
                         comp_tile_trigger ~~~ K8_grad["(8) calc_module_grads"]:::kernel
                         comp_tile_trigger ~~~ K9_bprop["(9) backprop_error_hidden"]:::kernel
                         comp_tile_trigger ~~~ K10_temp["(10) calc_temp_grads"]:::kernel
-                        hidden_i & PARTIALS_Probs & Targets & SampleMask & Full_Logits --> K8_grad & K9_bprop & K10_temp
-                        P_Module & P_Temps --> K8_grad & K9_bprop & K10_temp
+                        hidden_i & PARTIALS_Probs & Targets & SampleMask --> K8_grad
+                        PARTIALS_Probs & Targets & SampleMask --> K9_bprop
+                        PARTIALS_Probs & Targets & SampleMask & Full_Logits --> K10_temp
+                        P_Module --> K8_grad & K9_bprop
+                        P_Temps --> K10_temp
 
                         K8_grad --> PARTIALS_Grad_Mod["PARTIAL Grad (Mod)"]:::partial_data
                         K9_bprop --> PARTIALS_Grad_H["PARTIAL Grad_H"]:::partial_data
@@ -560,14 +573,14 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
 
   - **Description:** This refers to the intelligent composition of simple, single-purpose kernels by the Host Orchestrator to form a `log_K(N)` reduction tree. This is the physical implementation of the **Primacy of Memory Strategy**, using the **Indirection Contract** (`offset_list`) to sum scattered partials without intermediate copies.
   - **Contextual Composition:** The Host Orchestrator renders the engine differently based on the data being processed and the tree depth:
-    - **For Single-Stage Trees** (`num_stages == 1`): The tree is composed of the all-to-one `aggregate_stage_j` kernel (reducing all partials to a single output), optionally followed by `clip_stage_j` for gradient stabilization.
-    - **For Multi-Stage Trees** (`num_stages > 1`): The tree is composed of the K-fan-in `reduce_k_fan_in_and_clip` kernel at each stage (ADR-019). Each stage produces `ceil(N/K)` independent output nodes, each formed by summing exactly K input partials and applying an independent per-node L2 clip. This fused kernel eliminates intermediate global memory traffic between the sum and clip operations.
+    - **For Single-Stage Trees** (`num_stages == 1`): The tree uses `aggregate_stage_j` (storage-entry or compute-entry variant, depending on the source buffer's `precision_role`), optionally followed by `clip_stage_j` for gradient stabilization.
+    - **For Multi-Stage Trees** (`num_stages > 1`): The tree's leaf stage (stage 0) uses `reduce_k_fan_in_and_clip` when the source collection is storage-role, or `reduce_k_fan_in_and_clip_from_compute` when the source collection is compute-role (e.g., BCE loss partials). All interior stages (stage ≥ 1) use `reduce_k_fan_in_and_clip_from_compute`, reading the prior stage's COMPUTE_TYPE output. This stage-typed variant selection is an Orchestration-tier concern, resolved by inspecting the source buffer's `precision_role` from its `BufferDescriptor` (ADR-026). Each stage produces `ceil(N/K)` independent output nodes, each formed by summing exactly K input partials and applying an independent per-node L2 clip. This fused kernel eliminates intermediate global memory traffic between the sum and clip operations.
     - **For Diagnostic Reduction (Node 14):** Clipping is disabled (the threshold sentinel bypasses the clip path), producing a simple summation of `PARTIAL_Probs` and `PARTIALS_Loss_BCE`.
     - **For Gradient Reduction (Nodes 15 & 20):** Clipping is enabled at each stage, implementing the `Gradient Stabilization` policy's Quadratic Scaling threshold schedule.
 
 - **`aggregate_stage_j`**: **[Utility Kernel]** A stateless, all-to-one summation kernel.
 
-  - **Note:** The `aggregate_stage_j` is a conceptual role fulfilled by a tiered set of concrete kernels (e.g., `aggregate_register_reduce`, `aggregate_local_reduce`) selected by the Host Orchestrator based on reduction width.
+  - **Note:** The `aggregate_stage_j` is a conceptual role fulfilled by a tiered set of concrete kernels (e.g., `aggregate_register_reduce`, `aggregate_local_reduce`) selected by the Host Orchestrator based on reduction width. Each concrete kernel exists in two **precision variants** (ADR-026): the storage-entry variant (e.g., `aggregate_register_reduce`) reads `STORAGE_TYPE` partials via `load_storage()`, while the compute-entry variant (e.g., `aggregate_register_reduce_from_compute`) reads `COMPUTE_TYPE` intermediates directly. The Orchestration tier selects the variant based on the source buffer's `precision_role`.
 
   - **Contract:** Accepts a generic memory pool (`partial_collection`) and an indirection table (`offset_list`) and reduces **all** referenced partials into a **single**, contiguous `Intermediate Sum` buffer of `partial_width` elements. It performs no other logic.
   - **Invocation:** Used for single-stage trees in Nodes (14), (15a), and (20a).
@@ -578,10 +591,10 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
 
 - **`reduce_k_fan_in_and_clip`**: **[Utility Kernel]** A stateless, fused K-fan-in reduction-and-clip kernel (ADR-019).
 
-  - **Note:** This kernel is the multi-stage counterpart to the `aggregate_stage_j` + `clip_stage_j` pipeline. It processes `ceil(N/K)` independent reduction nodes in a single dispatch, fusing summation and per-node clipping to avoid intermediate global memory traffic.
+  - **Note:** This kernel is the multi-stage counterpart to the `aggregate_stage_j` + `clip_stage_j` pipeline. It processes `ceil(N/K)` independent reduction nodes in a single dispatch, fusing summation and per-node clipping to avoid intermediate global memory traffic. Like the aggregate kernels, it exists in two **precision variants** (ADR-026): the storage-entry variant reads `STORAGE_TYPE` partials via `load_storage()`, while the compute-entry variant (`reduce_k_fan_in_and_clip_from_compute`) reads `COMPUTE_TYPE` intermediates directly.
 
   - **Contract:** Accepts a generic memory pool (`partial_collection`), a flat offset list with K consecutive entries per node, and a scalar clipping threshold `T_j`. For each node: sums K partials via the Indirection Contract, computes a per-node L2 norm, and conditionally scales the node's output independently. A threshold of `0.0` disables clipping (diagnostic mode). Absent partials in the tail node use a sentinel offset (`0xFFFFFFFF`).
-  - **Invocation:** Used for multi-stage trees (`num_stages > 1`) at each stage in Nodes (14), (15a), and (20a). Replaces the broken all-to-one aggregate + separate clip sequence that produced incorrect results for multi-stage trees.
+  - **Invocation:** The storage-entry variant is used for leaf-stage (stage 0) reduction of storage-role collections. The compute-entry variant (`_from_compute`) is used for interior stages (stage ≥ 1) reading prior COMPUTE_TYPE outputs, and for leaf stages whose source is natively compute-role (e.g., BCE loss partials).
 - **`(16) stabilize_and_reduce_grad_hidden_activations`**: **[Specialized Kernel]** A self-contained reduction engine that preserves maximum signal fidelity while applying the system's stabilization policy to the `Grad_H` vector.
   - **Contract:** Internally executes a multi-stage `log_K(M)` reduction. At each internal stage, it performs a **`sum-then-clip`** operation on its inputs, applying the host-provided **Quadratic Scaling Policy**.
   - **Justification for Specialization:** This kernel works in synergy with the mandatory leaf-level clipping from Node (11) to provide a complete, two-stage stabilization strategy. A generic engine is unsuitable because:

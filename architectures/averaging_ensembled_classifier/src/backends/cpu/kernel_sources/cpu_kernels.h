@@ -245,6 +245,24 @@ typedef struct {                                                               \
     COMPUTE_T        epsilon;                                                  \
 } ReductionTreePlanC_##SUFFIX;                                                 \
                                                                                \
+/* ADR-026: Compute-entry variant — reads from COMPUTE_T partial_collection */ \
+typedef struct {                                                               \
+    const COMPUTE_T* partial_collection;                                       \
+    const uint*      offset_lists_flat;                                        \
+    const uint*      stage_offsets_into_list;                                  \
+    const uint*      stage_fan_in;                                             \
+    const uint*      stage_node_counts;                                        \
+    COMPUTE_T*       staging_buffer_0;                                         \
+    COMPUTE_T*       staging_buffer_1;                                         \
+    COMPUTE_T*       output;                                                   \
+    uint             partial_width;                                            \
+    uint             num_stages;                                               \
+    COMPUTE_T        t_algorithmic;                                            \
+    COMPUTE_T        lambda;                                                   \
+    COMPUTE_T        fp_max;                                                   \
+    COMPUTE_T        epsilon;                                                  \
+} ReductionTreePlanComputeEntry_##SUFFIX;                                      \
+                                                                               \
 typedef struct {                                                               \
     const STORAGE_T* grad_hidden_activations_permuted_soa;                     \
     COMPUTE_T*       summed_grad_hidden_activations;                           \
@@ -407,6 +425,8 @@ CPU_KERNELS_EXPORT void task_clamp_temperatures_##SUFFIX(                      \
 /* Reduction Engine */                                                         \
 CPU_KERNELS_EXPORT void execute_reduction_tree_##SUFFIX(                       \
     ThreadPool* pool, ReductionTreePlanC_##SUFFIX* plan);                      \
+CPU_KERNELS_EXPORT void execute_reduction_tree_from_compute_##SUFFIX(          \
+    ThreadPool* pool, ReductionTreePlanComputeEntry_##SUFFIX* plan);           \
 /* Layout Verification (ADR-015) */                                            \
 CPU_KERNELS_EXPORT size_t get_struct_size_forward_pass_args_##SUFFIX(void);    \
 CPU_KERNELS_EXPORT size_t get_struct_size_render_logits_args_##SUFFIX(void);   \
@@ -418,6 +438,7 @@ CPU_KERNELS_EXPORT size_t get_struct_size_temp_gradients_args_##SUFFIX(void);  \
 CPU_KERNELS_EXPORT size_t get_struct_size_clip_partials_args_##SUFFIX(void);   \
 CPU_KERNELS_EXPORT size_t get_struct_size_gather_permute_args_##SUFFIX(void);  \
 CPU_KERNELS_EXPORT size_t get_struct_size_reduction_tree_plan_##SUFFIX(void);  \
+CPU_KERNELS_EXPORT size_t get_struct_size_reduction_tree_plan_compute_entry_##SUFFIX(void); \
 CPU_KERNELS_EXPORT size_t get_struct_size_stabilize_reduce_args_##SUFFIX(void);\
 CPU_KERNELS_EXPORT size_t get_struct_size_clip_intermediate_args_##SUFFIX(void);\
 CPU_KERNELS_EXPORT size_t get_struct_size_backprop_shared_weights_args_##SUFFIX(void); \

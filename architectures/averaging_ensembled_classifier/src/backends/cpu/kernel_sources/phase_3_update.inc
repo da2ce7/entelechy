@@ -81,6 +81,7 @@ size_t PREC_FN(get_struct_size_temp_gradients_args)(void)        { return sizeof
 size_t PREC_FN(get_struct_size_clip_partials_args)(void)         { return sizeof(PREC_TY(ClipPartialsArgs)); }
 size_t PREC_FN(get_struct_size_gather_permute_args)(void)        { return sizeof(PREC_TY(GatherPermuteArgs)); }
 size_t PREC_FN(get_struct_size_reduction_tree_plan)(void)        { return sizeof(PREC_TY(ReductionTreePlanC)); }
+size_t PREC_FN(get_struct_size_reduction_tree_plan_compute_entry)(void) { return sizeof(PREC_TY(ReductionTreePlanComputeEntry)); }
 size_t PREC_FN(get_struct_size_stabilize_reduce_args)(void)      { return sizeof(PREC_TY(StabilizeReduceArgs)); }
 size_t PREC_FN(get_struct_size_clip_intermediate_args)(void)     { return sizeof(PREC_TY(ClipIntermediateArgs)); }
 size_t PREC_FN(get_struct_size_backprop_shared_weights_args)(void) { return sizeof(PREC_TY(BackpropSharedWeightsArgs)); }

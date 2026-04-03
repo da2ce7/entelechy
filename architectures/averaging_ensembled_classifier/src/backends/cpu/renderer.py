@@ -208,11 +208,29 @@ class CPUPlanRenderer:
         plan: ExecutionPlan,
         suffix: str,
     ) -> None:
-        """Render a ReductionTreeNode via execute_reduction_tree."""
+        """Render a ReductionTreeNode via execute_reduction_tree.
+
+        ADR-026: Selects between storage-entry and compute-entry variants
+        based on the source buffer's precision_role.
+        """
         _, c_storage_p, _, c_compute_p, _, _ = PRECISION_C_TYPES[suffix]
-        ReductionTreePlanFFI = PRECISION_STRUCTS[suffix]["ReductionTreePlanFFI"]
 
         rtp = node.reduction_plan
+
+        # ADR-026 §3: Select variant based on source buffer's precision_role
+        source_desc = plan.buffers[rtp.source_buffer]
+        use_compute_entry = source_desc.precision_role == "compute"
+
+        if use_compute_entry:
+            PlanStruct = PRECISION_STRUCTS[suffix]["ReductionTreePlanComputeEntryFFI"]
+            c_collection_p = c_compute_p
+            staging_dtype = plan.precision.compute_dtype
+            fn_name = f"execute_reduction_tree_from_compute_{suffix}"
+        else:
+            PlanStruct = PRECISION_STRUCTS[suffix]["ReductionTreePlanFFI"]
+            c_collection_p = c_storage_p
+            staging_dtype = plan.precision.storage_dtype
+            fn_name = f"execute_reduction_tree_{suffix}"
 
         offsets = rtp.initial_offset_list
         fan_in = rtp.fan_in_K
@@ -255,16 +273,16 @@ class CPUPlanRenderer:
         stage_fan_in = (ctypes.c_uint32 * num_stages)(*([fan_in] * num_stages))
         stage_node_counts = (ctypes.c_uint32 * num_stages)(*stage_counts)
 
-        # Allocate staging buffers (ping-pong)
+        # Allocate staging buffers (ping-pong) — dtype matches variant
         max_intermediates: int = max(stage_counts) if stage_counts else 1
-        staging_0 = np.zeros(max_intermediates * pw, dtype=plan.precision.storage_dtype)
-        staging_1 = np.zeros(max_intermediates * pw, dtype=plan.precision.storage_dtype)
+        staging_0 = np.zeros(max_intermediates * pw, dtype=staging_dtype)
+        staging_1 = np.zeros(max_intermediates * pw, dtype=staging_dtype)
 
         # Build the C plan struct
-        c_plan = ReductionTreePlanFFI()
+        c_plan = PlanStruct()
         c_plan.partial_collection = ctypes.cast(
             allocator.get_data_pointer(rtp.source_buffer),
-            c_storage_p,
+            c_collection_p,
         )
         c_plan.offset_lists_flat = ctypes.cast(
             offsets_array, ctypes.POINTER(ctypes.c_uint32)
@@ -278,8 +296,8 @@ class CPUPlanRenderer:
         c_plan.stage_node_counts = ctypes.cast(
             stage_node_counts, ctypes.POINTER(ctypes.c_uint32)
         )
-        c_plan.staging_buffer_0 = staging_0.ctypes.data_as(c_storage_p)
-        c_plan.staging_buffer_1 = staging_1.ctypes.data_as(c_storage_p)
+        c_plan.staging_buffer_0 = staging_0.ctypes.data_as(c_collection_p)
+        c_plan.staging_buffer_1 = staging_1.ctypes.data_as(c_collection_p)
         c_plan.output = ctypes.cast(
             allocator.get_data_pointer(rtp.destination_buffer),
             c_compute_p,
@@ -301,7 +319,7 @@ class CPUPlanRenderer:
         c_plan.fp_max = _to_compute_scalar(plan.precision.compute_fp_format_max, suffix)
         c_plan.epsilon = _to_compute_scalar(plan.precision.compute_epsilon, suffix)
 
-        getattr(self._lib, f"execute_reduction_tree_{suffix}")(
+        getattr(self._lib, fn_name)(
             self._pool, ctypes.byref(c_plan)
         )
 

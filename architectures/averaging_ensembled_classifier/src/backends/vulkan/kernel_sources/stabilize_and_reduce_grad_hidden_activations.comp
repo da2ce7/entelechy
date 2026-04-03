@@ -55,6 +55,17 @@ void main() {
     for (uint i = lid; i < push.total_modules_count; i += lsize) {
         thread_accum += read_storage(src_grad_h.data[row_offset + i]);
     }
+
+    // Phase 1 Safety Clip (ADR-005 Opacity Principle):
+    // The Phase 2 staged reduction sums up to `lsize` partial values at its first stage.
+    // To prevent overflow, each partial must be bounded by fp_max / lsize. This keeps
+    // the workgroup size as an internal execution-tier concern, not leaking to host policy.
+    COMPUTE_FLOAT phase1_ceiling = COMPUTE_FLOAT(push.fp_max) / COMPUTE_FLOAT(lsize);
+    COMPUTE_FLOAT mag            = abs(thread_accum);
+    if (mag > phase1_ceiling) {
+        thread_accum *= phase1_ceiling / (mag + COMPUTE_FLOAT(push.epsilon));
+    }
+
     reduction_tile[lid] = thread_accum;
     barrier();
 

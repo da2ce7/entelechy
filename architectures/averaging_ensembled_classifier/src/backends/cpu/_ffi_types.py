@@ -73,6 +73,7 @@ _LAYOUT_CHECK_BASE_NAMES: list[tuple[str, str]] = [
     ("get_struct_size_clip_partials_args", "ClipPartialsArgs"),
     ("get_struct_size_gather_permute_args", "GatherPermuteArgs"),
     ("get_struct_size_reduction_tree_plan", "ReductionTreePlanFFI"),
+    ("get_struct_size_reduction_tree_plan_compute_entry", "ReductionTreePlanComputeEntryFFI"),
     ("get_struct_size_stabilize_reduce_args", "StabilizeReduceArgs"),
     ("get_struct_size_clip_intermediate_args", "ClipIntermediateArgs"),
     ("get_struct_size_backprop_shared_weights_args", "BackpropSharedWeightsArgs"),
@@ -292,6 +293,24 @@ def make_precision_types(
         ("staging_buffer_0", c_storage_p),
         ("staging_buffer_1", c_storage_p),
         ("output", c_compute_p),  # compute output
+        ("partial_width", c_uint32),
+        ("num_stages", c_uint32),
+        ("t_algorithmic", c_compute),
+        ("lambda_", c_compute),
+        ("fp_max", c_compute),
+        ("epsilon", c_compute),
+    ])
+
+    # ADR-026: Compute-entry variant for compute-role source buffers
+    structs["ReductionTreePlanComputeEntryFFI"] = _s("ReductionTreePlanComputeEntryFFI", [
+        ("partial_collection", c_compute_p),  # compute-role input
+        ("offset_lists_flat", c_uint_p),
+        ("stage_offsets_into_list", c_uint_p),
+        ("stage_fan_in", c_uint_p),
+        ("stage_node_counts", c_uint_p),
+        ("staging_buffer_0", c_compute_p),  # compute-role staging
+        ("staging_buffer_1", c_compute_p),  # compute-role staging
+        ("output", c_compute_p),
         ("partial_width", c_uint32),
         ("num_stages", c_uint32),
         ("t_algorithmic", c_compute),

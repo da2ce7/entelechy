@@ -624,6 +624,35 @@ Stage 0 (root):     [node0]                       ← 1 task
 
 For large numbers of partials, the leaf stages have high parallelism. The root is sequential, but it processes one buffer — the cost is trivial.
 
+### Precision-Typed Variants (ADR-026)
+
+Under mixed-precision configurations (`PrecisionConfig.mixed_f16_f32()`), the reduction engine must handle two entry point types differentiated by the source buffer's `precision_role`:
+
+| Variant | Source Buffer Role | Load Mechanism | When Used |
+| :--- | :--- | :--- | :--- |
+| **Storage-entry** (existing) | `"storage"` | Widening conversion (`STORAGE_TYPE` → `COMPUTE_TYPE`) | Leaf stage reading from STORAGE_TYPE partial collection |
+| **Compute-entry** (ADR-026) | `"compute"` | Direct `COMPUTE_TYPE` read | Interior stages; leaf stage reading from COMPUTE_TYPE collection (e.g., BCE loss) |
+
+**Variant selection rule:** The Orchestration tier queries the source buffer's `BufferDescriptor.precision_role`:
+
+```python
+# Multi-stage tree
+for stage in range(num_stages):
+    if stage == 0 and source_desc.precision_role == "storage":
+        dispatch execute_reduction_tree_<suffix>           # storage-entry
+    else:
+        dispatch execute_reduction_tree_from_compute_<suffix>  # compute-entry
+```
+
+The C library exposes both entry points per precision suffix (`s32x32`, `s16x16`, `s16x32`):
+
+| Entry Point | Parameter Type |
+| :--- | :--- |
+| `execute_reduction_tree_<suffix>` | `STORAGE_TYPE* partial_collection` |
+| `execute_reduction_tree_from_compute_<suffix>` | `COMPUTE_TYPE* partial_collection` |
+
+Both share identical algorithm, clipping logic, and output type (`COMPUTE_TYPE`). The divergence is exactly one parameter's C type.
+
 ---
 
 ## Cache Considerations

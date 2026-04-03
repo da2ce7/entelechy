@@ -148,6 +148,12 @@ static inline void store_storage(
 //                       the narrower compute value preserves all its bits)
 // When STATE_TYPE = double and COMPUTE_TYPE = double:
 //   Both casts are identity operations, eliminated by the compiler.
+//
+// STATE_TYPE = half Note (ADR-024 invariant):
+//   STATE_TYPE = half is architecturally valid only when STORAGE_TYPE is also
+//   half (enforced by PrecisionConfig.__post_init__), guaranteeing cl_khr_fp16
+//   is enabled. Plain array access on half* is valid when the extension is
+//   active, so no vload_half/vstore_half path is required here.
 
 static inline COMPUTE_TYPE load_state(
     __global const STATE_TYPE *buf, size_t idx)
@@ -983,8 +989,38 @@ __kernel void clip_partial_gradients(
      *        - Validation Preconditions: Host shall allocate a buffer with a size and layout identical to `src_buffer_GLOBAL_partial_grad_weights_module`.
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_weights_module,
+
+    /**
+     * @param dest_buffer_GLOBAL_clipped_partial_grad_biases_module Output for clipped bias gradients.
+     *        - Tensor Shape: Identical to its `src_` counterpart.
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "storage"
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_classes_per_chunk]
+     *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
+     *        - Validation Preconditions: Host shall allocate a buffer with a size and layout identical to `src_buffer_GLOBAL_partial_grad_biases_module`.
+     */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_biases_module,
+
+    /**
+     * @param dest_buffer_GLOBAL_clipped_partial_grad_temps Output for clipped temperature gradients.
+     *        - Tensor Shape: Identical to its `src_` counterpart.
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "storage"
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk]
+     *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
+     *        - Validation Preconditions: Host shall allocate a buffer with a size and layout identical to `src_buffer_GLOBAL_partial_grad_temps`.
+     */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_temps,
+
+    /**
+     * @param dest_buffer_GLOBAL_clipped_partial_grad_hidden_activations_aos Output for clipped upstream gradients.
+     *        - Tensor Shape: Identical to its `src_` counterpart.
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "storage"
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
+     *        - Validation Preconditions: Host shall allocate a buffer with a size and layout identical to `src_buffer_GLOBAL_partial_grad_hidden_activations_aos`.
+     */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_hidden_activations_aos,
 
     /**
@@ -1161,13 +1197,113 @@ __kernel void aggregate_local_reduce(
     uint src_scalar_NATURAL_partial_width,
     uint src_scalar_FLAG_operation_type);
 
+// --- ADR-026: Precision-Typed Reduction Kernel Variants (Compute-Entry) ---
+
+/**
+ * @brief (Node 14, 15a & 20a) Compute-entry variant of aggregate_register_reduce.
+ *        Identical algorithm reading COMPUTE_TYPE intermediates directly.
+ * @kernel_contract
+ *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a COMPUTE_TYPE collection buffer, located via an explicit offset list."
+ *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag. All buffers are compute-role; no precision boundary conversion is required. All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Idempotency: "Associatively Non-Idempotent"
+ *        - Synchronization Model: "Reduction Engine Stage"
+ *        - Precision Variant: "Compute-entry variant of aggregate_register_reduce. Used for interior stages of multi-stage reduction trees (where the source is a prior stage's COMPUTE_TYPE output) and for leaf stages whose source collection is natively COMPUTE_TYPE."
+ */
+__kernel void aggregate_register_reduce_from_compute(
+    /**
+     * @param src_buffer_GLOBAL_partial_collection The memory pool containing COMPUTE_TYPE intermediate results.
+     *        - Tensor Shape: Undefined.
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof: N/A.
+     *        - Validation Preconditions: Host must provide a valid buffer that encompasses all memory regions referenced by the combination of `src_buffer_GLOBAL_CONST_partial_offset_list` and `src_scalar_NATURAL_partial_width`.
+     */
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_partial_collection,
+
+    /**
+     * @param src_buffer_GLOBAL_CONST_partial_offset_list The indirection table. Each element is an offset into `src_buffer_GLOBAL_partial_collection`.
+     *        - Tensor Shape: (src_scalar_NATURAL_partial_offset_list_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_partial_offset_list_count]
+     *        - Validation Preconditions: Host must provide a buffer containing exactly `src_scalar_NATURAL_partial_offset_list_count` uints.
+     */
+    __global const uint *src_buffer_GLOBAL_CONST_partial_offset_list,
+
+    /**
+     * @param dest_buffer_GLOBAL_partial The destination buffer for the single, reduced partial result.
+     *        - Tensor Shape: (src_scalar_NATURAL_partial_width)
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof: [src_scalar_NATURAL_partial_width]
+     *        - Validation Preconditions: Host must allocate exactly [src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)] bytes.
+     */
+    __global COMPUTE_TYPE *dest_buffer_GLOBAL_partial,
+
+    uint src_scalar_NATURAL_partial_offset_list_count,
+    uint src_scalar_NATURAL_partial_width,
+    uint src_scalar_FLAG_operation_type);
+
+/**
+ * @brief (Node 14, 15a & 20a) Compute-entry variant of aggregate_local_reduce.
+ *        Identical algorithm reading COMPUTE_TYPE intermediates directly.
+ * @kernel_contract
+ *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a COMPUTE_TYPE collection buffer, located via an explicit offset list."
+ *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag. All buffers are compute-role; no precision boundary conversion is required. All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Idempotency: "Associatively Non-Idempotent"
+ *        - Synchronization Model: "Reduction Engine Stage / Work-group Parallel"
+ *        - Precision Variant: "Compute-entry variant of aggregate_local_reduce. Used for interior stages of multi-stage reduction trees (where the source is a prior stage's COMPUTE_TYPE output) and for leaf stages whose source collection is natively COMPUTE_TYPE."
+ */
+__kernel void aggregate_local_reduce_from_compute(
+    /**
+     * @param update_buffer_LOCAL_reduction_tile Local memory for performing the intra-work-group reduction.
+     *        - Tensor Shape: (get_local_size(0))
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute" (LOCAL scratch)
+     *        - Calculability Proof: [Implicit from work-group dispatch]
+     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     */
+    __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
+
+    /**
+     * @param src_buffer_GLOBAL_partial_collection The memory pool containing COMPUTE_TYPE intermediate results.
+     *        - Tensor Shape: Undefined.
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof: N/A.
+     *        - Validation Preconditions: Host must provide a valid buffer that encompasses all memory regions referenced by the combination of `src_buffer_GLOBAL_CONST_partial_offset_list` and `src_scalar_NATURAL_partial_width`.
+     */
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_partial_collection,
+
+    /**
+     * @param src_buffer_GLOBAL_CONST_partial_offset_list The indirection table. Each element is an offset into `src_buffer_GLOBAL_partial_collection`.
+     *        - Tensor Shape: (src_scalar_NATURAL_partial_offset_list_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_partial_offset_list_count]
+     *        - Validation Preconditions: Host must provide a buffer containing exactly `src_scalar_NATURAL_partial_offset_list_count` uints.
+     */
+    __global const uint *src_buffer_GLOBAL_CONST_partial_offset_list,
+
+    /**
+     * @param dest_buffer_GLOBAL_partial The destination buffer for the single, reduced partial result.
+     *        - Tensor Shape: (src_scalar_NATURAL_partial_width)
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof: [src_scalar_NATURAL_partial_width]
+     *        - Validation Preconditions: Host must allocate exactly [src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)] bytes.
+     */
+    __global COMPUTE_TYPE *dest_buffer_GLOBAL_partial,
+
+    uint src_scalar_NATURAL_partial_offset_list_count,
+    uint src_scalar_NATURAL_partial_width,
+    uint src_scalar_FLAG_operation_type);
+
 /**
  * @brief (Node 15b, 20b) [Utility Kernel] Applies partial-group-wise clipping to a single, contiguous, intermediate gradient buffer.
  * @kernel_contract
  *        - Holistic Constraints: "This kernel is a core component of the host-driven, recursive clip-aggregation engine. It atomically computes an L2 norm over its entire input buffer and
  * conditionally scales that buffer in-place."
  *        - Behavioral Invariants: "An epsilon term shall be used to prevent division by zero when calculating the scaling factor. The implementation must use local memory for the norm reduction to be
- * scalable. Precision Boundary Conversion: compute-role buffer accessed directly in COMPUTE_TYPE; all arithmetic in COMPUTE_TYPE."
+ * scalable. All buffers are compute-role; no precision boundary conversion is required."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Reduction Engine Stage Clip Primitive"
  */
@@ -1315,7 +1451,7 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
  * @brief (Node 17) Computes partial gradients for shared layer weights from a batch chunk.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative is computed internally from `hidden_activations` (mask = activation > 0); no explicit `hidden_mask` input is required."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Partial Renderer. Designed for the 'True Streaming' backpropagation model."
  */
@@ -1400,7 +1536,7 @@ __kernel void backprop_shared_weights_chunk(
  * @brief (Node 18) Computes partial gradients for shared layer biases from a batch chunk.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative is computed internally from `hidden_activations` (mask = activation > 0); no explicit `hidden_mask` input is required."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Partial Renderer. Designed for the 'True Streaming' backpropagation model."
  */
@@ -1453,6 +1589,7 @@ __kernel void backprop_shared_biases_chunk(
      * @param dest_buffer_GLOBAL_partial_grad_biases_shared The collection buffer for this chunk's computed bias gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks_count, src_scalar_NATURAL_padded_hidden_count]
      *        - Placement Contract: linear_batch(src_scalar_NATURAL_batch_chunk_index)
      *        - Validation Preconditions: [1] The write chunk index must be valid, as proven by: src_scalar_NATURAL_batch_chunk_index < src_scalar_NATURAL_num_batch_chunks_count. [2] Host shall
@@ -1559,7 +1696,7 @@ __kernel void clip_shared_gradients_chunk(
  * @kernel_contract
  *        - Holistic Constraints: "This kernel is a generic, element-wise scaling utility designed to operate on any parameter group's summed gradient buffer."
  *        - Behavioral Invariants: "Performs element-wise division: `output[i] = input[i] / (effective_batch_size + epsilon)`. An epsilon term MUST be used to prevent division by zero if the
- * effective_batch_size is 0. Precision Boundary Conversion: compute-role buffers accessed directly in COMPUTE_TYPE; all arithmetic in COMPUTE_TYPE."
+ * effective_batch_size is 0. All buffers are compute-role; no precision boundary conversion is required."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Finalizer Utility / Batch-wide Normalizer. Executes after the reduction engine and before the optimizer update."
  */
@@ -1737,6 +1874,113 @@ __kernel void reduce_k_fan_in_and_clip(
      *          `src_scalar_NATURAL_partial_width`.
      */
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_collection,
+
+    /**
+     * @param src_buffer_GLOBAL_CONST_offset_list_flat Flat offset list with K
+     *        consecutive entries per node. Sentinel SENTINEL_ABSENT_PARTIAL
+     *        (0xFFFFFFFF) indicates an absent partial in the tail node.
+     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in_K)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_fan_in_K]
+     *        - Validation Preconditions: Host must provide a buffer containing exactly
+     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in_K` uint entries.
+     */
+    __global const uint *src_buffer_GLOBAL_CONST_offset_list_flat,
+
+    /**
+     * @param dest_buffer_GLOBAL_stage_output Contiguous output buffer. Node n writes
+     *        at `[n * partial_width, (n+1) * partial_width)`.
+     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width)
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_partial_width]
+     *        - Validation Preconditions: Host must allocate exactly
+     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)` bytes.
+     */
+    __global COMPUTE_TYPE *dest_buffer_GLOBAL_stage_output,
+
+    /**
+     * @param src_scalar_NATURAL_fan_in_K Number of partials to reduce per node.
+     *        - Validation Preconditions: Must be >= 2.
+     */
+    uint src_scalar_NATURAL_fan_in_K,
+
+    /**
+     * @param src_scalar_NATURAL_node_count Number of independent reduction nodes.
+     *        - Validation Preconditions: Must be >= 1.
+     */
+    uint src_scalar_NATURAL_node_count,
+
+    /**
+     * @param src_scalar_NATURAL_partial_width Number of elements per partial vector.
+     *        - Validation Preconditions: Must be >= 1.
+     */
+    uint src_scalar_NATURAL_partial_width,
+
+    /**
+     * @param src_scalar_REAL_clipping_threshold The clipping threshold for this stage.
+     *        Value 0.0 disables clip (diagnostic mode).
+     *        - Validation Preconditions: Must be >= 0.0.
+     */
+    COMPUTE_TYPE src_scalar_REAL_clipping_threshold,
+
+    /**
+     * @param src_scalar_REAL_epsilon Small constant to prevent division by zero.
+     *        - Validation Preconditions: Must be a small, positive real number.
+     */
+    COMPUTE_TYPE src_scalar_REAL_epsilon);
+
+/**
+ * @brief (Node 14, 15a, 20a — interior stages and compute-role leaf stages)
+ *        Compute-entry variant of reduce_k_fan_in_and_clip. Identical algorithm,
+ *        but reads COMPUTE_TYPE intermediates rather than STORAGE_TYPE partials.
+ * @kernel_contract
+ *        - Holistic Constraints: "Each work-group processes one reduction node.
+ *          The kernel reads K partials per node from the source buffer via an
+ *          offset list, sums them, optionally clips the result per-node, and
+ *          writes one output vector of partial_width elements. Supports absent
+ *          partials via sentinel offset 0xFFFFFFFF for the tail node."
+ *        - Behavioral Invariants: "When clipping_threshold > 0, per-node L2
+ *          clip is applied: scale = threshold / (norm + epsilon). When
+ *          clipping_threshold == 0, clip is bypassed (diagnostic mode).
+ *          Epsilon prevents division by zero. All buffers are compute-role;
+ *          no precision boundary conversion is required. All arithmetic
+ *          exclusively in COMPUTE_TYPE."
+ *        - Idempotency: "Associatively Non-Idempotent"
+ *        - Synchronization Model: "Reduction Engine Stage"
+ *        - Precision Variant: "Compute-entry variant of reduce_k_fan_in_and_clip.
+ *          Used for interior stages of multi-stage reduction trees (where the
+ *          source is a prior stage's COMPUTE_TYPE output) and for leaf stages
+ *          whose source collection is natively COMPUTE_TYPE (e.g., BCE loss
+ *          partials from Node 7)."
+ */
+__kernel void reduce_k_fan_in_and_clip_from_compute(
+    /**
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group
+     *        parallel L2 norm reduction.
+     *        - Tensor Shape: (get_local_size(0))
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof: [Implicit from work-group dispatch]
+     *        - Validation Preconditions: Host shall allocate local memory equal to
+     *          the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     */
+    __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
+
+    /**
+     * @param src_buffer_GLOBAL_partial_collection The memory pool containing
+     *        COMPUTE_TYPE intermediate results from a prior reduction stage or
+     *        a natively compute-role partial collection.
+     *        - Tensor Shape: Undefined.
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof: N/A.
+     *        - Validation Preconditions: Host must provide a valid buffer that
+     *          encompasses all memory regions referenced by the combination of
+     *          `src_buffer_GLOBAL_CONST_offset_list_flat` and
+     *          `src_scalar_NATURAL_partial_width`.
+     */
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_partial_collection,
 
     /**
      * @param src_buffer_GLOBAL_CONST_offset_list_flat Flat offset list with K

@@ -19,7 +19,11 @@ from ...shared.precision_config import PrecisionConfig
 from .context import VulkanContext
 
 # Shaders with only compute-role buffers — use compute-only suffix.
-_COMPUTE_ONLY_SHADERS = frozenset({"normalize_gradients"})
+# ADR-026: aggregate_partials_from_compute reads/writes COMPUTE_TYPE only.
+_COMPUTE_ONLY_SHADERS = frozenset({
+    "normalize_gradients",
+    "aggregate_partials_from_compute",
+})
 
 # Three-axis suffix map: (storage_dtype.type, compute_dtype.type, state_dtype.type) → suffix
 _SUFFIX_MAP: dict[tuple[type, type, type], str] = {

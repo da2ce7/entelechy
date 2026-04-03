@@ -279,3 +279,44 @@ class ReduceKFanInAndClipBinding(KernelBinding):
         global_size = (node_count * wg,)
         local_size = (wg,)
         return global_size, local_size
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADR-026: Compute-entry variants for compute-role source buffers
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class AggregateRegisterReduceFromComputeBinding(AggregateRegisterReduceBinding):
+    """Binding for aggregate_register_reduce_from_compute (ADR-026).
+
+    Compute-entry variant of aggregate_register_reduce. Used when the source
+    buffer's precision_role is "compute" (e.g., BCE loss partials, or interior
+    stages of multi-stage reduction trees).
+    """
+
+    def get_kernel_name(self) -> str:
+        return "aggregate_register_reduce_from_compute"
+
+
+class AggregateLocalReduceFromComputeBinding(AggregateLocalReduceBinding):
+    """Binding for aggregate_local_reduce_from_compute (ADR-026).
+
+    Compute-entry variant of aggregate_local_reduce. Used when the source
+    buffer's precision_role is "compute".
+    """
+
+    def get_kernel_name(self) -> str:
+        return "aggregate_local_reduce_from_compute"
+
+
+class ReduceKFanInAndClipFromComputeBinding(ReduceKFanInAndClipBinding):
+    """Binding for reduce_k_fan_in_and_clip_from_compute (ADR-026).
+
+    Compute-entry variant of reduce_k_fan_in_and_clip. Used for interior
+    stages of multi-stage reduction trees (where the source is a prior
+    stage's COMPUTE_TYPE output) and for leaf stages whose source collection
+    is natively COMPUTE_TYPE (e.g., BCE loss partials).
+    """
+
+    def get_kernel_name(self) -> str:
+        return "reduce_k_fan_in_and_clip_from_compute"

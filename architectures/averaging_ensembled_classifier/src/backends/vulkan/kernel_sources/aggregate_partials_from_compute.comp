@@ -1,0 +1,90 @@
+// aggregate_partials_from_compute.comp — ADR-026: Compute-entry reduction variants
+//
+// Compute-entry counterpart to aggregate_partials.comp. Identical algorithm,
+// but reads COMPUTE_FLOAT intermediates directly (no read_storage conversion).
+//
+// Used for:
+//   - Interior stages of multi-stage reduction trees (stage >= 1)
+//   - Leaf stages whose source is natively compute-role (e.g., BCE loss partials)
+//
+// Algorithmic reference: kernels.cl.h §aggregate_register_reduce_from_compute
+//                                     §aggregate_local_reduce_from_compute
+//
+// Tier selection is identical to aggregate_partials.comp:
+//   Register tier (use_local_reduce = 0):
+//     Dispatch: vkCmdDispatch(ceil(partial_width / SIMD_WIDTH), 1, 1)
+//     Each invocation independently reduces all K partials for one output element.
+//
+//   Local tier (use_local_reduce = 1):
+//     Dispatch: vkCmdDispatch(partial_width, 1, 1)
+//     Each workgroup collaboratively reduces K partials for one output element
+//     via strided accumulation + subgroup-accelerated workgroup reduction.
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    uint partial_offset_list_count; // K: number of partials to sum
+    uint partial_width;             // Elements per partial
+    uint operation_type;            // 0=SUM, 1=AVERAGE
+    uint use_local_reduce;          // 0=register tier, 1=local tier
+} push;
+
+// Compute-entry: source collection is COMPUTE_FLOAT (no precision conversion)
+layout(set = 0, binding = 0) readonly buffer SrcCollection { COMPUTE_FLOAT data[]; } src_collection;
+layout(set = 0, binding = 1) readonly buffer OffsetList    { uint          data[]; } src_offsets;
+layout(set = 0, binding = 2) writeonly buffer DestPartial  { COMPUTE_FLOAT data[]; } dest;
+
+void main() {
+    uint lid   = gl_LocalInvocationID.x;
+    uint lsize = gl_WorkGroupSize.x;
+
+    if (push.use_local_reduce == 0) {
+        // ── Register Tier ──
+        // Each invocation maps to one output element.
+        // The entire K-partial loop runs serially in registers.
+        uint elem = gl_WorkGroupID.x * lsize + lid;
+        if (elem >= push.partial_width) return;
+
+        COMPUTE_FLOAT accum = COMPUTE_FLOAT(0.0);
+        for (uint k = 0; k < push.partial_offset_list_count; ++k) {
+            uint offset = src_offsets.data[k];
+            // Direct COMPUTE_FLOAT read (no read_storage conversion)
+            accum += src_collection.data[offset + elem];
+        }
+
+        if (push.operation_type == AGG_MODE_AVERAGE && push.partial_offset_list_count > 0) {
+            accum /= COMPUTE_FLOAT(push.partial_offset_list_count);
+        }
+
+        // Direct COMPUTE_FLOAT write (no write_storage conversion)
+        dest.data[elem] = accum;
+
+    } else {
+        // ── Local Tier ──
+        // Each workgroup collaborates on one output element.
+        // K partials are distributed across invocations in a strided pattern.
+        uint elem = gl_WorkGroupID.x;
+        if (elem >= push.partial_width) return;
+
+        COMPUTE_FLOAT accum = COMPUTE_FLOAT(0.0);
+        for (uint k = lid; k < push.partial_offset_list_count; k += lsize) {
+            uint offset = src_offsets.data[k];
+            // Direct COMPUTE_FLOAT read (no read_storage conversion)
+            accum += src_collection.data[offset + elem];
+        }
+
+        // Subgroup-accelerated workgroup reduction.
+        COMPUTE_FLOAT total = workgroup_reduce_add(accum);
+
+        if (lid == 0) {
+            if (push.operation_type == AGG_MODE_AVERAGE && push.partial_offset_list_count > 0) {
+                total /= COMPUTE_FLOAT(push.partial_offset_list_count);
+            }
+            // Direct COMPUTE_FLOAT write (no write_storage conversion)
+            dest.data[elem] = total;
+        }
+    }
+}

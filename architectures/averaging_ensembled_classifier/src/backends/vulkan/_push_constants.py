@@ -207,6 +207,7 @@ PUSH_CONSTANT_STRUCTS: dict[str, type[ctypes.Structure]] = {
     "clip_partial_gradients": ClipPartialsPush,
     "gather_and_permute_grad_hidden_activations": GatherPermutePush,
     "aggregate_partials": AggregatePush,
+    "aggregate_partials_from_compute": AggregatePush,  # ADR-026: shares push layout
     "clip_intermediate_grad": ClipIntermediatePush,
     "stabilize_and_reduce_grad_hidden_activations": StabilizeReducePush,
     "backprop_shared_weights_chunk": SharedBackpropWeightsPush,
@@ -231,6 +232,7 @@ DESCRIPTOR_BINDING_COUNTS: dict[str, int] = {
     "clip_partial_gradients": 9,
     "gather_and_permute_grad_hidden_activations": 2,
     "aggregate_partials": 3,
+    "aggregate_partials_from_compute": 3,  # ADR-026: same layout as storage-entry
     "clip_intermediate_grad": 1,
     "stabilize_and_reduce_grad_hidden_activations": 2,
     "backprop_shared_weights_chunk": 5,

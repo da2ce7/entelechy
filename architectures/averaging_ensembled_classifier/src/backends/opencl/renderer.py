@@ -47,10 +47,15 @@ class OpenCLPlanRenderer:
         self._hardware = hardware
         self._allocator = OpenCLBufferAllocator(context, queue)
         # Reduction engine bindings (set externally after construction)
+        # Storage-entry variants (existing)
         self._register_reduce_binding: Any | None = None
         self._local_reduce_binding: Any | None = None
         self._clip_intermediate_binding: Any | None = None
         self._k_fan_in_binding: Any | None = None
+        # ADR-026: Compute-entry variants
+        self._register_reduce_from_compute_binding: Any | None = None
+        self._local_reduce_from_compute_binding: Any | None = None
+        self._k_fan_in_from_compute_binding: Any | None = None
 
     def set_reduction_bindings(
         self,
@@ -58,12 +63,25 @@ class OpenCLPlanRenderer:
         local_reduce: Any,
         clip_intermediate: Any,
         k_fan_in: Any | None = None,
+        *,
+        register_reduce_from_compute: Any | None = None,
+        local_reduce_from_compute: Any | None = None,
+        k_fan_in_from_compute: Any | None = None,
     ) -> None:
-        """Inject reduction engine bindings (consumed by _render_reduction_tree)."""
+        """Inject reduction engine bindings (consumed by _render_reduction_tree).
+
+        ADR-026: Accepts both storage-entry and compute-entry variant bindings.
+        Compute-entry variants are used when the source buffer's precision_role
+        is "compute" (e.g., BCE loss partials, interior reduction stages).
+        """
         self._register_reduce_binding = register_reduce
         self._local_reduce_binding = local_reduce
         self._clip_intermediate_binding = clip_intermediate
         self._k_fan_in_binding = k_fan_in
+        # ADR-026: Compute-entry variants
+        self._register_reduce_from_compute_binding = register_reduce_from_compute
+        self._local_reduce_from_compute_binding = local_reduce_from_compute
+        self._k_fan_in_from_compute_binding = k_fan_in_from_compute
 
     @property
     def allocator(self) -> OpenCLBufferAllocator:
@@ -224,6 +242,9 @@ class OpenCLPlanRenderer:
     ) -> cl.Event:
         """Render a multi-stage log_K(N) reduction tree.
 
+        ADR-026: Selects between storage-entry and compute-entry kernel
+        variants based on the source buffer's precision_role.
+
         Single-stage trees (num_stages == 1): dispatch existing all-to-one
         aggregate kernel + clip_intermediate_grad (unchanged).
 
@@ -234,17 +255,29 @@ class OpenCLPlanRenderer:
         plan = node.reduction_plan
         element_size = 4  # float32 default
 
+        # ADR-026 §3: Determine if source buffer is compute-role
+        source_desc = self._plan.buffers[plan.source_buffer]
+        use_compute_entry = source_desc.precision_role == "compute"
+
         if plan.num_stages > 1:
-            return self._render_reduction_tree_multi_stage(plan, wait_for, element_size)
-        return self._render_reduction_tree_single_stage(plan, wait_for, element_size)
+            return self._render_reduction_tree_multi_stage(
+                plan, wait_for, element_size, use_compute_entry
+            )
+        return self._render_reduction_tree_single_stage(
+            plan, wait_for, element_size, use_compute_entry
+        )
 
     def _render_reduction_tree_single_stage(
         self,
         plan: Any,
         wait_for: list[cl.Event],
         element_size: int,
+        use_compute_entry: bool,
     ) -> cl.Event:
-        """Single-stage tree: existing all-to-one aggregate + clip path."""
+        """Single-stage tree: existing all-to-one aggregate + clip path.
+
+        ADR-026: Selects compute-entry variant when use_compute_entry is True.
+        """
         hw_simd = self._hardware.simd_width if self._hardware else 16
 
         # 1. Upload initial offset list to device
@@ -259,14 +292,30 @@ class OpenCLPlanRenderer:
         intermed_size = plan.partial_width * element_size
         ping = self._allocator.allocate_internal(intermed_size)
 
-        # 3. Select kernel tier and dispatch
+        # 3. Select kernel tier and dispatch (ADR-026: select variant)
         current_N = plan.num_partials
-        if current_N <= MAX_REG_AGG and self._register_reduce_binding is not None:
-            binding = self._register_reduce_binding
-        elif self._local_reduce_binding is not None:
-            binding = self._local_reduce_binding
+        if use_compute_entry:
+            # ADR-026: Compute-entry variant for compute-role source buffers
+            if current_N <= MAX_REG_AGG and self._register_reduce_from_compute_binding is not None:
+                binding = self._register_reduce_from_compute_binding
+            elif self._local_reduce_from_compute_binding is not None:
+                binding = self._local_reduce_from_compute_binding
+            else:
+                # Fallback: use storage-entry if compute-entry not registered
+                if current_N <= MAX_REG_AGG and self._register_reduce_binding is not None:
+                    binding = self._register_reduce_binding
+                elif self._local_reduce_binding is not None:
+                    binding = self._local_reduce_binding
+                else:
+                    raise RuntimeError("Reduction bindings not registered")
         else:
-            raise RuntimeError("Reduction bindings not registered")
+            # Storage-entry variant (existing behavior)
+            if current_N <= MAX_REG_AGG and self._register_reduce_binding is not None:
+                binding = self._register_reduce_binding
+            elif self._local_reduce_binding is not None:
+                binding = self._local_reduce_binding
+            else:
+                raise RuntimeError("Reduction bindings not registered")
 
         kernel = getattr(self._program, binding.get_kernel_name())
         args = binding.marshal_args_reduction(
@@ -328,8 +377,14 @@ class OpenCLPlanRenderer:
         plan: Any,
         wait_for: list[cl.Event],
         element_size: int,
+        use_compute_entry: bool,
     ) -> cl.Event:
-        """Multi-stage tree (ADR-019): dispatch reduce_k_fan_in_and_clip per stage."""
+        """Multi-stage tree (ADR-019): dispatch reduce_k_fan_in_and_clip per stage.
+
+        ADR-026 §3: Stage 0 uses storage-entry or compute-entry variant based
+        on the source buffer's precision_role. Stages ≥ 1 always use
+        compute-entry variant (prior stage output is COMPUTE_TYPE).
+        """
         if self._k_fan_in_binding is None:
             raise RuntimeError(
                 "Multi-stage reduction tree requires K-fan-in binding "
@@ -357,8 +412,14 @@ class OpenCLPlanRenderer:
         ping = self._allocator.allocate_internal(max_output_elems * element_size)
         pong = self._allocator.allocate_internal(max_output_elems * element_size)
 
-        fan_in_binding = self._k_fan_in_binding
-        fan_in_kernel = getattr(self._program, fan_in_binding.get_kernel_name())
+        # ADR-026 §3: Select binding variant based on stage and source role
+        storage_binding = self._k_fan_in_binding
+        compute_binding = (
+            self._k_fan_in_from_compute_binding
+            if self._k_fan_in_from_compute_binding is not None
+            else storage_binding  # fallback if not registered
+        )
+
         prev_events = [upload_evt]
 
         for stage in range(plan.num_stages):
@@ -366,6 +427,15 @@ class OpenCLPlanRenderer:
                 break
 
             node_count = math.ceil(current_N / K)
+
+            # ADR-026 §3: Stage 0 uses variant based on source role;
+            # stages ≥ 1 always use compute-entry (prior output is COMPUTE_TYPE)
+            if stage == 0 and not use_compute_entry:
+                fan_in_binding = storage_binding
+            else:
+                fan_in_binding = compute_binding
+
+            fan_in_kernel = getattr(self._program, fan_in_binding.get_kernel_name())
 
             # Determine clipping threshold for this stage
             threshold = 0.0

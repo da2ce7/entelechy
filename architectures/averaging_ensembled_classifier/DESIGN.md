@@ -1,7 +1,7 @@
 # Design Document: Averaging Ensembled Classifier
 
-**Revision:** 2.3 — Post-Phase 7  
-**Last Updated:** 2026-04-02  
+**Revision:** 2.4 — Post-ADR-026  
+**Last Updated:** 2026-04-03  
 **Scope:** Implementation design for the multi-backend averaging ensembled classifier architecture.
 
 ---
@@ -21,7 +21,7 @@
 | 9 | [Test Strategy](#9-test-strategy-adr-016) | Three-tier framework, fixtures, tolerances, oracle model |
 | 10 | [User-Facing API](#10-user-facing-api-adr-018) | WorkTicket lifecycle, design decisions |
 | 11 | [Migration Path](#11-migration-path-adr-017) | Phase sequencing, dependency graph, rollback |
-| 12 | [ADR Index](#12-adr-index) | Complete decision record reference (ADR-001 through ADR-023) |
+| 12 | [ADR Index](#12-adr-index) | Complete decision record reference (ADR-001 through ADR-026) |
 
 ---
 
@@ -101,7 +101,7 @@ class ReductionTreePlan:
 
 The threshold schedule follows the Quadratic Scaling Policy: $T_j = T_{\text{algorithmic}} + \lambda \cdot j^2$, clamped by $T_{\text{safety},\,j} = \text{FP\_FORMAT\_MAX} / K_j$.
 
-**Multi-stage trees (ADR-019):** When `num_stages > 1`, each stage produces `ceil(current_N / K)` intermediate nodes. The renderer dispatches `reduce_k_fan_in_and_clip` — a fused K-fan-in sum with per-node L2 clip — at each stage. Single-stage trees (`num_stages == 1`) use the existing all-to-one aggregate kernels followed by `clip_intermediate_grad`.
+**Multi-stage trees (ADR-019, ADR-026):** When `num_stages > 1`, each stage produces `ceil(current_N / K)` intermediate nodes. The renderer dispatches `reduce_k_fan_in_and_clip` — a fused K-fan-in sum with per-node L2 clip — at each stage. ADR-026 defines precision-typed variants: stage 0 uses the storage-entry or compute-entry variant depending on the source buffer's `precision_role`; stages ≥ 1 always use `reduce_k_fan_in_and_clip_from_compute` (reading prior stage's COMPUTE_TYPE output). Single-stage trees (`num_stages == 1`) use the existing all-to-one aggregate kernels followed by `clip_intermediate_grad`, with similar variant selection.
 
 ### 3.3 StreamingLoopPlan (ADR-004)
 
@@ -622,3 +622,6 @@ If a phase's tier gate regresses: revert the feature flag to `auto`, diagnose us
 | [021](adr/ADR-021-kernels-precision-role-migration.md) | Kernel Precision-Role Migration | `SCALAR_TYPE` → `STORAGE_TYPE`/`COMPUTE_TYPE`/`STATE_TYPE`; precision boundary abstractions |
 | [022](adr/ADR-022-host-code-precision-role-implications.md) | Host Code Precision-Role Implications | `PrecisionConfig` three-role cascade through plan builder, type mapping, buffer lifecycle |
 | [023](adr/ADR-023-backend-kernel-precision-role-implications.md) | Backend Kernel Precision-Role Implications | CPU two-axis `STORAGE_T`/`STATE_T`; Vulkan `STORAGE_FLOAT`/`STATE_FLOAT`; multi-variant SPIR-V |
+| [024](adr/ADR-024-double-precision-support.md) | Double Precision (FP64) Support | Extended state precision for validation scenarios; three-axis suffix scheme (`sXcYtZ`) |
+| [025](adr/ADR-025-fp8-support.md) | FP8 (E4M3/E5M2) Storage Precision | FP8 storage-role only; compute and state remain FP16/FP32/FP64 |
+| [026](adr/ADR-026-precision-typed-reduction-kernel-variants.md) | Precision-Typed Reduction Kernel Variants | `_from_compute` variants for interior stages and compute-role leaf sources |

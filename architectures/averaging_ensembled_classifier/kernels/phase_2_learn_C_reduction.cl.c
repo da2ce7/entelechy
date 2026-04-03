@@ -215,6 +215,18 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
     for (uint i = lid; i < src_scalar_NATURAL_total_modules_count; i += lsize) {
         thread_accumulator += load_storage(src_buffer_GLOBAL_grad_hidden_activations_permuted_soa, row_offset + i);
     }
+
+    // --- Phase 1 Safety Clip (ADR-005 Opacity Principle) ---
+    // The Phase 2 staged reduction sums up to `lsize` partial values at its first stage.
+    // To prevent overflow, each partial must be bounded by fp_max / lsize. This keeps
+    // the workgroup size as an internal execution-tier concern, not leaking to host policy.
+    // The host only needs to account for Node 13's `num_class_chunks` amplification.
+    const COMPUTE_TYPE phase1_ceiling = src_scalar_REAL_fp_max / (COMPUTE_TYPE)lsize;
+    const COMPUTE_TYPE mag            = fabs(thread_accumulator);
+    if (mag > phase1_ceiling) {
+        thread_accumulator *= phase1_ceiling / (mag + src_scalar_REAL_epsilon);
+    }
+
     update_buffer_LOCAL_reduction_tile[lid] = thread_accumulator;
 
     barrier(CLK_LOCAL_MEM_FENCE); // Ensure all initial partial sums are in local memory.
@@ -379,6 +391,176 @@ __kernel void reduce_k_fan_in_and_clip(
             for (uint elem = lid; elem < src_scalar_NATURAL_partial_width; elem += lsize) {
                 COMPUTE_TYPE val = load_storage(dest_buffer_GLOBAL_stage_output, dest_base + elem);
                 store_storage(dest_buffer_GLOBAL_stage_output, dest_base + elem, val * scale_factor);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// ADR-026: Precision-Typed Reduction Kernel Variants (_from_compute)
+// =============================================================================
+// These variants read from COMPUTE_TYPE buffers directly (no load_storage
+// conversion), used for:
+//   - Interior stages of multi-stage reduction trees
+//   - Leaf stages whose source collection is natively COMPUTE_TYPE (e.g., BCE loss)
+
+// --- Implementation: aggregate_register_reduce_from_compute (ADR-026 §5) ---
+// Compute-entry variant: identical algorithm, but reads COMPUTE_TYPE directly.
+__kernel void aggregate_register_reduce_from_compute(
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_partial_collection,
+    __global const uint         *src_buffer_GLOBAL_CONST_partial_offset_list,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_partial,
+    uint                         src_scalar_NATURAL_partial_offset_list_count,
+    uint                         src_scalar_NATURAL_partial_width,
+    uint                         src_scalar_FLAG_operation_type) {
+
+    const uint element_idx = get_global_id(0);
+
+    if (element_idx >= src_scalar_NATURAL_partial_width) {
+        return;
+    }
+
+    // Register-based reduction — no precision boundary conversion needed.
+    COMPUTE_TYPE accum = COMPUTE_ZERO;
+    for (uint i = 0; i < src_scalar_NATURAL_partial_offset_list_count; ++i) {
+        const uint offset = src_buffer_GLOBAL_CONST_partial_offset_list[i];
+        // Direct COMPUTE_TYPE read (no load_storage).
+        accum += src_buffer_GLOBAL_partial_collection[offset + element_idx];
+    }
+
+    if (src_scalar_FLAG_operation_type == AGG_MODE_AVERAGE && src_scalar_NATURAL_partial_offset_list_count > 0) {
+        accum /= (COMPUTE_TYPE)src_scalar_NATURAL_partial_offset_list_count;
+    }
+
+    // Direct COMPUTE_TYPE write (no store_storage).
+    dest_buffer_GLOBAL_partial[element_idx] = accum;
+}
+
+// --- Implementation: aggregate_local_reduce_from_compute (ADR-026 §5) ---
+// Compute-entry variant: identical algorithm, but reads COMPUTE_TYPE directly.
+__kernel void aggregate_local_reduce_from_compute(
+    __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_partial_collection,
+    __global const uint         *src_buffer_GLOBAL_CONST_partial_offset_list,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_partial,
+    uint                         src_scalar_NATURAL_partial_offset_list_count,
+    uint                         src_scalar_NATURAL_partial_width,
+    uint                         src_scalar_FLAG_operation_type) {
+
+    const uint element_idx = get_group_id(0);
+    const uint lid   = get_local_id(0);
+    const uint lsize = get_local_size(0);
+
+    if (element_idx >= src_scalar_NATURAL_partial_width) {
+        return;
+    }
+
+    // Parallel gather — no precision boundary conversion needed.
+    COMPUTE_TYPE accum = COMPUTE_ZERO;
+    for (uint i = lid; i < src_scalar_NATURAL_partial_offset_list_count; i += lsize) {
+        const uint offset = src_buffer_GLOBAL_CONST_partial_offset_list[i];
+        // Direct COMPUTE_TYPE read (no load_storage).
+        accum += src_buffer_GLOBAL_partial_collection[offset + element_idx];
+    }
+
+    // Intra-work-group reduction.
+    update_buffer_LOCAL_reduction_tile[lid] = accum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            update_buffer_LOCAL_reduction_tile[lid] += update_buffer_LOCAL_reduction_tile[lid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (lid == 0) {
+        COMPUTE_TYPE result = update_buffer_LOCAL_reduction_tile[0];
+        if (src_scalar_FLAG_operation_type == AGG_MODE_AVERAGE && src_scalar_NATURAL_partial_offset_list_count > 0) {
+            result /= (COMPUTE_TYPE)src_scalar_NATURAL_partial_offset_list_count;
+        }
+        // Direct COMPUTE_TYPE write (no store_storage).
+        dest_buffer_GLOBAL_partial[element_idx] = result;
+    }
+}
+
+// --- Implementation: reduce_k_fan_in_and_clip_from_compute (ADR-026 §4) ---
+// Compute-entry variant: identical algorithm, but reads COMPUTE_TYPE directly.
+// Used for interior stages of multi-stage trees or for COMPUTE_TYPE source
+// collections (e.g., BCE loss partials).
+__kernel void reduce_k_fan_in_and_clip_from_compute(
+    __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_partial_collection,
+    __global const uint         *src_buffer_GLOBAL_CONST_offset_list_flat,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_stage_output,
+    uint                         src_scalar_NATURAL_fan_in_K,
+    uint                         src_scalar_NATURAL_node_count,
+    uint                         src_scalar_NATURAL_partial_width,
+    COMPUTE_TYPE                 src_scalar_REAL_clipping_threshold,
+    COMPUTE_TYPE                 src_scalar_REAL_epsilon) {
+
+    const uint node_id = get_group_id(0);
+    const uint lid     = get_local_id(0);
+    const uint lsize   = get_local_size(0);
+
+    if (node_id >= src_scalar_NATURAL_node_count) {
+        return;
+    }
+
+    const uint offset_base = node_id * src_scalar_NATURAL_fan_in_K;
+    const uint dest_base   = node_id * src_scalar_NATURAL_partial_width;
+
+    // Phase 1: Gather and accumulate — no precision boundary conversion.
+    COMPUTE_TYPE local_sq_sum = COMPUTE_ZERO;
+
+    for (uint elem = lid; elem < src_scalar_NATURAL_partial_width; elem += lsize) {
+        COMPUTE_TYPE accum = COMPUTE_ZERO;
+
+        for (uint k = 0; k < src_scalar_NATURAL_fan_in_K; ++k) {
+            const uint offset = src_buffer_GLOBAL_CONST_offset_list_flat[offset_base + k];
+            if (offset != SENTINEL_ABSENT_PARTIAL) {
+                // Direct COMPUTE_TYPE read (no load_storage).
+                accum += src_buffer_GLOBAL_partial_collection[offset + elem];
+            }
+        }
+
+        // Direct COMPUTE_TYPE write.
+        dest_buffer_GLOBAL_stage_output[dest_base + elem] = accum;
+
+        local_sq_sum += accum * accum;
+    }
+
+    // Phase 2: Per-node L2 norm via local memory parallel reduction.
+    if (src_scalar_REAL_clipping_threshold > COMPUTE_ZERO) {
+        update_buffer_LOCAL_reduction_tile[lid] = local_sq_sum;
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
+            if (lid < stride) {
+                update_buffer_LOCAL_reduction_tile[lid] += update_buffer_LOCAL_reduction_tile[lid + stride];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+
+        if (lid == 0) {
+            const COMPUTE_TYPE total_sum_sq = update_buffer_LOCAL_reduction_tile[0];
+            const COMPUTE_TYPE norm         = MATH_FN sqrt(total_sum_sq);
+
+            COMPUTE_TYPE scale_factor = (COMPUTE_TYPE)1.0f;
+            if (norm > src_scalar_REAL_clipping_threshold) {
+                scale_factor = src_scalar_REAL_clipping_threshold / (norm + src_scalar_REAL_epsilon);
+            }
+            update_buffer_LOCAL_reduction_tile[0] = scale_factor;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const COMPUTE_TYPE scale_factor = update_buffer_LOCAL_reduction_tile[0];
+
+        // Phase 3: Conditional in-place scaling.
+        if (scale_factor < (COMPUTE_TYPE)1.0f) {
+            for (uint elem = lid; elem < src_scalar_NATURAL_partial_width; elem += lsize) {
+                // Direct COMPUTE_TYPE read/write.
+                COMPUTE_TYPE val = dest_buffer_GLOBAL_stage_output[dest_base + elem];
+                dest_buffer_GLOBAL_stage_output[dest_base + elem] = val * scale_factor;
             }
         }
     }

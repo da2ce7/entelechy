@@ -184,6 +184,13 @@ class StabilizationPolicy:
         entering the reduction pipeline. Therefore, this function provides a
         simple, high, and robust safety threshold that is independent of the
         quadratic policy.
+
+        Pre-summation Amplification (CONCEPT §3.4):
+        Callers must account for any downstream summation that occurs before
+        the values enter a reduction kernel. For Node 11, the clipped gradients
+        pass through Node 13, which sums across `num_class_chunks`. The caller
+        should divide this threshold by `num_class_chunks` to ensure the
+        post-summation magnitude stays within safe bounds for Node 16.
         """
         # WHY: A 10% safety margin below the absolute hardware maximum provides
         # a robust buffer against unforeseen floating-point edge cases without

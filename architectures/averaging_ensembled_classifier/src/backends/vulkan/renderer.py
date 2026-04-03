@@ -54,7 +54,11 @@ logger = logging.getLogger(__name__)
 _2D_DISPATCH_KERNELS = frozenset({"forward_pass", "backprop_shared_weights_chunk"})
 
 # Reduction engine shaders using push descriptors
-_REDUCTION_SHADERS = frozenset({"aggregate_partials", "clip_intermediate_grad"})
+_REDUCTION_SHADERS = frozenset({
+    "aggregate_partials",
+    "aggregate_partials_from_compute",  # ADR-026
+    "clip_intermediate_grad",
+})
 
 
 class VulkanPlanRenderer:
@@ -196,15 +200,35 @@ class VulkanPlanRenderer:
                 kernel_names.add(node.kernel_name)
             elif isinstance(node, ReductionTreeNode):
                 kernel_names.add("aggregate_partials")
+                # ADR-026: Compute-entry variant for compute-role sources
+                # or interior stages of multi-stage trees
+                source_desc = plan.buffers[node.reduction_plan.source_buffer]
+                if source_desc.precision_role == "compute" or node.reduction_plan.num_stages > 1:
+                    kernel_names.add("aggregate_partials_from_compute")
                 if node.reduction_plan.tree_variant == "sum_and_clip":
                     kernel_names.add("clip_intermediate_grad")
 
         for name in kernel_names:
-            binding_count = DESCRIPTOR_BINDING_COUNTS[name]
+            binding_count = DESCRIPTOR_BINDING_COUNTS.get(name)
+            if binding_count is None:
+                # ADR-026: Compute-entry variant shares binding count with storage-entry
+                if name == "aggregate_partials_from_compute":
+                    binding_count = DESCRIPTOR_BINDING_COUNTS["aggregate_partials"]
+                else:
+                    raise KeyError(f"Unknown kernel {name}")
+
             layout = self._descriptor_mgr.create_layout(binding_count)
             self._descriptor_layouts[name] = layout
 
-            push_size = ctypes.sizeof(PUSH_CONSTANT_STRUCTS[name])
+            push_struct = PUSH_CONSTANT_STRUCTS.get(name)
+            if push_struct is None:
+                # ADR-026: Compute-entry variant shares push constant struct
+                if name == "aggregate_partials_from_compute":
+                    push_struct = PUSH_CONSTANT_STRUCTS["aggregate_partials"]
+                else:
+                    raise KeyError(f"Unknown kernel {name}")
+
+            push_size = ctypes.sizeof(push_struct)
             pipeline = self._pipeline_cache.create_pipeline(
                 name, layout, push_size, spec, plan.precision
             )
@@ -333,10 +357,17 @@ class VulkanPlanRenderer:
     ) -> None:
         """Record a staged reduction tree into the command buffer.
 
+        ADR-026: Selects between storage-entry and compute-entry kernel
+        variants based on the source buffer's precision_role and stage.
+
         Uses aggregate_partials with ping-pong buffers and optional
         clip_intermediate_grad between stages.
         """
         rtp = node.reduction_plan
+
+        # ADR-026 §3: Determine if source buffer is compute-role
+        source_desc = plan.buffers[rtp.source_buffer]
+        use_compute_entry = source_desc.precision_role == "compute"
 
         # Get source/destination device buffers
         src_device_buf = self._allocator.get_buffer(rtp.source_buffer)
@@ -408,7 +439,11 @@ class VulkanPlanRenderer:
         )
         vk.vkDestroyFence(self._ctx.device, upload_fence, None)
 
-        agg_pipeline = self._pipelines["aggregate_partials"]
+        # ADR-026 §3: Select pipeline variants based on source role and stage
+        storage_pipeline = self._pipelines["aggregate_partials"]
+        compute_pipeline = self._pipelines.get(
+            "aggregate_partials_from_compute", storage_pipeline
+        )
         clip_pipeline = (
             self._pipelines.get("clip_intermediate_grad")
             if rtp.tree_variant == "sum_and_clip"
@@ -431,6 +466,15 @@ class VulkanPlanRenderer:
             nodes_at_stage = (current_n + fan_in - 1) // fan_in
             use_local = fan_in > simd_w
 
+            # ADR-026 §3: Stage 0 uses variant based on source role;
+            # stages ≥ 1 always use compute-entry (prior output is COMPUTE_TYPE)
+            if stage == 0 and not use_compute_entry:
+                agg_pipeline = storage_pipeline
+                agg_shader_name = "aggregate_partials"
+            else:
+                agg_pipeline = compute_pipeline
+                agg_shader_name = "aggregate_partials_from_compute"
+
             # If last stage, write to destination
             if stage == rtp.num_stages - 1:
                 current_dst = dst_device_buf
@@ -448,7 +492,7 @@ class VulkanPlanRenderer:
                 )
             else:
                 # Fallback: allocate a temporary descriptor set
-                agg_layout = self._descriptor_layouts["aggregate_partials"]
+                agg_layout = self._descriptor_layouts[agg_shader_name]
                 tmp_set = self._descriptor_mgr.allocate_set(agg_layout)
                 self._descriptor_mgr.update_set(tmp_set, agg_bindings)
                 vk.vkCmdBindDescriptorSets(

@@ -1,6 +1,6 @@
 # Phase 8C: Double Precision — CPU Backend Three-Axis Migration
 
-**Status: COMPLETE** (implemented 2 April 2026)  
+**Status: NOT STARTED**  
 **Phase:** 8C of 8  
 **Prerequisite:** Phase 8B complete and rollback gate passed.  
 **Objective:** Migrate the CPU backend from the two-axis precision scheme (`STORAGE_T × STATE_T`, suffix `s{s}x{x}`) to the three-axis scheme (`STORAGE_T × COMPUTE_T × STATE_T`, suffix `s{s}c{c}x{x}`). Remove the `cpu_compute_t = float` invariant. Extend `DECLARE_PRECISION_STRUCTS` to accept three type parameters. Instantiate all 11 valid precision combinations. Add scalar FP64 load/store variants to `cpu_precision.h`. Update the FFI layer and dispatch table. Rebuild the shared library. The phase ends when the CPU library compiles cleanly with all 11 instantiations and existing FP32/FP16-pathway tests pass.  

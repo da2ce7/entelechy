@@ -81,7 +81,8 @@ The `@param` block constitutes the complete logical specification for a paramete
 
 - **`Tensor Shape`**: The logical dimensions of the tensor.
 - **`Padding Contract`**: A key-value object literal specifying padding strategy.  > Under the three-role precision model, padding byte counts use the element size of the buffer's actual `precision_role` type: `sizeof(STORAGE_TYPE)`, `sizeof(COMPUTE_TYPE)`, or `sizeof(STATE_TYPE)` as appropriate. Using a different role's `sizeof` in a `Padding Contract` expression is a contract violation.
-- **`Precision Role`**: One of `"storage"`, `"compute"`, or `"state"`. Declares which precision-role dtype from the active `PrecisionConfig` governs this buffer's element type and allocation size. **Mandatory** for all buffer parameters.- **`Calculability Proof`**: Defines the derivation of buffer dimensions or scalar values through a constructive arithmetic expression composed solely of parameters present within the kernel’s interface. All terms in this expression shall correspond to kernel arguments, satisfying the Axiom of Interface Verifiability (1.4).
+- **`Precision Role`**: One of `"storage"`, `"compute"`, or `"state"`. Declares which precision-role dtype from the active `PrecisionConfig` governs this buffer's element type and allocation size. **Mandatory** for all floating-point buffer parameters. Integer-typed buffers (`int`, `uint`, `atomic_uint`) whose element size is format-independent are exempt.
+- **`Calculability Proof`**: Defines the derivation of buffer dimensions or scalar values through a constructive arithmetic expression composed solely of parameters present within the kernel's interface. All terms in this expression shall correspond to kernel arguments, satisfying the Axiom of Interface Verifiability (1.4).
 - **`Validation Preconditions`**: Mandatory conditions the host must meet.
 - **`Performance Notes`**: Optional, non-binding performance optimization hints.
 
@@ -132,6 +133,7 @@ The following strategy names are exhaustive. Their use contractually binds the i
 | **`Idempotency`**           | Declares the kernel's precise deterministic and state-modifying behavior. It **shall** be one of the following string literals: `Strictly Idempotent`, `Associatively Non-Idempotent`, or `Fundamentally Non-Idempotent (Stateful)`.                   | **Mandatory** |
 | **`Synchronization Model`** | Describes the kernel's role within the global DAG, using terms defined in **Article 4.3**.                                                                                                                                                             | Optional      |
 | **`Behavioral Invariants`** | Defines strict rules governing the kernel's internal implementation (e.g., "Forbidden from using `pown`"). The recognized values include: `Precision Boundary Conversion` — required for any kernel that accesses buffers whose `precision_role` is `"storage"` or `"state"`. Declares that storage-role and state-role inputs are widened to `COMPUTE_TYPE` upon load, and that outputs to storage-role or state-role buffers are narrowed from `COMPUTE_TYPE` upon store. All intermediate arithmetic is exclusively `COMPUTE_TYPE`. Kernels that access only `"compute"`-role and integer buffers do not require this invariant. | Optional      |
+| **`Precision Variant`** | Declares this kernel as a precision-typed variant of a named base kernel (ADR-026). Documents the specific buffer role divergence (storage-entry vs. compute-entry) and the selection criterion. The Orchestration tier selects the variant based on the source buffer's `precision_role`. When `STORAGE_TYPE == COMPUTE_TYPE`, both variants compile to identical machine code. | Optional      |
 
 **4.3. Canonical Behavioral Vocabulary.**
 This section defines the canonical terms used to describe a kernel's behavior or its role in the system DAG, typically within the `Synchronization Model` key.
@@ -190,6 +192,7 @@ __kernel void illustrative_kernel_name(
     * @param src_buffer_GLOBAL_input_stream The primary data source for the computational unit.
     *        - Tensor Shape: (src_scalar_NATURAL_total_item_count)
     *        - Padding Contract: {Type: CACHE, Formula: "Post-pad to 128-byte alignment"}
+    *        - Precision Role: "storage"
     *        - Calculability Proof: [src_scalar_NATURAL_total_item_count]
     *        - Validation Preconditions: [src_scalar_NATURAL_item_offset + src_scalar_NATURAL_item_count <= src_scalar_NATURAL_total_item_count]
     */
@@ -199,6 +202,7 @@ __kernel void illustrative_kernel_name(
     * @param src_buffer_DEVICE_CONST_lookup_table A read-only, device-constant memory resource.
     *        - Tensor Shape: (LUT_CAPACITY)
     *        - Padding Contract: {Type: NONE}
+    *        - Precision Role: "compute"
     *        - Calculability Proof: [Compile-time constant: LUT_CAPACITY]
     *        - Validation Preconditions: None.
     */
@@ -208,6 +212,7 @@ __kernel void illustrative_kernel_name(
     * @param dest_buffer_GLOBAL_partial_results The sole collection resource for this unit's partial output.
     *        - Tensor Shape: (dest_scalar_NATURAL_total_chunks, RESULT_ELEMENTS_PER_CHUNK)
     *        - Padding Contract: {Type: NONE}
+    *        - Precision Role: "storage"
     *        - Calculability Proof: [dest_scalar_NATURAL_total_chunks, Compile-time constant: RESULT_ELEMENTS_PER_CHUNK]
     *        - Validation Preconditions: Host shall zero-initialize this buffer prior to dispatch.
     */
@@ -217,6 +222,7 @@ __kernel void illustrative_kernel_name(
     * @param update_buffer_LOCAL_transpose_tile A work-group exclusive memory resource for a tiled matrix transpose.
     *        - Tensor Shape: (TILE_DIM, TILE_DIM + LOCAL_MEM_BANK_PADDING)
     *        - Padding Contract: {Type: BANK_CONFLICT_AVOIDANCE, Formula: "Pad row stride to (TILE_DIM + LOCAL_MEM_BANK_PADDING) elements"}
+    *        - Precision Role: "compute"
     *        - Validation Preconditions: Host shall allocate size according to the formula derived from this contract, using the value of `LOCAL_MEM_BANK_PADDING` defined in System Contract Article 5.
     */
     __local COMPUTE_TYPE* update_buffer_LOCAL_transpose_tile,
@@ -244,6 +250,16 @@ __kernel void illustrative_kernel_name(
 #### **1.0 Mandate**
 
 This Lexicon establishes the sole binding definitions for the `[ContextAndUsage]` component. Usage of any term not defined herein is a violation.
+
+#### **1.1 Canonical Abbreviations**
+
+The following abbreviations are formally blessed as equivalent short-form representations of their corresponding Lexicon terms. They may be used interchangeably in `[ContextAndUsage]` components.
+
+| Lexicon Term    | Abbreviation |
+| :-------------- | :----------- |
+| `temperatures`  | `temps`      |
+| `probabilities` | `probs`      |
+| `gradient`      | `grad`       |
 
 #### **2.0 Core Data Role Primitives**
 

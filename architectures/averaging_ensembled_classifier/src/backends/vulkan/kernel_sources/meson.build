@@ -27,6 +27,7 @@ role_bearing_shaders = [
 # Shaders with only compute-role buffers — single build, no precision flags.
 compute_only_shaders = [
     'normalize_gradients.comp',
+    'aggregate_partials_from_compute.comp',  # ADR-026: Compute-entry variant
 ]
 
 # Precision variant definitions: [suffix, extra glslc flags]

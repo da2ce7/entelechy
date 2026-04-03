@@ -1,6 +1,6 @@
 # Phase 8E: Double Precision — FP64 Tier 2 Tests & Alchemist II Validation
 
-**Status: COMPLETE** (implemented 2 April 2026)  
+**Status: NOT STARTED**  
 **Phase:** 8E of 8  
 **Prerequisite:** Phases 8A–8D complete and all rollback gates passed.  
 **Objective:** Add comprehensive Tier 2 test coverage for all four FP64 `PrecisionConfig` factories across all three backends. Implement the Alchemist II validation scenario (ADR-024 §8.2). Verify backend capability checks fail fast on unsupported hardware. Run full migration completion verification. The phase ends when all FP64 test scenarios pass on at least one backend (CPU) and gracefully skip on backends lacking FP64 support.  

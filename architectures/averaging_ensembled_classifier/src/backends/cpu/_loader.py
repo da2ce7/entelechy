@@ -165,8 +165,13 @@ def _set_function_signatures(lib: ctypes.CDLL) -> None:
 
     # Per-precision exports: task functions, reduction engine, layout getters
     for suffix in ffi.PRECISION_SUFFIXES:
-        # Reduction engine
+        # Reduction engine — storage-entry variant
         fn = getattr(lib, f"execute_reduction_tree_{suffix}")
+        fn.argtypes = [c_void_p, c_void_p]
+        fn.restype = None
+
+        # ADR-026: Reduction engine — compute-entry variant
+        fn = getattr(lib, f"execute_reduction_tree_from_compute_{suffix}")
         fn.argtypes = [c_void_p, c_void_p]
         fn.restype = None
 

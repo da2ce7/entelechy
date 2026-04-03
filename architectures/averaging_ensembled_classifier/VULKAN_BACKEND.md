@@ -381,6 +381,27 @@ vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
 
 This records the binding update directly into the command buffer — no pre-allocation, no pool management, no per-stage descriptor sets.
 
+**Precision-Typed Variants (ADR-026):** Under mixed-precision configurations, the reduction tree renderer must select between storage-entry and compute-entry pipeline variants:
+
+| Stage | Source Role | Pipeline |
+| :--- | :--- | :--- |
+| Stage 0 | `"storage"` | `aggregate_partials` (reads via `load_storage()`) |
+| Stage 0 | `"compute"` | `aggregate_partials_from_compute` (direct COMPUTE_TYPE read) |
+| Stage ≥ 1 | always `"compute"` | `aggregate_partials_from_compute` |
+
+The `_from_compute` GLSL shader shares identical algorithm but declares `COMPUTE_TYPE` for its source buffer binding rather than `STORAGE_TYPE`. Pipeline selection occurs per-stage in `record_reduction_tree`:
+
+```c
+// Inside record_reduction_tree, per-stage:
+VkPipeline pipeline;
+if (stage == 0 && source_role == PRECISION_ROLE_STORAGE)
+    pipeline = vk->aggregate_partials;           // storage-entry
+else
+    pipeline = vk->aggregate_partials_from_compute;  // compute-entry
+
+vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+```
+
 ### Push Constant Design
 
 All scalar parameters from the architecture's kernel interfaces map to push constants. Vulkan guarantees a minimum of 128 bytes; every kernel in the architecture fits within this budget:

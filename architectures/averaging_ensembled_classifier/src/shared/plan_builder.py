@@ -760,7 +760,10 @@ def build_learn_plan(
          "clipped_partial_grad_temps": b_clipped_grad_temps,
          "clipped_partial_grad_hidden_activations_aos": b_clipped_grad_hidden},
         {"use_per_item_norm": 0,
-         "clipping_threshold_t_pre": policy.get_leaf_safety_threshold(),
+         # Pre-summation amplification factor (CONCEPT §3.4): Node 13 sums across
+         # num_class_chunks, so the safety ceiling must be divided by this factor
+         # to prevent overflow at Node 16's first stage.
+         "clipping_threshold_t_pre": policy.get_leaf_safety_threshold() / tiling.num_class_chunks,
          "epsilon": model_spec.precision.compute_epsilon,
          "flat_tile_index": 0,
          "num_class_chunks": tiling.num_class_chunks,

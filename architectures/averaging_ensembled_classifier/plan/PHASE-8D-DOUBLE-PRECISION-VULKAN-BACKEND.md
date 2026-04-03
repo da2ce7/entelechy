@@ -1,6 +1,6 @@
 # Phase 8D: Double Precision — Vulkan Backend & SPIR-V Variants
 
-**Status: COMPLETE** (implemented 2 April 2026)  
+**Status: NOT STARTED**  
 **Phase:** 8D of 8  
 **Prerequisite:** Phase 8C complete and rollback gate passed.  
 **Objective:** Extend the Vulkan backend's GLSL shader library, `common.glsl`, Meson SPIR-V compilation, and pipeline cache to support FP64 roles. Add the `GL_EXT_shader_explicit_arithmetic_types_float64` extension guard. Parameterize `COMPUTE_FLOAT` (previously hardcoded to `float`), completing the three-axis scheme. Compile all 11 valid precision SPIR-V variants per role-bearing shader. Add `supports_float64()` capability check. The phase ends when the Vulkan SPIR-V build produces all variant artifacts and existing FP32-pathway tests pass.  
