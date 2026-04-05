@@ -25,11 +25,11 @@ layout(push_constant) uniform PushConstants {
     uint final_grad_hidden_total_element_count;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer InputBuf      { STORAGE_FLOAT data[]; } input_buf;
-layout(set = 0, binding = 1) readonly buffer HiddenBuf     { STORAGE_FLOAT data[]; } hidden_acts;
-layout(set = 0, binding = 2) readonly buffer GradHBuf      { COMPUTE_FLOAT data[]; } grad_h;
-layout(set = 0, binding = 3) readonly buffer SampleMaskBuf { STORAGE_FLOAT data[]; } sample_mask;
-layout(set = 0, binding = 4) writeonly buffer GradSWOut    { STORAGE_FLOAT data[]; } grad_sw_out;
+layout(set = 0, binding = 0) readonly buffer InputBuf      { STORAGE_TYPE data[]; } input_buf;
+layout(set = 0, binding = 1) readonly buffer HiddenBuf     { STORAGE_TYPE data[]; } hidden_acts;
+layout(set = 0, binding = 2) readonly buffer GradHBuf      { COMPUTE_TYPE data[]; } grad_h;
+layout(set = 0, binding = 3) readonly buffer SampleMaskBuf { STORAGE_TYPE data[]; } sample_mask;
+layout(set = 0, binding = 4) writeonly buffer GradSWOut    { STORAGE_TYPE data[]; } grad_sw_out;
 
 void main() {
     uint i_idx = gl_WorkGroupID.x;  // input dimension
@@ -40,30 +40,30 @@ void main() {
     if (i_idx >= push.padded_input_count || j_idx >= push.padded_hidden_count) return;
 
     // ── Parallel reduction over the batch chunk ──
-    COMPUTE_FLOAT p_grad_sw = COMPUTE_FLOAT(0.0);
+    COMPUTE_TYPE p_grad_sw = COMPUTE_TYPE(0.0);
 
     for (uint b_local = lid; b_local < push.batch_chunk_count; b_local += lsize) {
         uint b_global = push.batch_chunk_offset + b_local;
 
         // Skip padded samples.
-        if (read_storage(sample_mask.data[b_global]) < COMPUTE_FLOAT(0.5)) continue;
+        if (read_storage(sample_mask.data[b_global]) < COMPUTE_TYPE(0.5)) continue;
 
         // Chain rule: dL/dW_ij = (dL/dA_j) * (dA_j/dZ_j) * (dZ_j/dW_ij)
         uint  hidden_offset = b_global * push.padded_hidden_count + j_idx;
-        COMPUTE_FLOAT grad_h_val    = grad_h.data[hidden_offset];       // dL/dA_j (compute-role)
-        COMPUTE_FLOAT hidden_val    = read_storage(hidden_acts.data[hidden_offset]);
+        COMPUTE_TYPE grad_h_val    = grad_h.data[hidden_offset];       // dL/dA_j (compute-role)
+        COMPUTE_TYPE hidden_val    = read_storage(hidden_acts.data[hidden_offset]);
 
         // ReLU derivative: dA_j/dZ_j
-        COMPUTE_FLOAT d_activation = (hidden_val > COMPUTE_FLOAT(0.0)) ? COMPUTE_FLOAT(1.0) : COMPUTE_FLOAT(0.0);
-        COMPUTE_FLOAT dL_dZ_j      = grad_h_val * d_activation;
+        COMPUTE_TYPE d_activation = (hidden_val > COMPUTE_TYPE(0.0)) ? COMPUTE_TYPE(1.0) : COMPUTE_TYPE(0.0);
+        COMPUTE_TYPE dL_dZ_j      = grad_h_val * d_activation;
 
         // dZ_j/dW_ij = input value
-        COMPUTE_FLOAT input_val = read_storage(input_buf.data[b_global * push.padded_input_count + i_idx]);
+        COMPUTE_TYPE input_val = read_storage(input_buf.data[b_global * push.padded_input_count + i_idx]);
         p_grad_sw += dL_dZ_j * input_val;
     }
 
     // ── Subgroup-accelerated workgroup reduction ──
-    COMPUTE_FLOAT total = workgroup_reduce_add(p_grad_sw);
+    COMPUTE_TYPE total = workgroup_reduce_add(p_grad_sw);
 
     // Leader writes the final reduced partial gradient for this chunk.
     // Write uses hidden-major order: j_idx * padded_input + i_idx (matches weight layout).

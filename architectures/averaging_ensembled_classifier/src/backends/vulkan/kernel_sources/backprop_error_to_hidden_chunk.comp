@@ -25,12 +25,12 @@ layout(push_constant) uniform PushConstants {
     uint total_tile_count;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer ProbsBuf   { STORAGE_FLOAT data[]; } src_probs;
+layout(set = 0, binding = 0) readonly buffer ProbsBuf   { STORAGE_TYPE data[]; } src_probs;
 layout(set = 0, binding = 1) readonly buffer TargetsCCE { int           data[]; } src_targets_cce;
-layout(set = 0, binding = 2) readonly buffer TargetsBCE { STORAGE_FLOAT data[]; } src_targets_bce;
-layout(set = 0, binding = 3) readonly buffer MaskBuf    { STORAGE_FLOAT data[]; } src_sample_mask;
-layout(set = 0, binding = 4) readonly buffer WeightsBuf { STATE_FLOAT   data[]; } src_weights;
-layout(set = 0, binding = 5) writeonly buffer GradHBuf  { STORAGE_FLOAT data[]; } dest_grad_h;
+layout(set = 0, binding = 2) readonly buffer TargetsBCE { STORAGE_TYPE data[]; } src_targets_bce;
+layout(set = 0, binding = 3) readonly buffer MaskBuf    { STORAGE_TYPE data[]; } src_sample_mask;
+layout(set = 0, binding = 4) readonly buffer WeightsBuf { STATE_TYPE   data[]; } src_weights;
+layout(set = 0, binding = 5) writeonly buffer GradHBuf  { STORAGE_TYPE data[]; } dest_grad_h;
 
 void main() {
     // Flat invocation index decomposed into (module_local, batch, hidden)
@@ -56,8 +56,8 @@ void main() {
     uint out_idx = tile_base + local_offset;
 
     // Padded sample early exit
-    if (read_storage(src_sample_mask.data[batch_idx]) < COMPUTE_FLOAT(0.5)) {
-        dest_grad_h.data[out_idx] = write_storage(COMPUTE_FLOAT(0.0));
+    if (read_storage(src_sample_mask.data[batch_idx]) < COMPUTE_TYPE(0.5)) {
+        dest_grad_h.data[out_idx] = write_storage(COMPUTE_TYPE(0.0));
         return;
     }
 
@@ -70,27 +70,27 @@ void main() {
     uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
 
     // Reduction over class chunk
-    COMPUTE_FLOAT grad_h_accum = COMPUTE_FLOAT(0.0);
+    COMPUTE_TYPE grad_h_accum = COMPUTE_TYPE(0.0);
     for (uint c_local = 0; c_local < push.classes_per_chunk; ++c_local) {
         uint c_global = class_offset + c_local;
         if (c_global < push.total_output_class_count) {
             uint prob_idx = prob_tile_base
                           + module_local_idx * push.total_batch_count * push.classes_per_chunk
                           + batch_idx * push.classes_per_chunk + c_local;
-            COMPUTE_FLOAT prob = read_storage(src_probs.data[prob_idx]);
+            COMPUTE_TYPE prob = read_storage(src_probs.data[prob_idx]);
 
-            COMPUTE_FLOAT d_loss_d_logit;
+            COMPUTE_TYPE d_loss_d_logit;
             if (SPEC_PROBLEM_TYPE == PROBLEM_TYPE_CCE) {
                 int target = src_targets_cce.data[batch_idx];
-                d_loss_d_logit = (c_global == target) ? (prob - COMPUTE_FLOAT(1.0)) : prob;
+                d_loss_d_logit = (c_global == target) ? (prob - COMPUTE_TYPE(1.0)) : prob;
             } else {
-                COMPUTE_FLOAT target = read_storage(src_targets_bce.data[batch_idx * push.padded_total_output_class_count + c_global]);
+                COMPUTE_TYPE target = read_storage(src_targets_bce.data[batch_idx * push.padded_total_output_class_count + c_global]);
                 d_loss_d_logit = prob - target;
             }
 
             uint w_idx = module_global_idx * push.padded_hidden_count * push.padded_total_output_class_count
                        + h_idx * push.padded_total_output_class_count + c_global;
-            COMPUTE_FLOAT w_val = read_state(src_weights.data[w_idx]);
+            COMPUTE_TYPE w_val = read_state(src_weights.data[w_idx]);
             grad_h_accum += d_loss_d_logit * w_val;
         }
     }

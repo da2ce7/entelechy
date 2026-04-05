@@ -294,7 +294,7 @@ For FP64-role buffers, scalar operations are preferred. The Adam kernel's access
 
 ### §5: Vulkan Backend — FP64 Shader Variants (amends ADR-023 §3)
 
-ADR-023 §3.3 established "COMPUTE_TYPE = float on Vulkan backend, invariant." This ADR removes that invariant — compute type is now parameterized via `COMPUTE_FLOAT`, completing the three-axis scheme.
+ADR-023 §3.3 established "COMPUTE_TYPE = float on Vulkan backend, invariant." This ADR removes that invariant — compute type is now parameterized via `COMPUTE_TYPE`, completing the three-axis scheme.
 
 #### §5.1: Three-Axis Macro Scheme
 
@@ -302,46 +302,46 @@ The Vulkan backend's `glslc -D` parameterization is extended from two axes to th
 
 | Macro | Values | Injected by |
 |:---|:---|:---|
-| `STORAGE_FLOAT` | `float16_t`, `float`, `double` | `glslc -DSTORAGE_FLOAT=...` |
-| `COMPUTE_FLOAT` | `float`, `double` | `glslc -DCOMPUTE_FLOAT=...` |
-| `STATE_FLOAT` | `float16_t`, `float`, `double` | `glslc -DSTATE_FLOAT=...` |
+| `STORAGE_TYPE` | `float16_t`, `float`, `double` | `glslc -DSTORAGE_TYPE=...` |
+| `COMPUTE_TYPE` | `float`, `double` | `glslc -DCOMPUTE_TYPE=...` |
+| `STATE_TYPE` | `float16_t`, `float`, `double` | `glslc -DSTATE_TYPE=...` |
 
 The `common.glsl` macro block (ADR-023 §3.2.1) is extended:
 
 ```glsl
-#ifndef STORAGE_FLOAT
-#define STORAGE_FLOAT float
+#ifndef STORAGE_TYPE
+#define STORAGE_TYPE float
 #endif
-#ifndef COMPUTE_FLOAT
-#define COMPUTE_FLOAT float
+#ifndef COMPUTE_TYPE
+#define COMPUTE_TYPE float
 #endif
-#ifndef STATE_FLOAT
-#define STATE_FLOAT float
+#ifndef STATE_TYPE
+#define STATE_TYPE float
 #endif
 
-#define WIDEN_STORAGE(x)   COMPUTE_FLOAT(x)
-#define NARROW_STORAGE(x)  STORAGE_FLOAT(x)
-#define WIDEN_STATE(x)     COMPUTE_FLOAT(x)
-#define NARROW_STATE(x)    STATE_FLOAT(x)
+#define WIDEN_STORAGE(x)   COMPUTE_TYPE(x)
+#define NARROW_STORAGE(x)  STORAGE_TYPE(x)
+#define WIDEN_STATE(x)     COMPUTE_TYPE(x)
+#define NARROW_STATE(x)    STATE_TYPE(x)
 ```
 
-Note: `WIDEN_*` now casts to `COMPUTE_FLOAT` rather than hardcoded `float`.
+Note: `WIDEN_*` now casts to `COMPUTE_TYPE` rather than hardcoded `float`.
 
 #### §5.2: Workgroup Scratch Type
 
-The workgroup reduction scratch (ADR-023 §3.2.3) changes from hardcoded `float` to `COMPUTE_FLOAT`:
+The workgroup reduction scratch (ADR-023 §3.2.3) changes from hardcoded `float` to `COMPUTE_TYPE`:
 
 ```glsl
 // Compute-role scratch for cross-subgroup bridge.
-shared COMPUTE_FLOAT _compute_scratch[32];
+shared COMPUTE_TYPE _compute_scratch[32];
 ```
 
 #### §5.3: Extension Requirements
 
 | Extension | Required when |
 |:---|:---|
-| `GL_EXT_shader_explicit_arithmetic_types_float16` | `STORAGE_FLOAT=float16_t` or `STATE_FLOAT=float16_t` |
-| `GL_EXT_shader_explicit_arithmetic_types_float64` | `COMPUTE_FLOAT=double` or `STATE_FLOAT=double` or `STORAGE_FLOAT=double` |
+| `GL_EXT_shader_explicit_arithmetic_types_float16` | `STORAGE_TYPE=float16_t` or `STATE_TYPE=float16_t` |
+| `GL_EXT_shader_explicit_arithmetic_types_float64` | `COMPUTE_TYPE=double` or `STATE_TYPE=double` or `STORAGE_TYPE=double` |
 
 The extension guard in `common.glsl` is extended:
 
@@ -369,7 +369,7 @@ Plan construction for a `PrecisionConfig` with FP64 roles fails fast if `support
 
 #### §5.5: SPIR-V Variant Enumeration
 
-All valid `(STORAGE_FLOAT, COMPUTE_FLOAT, STATE_FLOAT)` combinations are compiled to SPIR-V at build time. The enumeration follows the same constraints as the CPU backend (§4.1):
+All valid `(STORAGE_TYPE, COMPUTE_TYPE, STATE_TYPE)` combinations are compiled to SPIR-V at build time. The enumeration follows the same constraints as the CPU backend (§4.1):
 
 | STORAGE | COMPUTE | STATE | Count |
 |:---|:---|:---|:---|
@@ -469,7 +469,7 @@ The validation scenario from ADR-020 §2.6 is extended:
 4. **CPU struct instantiations.** Migrate existing suffixes to three-axis scheme (`s32x32` → `s32c32x32`) and add all 11 valid variants to `cpu_kernels.h`.
 5. **CPU precision macros.** Extend `cpu_precision.h` to accept `COMPUTE_T` alongside `STORAGE_T` and `STATE_T`.
 6. **OpenCL extension guard.** Add `cl_khr_fp64` pragma to `kernels.cl.h`.
-7. **Vulkan `common.glsl`.** Add `COMPUTE_FLOAT` macro; update `WIDEN_*` to cast to `COMPUTE_FLOAT`; update `_compute_scratch` type.
+7. **Vulkan `common.glsl`.** Add `COMPUTE_TYPE` macro; update `WIDEN_*` to cast to `COMPUTE_TYPE`; update `_compute_scratch` type.
 8. **Vulkan extension guards.** Add `GL_EXT_shader_explicit_arithmetic_types_float64` conditional enablement.
 9. **Vulkan SPIR-V compilation.** Extend `meson.build` to compile all 11 precision variants per shader.
 10. **Vulkan capability check.** Add `supports_float64()` to `capabilities.py`.

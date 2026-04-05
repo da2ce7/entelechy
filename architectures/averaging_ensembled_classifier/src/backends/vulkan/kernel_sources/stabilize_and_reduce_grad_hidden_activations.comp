@@ -34,11 +34,11 @@ layout(push_constant) uniform PushConstants {
     uint  padded_total_modules_count;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer SrcGradH  { STORAGE_FLOAT data[]; } src_grad_h;
-layout(set = 0, binding = 1) writeonly buffer DestGradH { COMPUTE_FLOAT data[]; } dest_grad_h;
+layout(set = 0, binding = 0) readonly buffer SrcGradH  { STORAGE_TYPE data[]; } src_grad_h;
+layout(set = 0, binding = 1) writeonly buffer DestGradH { COMPUTE_TYPE data[]; } dest_grad_h;
 
 // Local scratch for the staged reduction. Must accommodate full workgroup size.
-shared COMPUTE_FLOAT reduction_tile[1024];
+shared COMPUTE_TYPE reduction_tile[1024];
 
 void main() {
     uint row_idx = gl_WorkGroupID.x;
@@ -50,7 +50,7 @@ void main() {
 
     // ── Phase 1: Unified data ingress & initial reduction ──
     // Reduce the global input row into lsize partial sums in shared memory.
-    COMPUTE_FLOAT thread_accum = COMPUTE_FLOAT(0.0);
+    COMPUTE_TYPE thread_accum = COMPUTE_TYPE(0.0);
     uint row_offset = row_idx * push.padded_total_modules_count;
     for (uint i = lid; i < push.total_modules_count; i += lsize) {
         thread_accum += read_storage(src_grad_h.data[row_offset + i]);
@@ -60,10 +60,10 @@ void main() {
     // The Phase 2 staged reduction sums up to `lsize` partial values at its first stage.
     // To prevent overflow, each partial must be bounded by fp_max / lsize. This keeps
     // the workgroup size as an internal execution-tier concern, not leaking to host policy.
-    COMPUTE_FLOAT phase1_ceiling = COMPUTE_FLOAT(push.fp_max) / COMPUTE_FLOAT(lsize);
-    COMPUTE_FLOAT mag            = abs(thread_accum);
+    COMPUTE_TYPE phase1_ceiling = COMPUTE_TYPE(push.fp_max) / COMPUTE_TYPE(lsize);
+    COMPUTE_TYPE mag            = abs(thread_accum);
     if (mag > phase1_ceiling) {
-        thread_accum *= phase1_ceiling / (mag + COMPUTE_FLOAT(push.epsilon));
+        thread_accum *= phase1_ceiling / (mag + COMPUTE_TYPE(push.epsilon));
     }
 
     reduction_tile[lid] = thread_accum;
@@ -88,10 +88,10 @@ void main() {
     for (uint s = 0; s < num_stages_total; ++s) {
         // Synthesize stage-specific threshold (contract compliant).
         uint  j               = num_stages_total - 1 - s;
-        COMPUTE_FLOAT T_policy        = COMPUTE_FLOAT(push.policy_t_algorithmic) + COMPUTE_FLOAT(push.policy_lambda) * COMPUTE_FLOAT(j * j);
+        COMPUTE_TYPE T_policy        = COMPUTE_TYPE(push.policy_t_algorithmic) + COMPUTE_TYPE(push.policy_lambda) * COMPUTE_TYPE(j * j);
         uint  K_actual        = min(K_plan, num_items_in_stage);
-        COMPUTE_FLOAT T_safety        = (K_actual > 0) ? (COMPUTE_FLOAT(push.fp_max) / COMPUTE_FLOAT(K_actual)) : COMPUTE_FLOAT(push.fp_max);
-        COMPUTE_FLOAT final_threshold = min(T_policy, T_safety);
+        COMPUTE_TYPE T_safety        = (K_actual > 0) ? (COMPUTE_TYPE(push.fp_max) / COMPUTE_TYPE(K_actual)) : COMPUTE_TYPE(push.fp_max);
+        COMPUTE_TYPE final_threshold = min(T_policy, T_safety);
 
         // Perform one level of sum-then-clip reduction.
         // Each thread lid becomes a "sub-group leader" for a block of up to K_plan items.
@@ -99,15 +99,15 @@ void main() {
             uint start_idx = lid * K_plan;
             uint end_idx   = min(start_idx + K_plan, num_items_in_stage);
 
-            COMPUTE_FLOAT sum_val = COMPUTE_FLOAT(0.0);
+            COMPUTE_TYPE sum_val = COMPUTE_TYPE(0.0);
             for (uint i = start_idx; i < end_idx; ++i) {
                 sum_val += reduction_tile[i];
             }
 
             // For a scalar sum, L2 norm is absolute value.
-            COMPUTE_FLOAT norm = abs(sum_val);
+            COMPUTE_TYPE norm = abs(sum_val);
             if (norm > final_threshold) {
-                sum_val *= final_threshold / (norm + COMPUTE_FLOAT(push.epsilon));
+                sum_val *= final_threshold / (norm + COMPUTE_TYPE(push.epsilon));
             }
             // Overwrite this sub-group's slot with the compacted value.
             reduction_tile[lid] = sum_val;

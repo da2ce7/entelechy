@@ -258,23 +258,23 @@ OpenCL and C backends receive precision type symbols via `-D` preprocessor flags
 GLSL does not support preprocessor-aliased type names at the `layout(buffer)` block member position. The following is not valid GLSL:
 
 ```glsl
-// INVALID — STORAGE_FLOAT is not a built-in GLSL type name
-layout(set = 0, binding = 0) buffer Buf { STORAGE_FLOAT data[]; } b;
+// INVALID — STORAGE_TYPE is not a built-in GLSL type name
+layout(set = 0, binding = 0) buffer Buf { STORAGE_TYPE data[]; } b;
 ```
 
 The three viable strategies are:
 
 | Strategy | Mechanism | Assessment |
 |:---|:---|:---|
-| **A: Preprocessor macro + glslc `-D`** | Define `STORAGE_FLOAT` as a GLSL type alias via `-DSTORAGE_FLOAT=float16_t` passed to `glslc`. GLSL preprocessor substitution applies to buffer layout member types. | Valid. `glslc` supports `-D`. Requires `GL_EXT_shader_explicit_arithmetic_types_float16` enabled in source. Produces clean single-source shaders. |
+| **A: Preprocessor macro + glslc `-D`** | Define `STORAGE_TYPE` as a GLSL type alias via `-DSTORAGE_TYPE=float16_t` passed to `glslc`. GLSL preprocessor substitution applies to buffer layout member types. | Valid. `glslc` supports `-D`. Requires `GL_EXT_shader_explicit_arithmetic_types_float16` enabled in source. Produces clean single-source shaders. |
 | **B: `uint16_t` reinterpret** | Declare storage-role SSBOs as `{ uint16_t data[]; }`. Use `unpackHalf2x16` / `packHalf2x16` for FP16 load/store. No extension required. | Valid but indirect. Destroys the "identity conversion when types equal" property in the FP32 case. `unpackHalf2x16` returns a `vec2` requiring explicit lane selection. Not idiomatic. |
 | **C: Separate shader source files per precision** | Maintain `forward_pass_fp32.comp` and `forward_pass_fp16.comp`. | Precise code duplication that the architecture's principles reject. Violates "one codepath" mandate (ADR-020 §2.3). |
 
 **Decision: Strategy A.** The `glslc` preprocessor accepts `-D` defines. GLSL's preprocessor substitution applies to built-in type names in buffer member positions because the substitution occurs in the token stream before parsing. The approach:
 
-1. `common.glsl` defines `STORAGE_FLOAT`, `NARROW_STORAGE()`, `WIDEN_STORAGE()`, `STATE_FLOAT`, `NARROW_STATE()`, `WIDEN_STATE()` macros, defaulting to `float` when no define is injected.
-2. Each `.comp` shader uses `STORAGE_FLOAT` and `STATE_FLOAT` in its buffer layout declarations and the conversion macros at load/store sites.
-3. The Meson build passes `-DSTORAGE_FLOAT=float16_t -DSTATE_FLOAT=float` (etc.) to `glslc` per precision variant.
+1. `common.glsl` defines `STORAGE_TYPE`, `NARROW_STORAGE()`, `WIDEN_STORAGE()`, `STATE_TYPE`, `NARROW_STATE()`, `WIDEN_STATE()` macros, defaulting to `float` when no define is injected.
+2. Each `.comp` shader uses `STORAGE_TYPE` and `STATE_TYPE` in its buffer layout declarations and the conversion macros at load/store sites.
+3. The Meson build passes `-DSTORAGE_TYPE=float16_t -DSTATE_TYPE=float` (etc.) to `glslc` per precision variant.
 4. `GL_EXT_shader_explicit_arithmetic_types_float16` is conditionally enabled in `common.glsl` when `float16_t` is in use.
 
 ### §3.2: `common.glsl` changes
@@ -287,20 +287,20 @@ The following block is added immediately after the specialization constant decla
 
 ```glsl
 // ── Precision-Role Type Macros (ADR-023 §3.2) ─────────────────────────
-// STORAGE_FLOAT and STATE_FLOAT are injected by the build system via
+// STORAGE_TYPE and STATE_TYPE are injected by the build system via
 // glslc -D flags. Default to float (FP32) when not injected, matching
 // PrecisionConfig.float32() and maintaining the uniform-FP32 baseline.
 //
 // WIDEN_*() converts a role-precision value to float (COMPUTE_TYPE, always
 // float in the Vulkan backend). NARROW_*() converts float to role precision.
-// When STORAGE_FLOAT == float, both are identity functions eliminated by
+// When STORAGE_TYPE == float, both are identity functions eliminated by
 // the SPIR-V compiler. No #ifdef on type equality anywhere in shaders.
 
-#ifndef STORAGE_FLOAT
-#define STORAGE_FLOAT float
+#ifndef STORAGE_TYPE
+#define STORAGE_TYPE float
 #endif
-#ifndef STATE_FLOAT
-#define STATE_FLOAT float
+#ifndef STATE_TYPE
+#define STATE_TYPE float
 #endif
 
 #if defined(float16_t)
@@ -308,12 +308,12 @@ The following block is added immediately after the specialization constant decla
 #endif
 
 #define WIDEN_STORAGE(x)   float(x)
-#define NARROW_STORAGE(x)  STORAGE_FLOAT(x)
+#define NARROW_STORAGE(x)  STORAGE_TYPE(x)
 #define WIDEN_STATE(x)     float(x)
-#define NARROW_STATE(x)    STATE_FLOAT(x)
+#define NARROW_STATE(x)    STATE_TYPE(x)
 ```
 
-Note: `float(float_val)` is a valid no-op cast in GLSL. When `STORAGE_FLOAT = float`, `NARROW_STORAGE(x)` expands to `float(x)`, an identity. The SPIR-V compiler emits no conversion instruction.
+Note: `float(float_val)` is a valid no-op cast in GLSL. When `STORAGE_TYPE = float`, `NARROW_STORAGE(x)` expands to `float(x)`, an identity. The SPIR-V compiler emits no conversion instruction.
 
 #### §3.2.2: Conditional FP16 extension enablement
 
@@ -327,7 +327,7 @@ The following guard is added before the macro definitions:
 #endif
 ```
 
-The Meson build injects `-DENABLE_FP16_EXTENSION=1` for any precision variant where `STORAGE_FLOAT=float16_t` or `STATE_FLOAT=float16_t`.
+The Meson build injects `-DENABLE_FP16_EXTENSION=1` for any precision variant where `STORAGE_TYPE=float16_t` or `STATE_TYPE=float16_t`.
 
 #### §3.2.3: Compute-role scratch declared explicitly
 
@@ -348,14 +348,14 @@ The following helper functions are added to `common.glsl` after the reduction he
 ```glsl
 // ── Precision Boundary Helpers (ADR-023 §3.2.4) ───────────────────────
 // Inline load/store wrappers that cross the storage/state → compute boundary.
-// When STORAGE_FLOAT == float, these are identity operations. The SPIR-V
+// When STORAGE_TYPE == float, these are identity operations. The SPIR-V
 // compiler eliminates them. One codepath — no #ifdef on type equality.
 
-float read_storage(STORAGE_FLOAT val) { return WIDEN_STORAGE(val); }
-STORAGE_FLOAT write_storage(float val) { return NARROW_STORAGE(val); }
+float read_storage(STORAGE_TYPE val) { return WIDEN_STORAGE(val); }
+STORAGE_TYPE write_storage(float val) { return NARROW_STORAGE(val); }
 
-float read_state(STATE_FLOAT val) { return WIDEN_STATE(val); }
-STATE_FLOAT write_state(float val) { return NARROW_STATE(val); }
+float read_state(STATE_TYPE val) { return WIDEN_STATE(val); }
+STATE_TYPE write_state(float val) { return NARROW_STATE(val); }
 ```
 
 These helpers have value-semantics (taking the element value, not an array index). Each `.comp` shader passes the element value obtained from its SSBO binding through these helpers at every precision boundary crossing.
@@ -368,7 +368,7 @@ As on the CPU backend, the Vulkan backend commits to `COMPUTE_TYPE = float` as a
 
 Every `.comp` shader that declares storage-role or state-role buffer bindings is updated as follows:
 
-1. **Buffer layout declarations:** replace `float data[]` with `STORAGE_FLOAT data[]` (for storage-role buffers) or `STATE_FLOAT data[]` (for state-role buffers). Compute-role buffer bindings keep `float data[]`.
+1. **Buffer layout declarations:** replace `float data[]` with `STORAGE_TYPE data[]` (for storage-role buffers) or `STATE_TYPE data[]` (for state-role buffers). Compute-role buffer bindings keep `float data[]`.
 
    ```glsl
    // Before (forward_pass.comp):
@@ -376,8 +376,8 @@ Every `.comp` shader that declares storage-role or state-role buffer bindings is
    layout(set = 0, binding = 2) readonly buffer WeightsBuf { float data[]; } src_weights;
 
    // After:
-   layout(set = 0, binding = 0) readonly buffer InputBuf   { STORAGE_FLOAT data[]; } src_input;
-   layout(set = 0, binding = 2) readonly buffer WeightsBuf { STATE_FLOAT data[]; }   src_weights;
+   layout(set = 0, binding = 0) readonly buffer InputBuf   { STORAGE_TYPE data[]; } src_input;
+   layout(set = 0, binding = 2) readonly buffer WeightsBuf { STATE_TYPE data[]; }   src_weights;
    ```
 
 2. **Load sites:** every read from a storage-role buffer wraps the element through `read_storage()`; state-role reads through `read_state()`.
@@ -420,13 +420,13 @@ The role assignment for each buffer in each `.comp` shader follows the tables in
 
 The Meson build in `src/backends/vulkan/meson.build` currently calls `glslc` once per `.comp` file. Under this ADR the precision-variant flags are injected. Three precision combinations correspond to the three `PrecisionConfig` factories:
 
-| Variant suffix | `STORAGE_FLOAT` | `STATE_FLOAT` | `ENABLE_FP16_EXTENSION` |
+| Variant suffix | `STORAGE_TYPE` | `STATE_TYPE` | `ENABLE_FP16_EXTENSION` |
 |:---|:---|:---|:---|
 | `_fp32` | `float` | `float` | (not set) |
 | `_s16fp32` | `float16_t` | `float` | `1` |
 | `_fp16` | `float16_t` | `float16_t` | `1` |
 
-For shaders that contain no storage-role or state-role typed buffers, only the `_fp32` variant is built (no `STORAGE_FLOAT`/`STATE_FLOAT` substitution occurs; single SPIR-V is sufficient).
+For shaders that contain no storage-role or state-role typed buffers, only the `_fp32` variant is built (no `STORAGE_TYPE`/`STATE_TYPE` substitution occurs; single SPIR-V is sufficient).
 
 The Vulkan backend's `_pipeline_cache.py` is updated to select the correct SPIR-V variant path based on `PrecisionConfig.storage_dtype` and `PrecisionConfig.state_dtype` at pipeline creation time. This is an extension of the existing pipeline cache parameterisation; the file path convention (`kernel_name_fp32.spv`, `kernel_name_s16fp32.spv`, `kernel_name_fp16.spv`) is the only new artifact.
 
@@ -472,7 +472,7 @@ The Python FFI layer (ADR-015) currently binds against `CceChunkArgs_fp64`, `Ada
 |:---|:---|:---|:---|
 | OpenCL | Inline `load_storage()`/`store_storage()`/`load_state()`/`store_state_update()` in `kernels.cl.h`; `vload_half`/`vstore_half` when `STORAGE_TYPE_IS_HALF` | `COMPUTE_TYPE` (typically `float`) via `-D` | `-DSTORAGE_TYPE`, `-DCOMPUTE_TYPE`, `-DSTATE_TYPE`, `-DSTORAGE_TYPE_IS_HALF` per ADR-022 §7.1 |
 | CPU | `simd_load_storage()`/`simd_load_state()` macros via `cpu_precision.h`; two-axis `STORAGE_SUFFIX`/`STATE_SUFFIX` dispatch; `cpu_compute_t = float` invariant | `float` — fixed CPU backend constant | `DECLARE_PRECISION_STRUCTS(SUFFIX, STORAGE_T, STATE_T)` per precision variant in `cpu_kernels.h` |
-| Vulkan | `read_storage()`/`write_storage()`/`read_state()`/`write_state()` helpers in `common.glsl`; `STORAGE_FLOAT`/`STATE_FLOAT` macros injected via `glslc -D`; `float16_t` SSBO elements under FP16 configs | `float` — fixed Vulkan backend constant | Three SPIR-V variants per storage/state-role-bearing shader (`_fp32`, `_s16fp32`, `_fp16`) |
+| Vulkan | `read_storage()`/`write_storage()`/`read_state()`/`write_state()` helpers in `common.glsl`; `STORAGE_TYPE`/`STATE_TYPE` macros injected via `glslc -D`; `float16_t` SSBO elements under FP16 configs | `float` — fixed Vulkan backend constant | Three SPIR-V variants per storage/state-role-bearing shader (`_fp32`, `_s16fp32`, `_fp16`) |
 
 The "one codepath" invariant holds in all three backends: the conversion helpers are always present at the code level; the compiler/SPIR-V optimizer eliminates them when types are equal.
 
@@ -482,7 +482,7 @@ The "one codepath" invariant holds in all three backends: the conversion helpers
 
 Per ADR-021 §5 (extended here to cover all backends), the following obligations apply across all three backends:
 
-1. **Abstraction completeness:** Every load from a storage-role or state-role buffer passes through the role-appropriate abstraction. `grep -n 'STORAGE_TYPE\b\|STATE_TYPE\b\|STORAGE_FLOAT\b\|STATE_FLOAT\b' <source>` must not appear as a raw dereference on the left of `=` without the helper wrapper.
+1. **Abstraction completeness:** Every load from a storage-role or state-role buffer passes through the role-appropriate abstraction. `grep -n 'STORAGE_TYPE\b\|STATE_TYPE\b\|STORAGE_TYPE\b\|STATE_TYPE\b' <source>` must not appear as a raw dereference on the left of `=` without the helper wrapper.
 
 2. **Uniform-FP32 baseline invariance:** All three `PrecisionConfig.float32()` test runs must produce results bit-for-bit identical to the prior single-axis FP32 results. The precision boundary helpers with equal types must be genuinely zero-overhead in the compiled output.
 
@@ -502,7 +502,7 @@ Per ADR-021 §5 (extended here to cover all backends), the following obligations
 
 - **ADR-021 §1.3 deferral fulfilled.** The precision boundary abstractions declared in the kernel specification document now have concrete implementations in all three backends.
 - **CPU backend's existing three-role intuition is formalized.** The existing "compute is always float" practice becomes an architectural declaration. The storage/state split eliminates the last ambiguity in the CPU kernel struct ABI.
-- **Vulkan FP16 storage is unblocked.** The `STORAGE_FLOAT`/`STATE_FLOAT` macro pattern in `common.glsl` and the multi-variant `glslc` compilation provide a GLSL-native mechanism for precision-role typed buffer binding. `PrecisionConfig.mixed_f16_f32()` can drive a Vulkan backend end-to-end.
+- **Vulkan FP16 storage is unblocked.** The `STORAGE_TYPE`/`STATE_TYPE` macro pattern in `common.glsl` and the multi-variant `glslc` compilation provide a GLSL-native mechanism for precision-role typed buffer binding. `PrecisionConfig.mixed_f16_f32()` can drive a Vulkan backend end-to-end.
 - **Role assignment is visible in source.** Every buffer access — across all three backends — uses a named abstraction that encodes its role. Future readers can determine the precision role of any buffer from the access pattern alone, without consulting external tables.
 
 ### Negative
@@ -518,7 +518,7 @@ Per ADR-021 §5 (extended here to cover all backends), the following obligations
 - Changes to `phase_*.cl.c` type declarations — covered by ADR-021 §2.
 - Changes to `PrecisionConfig`, `BufferDescriptor`, `StabilizationPolicy`, or any Python host module — covered by ADR-022.
 - Changes to `CONCEPT.md` or `CONTRACT.md` authority text — covered by ADR-020 §§2–3.
-- FP8 `STORAGE_FLOAT=float8_e4m3` or equivalent — gated by ADR-020 §5 preconditions; the abstraction layer defined here structurally supports it but no `PrecisionConfig` factory exists.
+- FP8 `STORAGE_TYPE=float8_e4m3` or equivalent — gated by ADR-020 §5 preconditions; the abstraction layer defined here structurally supports it but no `PrecisionConfig` factory exists.
 - `_pipeline_cache.py` implementation details for SPIR-V variant selection — flagged in §4.1 but scoped to the Vulkan backend implementation sprint.
 
 ---

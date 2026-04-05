@@ -24,13 +24,13 @@ layout(push_constant) uniform PushConstants {
     uint total_tile_count;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer HiddenBuf   { STORAGE_FLOAT data[]; } src_hidden;
-layout(set = 0, binding = 1) readonly buffer ProbsBuf    { STORAGE_FLOAT data[]; } src_probs;
+layout(set = 0, binding = 0) readonly buffer HiddenBuf   { STORAGE_TYPE data[]; } src_hidden;
+layout(set = 0, binding = 1) readonly buffer ProbsBuf    { STORAGE_TYPE data[]; } src_probs;
 layout(set = 0, binding = 2) readonly buffer TargetsBuf  { int           data[]; } src_targets_cce;
-layout(set = 0, binding = 3) readonly buffer TargetsBCE  { STORAGE_FLOAT data[]; } src_targets_bce;
-layout(set = 0, binding = 4) readonly buffer MaskBuf     { STORAGE_FLOAT data[]; } src_sample_mask;
-layout(set = 0, binding = 5) writeonly buffer GradWBuf   { STORAGE_FLOAT data[]; } dest_grad_w;
-layout(set = 0, binding = 6) writeonly buffer GradBBuf   { STORAGE_FLOAT data[]; } dest_grad_b;
+layout(set = 0, binding = 3) readonly buffer TargetsBCE  { STORAGE_TYPE data[]; } src_targets_bce;
+layout(set = 0, binding = 4) readonly buffer MaskBuf     { STORAGE_TYPE data[]; } src_sample_mask;
+layout(set = 0, binding = 5) writeonly buffer GradWBuf   { STORAGE_TYPE data[]; } dest_grad_w;
+layout(set = 0, binding = 6) writeonly buffer GradBBuf   { STORAGE_TYPE data[]; } dest_grad_b;
 
 void main() {
     uint tile_idx = gl_WorkGroupID.x;
@@ -76,27 +76,27 @@ void main() {
     uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
 
     // Parallel reduction over batch
-    COMPUTE_FLOAT p_grad_w = COMPUTE_FLOAT(0.0);
-    COMPUTE_FLOAT p_grad_b = COMPUTE_FLOAT(0.0);
+    COMPUTE_TYPE p_grad_w = COMPUTE_TYPE(0.0);
+    COMPUTE_TYPE p_grad_b = COMPUTE_TYPE(0.0);
 
     for (uint b = lid; b < push.total_batch_count; b += lsize) {
-        if (read_storage(src_sample_mask.data[b]) < COMPUTE_FLOAT(0.5)) continue;
+        if (read_storage(src_sample_mask.data[b]) < COMPUTE_TYPE(0.5)) continue;
 
         uint prob_idx = prob_tile_base
                       + module_local_idx * push.total_batch_count * push.classes_per_chunk
                       + b * push.classes_per_chunk + class_local_idx;
-        COMPUTE_FLOAT prob = read_storage(src_probs.data[prob_idx]);
+        COMPUTE_TYPE prob = read_storage(src_probs.data[prob_idx]);
 
-        COMPUTE_FLOAT d_loss_d_logit;
+        COMPUTE_TYPE d_loss_d_logit;
         if (SPEC_PROBLEM_TYPE == PROBLEM_TYPE_CCE) {
             int target = src_targets_cce.data[b];
-            d_loss_d_logit = (class_global_idx == target) ? (prob - COMPUTE_FLOAT(1.0)) : prob;
+            d_loss_d_logit = (class_global_idx == target) ? (prob - COMPUTE_TYPE(1.0)) : prob;
         } else {
-            COMPUTE_FLOAT target = read_storage(src_targets_bce.data[b * push.padded_total_output_class_count + class_global_idx]);
+            COMPUTE_TYPE target = read_storage(src_targets_bce.data[b * push.padded_total_output_class_count + class_global_idx]);
             d_loss_d_logit = prob - target;
         }
 
-        COMPUTE_FLOAT h_val = read_storage(src_hidden.data[b * push.padded_hidden_count + h_idx]);
+        COMPUTE_TYPE h_val = read_storage(src_hidden.data[b * push.padded_hidden_count + h_idx]);
         p_grad_w += d_loss_d_logit * h_val;
 
         if (h_idx == 0) {
@@ -105,7 +105,7 @@ void main() {
     }
 
     // Workgroup reduction for weight gradient
-    COMPUTE_FLOAT w_sum = workgroup_reduce_add(p_grad_w);
+    COMPUTE_TYPE w_sum = workgroup_reduce_add(p_grad_w);
     if (lid == 0) {
         uint w_tile_base = tile_idx * push.modules_per_chunk * push.padded_hidden_count * push.padded_total_output_class_count;
         uint w_out = w_tile_base
@@ -117,7 +117,7 @@ void main() {
 
     // Bias gradient (only h_idx == 0 workgroups contribute)
     if (h_idx == 0) {
-        COMPUTE_FLOAT b_sum = workgroup_reduce_add(p_grad_b);
+        COMPUTE_TYPE b_sum = workgroup_reduce_add(p_grad_b);
         if (lid == 0) {
             uint b_tile_base = tile_idx * push.modules_per_chunk * push.padded_total_output_class_count;
             uint b_out = b_tile_base + module_local_idx * push.padded_total_output_class_count + class_global_idx;

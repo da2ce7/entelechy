@@ -25,30 +25,30 @@ layout(push_constant) uniform PushConstants {
     uint  parameter_count;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer GradBuf   { COMPUTE_FLOAT data[]; } grads;
-layout(set = 0, binding = 1) buffer ParamBuf            { STATE_FLOAT data[]; } params;
-layout(set = 0, binding = 2) buffer M1Buf               { STATE_FLOAT data[]; } m1;
-layout(set = 0, binding = 3) buffer M2Buf               { STATE_FLOAT data[]; } m2;
+layout(set = 0, binding = 0) readonly buffer GradBuf   { COMPUTE_TYPE data[]; } grads;
+layout(set = 0, binding = 1) buffer ParamBuf            { STATE_TYPE data[]; } params;
+layout(set = 0, binding = 2) buffer M1Buf               { STATE_TYPE data[]; } m1;
+layout(set = 0, binding = 3) buffer M2Buf               { STATE_TYPE data[]; } m2;
 
 void main() {
     uint i = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
     if (i >= push.parameter_count) return;
 
     // Load current state.
-    COMPUTE_FLOAT g      = grads.data[i];
-    COMPUTE_FLOAT m_prev = read_state(m1.data[i]);
-    COMPUTE_FLOAT v_prev = read_state(m2.data[i]);
+    COMPUTE_TYPE g      = grads.data[i];
+    COMPUTE_TYPE m_prev = read_state(m1.data[i]);
+    COMPUTE_TYPE v_prev = read_state(m2.data[i]);
 
     // Update biased moment estimates.
-    COMPUTE_FLOAT m_new = COMPUTE_FLOAT(push.beta1) * m_prev + (COMPUTE_FLOAT(1.0) - COMPUTE_FLOAT(push.beta1)) * g;
-    COMPUTE_FLOAT v_new = COMPUTE_FLOAT(push.beta2) * v_prev + (COMPUTE_FLOAT(1.0) - COMPUTE_FLOAT(push.beta2)) * (g * g);
+    COMPUTE_TYPE m_new = COMPUTE_TYPE(push.beta1) * m_prev + (COMPUTE_TYPE(1.0) - COMPUTE_TYPE(push.beta1)) * g;
+    COMPUTE_TYPE v_new = COMPUTE_TYPE(push.beta2) * v_prev + (COMPUTE_TYPE(1.0) - COMPUTE_TYPE(push.beta2)) * (g * g);
 
     // Bias-corrected estimates (using host-provided beta powers).
-    COMPUTE_FLOAT m_hat = m_new / (COMPUTE_FLOAT(1.0) - COMPUTE_FLOAT(push.beta1_pow_t));
-    COMPUTE_FLOAT v_hat = v_new / (COMPUTE_FLOAT(1.0) - COMPUTE_FLOAT(push.beta2_pow_t));
+    COMPUTE_TYPE m_hat = m_new / (COMPUTE_TYPE(1.0) - COMPUTE_TYPE(push.beta1_pow_t));
+    COMPUTE_TYPE v_hat = v_new / (COMPUTE_TYPE(1.0) - COMPUTE_TYPE(push.beta2_pow_t));
 
     // Parameter update.
-    COMPUTE_FLOAT update = COMPUTE_FLOAT(push.learning_rate) * m_hat / (sqrt(v_hat) + COMPUTE_FLOAT(push.epsilon));
+    COMPUTE_TYPE update = COMPUTE_TYPE(push.learning_rate) * m_hat / (sqrt(v_hat) + COMPUTE_TYPE(push.epsilon));
 
     // Write back.
     params.data[i] = write_state(read_state(params.data[i]) - update);

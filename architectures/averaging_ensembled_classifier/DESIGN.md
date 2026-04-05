@@ -621,7 +621,7 @@ If a phase's tier gate regresses: revert the feature flag to `auto`, diagnose us
 | [020](adr/ADR-020-mixed-precision-execution-model.md) | Mixed-Precision Execution Model | Three-role precision (storage/compute/state); `PrecisionConfig` factories; FP16/FP32 mixed pipelines |
 | [021](adr/ADR-021-kernels-precision-role-migration.md) | Kernel Precision-Role Migration | `SCALAR_TYPE` → `STORAGE_TYPE`/`COMPUTE_TYPE`/`STATE_TYPE`; precision boundary abstractions |
 | [022](adr/ADR-022-host-code-precision-role-implications.md) | Host Code Precision-Role Implications | `PrecisionConfig` three-role cascade through plan builder, type mapping, buffer lifecycle |
-| [023](adr/ADR-023-backend-kernel-precision-role-implications.md) | Backend Kernel Precision-Role Implications | CPU two-axis `STORAGE_T`/`STATE_T`; Vulkan `STORAGE_FLOAT`/`STATE_FLOAT`; multi-variant SPIR-V |
+| [023](adr/ADR-023-backend-kernel-precision-role-implications.md) | Backend Kernel Precision-Role Implications | CPU two-axis `STORAGE_T`/`STATE_T`; Vulkan `STORAGE_TYPE`/`STATE_TYPE`; multi-variant SPIR-V |
 | [024](adr/ADR-024-double-precision-support.md) | Double Precision (FP64) Support | Extended state precision for validation scenarios; three-axis suffix scheme (`sXcYtZ`) |
 | [025](adr/ADR-025-fp8-support.md) | FP8 (E4M3/E5M2) Storage Precision | FP8 storage-role only; compute and state remain FP16/FP32/FP64 |
 | [026](adr/ADR-026-precision-typed-reduction-kernel-variants.md) | Precision-Typed Reduction Kernel Variants | `_from_compute` variants for interior stages and compute-role leaf sources |

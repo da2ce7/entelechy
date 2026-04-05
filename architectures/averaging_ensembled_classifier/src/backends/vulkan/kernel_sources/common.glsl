@@ -5,9 +5,9 @@
 // reduction helpers, and common type/constant definitions.
 //
 // Three-axis precision model (ADR-024):
-//   STORAGE_FLOAT — element type in memory (bandwidth lever)
-//   COMPUTE_FLOAT — element type for arithmetic (fidelity lever)
-//   STATE_FLOAT   — element type for optimizer state (accumulation lever)
+//   STORAGE_TYPE — element type in memory (bandwidth lever)
+//   COMPUTE_TYPE — element type for arithmetic (fidelity lever)
+//   STATE_TYPE   — element type for optimizer state (accumulation lever)
 
 #ifndef COMMON_GLSL
 #define COMMON_GLSL
@@ -35,24 +35,24 @@ layout(constant_id = 2) const uint SPEC_C_TILE_SIZE            = 8;
 layout(constant_id = 3) const uint SPEC_PROBLEM_TYPE           = 0; // 0=CCE, 1=BCE
 
 // ── Precision-Role Type Macros (ADR-024 §5.1) ─────────────────────────
-// STORAGE_FLOAT, COMPUTE_FLOAT, and STATE_FLOAT are injected by the build
+// STORAGE_TYPE, COMPUTE_TYPE, and STATE_TYPE are injected by the build
 // system via glslc -D flags. Default to float (FP32) when not injected.
 // When a role type == float, WIDEN/NARROW are identity operations
 // eliminated by the SPIR-V compiler.
-#ifndef STORAGE_FLOAT
-#define STORAGE_FLOAT float
+#ifndef STORAGE_TYPE
+#define STORAGE_TYPE float
 #endif
-#ifndef COMPUTE_FLOAT
-#define COMPUTE_FLOAT float
+#ifndef COMPUTE_TYPE
+#define COMPUTE_TYPE float
 #endif
-#ifndef STATE_FLOAT
-#define STATE_FLOAT float
+#ifndef STATE_TYPE
+#define STATE_TYPE float
 #endif
 
-#define WIDEN_STORAGE(x)   COMPUTE_FLOAT(x)
-#define NARROW_STORAGE(x)  STORAGE_FLOAT(x)
-#define WIDEN_STATE(x)     COMPUTE_FLOAT(x)
-#define NARROW_STATE(x)    STATE_FLOAT(x)
+#define WIDEN_STORAGE(x)   COMPUTE_TYPE(x)
+#define NARROW_STORAGE(x)  STORAGE_TYPE(x)
+#define WIDEN_STATE(x)     COMPUTE_TYPE(x)
+#define NARROW_STATE(x)    STATE_TYPE(x)
 
 // ── Derived Constants ──────────────────────────────────────────────────
 // NUMERICAL_EPSILON_VALUE is injected by the build system for FP64
@@ -61,7 +61,7 @@ layout(constant_id = 3) const uint SPEC_PROBLEM_TYPE           = 0; // 0=CCE, 1=
 #ifndef NUMERICAL_EPSILON_VALUE
 #define NUMERICAL_EPSILON_VALUE 1e-7
 #endif
-const COMPUTE_FLOAT NUMERICAL_STABILITY_EPSILON = COMPUTE_FLOAT(NUMERICAL_EPSILON_VALUE);
+const COMPUTE_TYPE NUMERICAL_STABILITY_EPSILON = COMPUTE_TYPE(NUMERICAL_EPSILON_VALUE);
 
 const uint  PROBLEM_TYPE_CCE            = 0;
 const uint  PROBLEM_TYPE_BCE            = 1;
@@ -70,27 +70,27 @@ const uint  AGG_MODE_AVERAGE            = 1;
 
 // ── Precision Boundary Helpers (ADR-024 §5.1) ─────────────────────────
 // Value-semantics wrappers that cross the storage/state → compute boundary.
-// When a role type matches COMPUTE_FLOAT, these are identity operations.
+// When a role type matches COMPUTE_TYPE, these are identity operations.
 // The SPIR-V compiler eliminates them.
 
-COMPUTE_FLOAT read_storage(STORAGE_FLOAT val) { return WIDEN_STORAGE(val); }
-STORAGE_FLOAT write_storage(COMPUTE_FLOAT val) { return NARROW_STORAGE(val); }
+COMPUTE_TYPE read_storage(STORAGE_TYPE val) { return WIDEN_STORAGE(val); }
+STORAGE_TYPE write_storage(COMPUTE_TYPE val) { return NARROW_STORAGE(val); }
 
-COMPUTE_FLOAT read_state(STATE_FLOAT val) { return WIDEN_STATE(val); }
-STATE_FLOAT write_state(COMPUTE_FLOAT val) { return NARROW_STATE(val); }
+COMPUTE_TYPE read_state(STATE_TYPE val) { return WIDEN_STATE(val); }
+STATE_TYPE write_state(COMPUTE_TYPE val) { return NARROW_STATE(val); }
 
 // ── Transcendental Wrappers (ADR-024 §5.1) ────────────────────────────
 // GLSL exp/log only accept float.  We always round-trip through float:
-// identity for COMPUTE_FLOAT=float, narrowing for float16_t, widening
+// identity for COMPUTE_TYPE=float, narrowing for float16_t, widening
 // for double.  Accumulation surrounding these calls still benefits from
 // the full compute precision; only the transcendental itself is FP32.
-COMPUTE_FLOAT COMPUTE_EXP(COMPUTE_FLOAT x) { return COMPUTE_FLOAT(exp(float(x))); }
-COMPUTE_FLOAT COMPUTE_LOG(COMPUTE_FLOAT x) { return COMPUTE_FLOAT(log(float(x))); }
+COMPUTE_TYPE COMPUTE_EXP(COMPUTE_TYPE x) { return COMPUTE_TYPE(exp(float(x))); }
+COMPUTE_TYPE COMPUTE_LOG(COMPUTE_TYPE x) { return COMPUTE_TYPE(log(float(x))); }
 
 // ── Subgroup-Accelerated Workgroup Reduction ───────────────────────────
 // Compute-role scratch for cross-subgroup bridge.
-// Type is COMPUTE_FLOAT, parameterized by the active precision configuration.
-shared COMPUTE_FLOAT _compute_scratch[32];
+// Type is COMPUTE_TYPE, parameterized by the active precision configuration.
+shared COMPUTE_TYPE _compute_scratch[32];
 
 // workgroup_reduce_add — returns the sum of `value` across the entire
 // workgroup using subgroup intrinsics.
@@ -99,9 +99,9 @@ shared COMPUTE_FLOAT _compute_scratch[32];
 //   1. Intra-subgroup: subgroupAdd(value) — single instruction
 //   2. Cross-subgroup: elected lane writes to shared memory; barrier
 //   3. Final reduction: first subgroup reduces representatives; broadcast
-COMPUTE_FLOAT workgroup_reduce_add(COMPUTE_FLOAT value) {
+COMPUTE_TYPE workgroup_reduce_add(COMPUTE_TYPE value) {
     // Level 1: native subgroup reduction
-    COMPUTE_FLOAT subgroup_sum = subgroupAdd(value);
+    COMPUTE_TYPE subgroup_sum = subgroupAdd(value);
 
     // Level 2: cross-subgroup bridge via shared memory
     if (subgroupElect()) {
@@ -110,10 +110,10 @@ COMPUTE_FLOAT workgroup_reduce_add(COMPUTE_FLOAT value) {
     barrier();
 
     // Level 3: first subgroup reduces all subgroup representatives
-    COMPUTE_FLOAT total = COMPUTE_FLOAT(0.0);
+    COMPUTE_TYPE total = COMPUTE_TYPE(0.0);
     if (gl_SubgroupID == 0) {
-        COMPUTE_FLOAT val = (gl_SubgroupInvocationID < gl_NumSubgroups)
-                    ? _compute_scratch[gl_SubgroupInvocationID] : COMPUTE_FLOAT(0.0);
+        COMPUTE_TYPE val = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? _compute_scratch[gl_SubgroupInvocationID] : COMPUTE_TYPE(0.0);
         total = subgroupAdd(val);
     }
 
@@ -127,18 +127,18 @@ COMPUTE_FLOAT workgroup_reduce_add(COMPUTE_FLOAT value) {
 
 // workgroup_reduce_max — returns the maximum of `value` across the entire
 // workgroup.  Same three-level pattern with subgroupMax.
-COMPUTE_FLOAT workgroup_reduce_max(COMPUTE_FLOAT value) {
-    COMPUTE_FLOAT subgroup_max = subgroupMax(value);
+COMPUTE_TYPE workgroup_reduce_max(COMPUTE_TYPE value) {
+    COMPUTE_TYPE subgroup_max = subgroupMax(value);
 
     if (subgroupElect()) {
         _compute_scratch[gl_SubgroupID] = subgroup_max;
     }
     barrier();
 
-    COMPUTE_FLOAT total = COMPUTE_FLOAT(-1.0 / 0.0); // -Inf
+    COMPUTE_TYPE total = COMPUTE_TYPE(-1.0 / 0.0); // -Inf
     if (gl_SubgroupID == 0) {
-        COMPUTE_FLOAT val = (gl_SubgroupInvocationID < gl_NumSubgroups)
-                    ? _compute_scratch[gl_SubgroupInvocationID] : COMPUTE_FLOAT(-1.0 / 0.0);
+        COMPUTE_TYPE val = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? _compute_scratch[gl_SubgroupInvocationID] : COMPUTE_TYPE(-1.0 / 0.0);
         total = subgroupMax(val);
     }
 

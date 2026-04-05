@@ -25,18 +25,18 @@ layout(push_constant) uniform PushConstants {
     uint  total_tile_count;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer GradWIn    { STORAGE_FLOAT data[]; } src_grad_w;
-layout(set = 0, binding = 1) readonly buffer GradBIn    { STORAGE_FLOAT data[]; } src_grad_b;
-layout(set = 0, binding = 2) readonly buffer GradTIn    { STORAGE_FLOAT data[]; } src_grad_temps;
-layout(set = 0, binding = 3) readonly buffer GradHIn    { STORAGE_FLOAT data[]; } src_grad_h;
-layout(set = 0, binding = 4) readonly buffer ThreshBuf  { STORAGE_FLOAT data[]; } src_threshold_per_item;
-layout(set = 0, binding = 5) writeonly buffer GradWOut  { STORAGE_FLOAT data[]; } dest_grad_w;
-layout(set = 0, binding = 6) writeonly buffer GradBOut  { STORAGE_FLOAT data[]; } dest_grad_b;
-layout(set = 0, binding = 7) writeonly buffer GradTOut  { STORAGE_FLOAT data[]; } dest_grad_temps;
-layout(set = 0, binding = 8) writeonly buffer GradHOut  { STORAGE_FLOAT data[]; } dest_grad_h;
+layout(set = 0, binding = 0) readonly buffer GradWIn    { STORAGE_TYPE data[]; } src_grad_w;
+layout(set = 0, binding = 1) readonly buffer GradBIn    { STORAGE_TYPE data[]; } src_grad_b;
+layout(set = 0, binding = 2) readonly buffer GradTIn    { STORAGE_TYPE data[]; } src_grad_temps;
+layout(set = 0, binding = 3) readonly buffer GradHIn    { STORAGE_TYPE data[]; } src_grad_h;
+layout(set = 0, binding = 4) readonly buffer ThreshBuf  { STORAGE_TYPE data[]; } src_threshold_per_item;
+layout(set = 0, binding = 5) writeonly buffer GradWOut  { STORAGE_TYPE data[]; } dest_grad_w;
+layout(set = 0, binding = 6) writeonly buffer GradBOut  { STORAGE_TYPE data[]; } dest_grad_b;
+layout(set = 0, binding = 7) writeonly buffer GradTOut  { STORAGE_TYPE data[]; } dest_grad_temps;
+layout(set = 0, binding = 8) writeonly buffer GradHOut  { STORAGE_TYPE data[]; } dest_grad_h;
 
 // Shared memory for broadcasting scale factor
-shared COMPUTE_FLOAT _clip_scale;
+shared COMPUTE_TYPE _clip_scale;
 
 void main() {
     uint tile_idx = gl_WorkGroupID.x;
@@ -59,9 +59,9 @@ void main() {
     uint h_base = tile_idx * n_hidden;
 
     // Pass 1: sum of squares
-    COMPUTE_FLOAT local_sq_sum = COMPUTE_FLOAT(0.0);
+    COMPUTE_TYPE local_sq_sum = COMPUTE_TYPE(0.0);
     for (uint i = lid; i < total_elements; i += lsize) {
-        COMPUTE_FLOAT val;
+        COMPUTE_TYPE val;
         if (i < n_weights) {
             val = read_storage(src_grad_w.data[w_base + i]);
         } else if (i < n_weights + n_biases) {
@@ -74,26 +74,26 @@ void main() {
         local_sq_sum += val * val;
     }
 
-    COMPUTE_FLOAT total_sq = workgroup_reduce_add(local_sq_sum);
+    COMPUTE_TYPE total_sq = workgroup_reduce_add(local_sq_sum);
 
     // Compute scale factor
     if (lid == 0) {
-        COMPUTE_FLOAT threshold;
+        COMPUTE_TYPE threshold;
         if (push.use_per_item_norm == 1) {
             threshold = read_storage(src_threshold_per_item.data[tile_idx]);
         } else {
-            threshold = COMPUTE_FLOAT(push.clipping_threshold);
+            threshold = COMPUTE_TYPE(push.clipping_threshold);
         }
 
-        COMPUTE_FLOAT norm = sqrt(total_sq);
-        COMPUTE_FLOAT scale = COMPUTE_FLOAT(1.0);
+        COMPUTE_TYPE norm = sqrt(total_sq);
+        COMPUTE_TYPE scale = COMPUTE_TYPE(1.0);
         if (norm > threshold) {
-            scale = threshold / (norm + COMPUTE_FLOAT(push.epsilon));
+            scale = threshold / (norm + COMPUTE_TYPE(push.epsilon));
         }
         _clip_scale = scale;
     }
     barrier();
-    COMPUTE_FLOAT scale_factor = _clip_scale;
+    COMPUTE_TYPE scale_factor = _clip_scale;
 
     // Pass 2: conditional scaling → destination
     for (uint i = lid; i < total_elements; i += lsize) {

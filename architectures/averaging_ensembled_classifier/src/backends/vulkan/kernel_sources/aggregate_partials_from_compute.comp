@@ -1,7 +1,7 @@
 // aggregate_partials_from_compute.comp — ADR-026: Compute-entry reduction variants
 //
 // Compute-entry counterpart to aggregate_partials.comp. Identical algorithm,
-// but reads COMPUTE_FLOAT intermediates directly (no read_storage conversion).
+// but reads COMPUTE_TYPE intermediates directly (no read_storage conversion).
 //
 // Used for:
 //   - Interior stages of multi-stage reduction trees (stage >= 1)
@@ -32,10 +32,10 @@ layout(push_constant) uniform PushConstants {
     uint use_local_reduce;          // 0=register tier, 1=local tier
 } push;
 
-// Compute-entry: source collection is COMPUTE_FLOAT (no precision conversion)
-layout(set = 0, binding = 0) readonly buffer SrcCollection { COMPUTE_FLOAT data[]; } src_collection;
+// Compute-entry: source collection is COMPUTE_TYPE (no precision conversion)
+layout(set = 0, binding = 0) readonly buffer SrcCollection { COMPUTE_TYPE data[]; } src_collection;
 layout(set = 0, binding = 1) readonly buffer OffsetList    { uint          data[]; } src_offsets;
-layout(set = 0, binding = 2) writeonly buffer DestPartial  { COMPUTE_FLOAT data[]; } dest;
+layout(set = 0, binding = 2) writeonly buffer DestPartial  { COMPUTE_TYPE data[]; } dest;
 
 void main() {
     uint lid   = gl_LocalInvocationID.x;
@@ -48,18 +48,18 @@ void main() {
         uint elem = gl_WorkGroupID.x * lsize + lid;
         if (elem >= push.partial_width) return;
 
-        COMPUTE_FLOAT accum = COMPUTE_FLOAT(0.0);
+        COMPUTE_TYPE accum = COMPUTE_TYPE(0.0);
         for (uint k = 0; k < push.partial_offset_list_count; ++k) {
             uint offset = src_offsets.data[k];
-            // Direct COMPUTE_FLOAT read (no read_storage conversion)
+            // Direct COMPUTE_TYPE read (no read_storage conversion)
             accum += src_collection.data[offset + elem];
         }
 
         if (push.operation_type == AGG_MODE_AVERAGE && push.partial_offset_list_count > 0) {
-            accum /= COMPUTE_FLOAT(push.partial_offset_list_count);
+            accum /= COMPUTE_TYPE(push.partial_offset_list_count);
         }
 
-        // Direct COMPUTE_FLOAT write (no write_storage conversion)
+        // Direct COMPUTE_TYPE write (no write_storage conversion)
         dest.data[elem] = accum;
 
     } else {
@@ -69,21 +69,21 @@ void main() {
         uint elem = gl_WorkGroupID.x;
         if (elem >= push.partial_width) return;
 
-        COMPUTE_FLOAT accum = COMPUTE_FLOAT(0.0);
+        COMPUTE_TYPE accum = COMPUTE_TYPE(0.0);
         for (uint k = lid; k < push.partial_offset_list_count; k += lsize) {
             uint offset = src_offsets.data[k];
-            // Direct COMPUTE_FLOAT read (no read_storage conversion)
+            // Direct COMPUTE_TYPE read (no read_storage conversion)
             accum += src_collection.data[offset + elem];
         }
 
         // Subgroup-accelerated workgroup reduction.
-        COMPUTE_FLOAT total = workgroup_reduce_add(accum);
+        COMPUTE_TYPE total = workgroup_reduce_add(accum);
 
         if (lid == 0) {
             if (push.operation_type == AGG_MODE_AVERAGE && push.partial_offset_list_count > 0) {
-                total /= COMPUTE_FLOAT(push.partial_offset_list_count);
+                total /= COMPUTE_TYPE(push.partial_offset_list_count);
             }
-            // Direct COMPUTE_FLOAT write (no write_storage conversion)
+            // Direct COMPUTE_TYPE write (no write_storage conversion)
             dest.data[elem] = total;
         }
     }

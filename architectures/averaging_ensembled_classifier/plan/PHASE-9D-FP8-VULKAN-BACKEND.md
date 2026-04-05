@@ -74,48 +74,51 @@ Extend the compile-time `-D` flag scheme. The GLSL preprocessor cannot evaluate 
 
 ```glsl
 // FP8 compile-time flags (ADR-025 §7.2)
-// Injected by glslc: -DSTORAGE_IS_FP8=1 -DSTORAGE_IS_E4M3=1 (or -DSTORAGE_IS_E5M2=1)
-// When FP8: -DCOMPUTE_IS_FP16=1 or -DCOMPUTE_IS_FP32=1
+// Injected by glslc: -DSTORAGE_TYPE_IS_FP8=1 -DSTORAGE_TYPE_IS_E4M3=1 (or -DSTORAGE_TYPE_IS_E5M2=1)
+// When FP8: -DCOMPUTE_TYPE_IS_HALF=1 or -DCOMPUTE_TYPE_IS_FLOAT=1
 
-#ifndef STORAGE_IS_FP8
-#define STORAGE_IS_FP8 0
+#ifndef STORAGE_TYPE_IS_FP8
+#define STORAGE_TYPE_IS_FP8 0
 #endif
-#ifndef STORAGE_IS_E4M3
-#define STORAGE_IS_E4M3 0
+#ifndef STORAGE_TYPE_IS_E4M3
+#define STORAGE_TYPE_IS_E4M3 0
 #endif
-#ifndef STORAGE_IS_E5M2
-#define STORAGE_IS_E5M2 0
+#ifndef STORAGE_TYPE_IS_E5M2
+#define STORAGE_TYPE_IS_E5M2 0
 #endif
-#ifndef COMPUTE_IS_FP16
-#define COMPUTE_IS_FP16 0
+#ifndef COMPUTE_TYPE_IS_HALF
+#define COMPUTE_TYPE_IS_HALF 0
 #endif
-#ifndef COMPUTE_IS_FP32
-#define COMPUTE_IS_FP32 0
+#ifndef COMPUTE_TYPE_IS_FLOAT
+#define COMPUTE_TYPE_IS_FLOAT 0
 #endif
-#ifndef COMPUTE_IS_FP64
-#define COMPUTE_IS_FP64 0
+#ifndef COMPUTE_TYPE_IS_DOUBLE
+#define COMPUTE_TYPE_IS_DOUBLE 0
 #endif
 
 // Enable required extensions
-#if STORAGE_IS_FP8
+#if STORAGE_TYPE_IS_FP8
 // VK_KHR_8bit_storage (Vulkan extension) → GL_EXT_shader_8bit_storage (GLSL pragma)
 #extension GL_EXT_shader_8bit_storage : require
 #endif
 
-#if COMPUTE_IS_FP16
+#if COMPUTE_TYPE_IS_HALF
 // VK_KHR_shader_float16_int8 (Vulkan extension) → GL_EXT_shader_explicit_arithmetic_types_float16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
 
-#if COMPUTE_IS_FP64
-// FP64 requires shaderFloat64 device feature; fail-fast with :require
-#extension GL_ARB_gpu_shader_fp64 : require
+#if COMPUTE_TYPE_IS_DOUBLE
+// FP64 requires shaderFloat64 device feature
+// Note: Vulkan GLSL uses GL_EXT, not GL_ARB (which is for desktop GL)
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
 #endif
 ```
 
 **Note:** FP64 compute configurations (`fp8_e4m3_f64()`, `fp8_e5m2_f64()`) require the `shaderFloat64` Vulkan device feature. The renderer must check `VkPhysicalDeviceFeatures.shaderFloat64` at device selection and raise `RuntimeError` if FP64 compute is requested on unsupported hardware.
 
-This mirrors the existing `-D` macro pattern used for `STORAGE_FLOAT`, `COMPUTE_FLOAT`, and `STATE_FLOAT` (see [common.glsl](src/backends/vulkan/kernel_sources/common.glsl)).
+This mirrors the existing `-D` macro pattern used for `STORAGE_TYPE`, `COMPUTE_TYPE`, and `STATE_TYPE` (see [common.glsl](src/backends/vulkan/kernel_sources/common.glsl)).
+
+> **Naming convention note:** All backends (OpenCL, CPU, and Vulkan) use the canonical CONTRACT.md Article 6 flag names: `STORAGE_TYPE_IS_FP8`, `STORAGE_TYPE_IS_E4M3`, `STORAGE_TYPE_IS_E5M2`, `COMPUTE_TYPE_IS_HALF`, `COMPUTE_TYPE_IS_DOUBLE`, etc. The Vulkan GLSL type macros (`STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE`) also use the same canonical names as OpenCL, injected via `glslc -D`. No backend-specific shortened names are used.
 
 ---
 
@@ -124,18 +127,27 @@ This mirrors the existing `-D` macro pattern used for `STORAGE_FLOAT`, `COMPUTE_
 **Governing authority:** ADR-025 §7.3  
 **File:** `src/backends/vulkan/kernel_sources/common.glsl`
 
+> **Arithmetic vs. Lookup Table approach:**
+> Unlike the OpenCL and CPU backends which use 256-entry lookup tables (LUTs) for FP8→float conversion, Vulkan uses **arithmetic conversion** via bit manipulation and `exp2()`. This is deliberate:
+> - GLSL lacks OpenCL's `__constant` memory space for kernel-scope constant arrays
+> - SPIR-V specialization constants could embed tables, but inflate shader binaries
+> - Arithmetic conversion uses ~10-15 ALU ops — negligible overhead for bandwidth-bound workloads
+> - The 4× storage bandwidth savings dominate any conversion overhead
+>
+> See [Technical Notes §4](#4-technical-notes) for detailed comparison.
+
 Add software FP8↔float/float16 conversion:
 
 ```glsl
 // --- FP8 Conversion Constants ---
-#if STORAGE_IS_FP8
+#if STORAGE_TYPE_IS_FP8
 
-#if STORAGE_IS_E4M3
+#if STORAGE_TYPE_IS_E4M3
 #define FP8_BIAS 7
 #define FP8_MANTISSA_BITS 3
 #define FP8_MAX_VAL 448.0
 #define FP8_MIN_SUBNORMAL 0.001953125  // 2^-9
-#elif STORAGE_IS_E5M2
+#elif STORAGE_TYPE_IS_E5M2
 #define FP8_BIAS 15
 #define FP8_MANTISSA_BITS 2
 #define FP8_MAX_VAL 57344.0
@@ -150,7 +162,7 @@ float fp8_to_float_internal(uint bits) {
     // Extract components
     uint sign = (bits >> 7) & 1u;
     
-#if STORAGE_IS_E4M3
+#if STORAGE_TYPE_IS_E4M3
     uint exp8 = (bits >> 3) & 0xFu;   // 4-bit exponent
     uint mant = bits & 0x7u;          // 3-bit mantissa
     
@@ -165,12 +177,25 @@ float fp8_to_float_internal(uint bits) {
         result = m * exp2(float(int(exp8) - FP8_BIAS));
     }
     
-#elif STORAGE_IS_E5M2
+#elif STORAGE_TYPE_IS_E5M2
     uint exp8 = (bits >> 2) & 0x1Fu;  // 5-bit exponent
     uint mant = bits & 0x3u;          // 2-bit mantissa
     
     float result;
-    if (exp8 == 0u) {
+    if (exp8 == 0x1Fu) {
+        // IEEE special exponent: inf (mant==0) or NaN (mant!=0)
+        // The store path never writes these patterns, but handle for safety.
+        if (mant != 0u) {
+            // NaN → zero: Returns BEFORE sign application. This is intentional —
+            // NaN has no meaningful sign, and +0.0 is the correct "safe" value
+            // regardless of the sign bit in the NaN bit pattern.
+            return 0.0;
+        }
+        // ±inf → ±MAX: Saturate to max finite E5M2 value. Sign is applied below
+        // by the shared `sign == 1u ? -result : result` return at the end of the
+        // function. This produces correctly-signed ±57344.0.
+        result = 57344.0;
+    } else if (exp8 == 0u) {
         // Subnormal: value = mant * 2^(1-bias-mantissa_bits) = mant * 2^(-16)
         result = float(mant) * 0.0000152587890625;  // 2^-16, exact constant
     } else {
@@ -185,11 +210,11 @@ float fp8_to_float_internal(uint bits) {
 
 // --- COMPUTE_TYPE-aware load ---
 // Returns float16_t, float, or double depending on compute precision
-#if COMPUTE_IS_FP16
+#if COMPUTE_TYPE_IS_HALF
 float16_t load_storage_fp8(uint bits) {
     return float16_t(fp8_to_float_internal(bits));
 }
-#elif COMPUTE_IS_FP64
+#elif COMPUTE_TYPE_IS_DOUBLE
 double load_storage_fp8(uint bits) {
     return double(fp8_to_float_internal(bits));  // Widen to FP64 (lossless)
 }
@@ -201,15 +226,24 @@ float load_storage_fp8(uint bits) {
 
 // --- float → FP8 conversion ---
 // Always works in float, then quantizes to FP8
+//
+// NaN handling: NaN input → zero for both E4M3 and E5M2.
+// See Phase 9B Step 9B.3 and ADR-025 §4.2 for the canonical rationale
+// (safe failure mode, matches ml_dtypes behavior, upstream should catch NaN).
 uint store_storage_fp8_internal(float val) {
+    // NaN → zero (same rationale as OpenCL/CPU backends)
+    if (isnan(val)) return 0u;
+    
     uint sign = val < 0.0 ? 1u : 0u;
     val = abs(val);
     
-    // Saturation
+    // Saturation: >= is intentional. FP8_MAX_VAL is exactly representable and
+    // encodes to max bit pattern, so == short-circuits to the same result the
+    // rounding path would produce. Consistent with OpenCL/CPU backends.
     if (val >= FP8_MAX_VAL) {
-#if STORAGE_IS_E4M3
+#if STORAGE_TYPE_IS_E4M3
         return (sign << 7) | 0x7Eu;  // Max E4M3
-#elif STORAGE_IS_E5M2
+#elif STORAGE_TYPE_IS_E5M2
         return (sign << 7) | 0x7Bu;  // Max E5M2
 #endif
     }
@@ -227,18 +261,26 @@ uint store_storage_fp8_internal(float val) {
     // Compute FP8 exponent
     int exp8 = exp32 + FP8_BIAS;
     
-#if STORAGE_IS_E4M3
+#if STORAGE_TYPE_IS_E4M3
     // Handle subnormals and rounding for E4M3
     if (exp8 <= 0) {
         int shift = 1 - exp8;
+        if (shift >= 24) {
+            return sign << 7;  // Underflow to zero (shift >= 24 is UB)
+        }
         mant32 = (mant32 | 0x800000u) >> shift;
         exp8 = 0;
     } else if (exp8 >= 15) {
         return (sign << 7) | 0x7Eu;
     }
     
-    // Round to 3 bits
-    uint mant8 = (mant32 + (1u << 19)) >> 20;
+    // Round to 3 bits (round-to-nearest-even)
+    uint round_bit = (mant32 >> 19) & 1u;
+    uint sticky = mant32 & ((1u << 19) - 1u);
+    uint mant8 = mant32 >> 20;
+    if (round_bit != 0u && (sticky != 0u || (mant8 & 1u) != 0u)) {
+        mant8++;
+    }
     if (mant8 >= 8u) {
         mant8 = 0u;
         exp8++;
@@ -247,18 +289,26 @@ uint store_storage_fp8_internal(float val) {
     
     return (sign << 7) | (uint(exp8) << 3) | (mant8 & 0x7u);
     
-#elif STORAGE_IS_E5M2
+#elif STORAGE_TYPE_IS_E5M2
     // Handle subnormals and rounding for E5M2
     if (exp8 <= 0) {
         int shift = 1 - exp8;
+        if (shift >= 24) {
+            return sign << 7;  // Underflow to zero (shift >= 24 is UB)
+        }
         mant32 = (mant32 | 0x800000u) >> shift;
         exp8 = 0;
     } else if (exp8 >= 31) {
         return (sign << 7) | 0x7Bu;
     }
     
-    // Round to 2 bits
-    uint mant8 = (mant32 + (1u << 20)) >> 21;
+    // Round to 2 bits (round-to-nearest-even)
+    uint round_bit = (mant32 >> 20) & 1u;
+    uint sticky = mant32 & ((1u << 20) - 1u);
+    uint mant8 = mant32 >> 21;
+    if (round_bit != 0u && (sticky != 0u || (mant8 & 1u) != 0u)) {
+        mant8++;
+    }
     if (mant8 >= 4u) {
         mant8 = 0u;
         exp8++;
@@ -271,13 +321,22 @@ uint store_storage_fp8_internal(float val) {
 
 // --- COMPUTE_TYPE-aware store ---
 // All paths narrow to float for bit manipulation, then quantize to FP8
-#if COMPUTE_IS_FP16
+#if COMPUTE_TYPE_IS_HALF
 uint store_storage_fp8(float16_t val) {
     return store_storage_fp8_internal(float(val));
 }
-#elif COMPUTE_IS_FP64
+#elif COMPUTE_TYPE_IS_DOUBLE
 uint store_storage_fp8(double val) {
-    return store_storage_fp8_internal(float(val));  // Narrow to float for quantization
+    // NaN check BEFORE clamp: GLSL clamp(NaN, lo, hi) returns lo per spec,
+    // so NaN would be silently converted to -FLT_MAX by the clamp below.
+    if (isnan(val)) return 0u;  // NaN → zero (see rationale in store_storage_fp8_internal)
+    // Defense-in-depth: clamp before double→float narrowing to prevent UB
+    // (GLSL spec §4.1.4: double→float overflow is implementation-defined/UB).
+    // Pre-scaling (Phase 9E) ensures values are in FP8 range ⊂ FP32 range,
+    // so this clamp is redundant under correct operation. See "Note on FP64
+    // precision loss" below.
+    double clamped = clamp(val, -double(3.4028235e+38), double(3.4028235e+38));
+    return store_storage_fp8_internal(float(clamped));
 }
 #else  // FP32 compute (default)
 uint store_storage_fp8(float val) {
@@ -285,7 +344,7 @@ uint store_storage_fp8(float val) {
 }
 #endif
 
-#endif // STORAGE_IS_FP8
+#endif // STORAGE_TYPE_IS_FP8
 ```
 
 **Note on FP64 precision loss:** When storing FP64 compute results to FP8, values are first narrowed to float (which may lose precision for values outside float's range), then quantized to FP8. This is acceptable because:
@@ -293,9 +352,39 @@ uint store_storage_fp8(float val) {
 2. Values destined for FP8 storage should already be scaled to fit
 3. The narrowing step is lossless for typical activation/gradient magnitudes
 
+> **FP64 narrowing is safe because values are pre-scaled.** The host-side FP8 scaling path
+> (Phase 9E) ensures all values are within `storage_fp_format_max` (448 or 57344) before
+> shader invocation. Since both FP8 max values are well within float's range (~3.4e38),
+> the intermediate `float(val)` cast is exact for all values that survive the scaling step.
+> The `#elif COMPUTE_TYPE_IS_DOUBLE` defense-in-depth clamp in the code above prevents UB
+> unconditionally, even if upstream scaling is bypassed or buggy.
+
 The key insight: FP8↔FP16 conversion routes through FP32 intermediate since all FP8 values are exactly representable in FP32.
 
 ---
+
+#### Step 9D.2.1: Pre-flight audit of `.comp` files for unguarded `STORAGE_TYPE` references
+
+Before modifying any `.comp` shader file, audit for existing `STORAGE_TYPE` references that assume FP16/FP32/FP64 and would break when `STORAGE_TYPE` becomes `uint8_t`:
+
+```bash
+# Find all unguarded STORAGE_TYPE references in .comp files
+grep -rn 'STORAGE_TYPE' src/backends/vulkan/kernel_sources/*.comp \
+    | grep -v 'STORAGE_TYPE_IS_FP8' \
+    | grep -v 'STORAGE_TYPE_IS_E4M3' \
+    | grep -v 'STORAGE_TYPE_IS_E5M2' \
+    | grep -v '#if\|#elif\|#ifdef\|#ifndef\|#define' \
+    | tee /tmp/storage-type-audit.txt
+```
+
+Each match in `/tmp/storage-type-audit.txt` is a location that may need an `#if STORAGE_TYPE_IS_FP8` guard or a switch to the `LOAD_STORAGE` / `STORE_STORAGE` macros. Categorize each match:
+
+- **Buffer declarations** (`layout(...) buffer ... { STORAGE_TYPE data[]; }`) — these get `#if`/`#else` branching in Step 9D.3
+- **Direct buffer reads** (`buf.data[i]` cast to `COMPUTE_TYPE`) — these must use `LOAD_STORAGE(i)` macro
+- **Direct buffer writes** (`buf.data[i] = val`) — these must use `STORE_STORAGE(i, val)` macro
+- **Sizeof/stride calculations** — these must use `1` when `STORAGE_TYPE_IS_FP8` (since `uint8_t` is 1 byte)
+
+**This audit is blocking** — do not proceed to Step 9D.3 without reviewing every match. Unguarded `STORAGE_TYPE` usage with `uint8_t` will produce corrupted reads (interpreting raw bytes as floats).
 
 ### Step 9D.3: Extend storage buffer declarations
 
@@ -306,7 +395,7 @@ Modify storage buffer declarations to use `uint8_t` when FP8:
 
 ```glsl
 // Example buffer declaration with FP8 support
-#if STORAGE_IS_FP8
+#if STORAGE_TYPE_IS_FP8
 // Requires VK_KHR_8bit_storage extension
 layout(set = 0, binding = 0) buffer StorageBuffer {
     uint8_t data[];
@@ -352,7 +441,7 @@ def _check_precision_requirements(self, precision: PrecisionConfig) -> None:
         if not self._physical_device_features.shaderFloat64:
             raise RuntimeError(
                 f"FP64 compute requested but shaderFloat64 feature not supported. "
-                f"Use fp8_e4m3() or fp8_e4m3_f16() instead of fp8_e4m3_f64()."
+                f"Use fp8_e4m3() (FP32 compute) instead of fp8_e4m3_f64()."
             )
 ```
 
@@ -381,19 +470,24 @@ def compile_shader_variant(self, shader_path: Path, precision: PrecisionConfig) 
     is_e5m2 = precision.storage_dtype == FP8_E5M2
     
     flags.extend([
-        f"-DSTORAGE_IS_FP8={1 if is_fp8 else 0}",
-        f"-DSTORAGE_IS_E4M3={1 if is_e4m3 else 0}",
-        f"-DSTORAGE_IS_E5M2={1 if is_e5m2 else 0}",
+        f"-DSTORAGE_TYPE_IS_FP8={1 if is_fp8 else 0}",
+        f"-DSTORAGE_TYPE_IS_E4M3={1 if is_e4m3 else 0}",
+        f"-DSTORAGE_TYPE_IS_E5M2={1 if is_e5m2 else 0}",
     ])
+    
+    # When FP8: STORAGE_TYPE is NOT emitted (FP8 uses uint8_t buffers, not a
+    # floating-point type). All existing code that references STORAGE_TYPE must
+    # be guarded with `#if !STORAGE_TYPE_IS_FP8`. Storage buffer access in FP8 mode
+    # goes exclusively through load_storage_fp8/store_storage_fp8.
     
     # Compute type flags for FP8 dispatch
     is_compute_fp16 = precision.compute_dtype == np.float16
     is_compute_fp32 = precision.compute_dtype == np.float32
     
     flags.extend([
-        f"-DCOMPUTE_IS_FP16={1 if is_compute_fp16 else 0}",
-        f"-DCOMPUTE_IS_FP32={1 if is_compute_fp32 else 0}",
-        f"-DCOMPUTE_IS_FP64={1 if precision.compute_dtype == np.float64 else 0}",
+        f"-DCOMPUTE_TYPE_IS_HALF={1 if is_compute_fp16 else 0}",
+        f"-DCOMPUTE_TYPE_IS_FLOAT={1 if is_compute_fp32 else 0}",
+        f"-DCOMPUTE_TYPE_IS_DOUBLE={1 if precision.compute_dtype == np.float64 else 0}",
     ])
     
     # Enable extensions as needed
@@ -402,17 +496,17 @@ def compile_shader_variant(self, shader_path: Path, precision: PrecisionConfig) 
     if is_compute_fp16:
         flags.append("-DENABLE_FP16_EXTENSION=1")
     
-    # Existing STORAGE_FLOAT/COMPUTE_FLOAT/STATE_FLOAT macros for non-FP8 paths
+    # Existing STORAGE_TYPE/COMPUTE_TYPE/STATE_TYPE macros for non-FP8 paths
     # Note: FP8 storage uses uint8_t buffers, not a floating-point type.
-    # STORAGE_FLOAT is used only for FP16/FP32/FP64 storage; FP8 paths use STORAGE_IS_FP8 flag.
+    # STORAGE_TYPE is used only for FP16/FP32/FP64 storage; FP8 paths use STORAGE_TYPE_IS_FP8 flag.
     if not is_fp8:
-        storage_float = {
+        storage_glsl_type = {
             np.float16: "float16_t",
             np.float32: "float",
             np.float64: "double",
         }[precision.storage_dtype.type]
-        flags.append(f"-DSTORAGE_FLOAT={storage_float}")
-    # For FP8, STORAGE_FLOAT is not emitted — shaders use STORAGE_IS_FP8 conditional
+        flags.append(f"-DSTORAGE_TYPE={storage_glsl_type}")
+    # For FP8, STORAGE_TYPE is not emitted — shaders use STORAGE_TYPE_IS_FP8 conditional
     # ... additional flags ...
     
     # Compile with glslc
@@ -472,7 +566,8 @@ def _get_vulkan_extensions() -> tuple[set[str], int]:
         vk.vkDestroyInstance(instance, None)
         return ext_names, api_version
         
-    except (ImportError, Exception):
+    except (ImportError, RuntimeError, OSError, SystemError):
+        # SystemError: some Vulkan ICDs raise this on initialization failure
         return set(), 0
 
 def _get_vulkan_features() -> dict[str, bool]:
@@ -508,7 +603,8 @@ def _get_vulkan_features() -> dict[str, bool]:
         vk.vkDestroyInstance(instance, None)
         return result
         
-    except (ImportError, Exception):
+    except (ImportError, RuntimeError, OSError, SystemError):
+        # SystemError: some Vulkan ICDs raise this on initialization failure
         return {}
 
 # Cache extension query results (avoid repeated Vulkan instance creation)
@@ -563,8 +659,25 @@ class TestFP8VulkanRoundtrip:
     
     @pytest.fixture
     def vulkan_context(self):
-        # ... setup Vulkan context with VK_KHR_8bit_storage ...
-        pass
+        """Create Vulkan context with VK_KHR_8bit_storage for testing.
+        
+        Yields the context and handles cleanup.
+        """
+        from backends.vulkan.renderer import VulkanRenderer
+        
+        # Create renderer with FP8 extension enabled
+        try:
+            renderer = VulkanRenderer(
+                required_extensions=["VK_KHR_8bit_storage"],
+                enable_validation=True,
+            )
+        except RuntimeError as e:
+            pytest.skip(f"Vulkan setup failed: {e}")
+        
+        yield {"renderer": renderer}
+        
+        # Cleanup
+        renderer.destroy()
     
     @pytest.mark.skipif(
         not _vulkan_has_8bit_storage(),
@@ -668,6 +781,21 @@ renderer = VulkanRenderer(precision=cfg)  # Should fail with clear message
 
 ## 4. Technical Notes
 
+### Arithmetic Conversion vs. Lookup Tables
+
+Unlike the OpenCL and CPU backends which use 256-entry lookup tables for FP8→float conversion, the Vulkan backend uses **arithmetic conversion** via bit manipulation and `exp2()`. This is a deliberate design choice:
+
+| Approach | OpenCL/CPU (LUT) | Vulkan (Arithmetic) |
+|:---|:---|:---|
+| **Memory** | 1KB per table (2KB total) | No memory footprint |
+| **Latency** | Single memory access | ~10-15 ALU ops |
+| **GLSL limitation** | N/A | No `__constant` equivalent for kernel-scope arrays¹ |
+| **Portability** | Requires constant memory | Pure computation |
+
+¹ GLSL lacks OpenCL's `__constant` memory space. While SPIR-V specialization constants could embed tables, the arithmetic approach is simpler and avoids shader binary bloat.
+
+**Performance note:** FP8 conversion is not on the critical path—the bandwidth savings from 4× smaller storage buffers dominate. The arithmetic overhead is negligible for bandwidth-bound workloads.
+
 ### Vulkan Extensions vs. GLSL Pragmas
 
 The Vulkan driver exposes capabilities via named extensions; GLSL shaders enable them via `#extension` pragmas. The naming differs:
@@ -676,9 +804,9 @@ The Vulkan driver exposes capabilities via named extensions; GLSL shaders enable
 |:---|:---|:---|
 | `VK_KHR_8bit_storage` | `GL_EXT_shader_8bit_storage` | `uint8_t` in storage buffers |
 | `VK_KHR_shader_float16_int8` | `GL_EXT_shader_explicit_arithmetic_types_float16` | `float16_t` arithmetic |
-| `shaderFloat64` device feature¹ | `GL_ARB_gpu_shader_fp64` | `double` arithmetic |
+| `shaderFloat64` device feature¹ | `GL_EXT_shader_explicit_arithmetic_types_float64` | `double` arithmetic |
 
-¹ Note: FP64 is a **device feature** (`VkPhysicalDeviceFeatures.shaderFloat64`), not an extension. It's queried via `vkGetPhysicalDeviceFeatures()` during device enumeration. The GLSL pragma `GL_ARB_gpu_shader_fp64` is core in GLSL 4.00+ but requires the Vulkan device feature to be enabled.
+¹ The `shaderFloat64` feature is a device feature (not an extension), queried via `VkPhysicalDeviceFeatures.shaderFloat64` during device enumeration.
 
 The shader builder checks Vulkan extension availability at device init; the GLSL pragmas are injected via `-D` flags at compile time.
 
@@ -690,11 +818,11 @@ This extension is **required** for FP8 storage buffers. It allows `uint8_t` in s
 
 **GPUs lacking VK_KHR_8bit_storage:**
 - Intel HD Graphics 5xx/6xx (Skylake/Kaby Lake integrated)—pre-Vulkan-1.2
-- AMD GCN 1st/2nd gen (HD 7000, R9 200 series)—Vulkan 1.0 only¹
+- AMD GCN 1st/2nd gen (HD 7000, R9 200 series)—Vulkan 1.0 only²
 - Mali-G5x and earlier (Bifrost 1st gen)—limited Vulkan 1.0
 - Adreno 5xx (Snapdragon 6xx/7xx)—partial Vulkan 1.0 support
 
-¹ These GPUs have limited or no driver updates; they represent <5% of active Vulkan devices (per vulkan.gpuinfo.org, March 2026).
+² These GPUs have limited or no driver updates; they represent <5% of active Vulkan devices (per vulkan.gpuinfo.org, March 2026).
 
 **Behavior when extension is unavailable:**
 
@@ -738,6 +866,25 @@ The OpenCL backend uses lookup tables because OpenCL's `__constant` memory is op
 
 The FP8 conversion functions use only standard GLSL operations (`floatBitsToUint`, `exp2`, `abs`, bit operations). No SPIR-V extensions beyond `VK_KHR_8bit_storage` are required. The `exp2()` function is standard GLSL (core since GLSL 1.30) and compiles to portable SPIR-V.
 
+### `exp2()` accuracy for FP8 exponent range
+
+The FP8→float conversion uses `exp2(float(exp8 - FP8_BIAS))` for power-of-2 scaling. This is **exact** (no rounding error) for all FP8 exponent values because:
+
+| Format | Exponent Range | Bias | `exp2()` Argument Range | Result Range |
+|:---|:---|:---|:---|:---|
+| E4M3 | [0, 14] | 7 | [-7, 7] | [2⁻⁷, 2⁷] = [0.0078125, 128] |
+| E5M2 | [0, 30] | 15 | [-15, 15] | [2⁻¹⁵, 2¹⁵] = [~0.000031, 32768] |
+
+All these values are exactly representable in float (powers of 2 within float's exponent range). The `exp2()` result introduces zero error. The only rounding possible is in the mantissa multiplication (`(1 + mant/M) * exp2(...)`) when the product rounds to the nearest float, but since we're reconstructing an FP8 value that was originally quantized from float, this reconstruction is exact—the product always equals a float value that was the source of the FP8 encoding.
+
+### FP64 NaN-before-clamp ordering
+
+The FP64 store path must check `isnan()` **before** the `clamp()` call. GLSL `clamp(NaN, lo, hi)` returns `lo` per spec, so a NaN input would be silently converted to `-FLT_MAX` by the clamp, then stored as a negative saturated value instead of zero. The NaN check is placed at the top of the `COMPUTE_TYPE_IS_DOUBLE` `store_storage_fp8()` overload. The FP16 and FP32 paths route through `store_storage_fp8_internal()`, which checks `isnan()` after the `float(val)` widening/identity cast (which preserves NaN). This is the same pattern and rationale as the OpenCL backend (Phase 9B).
+
+### Subnormal conversion accuracy (store path)
+
+The FP32→FP8 store path uses fixed rounding shift distances that are correct for **both** normalized and subnormal cases. After subnormal denormalization (`mant32 = (mant32 | 0x800000u) >> shift`), the significant bits are right-shifted into positions that align with the fixed extraction window at bits [22:20] (E4M3) or [22:21] (E5M2). The round bit at position 19 (E4M3) or 20 (E5M2) correctly captures the first truncated bit, and sticky bits below capture the remainder. The early underflow check (`val < FP8_MIN_SUBNORMAL * 0.5`) prevents the subnormal path from reaching shift values large enough to push significant bits entirely below the extraction window (E4M3: max reachable shift = 4, MSB at bit 19 = round bit position; E5M2: max reachable shift = 3, MSB at bit 20 = round bit position). The rounding is therefore exact round-to-nearest-even for all reachable subnormal values. The roundtrip tests (Step 9D.5) validate against `ml_dtypes` reference values and should produce exact agreement for all representable inputs.
+
 ---
 
 ## 5. Risk Register
@@ -757,6 +904,10 @@ The FP8 conversion functions use only standard GLSL operations (`floatBitsToUint
 |:---|:---|:---|
 | `src/backends/vulkan/kernel_sources/common.glsl` | **Edit** | Add FP8 compile-time flags, extension enables, `fp8_to_float_internal`, `load_storage_fp8`, `store_storage_fp8` functions |
 | `src/backends/vulkan/kernel_sources/*.comp` | **Edit** | Update storage buffer declarations for FP8 (`uint8_t` via `VK_KHR_8bit_storage`) |
-| `src/backends/vulkan/shader_builder.py` | **Edit** | Add FP8/FP16/FP64 compute flag emission (`-DSTORAGE_IS_FP8`, etc.) |
+| `src/backends/vulkan/shader_builder.py` | **Edit** | Add FP8/FP16/FP64 compute flag emission (`-DSTORAGE_TYPE_IS_FP8`, etc.) |
 | `src/backends/vulkan/renderer.py` | **Edit** | Check `VK_KHR_8bit_storage` and `VK_KHR_shader_float16_int8` availability at init |
 | `tests/tier2/vulkan/test_fp8_vulkan.py` | **New** | FP8 roundtrip and saturation tests for Vulkan backend |
+
+---
+
+*End of Phase 9D. This phase can be executed in parallel with Phases 9B and 9C. Proceed to Phase 9E after all three backend phases complete.*

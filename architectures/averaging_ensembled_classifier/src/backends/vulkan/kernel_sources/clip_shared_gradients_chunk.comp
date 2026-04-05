@@ -23,10 +23,10 @@ layout(push_constant) uniform PushConstants {
     uint  num_batch_chunks;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer SrcGradW  { STORAGE_FLOAT data[]; } src_grad_w;
-layout(set = 0, binding = 1) readonly buffer SrcGradB  { STORAGE_FLOAT data[]; } src_grad_b;
-layout(set = 0, binding = 2) writeonly buffer DstGradW { STORAGE_FLOAT data[]; } dst_grad_w;
-layout(set = 0, binding = 3) writeonly buffer DstGradB { STORAGE_FLOAT data[]; } dst_grad_b;
+layout(set = 0, binding = 0) readonly buffer SrcGradW  { STORAGE_TYPE data[]; } src_grad_w;
+layout(set = 0, binding = 1) readonly buffer SrcGradB  { STORAGE_TYPE data[]; } src_grad_b;
+layout(set = 0, binding = 2) writeonly buffer DstGradW { STORAGE_TYPE data[]; } dst_grad_w;
+layout(set = 0, binding = 3) writeonly buffer DstGradB { STORAGE_TYPE data[]; } dst_grad_b;
 
 void main() {
     uint lid   = gl_LocalInvocationID.x;
@@ -34,9 +34,9 @@ void main() {
     uint total_elements = push.weights_parameter_count + push.biases_parameter_count;
 
     // ── Pass 1: Compute sum of squares for joint L2 norm ──
-    COMPUTE_FLOAT local_sq_sum = COMPUTE_FLOAT(0.0);
+    COMPUTE_TYPE local_sq_sum = COMPUTE_TYPE(0.0);
     for (uint i = lid; i < total_elements; i += lsize) {
-        COMPUTE_FLOAT val;
+        COMPUTE_TYPE val;
         if (i < push.weights_parameter_count) {
             val = read_storage(src_grad_w.data[i]);
         } else {
@@ -45,15 +45,15 @@ void main() {
         local_sq_sum += val * val;
     }
 
-    COMPUTE_FLOAT total_sq = workgroup_reduce_add(local_sq_sum);
+    COMPUTE_TYPE total_sq = workgroup_reduce_add(local_sq_sum);
 
     // ── Compute scaling factor and broadcast ──
-    COMPUTE_FLOAT scale_factor;
+    COMPUTE_TYPE scale_factor;
     if (lid == 0) {
-        COMPUTE_FLOAT norm = sqrt(total_sq);
-        scale_factor = COMPUTE_FLOAT(1.0);
-        if (norm > COMPUTE_FLOAT(push.clipping_threshold)) {
-            scale_factor = COMPUTE_FLOAT(push.clipping_threshold) / (norm + COMPUTE_FLOAT(push.epsilon));
+        COMPUTE_TYPE norm = sqrt(total_sq);
+        scale_factor = COMPUTE_TYPE(1.0);
+        if (norm > COMPUTE_TYPE(push.clipping_threshold)) {
+            scale_factor = COMPUTE_TYPE(push.clipping_threshold) / (norm + COMPUTE_TYPE(push.epsilon));
         }
         _compute_scratch[0] = scale_factor;
     }
@@ -63,11 +63,11 @@ void main() {
     // ── Pass 2: Scale and write to destination offsets ──
     for (uint i = lid; i < total_elements; i += lsize) {
         if (i < push.weights_parameter_count) {
-            COMPUTE_FLOAT val = read_storage(src_grad_w.data[i]);
+            COMPUTE_TYPE val = read_storage(src_grad_w.data[i]);
             dst_grad_w.data[push.weights_write_offset + i] = write_storage(val * scale_factor);
         } else {
             uint  rel = i - push.weights_parameter_count;
-            COMPUTE_FLOAT val = read_storage(src_grad_b.data[rel]);
+            COMPUTE_TYPE val = read_storage(src_grad_b.data[rel]);
             dst_grad_b.data[push.biases_write_offset + rel] = write_storage(val * scale_factor);
         }
     }

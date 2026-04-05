@@ -28,9 +28,9 @@ layout(push_constant) uniform PushConstants {
     uint use_local_reduce;          // 0=register tier, 1=local tier
 } push;
 
-layout(set = 0, binding = 0) readonly buffer SrcCollection { STORAGE_FLOAT data[]; } src_collection;
+layout(set = 0, binding = 0) readonly buffer SrcCollection { STORAGE_TYPE data[]; } src_collection;
 layout(set = 0, binding = 1) readonly buffer OffsetList    { uint          data[]; } src_offsets;
-layout(set = 0, binding = 2) writeonly buffer DestPartial  { STORAGE_FLOAT data[]; } dest;
+layout(set = 0, binding = 2) writeonly buffer DestPartial  { STORAGE_TYPE data[]; } dest;
 
 void main() {
     uint lid   = gl_LocalInvocationID.x;
@@ -43,14 +43,14 @@ void main() {
         uint elem = gl_WorkGroupID.x * lsize + lid;
         if (elem >= push.partial_width) return;
 
-        COMPUTE_FLOAT accum = COMPUTE_FLOAT(0.0);
+        COMPUTE_TYPE accum = COMPUTE_TYPE(0.0);
         for (uint k = 0; k < push.partial_offset_list_count; ++k) {
             uint offset = src_offsets.data[k];
             accum += read_storage(src_collection.data[offset + elem]);
         }
 
         if (push.operation_type == AGG_MODE_AVERAGE && push.partial_offset_list_count > 0) {
-            accum /= COMPUTE_FLOAT(push.partial_offset_list_count);
+            accum /= COMPUTE_TYPE(push.partial_offset_list_count);
         }
 
         dest.data[elem] = write_storage(accum);
@@ -62,18 +62,18 @@ void main() {
         uint elem = gl_WorkGroupID.x;
         if (elem >= push.partial_width) return;
 
-        COMPUTE_FLOAT accum = COMPUTE_FLOAT(0.0);
+        COMPUTE_TYPE accum = COMPUTE_TYPE(0.0);
         for (uint k = lid; k < push.partial_offset_list_count; k += lsize) {
             uint offset = src_offsets.data[k];
             accum += read_storage(src_collection.data[offset + elem]);
         }
 
         // Subgroup-accelerated workgroup reduction.
-        COMPUTE_FLOAT total = workgroup_reduce_add(accum);
+        COMPUTE_TYPE total = workgroup_reduce_add(accum);
 
         if (lid == 0) {
             if (push.operation_type == AGG_MODE_AVERAGE && push.partial_offset_list_count > 0) {
-                total /= COMPUTE_FLOAT(push.partial_offset_list_count);
+                total /= COMPUTE_TYPE(push.partial_offset_list_count);
             }
             dest.data[elem] = write_storage(total);
         }

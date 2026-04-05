@@ -27,7 +27,7 @@ IEEE 754 does not define 8-bit floating-point. Two de facto standards have emerg
 | **E4M3** | 1 | 4 | 3 | 7 | 448 | 2⁻⁹ ≈ 0.00195 | Activations, gradients (range-limited) |
 | **E5M2** | 1 | 5 | 2 | 15 | 57344 | 2⁻¹⁶ ≈ 0.0000153 | Wider dynamic range, lower precision |
 
-E4M3 provides 3 mantissa bits (8 distinct values per exponent binade) with a maximum representable value of 448. E5M2 provides 2 mantissa bits (4 distinct values per binade) but extends the dynamic range to 57344. Neither format supports infinity or NaN in their standard ML definitions — the bit patterns are repurposed for additional finite values.
+E4M3 provides 3 mantissa bits (8 distinct values per exponent binade) with a maximum representable value of 448. E5M2 provides 2 mantissa bits (4 distinct values per binade) but extends the dynamic range to 57344. The two formats differ in special-value semantics: **E4M3** (`float8_e4m3fn`) repurposes all 256 bit patterns for finite values — no infinity or NaN. **E5M2** follows IEEE-like conventions: exponent 0x1F encodes ±infinity (mantissa = 0) and NaN (mantissa ≠ 0), leaving 248 finite bit patterns. In practice this distinction is invisible to the training loop because the store path saturates to the maximum finite value in both formats, so infinity and NaN bit patterns are never written to storage buffers.
 
 **E4M3 is the primary target.** Its higher precision (3 mantissa bits vs. 2) better preserves gradient direction vectors and activation magnitudes. The 448 maximum is manageable under the architecture's existing Quadratic Scaling Policy — gradients are already scaled to prevent overflow at `COMPUTE_FP_FORMAT_MAX / K`, and post-scaling values fit within E4M3's range for practical K values.
 
@@ -124,8 +124,10 @@ The `storage_dtype` field accepts FP8 variants in addition to the existing FP16/
 @dataclass(frozen=True)
 class PrecisionConfig:
     storage_dtype: np.dtype   # float8_e4m3fn, float8_e5m2, float16, float32, float64
-    compute_dtype: np.dtype   # float32, float64 (FP8/FP16 compute prohibited on CPU)
-    state_dtype: np.dtype     # float32, float64 (FP8/FP16 state prohibited)
+    compute_dtype: np.dtype   # float16, float32, float64 (FP8 compute prohibited)
+                              # Note: FP16 compute on CPU requires _Float16 (C23 / GCC 12+ / Clang 15+).
+                              # See §5.3 for conditional CPU suffix variants.
+    state_dtype: np.dtype     # float32, float64 (FP8 and FP16 state prohibited)
 ```
 
 #### §2.2: Construction Invariants (amended)
@@ -144,6 +146,14 @@ def __post_init__(self) -> None:
         raise ValueError(
             "FP8 state is architecturally prohibited: "
             "EMA updates round to zero for β > 0.9"
+        )
+    
+    # FP16 state is also prohibited (EMA precision erosion over extended training)
+    if self.state_dtype == np.float16:
+        raise ValueError(
+            "FP16 state is architecturally prohibited: "
+            "EMA updates lose precision over extended training. "
+            "Use FP32 or FP64 for state_dtype."
         )
     
     # Existing invariants (storage ≤ compute, storage ≤ state) still apply
@@ -307,6 +317,17 @@ New valid CPU suffixes for FP8 storage:
 | `s8e5c32x64` | `cpu_fp8_e5m2` | `float` | `double` | E5M2 bandwidth + extended stability |
 | `s8e5c64x64` | `cpu_fp8_e5m2` | `double` | `double` | E5M2 bandwidth, FP64 compute/state |
 
+**Conditional FP16 compute variants** (compiled only when `_Float16` is available — C23, GCC 12+, or Clang 15+ with `-std=c2x`):
+
+| Suffix | `STORAGE_T` | `COMPUTE_T` | `STATE_T` | Use Case |
+|:---|:---|:---|:---|:---|
+| `s8e4c16x32` | `cpu_fp8_e4m3` | `_Float16` | `float` | E4M3 bandwidth + native FP16 compute |
+| `s8e4c16x64` | `cpu_fp8_e4m3` | `_Float16` | `double` | E4M3 bandwidth + FP16 compute + FP64 state |
+| `s8e5c16x32` | `cpu_fp8_e5m2` | `_Float16` | `float` | E5M2 bandwidth + native FP16 compute |
+| `s8e5c16x64` | `cpu_fp8_e5m2` | `_Float16` | `double` | E5M2 bandwidth + FP16 compute + FP64 state |
+
+The Meson build gates `c16` suffix variants on compiler `_Float16` capability detection. If `_Float16` is unavailable, these variants are not compiled and `PrecisionConfig.fp8_e4m3_f16()` raises `RuntimeError` at CPU kernel load time.
+
 The `8e4` and `8e5` shorthand distinguishes the two FP8 variants. The `DECLARE_PRECISION_STRUCTS` macro is extended:
 
 ```c
@@ -319,6 +340,14 @@ DECLARE_PRECISION_STRUCTS(s8e4c64x64, cpu_fp8_e4m3, double, double)
 DECLARE_PRECISION_STRUCTS(s8e5c32x32, cpu_fp8_e5m2, float, float)
 DECLARE_PRECISION_STRUCTS(s8e5c32x64, cpu_fp8_e5m2, float, double)
 DECLARE_PRECISION_STRUCTS(s8e5c64x64, cpu_fp8_e5m2, double, double)
+
+/* FP16 compute variants — conditional on _Float16 availability */
+#if defined(__FLT16_MAX__) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L)
+DECLARE_PRECISION_STRUCTS(s8e4c16x32, cpu_fp8_e4m3, _Float16, float)
+DECLARE_PRECISION_STRUCTS(s8e4c16x64, cpu_fp8_e4m3, _Float16, double)
+DECLARE_PRECISION_STRUCTS(s8e5c16x32, cpu_fp8_e5m2, _Float16, float)
+DECLARE_PRECISION_STRUCTS(s8e5c16x64, cpu_fp8_e5m2, _Float16, double)
+#endif
 ```
 
 #### §5.4: Load/Store Macro Extension
@@ -327,11 +356,16 @@ The macros dispatch on `COMPUTE_TYPE` to select the appropriate conversion funct
 
 ```c
 // cpu_precision.h — FP8 storage role load/store (COMPUTE_TYPE-aware)
-#if COMPUTE_TYPE_IS_DOUBLE
+#if defined(COMPUTE_TYPE_IS_DOUBLE) && COMPUTE_TYPE_IS_DOUBLE
 #define scalar_load_storage_fp8_e4m3(ptr) cpu_fp8_e4m3_to_double(*(ptr))
 #define scalar_store_storage_fp8_e4m3(ptr, val) (*(ptr) = cpu_double_to_fp8_e4m3(val))
 #define scalar_load_storage_fp8_e5m2(ptr) cpu_fp8_e5m2_to_double(*(ptr))
 #define scalar_store_storage_fp8_e5m2(ptr, val) (*(ptr) = cpu_double_to_fp8_e5m2(val))
+#elif defined(COMPUTE_TYPE_IS_HALF) && COMPUTE_TYPE_IS_HALF
+#define scalar_load_storage_fp8_e4m3(ptr) cpu_fp8_e4m3_to_half(*(ptr))
+#define scalar_store_storage_fp8_e4m3(ptr, val) (*(ptr) = cpu_half_to_fp8_e4m3(val))
+#define scalar_load_storage_fp8_e5m2(ptr) cpu_fp8_e5m2_to_half(*(ptr))
+#define scalar_store_storage_fp8_e5m2(ptr, val) (*(ptr) = cpu_half_to_fp8_e5m2(val))
 #else
 #define scalar_load_storage_fp8_e4m3(ptr) cpu_fp8_e4m3_to_float(*(ptr))
 #define scalar_store_storage_fp8_e4m3(ptr, val) (*(ptr) = cpu_float_to_fp8_e4m3(val))
@@ -423,24 +457,24 @@ Until such extensions are ratified, FP8 buffers are treated as `uint8_t` arrays 
 
 #### §7.2: Compile-Time Flag Extension
 
-The Vulkan backend uses compile-time `-D` flags for precision dispatch (consistent with the existing `STORAGE_FLOAT`, `COMPUTE_FLOAT`, `STATE_FLOAT` macros). The GLSL preprocessor cannot evaluate specialization constant values, so FP8 selection uses explicit flags:
+The Vulkan backend uses compile-time `-D` flags for precision dispatch (consistent with the existing `STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE` macros). The GLSL preprocessor cannot evaluate specialization constant values, so FP8 selection uses explicit flags:
 
 ```glsl
 // FP8 compile-time flags (injected via glslc -D)
-// -DSTORAGE_IS_FP8=1 -DSTORAGE_IS_E4M3=1 (or -DSTORAGE_IS_E5M2=1)
+// -DSTORAGE_TYPE_IS_FP8=1 -DSTORAGE_TYPE_IS_E4M3=1 (or -DSTORAGE_TYPE_IS_E5M2=1)
 
-#ifndef STORAGE_IS_FP8
-#define STORAGE_IS_FP8 0
+#ifndef STORAGE_TYPE_IS_FP8
+#define STORAGE_TYPE_IS_FP8 0
 #endif
-#ifndef STORAGE_IS_E4M3
-#define STORAGE_IS_E4M3 0
+#ifndef STORAGE_TYPE_IS_E4M3
+#define STORAGE_TYPE_IS_E4M3 0
 #endif
-#ifndef STORAGE_IS_E5M2
-#define STORAGE_IS_E5M2 0
+#ifndef STORAGE_TYPE_IS_E5M2
+#define STORAGE_TYPE_IS_E5M2 0
 #endif
 
 // Enable 8-bit storage extension when FP8 is active
-#if STORAGE_IS_FP8
+#if STORAGE_TYPE_IS_FP8
 #extension GL_EXT_shader_8bit_storage : require
 #endif
 ```
@@ -448,7 +482,7 @@ The Vulkan backend uses compile-time `-D` flags for precision dispatch (consiste
 #### §7.3: Software Conversion (Fallback)
 
 ```glsl
-#if STORAGE_IS_FP8 && !defined(VK_FP8_NATIVE)
+#if STORAGE_TYPE_IS_FP8 && !defined(VK_FP8_NATIVE)
 // FP8 as uint8 with software conversion
 float load_storage_fp8(uint bits) {
     // E4M3: sign(1) + exp(4) + mantissa(3), bias=7, max=448

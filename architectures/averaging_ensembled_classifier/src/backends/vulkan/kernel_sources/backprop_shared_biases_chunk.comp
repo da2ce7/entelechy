@@ -24,10 +24,10 @@ layout(push_constant) uniform PushConstants {
     uint final_grad_hidden_total_element_count;
 } push;
 
-layout(set = 0, binding = 0) readonly buffer HiddenBuf     { STORAGE_FLOAT data[]; } hidden_acts;
-layout(set = 0, binding = 1) readonly buffer GradHBuf      { COMPUTE_FLOAT data[]; } grad_h;
-layout(set = 0, binding = 2) readonly buffer SampleMaskBuf { STORAGE_FLOAT data[]; } sample_mask;
-layout(set = 0, binding = 3) writeonly buffer GradSBOut    { STORAGE_FLOAT data[]; } grad_sb_out;
+layout(set = 0, binding = 0) readonly buffer HiddenBuf     { STORAGE_TYPE data[]; } hidden_acts;
+layout(set = 0, binding = 1) readonly buffer GradHBuf      { COMPUTE_TYPE data[]; } grad_h;
+layout(set = 0, binding = 2) readonly buffer SampleMaskBuf { STORAGE_TYPE data[]; } sample_mask;
+layout(set = 0, binding = 3) writeonly buffer GradSBOut    { STORAGE_TYPE data[]; } grad_sb_out;
 
 void main() {
     uint j_idx = gl_WorkGroupID.x;
@@ -37,26 +37,26 @@ void main() {
     if (j_idx >= push.padded_hidden_count) return;
 
     // ── Parallel reduction over the batch chunk ──
-    COMPUTE_FLOAT p_grad_sb = COMPUTE_FLOAT(0.0);
+    COMPUTE_TYPE p_grad_sb = COMPUTE_TYPE(0.0);
 
     for (uint b_local = lid; b_local < push.batch_chunk_count; b_local += lsize) {
         uint b_global = push.batch_chunk_offset + b_local;
 
-        if (read_storage(sample_mask.data[b_global]) < COMPUTE_FLOAT(0.5)) continue;
+        if (read_storage(sample_mask.data[b_global]) < COMPUTE_TYPE(0.5)) continue;
 
         // Chain rule: dL/dB_j = (dL/dA_j) * (dA_j/dZ_j) * 1
         // For biases, dZ_j/dB_j = 1.
         uint  hidden_offset = b_global * push.padded_hidden_count + j_idx;
-        COMPUTE_FLOAT grad_h_val    = grad_h.data[hidden_offset];
-        COMPUTE_FLOAT hidden_val    = read_storage(hidden_acts.data[hidden_offset]);
+        COMPUTE_TYPE grad_h_val    = grad_h.data[hidden_offset];
+        COMPUTE_TYPE hidden_val    = read_storage(hidden_acts.data[hidden_offset]);
 
         // ReLU derivative
-        COMPUTE_FLOAT d_activation = (hidden_val > COMPUTE_FLOAT(0.0)) ? COMPUTE_FLOAT(1.0) : COMPUTE_FLOAT(0.0);
+        COMPUTE_TYPE d_activation = (hidden_val > COMPUTE_TYPE(0.0)) ? COMPUTE_TYPE(1.0) : COMPUTE_TYPE(0.0);
         p_grad_sb += grad_h_val * d_activation;
     }
 
     // ── Subgroup-accelerated workgroup reduction ──
-    COMPUTE_FLOAT total = workgroup_reduce_add(p_grad_sb);
+    COMPUTE_TYPE total = workgroup_reduce_add(p_grad_sb);
 
     if (lid == 0) {
         uint chunk_base = push.batch_chunk_index * push.padded_hidden_count;

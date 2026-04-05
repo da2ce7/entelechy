@@ -83,6 +83,7 @@ The `@param` block constitutes the complete logical specification for a paramete
 - **`Padding Contract`**: A key-value object literal specifying padding strategy.  > Under the three-role precision model, padding byte counts use the element size of the buffer's actual `precision_role` type: `sizeof(STORAGE_TYPE)`, `sizeof(COMPUTE_TYPE)`, or `sizeof(STATE_TYPE)` as appropriate. Using a different role's `sizeof` in a `Padding Contract` expression is a contract violation.
 - **`Precision Role`**: One of `"storage"`, `"compute"`, or `"state"`. Declares which precision-role dtype from the active `PrecisionConfig` governs this buffer's element type and allocation size. **Mandatory** for all floating-point buffer parameters. Integer-typed buffers (`int`, `uint`, `atomic_uint`) whose element size is format-independent are exempt.
 - **`Calculability Proof`**: Defines the derivation of buffer dimensions or scalar values through a constructive arithmetic expression composed solely of parameters present within the kernel's interface. All terms in this expression shall correspond to kernel arguments, satisfying the Axiom of Interface Verifiability (1.4).
+- **`Initialization Contract`**: For `dest_` flow buffers, declares whether the Host must pre-initialize the buffer contents before the producing kernel(s) are dispatched. Omission is equivalent to `{Type: NONE}`.
 - **`Validation Preconditions`**: Mandatory conditions the host must meet.
 - **`Performance Notes`**: Optional, non-binding performance optimization hints.
 
@@ -95,6 +96,17 @@ The `Padding Contract` field `Type` key accepts the following string literals:
 | `BANK_CONFLICT_AVOIDANCE` | Padding to the stride of a local memory array to prevent bank conflicts. |
 | `SIMD`                    | Padding to align a dimension to the natural SIMD vector width.           |
 | `NONE`                    | No padding is required or applied.                                       |
+
+**3.1.1. Initialization Contract Specification**
+
+The `Initialization Contract` field declares whether the Host must pre-initialize a destination buffer before the producing kernel(s) are dispatched.
+
+| Type Token       | Definition                                                                                                                                                                 |
+| :--------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ZERO_REQUIRED`  | Host must zero-fill the entire buffer before any kernel dispatch writes to it. The producing kernel uses partial-write or scatter-write patterns that leave positions unwritten; downstream consumers read the full buffer extent. |
+| `NONE`           | No initialization required. The producing kernel(s) guarantee that all positions read by downstream consumers are written before consumption.                               |
+
+**Default:** When a `dest_` buffer's commentary block omits the `Initialization Contract` field, the contract is implicitly `{Type: NONE}`. This field is not applicable to `src_` flow parameters (produced by prior pipeline stages), `update_buffer_GLOBAL_` parameters (persisted state), or `update_buffer_LOCAL_` parameters (transient work-group scratch).
 
 **3.2. Partial Renderer Contract**
 
@@ -212,6 +224,7 @@ __kernel void illustrative_kernel_name(
     * @param dest_buffer_GLOBAL_partial_results The sole collection resource for this unit's partial output.
     *        - Tensor Shape: (dest_scalar_NATURAL_total_chunks, RESULT_ELEMENTS_PER_CHUNK)
     *        - Padding Contract: {Type: NONE}
+    *        - Initialization Contract: {Type: ZERO_REQUIRED}
     *        - Precision Role: "storage"
     *        - Calculability Proof: [dest_scalar_NATURAL_total_chunks, Compile-time constant: RESULT_ELEMENTS_PER_CHUNK]
     *        - Validation Preconditions: Host shall zero-initialize this buffer prior to dispatch.
@@ -364,6 +377,7 @@ _Generic terms for special cases._
 | Suffix | `_pow_t`   | A value representing a base raised to the power of the current time-step `t`.                                                                                            |
 | Suffix | `_t_pre`   | A value that initial pre-process stage of a multi-stage process (e.g., processing the leaf in a reduction tree layer).                                                   |
 | Suffix | `_t_j`     | A value that is dependent on the stage j of a multi-stage process (e.g., reduction tree layer).                                                                          |
+| Suffix | `_per_item` | Denotes a per-item parameterization of a scalar quantity, providing one value per logical work-item (tile) rather than a single global scalar.                           |
 
 #### **5.0 Domain and Utility Primitives**
 
