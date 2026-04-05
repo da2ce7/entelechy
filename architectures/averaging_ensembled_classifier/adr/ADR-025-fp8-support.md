@@ -52,6 +52,24 @@ The three-role model exists precisely to decouple these concerns. FP8 storage wi
 - Full FP32 arithmetic fidelity in reductions and transcendentals
 - Full FP32 optimizer stability across unbounded training steps
 
+### Why Not Selective FP8 Compute?
+
+Modern accelerators (H100, MI300) provide FP8 tensor cores for matrix multiplication. One might ask: why not use FP8 compute for suitable operations while keeping others at FP32?
+
+The answer is architecture-specific. Hardware FP8 tensor cores accelerate **large dense GEMMs** (FP8×FP8→FP32 accumulation). However, this architecture's kernels do not contain such operations:
+
+| Kernel | Operation Type | Why Not Tensor-Core Eligible |
+|:---|:---|:---|
+| `forward_pass` | Matrix-vector multiply | Not a GEMM; tensor cores require matrix-matrix |
+| `aggregate_*_reduce` | Reduction tree | Pure accumulation — FP8's pathological case |
+| `calculate_module_param_grads_chunk` | Reduction over batch | Includes subtraction, reduction |
+| `clip_partial_gradients` | L2 norm (sum of squares) | Reduction + transcendental |
+| `adam_update` | Optimizer step | EMA, sqrt — requires precision |
+
+The $\log_K(N)$ Recursive Reduction Engine — the architectural centerpiece — is dominated by accumulation, not matrix multiplication. Even on tensor-core-capable hardware, FP8 storage captures the bandwidth benefit while compute remains reduction-dominated.
+
+This is not a general statement that FP8 compute is always inappropriate. Transformer architectures with large attention matrix products benefit from tensor-core FP8. This architecture's workload characteristics simply do not align with that hardware capability.
+
 ---
 
 ## Decision Drivers
@@ -76,7 +94,7 @@ FP8 (E4M3 and E5M2) is added as a supported precision format for the **storage r
 
 ### §1: NumPy dtype Representation
 
-NumPy 2.0+ provides `np.float8_e4m3fn` and `np.float8_e5m2` dtypes via the ml_dtypes package. The architecture adopts these as the canonical FP8 representations:
+The `ml_dtypes` package (maintained by the JAX team) provides NumPy-compatible FP8 dtypes. These are not native NumPy types but integrate seamlessly with NumPy's dtype system. The architecture adopts these as the canonical FP8 representations:
 
 ```python
 import ml_dtypes
@@ -129,19 +147,34 @@ def __post_init__(self) -> None:
         )
     
     # Existing invariants (storage ≤ compute, storage ≤ state) still apply
-    assert self.storage_dtype.itemsize <= self.compute_dtype.itemsize
-    assert self.storage_dtype.itemsize <= self.state_dtype.itemsize
+    if self.storage_dtype.itemsize > self.compute_dtype.itemsize:
+        raise ValueError(
+            f"storage_dtype ({self.storage_dtype}) cannot be wider than "
+            f"compute_dtype ({self.compute_dtype})"
+        )
+    if self.storage_dtype.itemsize > self.state_dtype.itemsize:
+        raise ValueError(
+            f"storage_dtype ({self.storage_dtype}) cannot be wider than "
+            f"state_dtype ({self.state_dtype})"
+        )
 ```
 
-Note: The itemsize invariant naturally holds (FP8 = 1 byte, FP32/FP64 = 4/8 bytes).
+Note: For FP8 configurations, the itemsize invariant naturally holds (FP8 = 1 byte, FP32/FP64 = 4/8 bytes).
 
 #### §2.3: New Factory Classmethods
+
+Six factory classmethods cover common FP8 configurations:
 
 | Factory | `storage_dtype` | `compute_dtype` | `state_dtype` | Primary Use Case |
 |:---|:---|:---|:---|:---|
 | `PrecisionConfig.fp8_e4m3()` | `float8_e4m3fn` | `float32` | `float32` | Maximum bandwidth, standard training |
 | `PrecisionConfig.fp8_e5m2()` | `float8_e5m2` | `float32` | `float32` | Maximum bandwidth, wider gradient range |
-| `PrecisionConfig.fp8_e4m3_f64_state()` | `float8_e4m3fn` | `float32` | `float64` | Maximum bandwidth + extended stability |
+| `PrecisionConfig.fp8_e4m3_f16()` | `float8_e4m3fn` | `float16` | `float32` | Maximum bandwidth + native FP16 compute |
+| `PrecisionConfig.fp8_e5m2_f16()` | `float8_e5m2` | `float16` | `float32` | Wider range + native FP16 compute |
+| `PrecisionConfig.fp8_e4m3_f64()` | `float8_e4m3fn` | `float64` | `float64` | Maximum bandwidth + extended stability |
+| `PrecisionConfig.fp8_e5m2_f64()` | `float8_e5m2` | `float64` | `float64` | Wider range + extended stability |
+
+Additional valid combinations (e.g., FP16 compute + FP64 state, FP32 compute + FP64 state) are constructed directly via `PrecisionConfig(...)`.
 
 The uniform `PrecisionConfig.fp8()` factory is **not provided**. There is no such thing as uniform FP8 — compute and state are always wider. Attempting to create a config with FP8 compute or state raises `ValueError`.
 
@@ -150,7 +183,7 @@ The uniform `PrecisionConfig.fp8()` factory is **not provided**. There is no suc
 | Field | E4M3 Value | E5M2 Value | Source |
 |:---|:---|:---|:---|
 | `storage_fp_format_max` | `448.0` | `57344.0` | Format-specific maximum finite value |
-| `storage_fp_format_min_subnormal` | `0.001953125` | `0.0000152588` | Smallest representable positive value |
+| `storage_fp_format_min_subnormal` | `0.001953125` | `0.0000152587890625` | Smallest representable positive value |
 | `storage_mantissa_bits` | `3` | `2` | Precision for quantization analysis |
 
 These values do not affect compute or state operations — they govern storage buffer sizing and the host's quantization/dequantization logic.
@@ -290,13 +323,21 @@ DECLARE_PRECISION_STRUCTS(s8e5c64x64, cpu_fp8_e5m2, double, double)
 
 #### §5.4: Load/Store Macro Extension
 
+The macros dispatch on `COMPUTE_TYPE` to select the appropriate conversion function:
+
 ```c
-// cpu_precision.h — FP8 storage role load/store
+// cpu_precision.h — FP8 storage role load/store (COMPUTE_TYPE-aware)
+#if COMPUTE_TYPE_IS_DOUBLE
+#define scalar_load_storage_fp8_e4m3(ptr) cpu_fp8_e4m3_to_double(*(ptr))
+#define scalar_store_storage_fp8_e4m3(ptr, val) (*(ptr) = cpu_double_to_fp8_e4m3(val))
+#define scalar_load_storage_fp8_e5m2(ptr) cpu_fp8_e5m2_to_double(*(ptr))
+#define scalar_store_storage_fp8_e5m2(ptr, val) (*(ptr) = cpu_double_to_fp8_e5m2(val))
+#else
 #define scalar_load_storage_fp8_e4m3(ptr) cpu_fp8_e4m3_to_float(*(ptr))
 #define scalar_store_storage_fp8_e4m3(ptr, val) (*(ptr) = cpu_float_to_fp8_e4m3(val))
-
 #define scalar_load_storage_fp8_e5m2(ptr) cpu_fp8_e5m2_to_float(*(ptr))
 #define scalar_store_storage_fp8_e5m2(ptr, val) (*(ptr) = cpu_float_to_fp8_e5m2(val))
+#endif
 ```
 
 SIMD variants are deferred. AVX-512 provides `VCVTPH2PS`/`VCVTPS2PH` for FP16 but no native FP8 instructions. Software SIMD (processing 8 FP8 values as a 64-bit word, converting in parallel via vectorized lookup) is a future optimization.
@@ -307,11 +348,11 @@ SIMD variants are deferred. AVX-512 provides `VCVTPH2PS`/`VCVTPS2PH` for FP16 bu
 
 #### §6.1: Extension Requirements
 
-No standard OpenCL extension defines FP8. Implementations fall into two categories:
+No standard OpenCL extension defines FP8 as of this writing. Implementations fall into two categories:
 
-1. **Vendor extensions** (e.g., `cl_intel_fp8`, hypothetical): Native FP8 types and conversion functions. The backend queries extension availability at device initialization.
+1. **Vendor extensions** (speculative): Future extensions such as `cl_intel_fp8` may provide native FP8 types and conversion functions. The backend queries extension availability at device initialization. If/when such extensions are ratified, the `CL_FP8_NATIVE` codepath activates.
 
-2. **Software emulation**: FP8 values stored as `uchar`. Conversion functions implemented in OpenCL C using bit manipulation. This is the fallback path.
+2. **Software emulation** (default): FP8 values stored as `uchar`. Conversion functions implemented in OpenCL C using bit manipulation. This is the expected path for current hardware.
 
 ```c
 // kernels.cl.h — FP8 software types (fallback)
@@ -374,37 +415,47 @@ static inline void store_storage(
 
 #### §7.1: Extension Requirements
 
-Vulkan FP8 support depends on vendor extensions:
-- **NVIDIA:** `VK_NV_fp8` (hypothetical, modeled on CUDA `__nv_fp8_e4m3`)
-- **AMD:** Part of `VK_AMD_shader_float16_int8` (extended interpretation)
+No ratified Vulkan extension provides FP8 shader types as of this writing. Potential future extensions:
+- **NVIDIA:** A hypothetical `VK_NV_fp8` extension, modeled on CUDA's `__nv_fp8_e4m3`
+- **AMD:** Potential extension to `VK_AMD_shader_float16_int8`
 
-When extensions are unavailable, FP8 buffers are treated as `uint8_t` arrays with software conversion in the shader.
+Until such extensions are ratified, FP8 buffers are treated as `uint8_t` arrays with software conversion in the shader. The `VK_FP8_NATIVE` codepath is a placeholder for future hardware support.
 
-#### §7.2: Specialization Constant Extension
+#### §7.2: Compile-Time Flag Extension
 
-The three-axis specialization constant scheme (ADR-024 §5.1) is extended:
+The Vulkan backend uses compile-time `-D` flags for precision dispatch (consistent with the existing `STORAGE_FLOAT`, `COMPUTE_FLOAT`, `STATE_FLOAT` macros). The GLSL preprocessor cannot evaluate specialization constant values, so FP8 selection uses explicit flags:
 
 ```glsl
-// Existing constants
-layout(constant_id = 0) const int STORAGE_FLOAT = 1;  // 0=fp8, 1=fp16, 2=fp32, 3=fp64
-layout(constant_id = 1) const int COMPUTE_FLOAT = 2;  // 2=fp32, 3=fp64
-layout(constant_id = 2) const int STATE_FLOAT = 2;    // 2=fp32, 3=fp64
+// FP8 compile-time flags (injected via glslc -D)
+// -DSTORAGE_IS_FP8=1 -DSTORAGE_IS_E4M3=1 (or -DSTORAGE_IS_E5M2=1)
 
-// New FP8 variant selector (only valid when STORAGE_FLOAT == 0)
-layout(constant_id = 3) const int FP8_VARIANT = 0;    // 0=E4M3, 1=E5M2
+#ifndef STORAGE_IS_FP8
+#define STORAGE_IS_FP8 0
+#endif
+#ifndef STORAGE_IS_E4M3
+#define STORAGE_IS_E4M3 0
+#endif
+#ifndef STORAGE_IS_E5M2
+#define STORAGE_IS_E5M2 0
+#endif
+
+// Enable 8-bit storage extension when FP8 is active
+#if STORAGE_IS_FP8
+#extension GL_EXT_shader_8bit_storage : require
+#endif
 ```
 
 #### §7.3: Software Conversion (Fallback)
 
 ```glsl
-#if STORAGE_FLOAT == 0 && !defined(VK_FP8_NATIVE)
+#if STORAGE_IS_FP8 && !defined(VK_FP8_NATIVE)
 // FP8 as uint8 with software conversion
-float load_storage_fp8(uint8_t bits) {
+float load_storage_fp8(uint bits) {
     // E4M3: sign(1) + exp(4) + mantissa(3), bias=7, max=448
     // Implementation via bit extraction
 }
 
-uint8_t store_storage_fp8(float val) {
+uint store_storage_fp8(float val) {
     // Saturating conversion with round-to-nearest-even
 }
 #endif
@@ -427,21 +478,15 @@ The primary concern is hidden layer pre-activations (before nonlinearity). The h
 
 #### §8.2: Gradient Scaling
 
-The existing Quadratic Scaling Policy scales gradients to `COMPUTE_FP_FORMAT_MAX / K` for overflow prevention. For FP8 storage, an additional `storage_scale` factor is applied:
+The existing Quadratic Scaling Policy scales gradients to `COMPUTE_FP_FORMAT_MAX / K` for overflow prevention. For FP8 storage, gradients after compute-phase scaling already lie well within E4M3's representable range (448) — the Quadratic Scaling Policy constrains gradients to values far below FP32's maximum.
 
-```python
-storage_scale = STORAGE_FP_FORMAT_MAX / COMPUTE_FP_FORMAT_MAX
-# E4M3: 448 / 3.4e38 ≈ 1.3e-36 (extreme narrowing)
-# This is inverted: we scale gradients DOWN to fit FP8 range
-```
+The FP8 storage path:
+1. Computes gradients in `COMPUTE_TYPE` (FP32/FP64) under Quadratic Scaling Policy
+2. Applies loss scaling if needed (standard mixed-precision technique)
+3. Clips to `[−STORAGE_FP_FORMAT_MAX, +STORAGE_FP_FORMAT_MAX]` as a safety bound
+4. Stores via `store_storage()` with saturating round-to-nearest-even conversion
 
-In practice, gradients are already scaled for stability. The FP8 storage path:
-1. Computes gradients in `COMPUTE_TYPE` (FP32/FP64)
-2. Applies loss scaling (standard mixed-precision technique)
-3. Clips to `[−STORAGE_FP_FORMAT_MAX, +STORAGE_FP_FORMAT_MAX]`
-4. Stores via `store_storage()` with saturating conversion
-
-The host tracks cumulative scaling for correct weight updates.
+The host tracks cumulative scaling for correct weight updates. In typical training, the clipping step is a no-op because the Quadratic Scaling Policy already constrains values.
 
 #### §8.3: Integration with Stabilization Policy
 
@@ -486,7 +531,13 @@ This ADR establishes FP8 as a first-class storage format. The following items ar
 
 3. **Mixed E4M3/E5M2 within a single configuration:** Using E4M3 for activations and E5M2 for gradients. Requires per-buffer format specification beyond the single `storage_dtype`. Deferred as a potential future `PrecisionConfig` extension.
 
-4. **Native FP8 ALU utilization:** When hardware provides FP8 tensor cores (H100, MI300), the architecture could theoretically route certain compute operations through FP8 ALUs. This violates the "FP8 is storage-only" constraint and would require re-evaluation of the fidelity analysis. Deferred indefinitely — the three-role model is correct as specified.
+4. **Native FP8 ALU utilization:** Modern accelerators (H100, MI300) provide FP8 tensor cores that perform FP8×FP8→FP32 matrix multiplication. However, this architecture's computational character does not benefit:
+   - **forward_pass** performs matrix-*vector* products (not tensor-core-eligible GEMMs)
+   - **aggregate_*_reduce** kernels are pure accumulation (the pathological FP8 case)
+   - **calculate_module_param_grads_chunk** combines reductions with gradient math
+   - **adam_update** requires EMA precision that FP8 cannot provide
+   
+   The $\log_K(N)$ Recursive Reduction Engine — the architectural centerpiece — is dominated by accumulation, which is precisely where narrow mantissa precision fails. Even on tensor-core-capable hardware, FP8 storage with FP32 compute captures the bandwidth advantage while the compute path remains reduction-dominated. Deferred indefinitely — the storage-only model is correct for this architecture's workload characteristics.
 
 ---
 
