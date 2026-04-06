@@ -52,11 +52,14 @@ static inline _Float16 _compute_fabs_f16(_Float16 x) { return (_Float16)fabsf((f
 static inline _Float16 _compute_fmax_f16(_Float16 x, _Float16 y) { return (_Float16)fmaxf((float)x, (float)y); }
 static inline _Float16 _compute_fmin_f16(_Float16 x, _Float16 y) { return (_Float16)fminf((float)x, (float)y); }
 
-/* FP64 detection table for accumulation-precision macros (ADR-027).
+/* Precision detection tables for accumulation-precision macros (ADR-027).
  * Maps suffix tokens to 0/1. Used by the per-inclusion ACCUM_T logic. */
 #define _PREC_IS_F64_fp16 0
 #define _PREC_IS_F64_fp32 0
 #define _PREC_IS_F64_fp64 1
+#define _PREC_IS_F16_fp16 1
+#define _PREC_IS_F16_fp32 0
+#define _PREC_IS_F16_fp64 0
 /* Note: FP8 suffixes (fp8e4m3, fp8e5m2) are storage-only, so ACCUM_T
  * detection based on STATE_SUFFIX never sees them. */
 
@@ -137,6 +140,15 @@ static inline _Float16 _compute_fmin_f16(_Float16 x, _Float16 y) { return (_Floa
     #define scalar_load_state_for_accum(ptr, idx) ((ptr)[(idx)])
     #define scalar_store_state_from_accum(ptr, idx, val) ((ptr)[(idx)] = (val))
     #define scalar_widen_to_accum(val) ((double)(val))
+    #define scalar_narrow_from_accum(val) ((COMPUTE_T)(val))
+#elif !_PREC_CAT2(_PREC_IS_F16, STATE_SUFFIX) && !_PREC_CAT2(_PREC_IS_F64, STATE_SUFFIX) && _PREC_CAT2(_PREC_IS_F16, COMPUTE_SUFFIX)
+    /* STATE_T (float) > COMPUTE_T (_Float16) — float by exclusion */
+    #define ACCUM_T STATE_T
+    #define ACCUM_IS_WIDER_THAN_COMPUTE 1
+
+    #define scalar_load_state_for_accum(ptr, idx) ((ptr)[(idx)])
+    #define scalar_store_state_from_accum(ptr, idx, val) ((ptr)[(idx)] = (val))
+    #define scalar_widen_to_accum(val) ((STATE_T)(val))
     #define scalar_narrow_from_accum(val) ((COMPUTE_T)(val))
 #else
     /* STATE_T <= COMPUTE_T (standard case) */

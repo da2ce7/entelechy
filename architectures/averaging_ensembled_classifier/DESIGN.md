@@ -562,7 +562,7 @@ All phases proceed in parallel behind `_build_config.py` feature flags. Each pha
 | **3: CPU Backend** | Implement C kernel library, ctypes FFI, `CPUPlanRenderer`; write CPU Tier 2 tests | Tier 1 + CPU Tier 2 green | **Complete** |
 | **4: Test Harness** | Full Tier 1/2/3 framework, fixtures, tolerance tables, oracle logic; can begin immediately | All enabled tiers green | **Complete** |
 | **5: Vulkan Backend** | GLSL shaders, SPIR-V compilation, vulkan-python `PlanRenderer`; write Vulkan Tier 2 tests | Tier 1 + Vulkan Tier 2 + Tier 3 parity green | **Complete** |
-| **User-Facing API** | `WorkTicket`, `LearnHandle`, `Engine`; parallel with Phase 4 | Tier 1 (ticket) + integration green | Not started |
+| **11: User-Facing API** | `WorkTicket`, `LearnHandle`, `Engine` (ADR-018); parallel with Phase 4 | Tier 1 (ticket) + integration green | **✅ Complete** |
 | **6: Legacy Removal** | Delete dissolved modules; system operates exclusively through plan-model dispatch | Tier 3 parity green, all backends, FP32 + FP16 | **✅ Complete** |
 | **7: Mixed Precision** | Three-role precision model (storage/compute/state); kernel spec, OpenCL, CPU, Vulkan migration; alias removal; multi-config tests | All Tier 2 tests pass for all three `PrecisionConfig` factories; zero `SCALAR_TYPE` references; Alchemist validation | **✅ Complete** |
 | **9A: FP8 Foundation** | `PrecisionConfig` FP8 factories; FP8 LUT generation; ADR-025 | Tier 1 green; LUT tables generated | **✅ Complete** |
@@ -581,7 +581,7 @@ Phase 1 (Plan Model) ──────────── ✅ Complete (332 test
   ├──▶ Phase 2 (OpenCL Adapter) ─── ✅ Complete
   ├──▶ Phase 3 (CPU Backend) ────── ✅ Complete
   ├──▶ Phase 5 (Vulkan Backend) ─── ✅ Complete
-  ├──▶ User-Facing API ─────────── Not started
+  ├──▶ Phase 11 (User-Facing API) ── ✅ Complete
   │
   │    Phase 4 (Test Harness) ────── ✅ Complete
   │

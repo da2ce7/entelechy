@@ -25,17 +25,17 @@ void PREC_FN(task_backprop_shared_weights)(void* raw_args, uint task_index, uint
     for (uint b_local = 0; b_local < a->batch_chunk_count; b_local++) {
         const uint b_global = a->batch_chunk_offset + b_local;
 
-        if (scalar_load_storage(a->sample_mask, b_global) < 0.5f)
+        if ((COMPUTE_T)scalar_load_storage(a->sample_mask, b_global) < (COMPUTE_T)0.5)
             continue;
 
         const size_t h_off = (size_t)b_global * a->padded_hidden_count + j_idx;
         const COMPUTE_T grad_h    = a->summed_grad_hidden_activations[h_off];  /* COMPUTE_T* compute */
-        const COMPUTE_T hidden_val = scalar_load_storage(a->hidden_activations, h_off);
+        const COMPUTE_T hidden_val = (COMPUTE_T)scalar_load_storage(a->hidden_activations, h_off);
 
         const COMPUTE_T d_act = (hidden_val > (COMPUTE_T)0.0) ? (COMPUTE_T)1.0 : (COMPUTE_T)0.0;
         const COMPUTE_T dL_dZ = grad_h * d_act;
 
-        const COMPUTE_T input_val = scalar_load_storage(a->input,
+        const COMPUTE_T input_val = (COMPUTE_T)scalar_load_storage(a->input,
             (size_t)b_global * a->padded_input_count + i_idx);
         grad_sw += dL_dZ * input_val;
     }
@@ -62,12 +62,12 @@ void PREC_FN(task_backprop_shared_biases)(void* raw_args, uint task_index, uint 
     for (uint b_local = 0; b_local < a->batch_chunk_count; b_local++) {
         const uint b_global = a->batch_chunk_offset + b_local;
 
-        if (scalar_load_storage(a->sample_mask, b_global) < 0.5f)
+        if ((COMPUTE_T)scalar_load_storage(a->sample_mask, b_global) < (COMPUTE_T)0.5)
             continue;
 
         const size_t h_off = (size_t)b_global * a->padded_hidden_count + j_idx;
         const COMPUTE_T grad_h    = a->summed_grad_hidden_activations[h_off];  /* COMPUTE_T* compute */
-        const COMPUTE_T hidden_val = scalar_load_storage(a->hidden_activations, h_off);
+        const COMPUTE_T hidden_val = (COMPUTE_T)scalar_load_storage(a->hidden_activations, h_off);
 
         const COMPUTE_T d_act = (hidden_val > (COMPUTE_T)0.0) ? (COMPUTE_T)1.0 : (COMPUTE_T)0.0;
         grad_sb += grad_h * d_act;

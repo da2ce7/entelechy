@@ -1233,7 +1233,7 @@ typedef struct {
     uint32_t batch_chunk_count;
     uint32_t batch_chunk_index;
     uint32_t total_batch_count;
-    uint32_t num_batch_chunks_count;
+    uint32_t num_batch_chunks;
     uint32_t padded_input_count;
     uint32_t padded_hidden_count;
     uint32_t final_grad_hidden_total_element_count;
@@ -1244,7 +1244,7 @@ typedef struct {
     uint32_t batch_chunk_count;
     uint32_t batch_chunk_index;
     uint32_t total_batch_count;
-    uint32_t num_batch_chunks_count;
+    uint32_t num_batch_chunks;
     uint32_t padded_hidden_count;
     uint32_t final_grad_hidden_total_element_count;
 } SharedBackpropBiasesPush;

@@ -30,6 +30,8 @@ The singular goal of the host-side orchestration is to ensure the core computati
 
 **FP8 is the ultimate expression of the Primacy of Memory Strategy.** FP8 (E4M3 or E5M2) storage achieves 4× bandwidth compression vs. FP32 and 2× vs. FP16. However, FP8's 3-bit mantissa (E4M3) or 2-bit mantissa (E5M2) is insufficient for compute or state roles: reductions saturate in one stage, and EMA updates round to zero for high β values. The architecture therefore permits FP8 **only in the storage role**, enforcing this constraint at `PrecisionConfig` construction time. Attempting to create a configuration with FP8 compute or FP8 state raises `ValueError` — there is no user-discipline escape hatch for non-functional training.
 
+**FP8 quantization floor and streaming backpropagation.** FP8 storage introduces a quantization floor at the format's minimum positive subnormal (2⁻⁹ ≈ 0.00195 for E4M3, 2⁻¹⁶ ≈ 1.53×10⁻⁵ for E5M2). Gradient contributions from activations below this floor are silently zeroed during streaming backpropagation (Nodes 17/18), where the ReLU derivative mask is recomputed from stored activations rather than an explicit `hidden_mask` input. This produces an effect equivalent to stochastic sparsification and is acceptable for the storage role — it does not affect convergence for typical activation distributions.
+
 #### 3. **Modular, "Dumb" Kernels**
 
 Kernels are simple, single-purpose modules. The architecture avoids complex branching ("smart" kernels) and monolithic designs in favor of composability. Where a complex data transformation is a critical-path bottleneck unsolved by generic tools, a **specialized, single-purpose kernel** will be employed. This specialist kernel remains "dumb"—stateless and reliant on the host for all contextual parameters.
@@ -292,7 +294,7 @@ Design decisions:
 
 The Policy tier's plan construction logic serves as a sophisticated orchestrator, responsible for resource assessment and plan-graph assembly. For each training batch, it performs strategic assessments that shape the execution plan:
 
-1.  **Memory Assessment & Chunk Definition:** The orchestrator determines an optimal chunking strategy, defining `num_module_chunks`, `num_batch_chunks`, and `num_class_chunks` to balance compute and memory demands. These decisions manifest as tile counts on `KernelDispatchNode`s and chunk counts on `StreamingLoopNode`s. The device's capabilities are described by a `HardwareProfile` carrying `max_reduce_fan_in`, `simd_width`, `cache_line_bytes`, and `global_mem_bytes`—named for its plan-construction role, not its hardware origin.
+1.  **Memory Assessment & Chunk Definition:** The orchestrator determines an optimal chunking strategy, defining `num_module_chunks`, `num_batch_chunks`, and `num_class_chunks` to balance compute and memory demands. These decisions manifest as tile counts on `KernelDispatchNode`s and chunk counts on `StreamingLoopNode`s. The device's capabilities are described by a `HardwareProfile` carrying `max_reduce_fan_in`, `simd_width`, `cache_line_bytes`, and `global_mem_bytes`—named for its plan-construction role, not its hardware origin. **Class-chunk amplification in collection buffers:** Node 8's `dest_buffer_GLOBAL_partial_grad_weights_module` is allocated with the full `padded_total_output_class_count` in its innermost dimension, but each tile writes only `classes_per_chunk` positions (the remainder is `ZERO_REQUIRED`-initialized). When `num_class_chunks` is large, the per-tile allocation is `num_class_chunks×` the actual write footprint — a deliberate trade-off enabling Node 11 to compute a contiguous-memory L2 norm without cross-tile gather. The chunking strategy must account for this amplification when budgeting device memory.
 2.  **Activation Lifecycle & Streaming:** It selects between a Cache or Recompute strategy and manages **two distinct backpropagation streaming models**, expressed as plan-level structural choices:
 
 - **Model A: Accumulate via Recompute (For `Grad_H` and `Grad_Mod*`):** Expressed as a `StreamingLoopNode` whose body recomputes `hidden_i` chunks and writes tile-indexed partials into a collection buffer for subsequent reduction. It maintains a minimal memory footprint at the cost of a parametric loop.
@@ -504,7 +506,7 @@ graph TD
         end
 
         EV_Final["<b>Host Sync Point</b><br/>final_batch_event"]:::sync_event
-        K25 --> EV_Final
+        K24_Shared & K24_Module & K25 --> EV_Final
         EV_Final --> HSM_Await_Batch
     end
 ```

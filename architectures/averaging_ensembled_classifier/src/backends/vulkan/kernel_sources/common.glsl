@@ -38,6 +38,12 @@
 #ifndef STATE_TYPE_IS_DOUBLE
 #define STATE_TYPE_IS_DOUBLE 0
 #endif
+#ifndef STATE_TYPE_IS_HALF
+#define STATE_TYPE_IS_HALF 0
+#endif
+#ifndef STATE_TYPE_IS_FLOAT
+#define STATE_TYPE_IS_FLOAT 0
+#endif
 
 // ── Extension Enables ──────────────────────────────────────────────────
 
@@ -331,9 +337,15 @@ STATE_TYPE write_state(COMPUTE_TYPE val) { return NARROW_STATE(val); }
 // are identity operations eliminated by the SPIR-V compiler.
 
 #if STATE_TYPE_IS_DOUBLE && !COMPUTE_TYPE_IS_DOUBLE
+    // STATE_TYPE (double) > COMPUTE_TYPE (float or half)
     #define ACCUM_FLOAT double
     #define ACCUM_IS_WIDER 1
+#elif !STATE_TYPE_IS_HALF && !STATE_TYPE_IS_DOUBLE && COMPUTE_TYPE_IS_HALF
+    // STATE_TYPE (float) > COMPUTE_TYPE (half) — float by exclusion
+    #define ACCUM_FLOAT float
+    #define ACCUM_IS_WIDER 1
 #else
+    // STATE_TYPE <= COMPUTE_TYPE (standard case)
     #define ACCUM_FLOAT COMPUTE_TYPE
     #define ACCUM_IS_WIDER 0
 #endif

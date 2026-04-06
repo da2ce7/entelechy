@@ -39,6 +39,63 @@ from .plan_renderer import PlanRenderer
 # Configuration types
 from .hardware_profile import HardwareProfile
 from .precision_config import PrecisionConfig
+from .model_spec import ModelSpec
+from .parameter_space import ParameterSpace
+from .stabilization_policy import StabilizationPolicy
+from .problem_type_strategy import PlanProblemTypeStrategy, PlanCceStrategy, PlanBceStrategy
 
 # Plan builder
 from .plan_builder import build_act_plan, build_learn_plan
+
+# ---------------------------------------------------------------------------
+# User-facing API (ADR-018)
+# ---------------------------------------------------------------------------
+from .ticket import WorkTicket, LearnHandle, TicketState, InvalidTicketStateError
+from .engine import Engine
+
+__all__ = [
+    # Plan node types
+    "KernelDispatchNode",
+    "ReductionTreeNode",
+    "StreamingLoopNode",
+    "BarrierNode",
+    "RetrievalNode",
+    "PlanNode",
+    "ExecutionPlan",
+    "PlanValidationError",
+    # Buffer lifecycle
+    "BufferHandle",
+    "BufferRole",
+    "BufferDescriptor",
+    # Reduction tree
+    "ReductionTreePlan",
+    # Streaming loop
+    "StreamingLoopPlan",
+    "IterationDimension",
+    "ParameterStride",
+    "ScratchBufferSpec",
+    # Retrieval protocol
+    "RetrievalFuture",
+    # Kernel contracts
+    "KernelContract",
+    # Plan renderer protocol
+    "PlanRenderer",
+    # Configuration types
+    "HardwareProfile",
+    "PrecisionConfig",
+    "ModelSpec",
+    "ParameterSpace",
+    "StabilizationPolicy",
+    "PlanProblemTypeStrategy",
+    "PlanCceStrategy",
+    "PlanBceStrategy",
+    # Plan builder
+    "build_act_plan",
+    "build_learn_plan",
+    # User-facing API (ADR-018)
+    "WorkTicket",
+    "LearnHandle",
+    "TicketState",
+    "InvalidTicketStateError",
+    "Engine",
+]

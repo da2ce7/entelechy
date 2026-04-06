@@ -39,7 +39,7 @@ void PREC_FN(task_gather_permute_grad_h)(void* raw_args, uint task_index, uint t
         const size_t local_off = (size_t)module_local_idx
             * a->total_batch_count * a->padded_hidden_count
             + (size_t)batch_idx * a->padded_hidden_count + h_idx;
-        accum += scalar_load_storage(a->clipped_partial_grad_hidden_activations_aos,
+        accum += (COMPUTE_T)scalar_load_storage(a->clipped_partial_grad_hidden_activations_aos,
                                      tile_base + local_off);
     }
 
@@ -66,7 +66,7 @@ void PREC_FN(task_stabilize_reduce_grad_h)(void* raw_args, uint task_index, uint
 
     if (M <= 1) {
         COMPUTE_T val = (M == 1)
-            ? scalar_load_storage(a->grad_hidden_activations_permuted_soa, row_offset)
+            ? (COMPUTE_T)scalar_load_storage(a->grad_hidden_activations_permuted_soa, row_offset)
             : (COMPUTE_T)0.0;
         a->summed_grad_hidden_activations[row_idx] = val;
         return;
@@ -214,7 +214,7 @@ static void PREC_FN(task_reduce_staging)(void* raw_args, uint task_index, uint t
 
     /* Accumulate from sources */
     const uint* offsets = a->offset_list + (size_t)task_index * a->fan_in;
-    COMPUTE_T* accum = (COMPUTE_T*)alloca(pw * sizeof(COMPUTE_T));
+    COMPUTE_T accum[pw];
     for (uint e = 0; e < pw; e++) accum[e] = (COMPUTE_T)0.0;
 
     for (uint k = 0; k < a->fan_in; k++) {
@@ -222,7 +222,7 @@ static void PREC_FN(task_reduce_staging)(void* raw_args, uint task_index, uint t
         if (off == 0xFFFFFFFF) continue;
         const size_t src_base = (size_t)off;
         for (uint e = 0; e < pw; e++) {
-            accum[e] += scalar_load_storage(a->source, src_base + e);
+            accum[e] += (COMPUTE_T)scalar_load_storage(a->source, src_base + e);
         }
     }
 
@@ -262,7 +262,7 @@ static void PREC_FN(task_reduce_final)(void* raw_args, uint task_index, uint thr
         if (off == 0xFFFFFFFF) continue;
         const size_t src_base = (size_t)off;
         for (uint e = 0; e < pw; e++) {
-            dest[e] += scalar_load_storage(a->source, src_base + e);
+            dest[e] += (COMPUTE_T)scalar_load_storage(a->source, src_base + e);
         }
     }
 
@@ -381,7 +381,7 @@ static void PREC_FN(task_reduce_staging_from_compute)(void* raw_args, uint task_
 
     /* Accumulate from COMPUTE_T sources (no precision conversion) */
     const uint* offsets = a->offset_list + (size_t)task_index * a->fan_in;
-    COMPUTE_T* accum = (COMPUTE_T*)alloca(pw * sizeof(COMPUTE_T));
+    COMPUTE_T accum[pw];
     for (uint e = 0; e < pw; e++) accum[e] = (COMPUTE_T)0.0;
 
     for (uint k = 0; k < a->fan_in; k++) {

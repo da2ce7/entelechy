@@ -10,10 +10,11 @@
 #   2  No linting tools available
 #
 # Usage:
-#   scripts/lint-c.sh              # Run all available linters
-#   scripts/lint-c.sh --gcc-only   # GCC warnings only
-#   scripts/lint-c.sh --cppcheck   # cppcheck only
-#   scripts/lint-c.sh --clang-tidy # clang-tidy only
+#   scripts/lint-c.sh                   # Run all available linters
+#   scripts/lint-c.sh --gcc-only        # GCC warnings only
+#   scripts/lint-c.sh --cppcheck        # cppcheck only (normal speed)
+#   scripts/lint-c.sh --cppcheck-exhaustive  # cppcheck deep analysis (slow)
+#   scripts/lint-c.sh --clang-tidy      # clang-tidy only
 
 set -euo pipefail
 
@@ -104,7 +105,8 @@ run_cppcheck() {
         warn "cppcheck not found — skipping (pip install cppcheck)"
         return
     fi
-    header "cppcheck Static Analysis (exhaustive)"
+    local check_level="${1:-normal}"
+    header "cppcheck Static Analysis ($check_level)"
     TOOLS_RAN=$((TOOLS_RAN + 1))
 
     local supp_file="$ARCH_ROOT/cppcheck.supp"
@@ -114,31 +116,30 @@ run_cppcheck() {
     fi
 
     local cppcheck_args=(
-        --check-level=exhaustive
+        --check-level="$check_level"
         --enable=warning,style,performance,portability
-        --inconclusive
-        --force
         --std=c11
         --error-exitcode=1
         "${supp_arg[@]}"
         -I "$KERNEL_DIR"
         -DCPU_KERNELS_BUILDING
     )
-
-    # Use compile_commands.json if available for accurate flags
-    if [ -f "$BUILDDIR/compile_commands.json" ]; then
-        cppcheck_args+=(--project="$BUILDDIR/compile_commands.json")
-    else
-        cppcheck_args+=("${C_FILES[@]}")
+    # Only use --force and --inconclusive for exhaustive (--force checks all
+    # #ifdef configurations which is slow with many SIMD branches)
+    if [ "$check_level" = "exhaustive" ]; then
+        cppcheck_args+=(--force --inconclusive)
     fi
+
+    # Analyze only the specific C files (--project scans ALL files which is slow)
+    cppcheck_args+=("${C_FILES[@]}")
 
     local cpp_out
     if cpp_out=$(cppcheck "${cppcheck_args[@]}" 2>&1); then
         pass "cppcheck: no issues"
     else
-        # Filter informational messages
+        # Filter informational/progress messages, keep warnings and errors
         local filtered
-        filtered=$(echo "$cpp_out" | grep -v '^\(Checking\|^$\|information:\)' || true)
+        filtered=$(echo "$cpp_out" | grep -E ': (warning|error|style|performance|portability):' || true)
         if [ -n "$filtered" ]; then
             echo "$filtered"
             fail "cppcheck: issues found"
@@ -206,16 +207,17 @@ printf "Kernel dir: %s\n" "$KERNEL_DIR"
 
 case "$MODE" in
     --gcc-only)   run_gcc_lint ;;
-    --cppcheck)   run_cppcheck ;;
+    --cppcheck)   run_cppcheck normal ;;
+    --cppcheck-exhaustive) run_cppcheck exhaustive ;;
     --clang-tidy) run_clang_tidy ;;
     all)
         run_gcc_lint
-        run_cppcheck
+        run_cppcheck normal
         run_clang_tidy
         run_header_checks
         ;;
     *)
-        echo "Usage: $0 [--gcc-only|--cppcheck|--clang-tidy|all]"
+        echo "Usage: $0 [--gcc-only|--cppcheck|--cppcheck-exhaustive|--clang-tidy|all]"
         exit 2
         ;;
 esac

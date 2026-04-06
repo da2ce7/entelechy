@@ -381,7 +381,7 @@ def make_precision_types(
         ("batch_chunk_count", c_uint32),
         ("batch_chunk_index", c_uint32),
         ("total_batch_count", c_uint32),
-        ("num_batch_chunks_count", c_uint32),
+        ("num_batch_chunks", c_uint32),
         ("padded_input_count", c_uint32),
         ("padded_hidden_count", c_uint32),
         ("final_grad_hidden_total_element_count", c_uint32),
@@ -396,7 +396,7 @@ def make_precision_types(
         ("batch_chunk_count", c_uint32),
         ("batch_chunk_index", c_uint32),
         ("total_batch_count", c_uint32),
-        ("num_batch_chunks_count", c_uint32),
+        ("num_batch_chunks", c_uint32),
         ("padded_hidden_count", c_uint32),
         ("final_grad_hidden_total_element_count", c_uint32),
     ])

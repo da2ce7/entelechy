@@ -50,13 +50,14 @@ if get_option('aec_cpu_debug_asserts')
 endif
 
 # --- _Float16 detection for FP8+FP16 compute variants (ADR-025 §5.3) ---
-# The `2.0f16` literal suffix is C23-specific (_Float16 constant suffix).
-# This intentionally tests for C23-conforming _Float16 support, NOT Clang's
-# legacy __fp16 extension (which is a storage-only type without arithmetic).
-# GCC 12+ and Clang 15+ support _Float16 with -std=c2x.
+# Test for _Float16 arithmetic support using a cast (works with GCC 12+ extension
+# in C11/C17 mode, not just C23). This intentionally tests for _Float16 as an
+# arithmetic type, NOT Clang's legacy __fp16 extension (which is storage-only
+# and would fail on the multiplication). The cast syntax avoids requiring the
+# C23-specific `f16` literal suffix while still verifying arithmetic capability.
 has_float16 = cc.compiles('''
-    _Float16 test_float16(_Float16 x) { return x * 2.0f16; }
-''', name: '_Float16 support check', args: ['-std=c2x'])
+    _Float16 test_float16(_Float16 x) { return x * (_Float16)2.0; }
+''', name: '_Float16 support check')
 
 if has_float16
     message('_Float16 support detected — FP16 compute variants enabled')

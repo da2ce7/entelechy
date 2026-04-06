@@ -25,3 +25,6 @@ option('aec_cpu_isa_flags', type: 'array', value: [],
 
 option('aec_cpu_debug_asserts', type: 'boolean', value: false,
        description: 'Enable CPU kernel runtime assertions (bounds checks, NaN guards)')
+
+option('feature_ticket_api', type: 'boolean', value: true,
+       description: 'WorkTicket / Engine user-facing API (ADR-018) — enabled by default since Phase 11 complete')

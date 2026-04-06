@@ -35,7 +35,7 @@ void PREC_FN(task_backprop_to_hidden)(void* raw_args, uint task_index, uint thre
         + (size_t)batch_idx * a->padded_hidden_count + h_idx;
     const size_t out_idx = tile_base + local_off;
 
-    if (scalar_load_storage(a->sample_mask, batch_idx) < 0.5f) {
+    if ((COMPUTE_T)scalar_load_storage(a->sample_mask, batch_idx) < (COMPUTE_T)0.5) {
         scalar_store_storage(a->partial_grad_hidden_activations_aos, out_idx, 0.0f);
         return;
     }
@@ -56,7 +56,7 @@ void PREC_FN(task_backprop_to_hidden)(void* raw_args, uint task_index, uint thre
         const size_t prob_idx = prob_tile_base
             + (size_t)module_local_idx * a->total_batch_count * a->classes_per_chunk
             + (size_t)batch_idx * a->classes_per_chunk + c_local;
-        const COMPUTE_T prob = scalar_load_storage(a->partial_probs, prob_idx);
+        const COMPUTE_T prob = (COMPUTE_T)scalar_load_storage(a->partial_probs, prob_idx);
 
         COMPUTE_T d_loss_d_logit;
         if (a->problem_type == PROBLEM_TYPE_CCE) {
@@ -65,7 +65,7 @@ void PREC_FN(task_backprop_to_hidden)(void* raw_args, uint task_index, uint thre
                 ? (prob - (COMPUTE_T)1.0) : prob;
         } else {
             const STORAGE_T* targets_bce = (const STORAGE_T*)a->targets;
-            d_loss_d_logit = prob - scalar_load_storage(targets_bce,
+            d_loss_d_logit = prob - (COMPUTE_T)scalar_load_storage(targets_bce,
                 (size_t)batch_idx * a->padded_total_output_class_count + c_global);
         }
 
@@ -73,7 +73,7 @@ void PREC_FN(task_backprop_to_hidden)(void* raw_args, uint task_index, uint thre
             * a->padded_total_output_class_count
             + (size_t)h_idx * a->padded_total_output_class_count
             + c_global;
-        grad_h_accum += d_loss_d_logit * scalar_load_state(a->weights_module, w_idx);
+        grad_h_accum += d_loss_d_logit * (COMPUTE_T)scalar_load_state(a->weights_module, w_idx);
     }
 
     scalar_store_storage(a->partial_grad_hidden_activations_aos, out_idx, grad_h_accum);
@@ -101,7 +101,7 @@ void PREC_FN(task_temp_gradients)(void* raw_args, uint task_index, uint thread_i
     COMPUTE_T p_grad_sum = (COMPUTE_T)0.0;
 
     for (uint b = 0; b < a->total_batch_count; b++) {
-        if (scalar_load_storage(a->sample_mask, b) < 0.5f) continue;
+        if ((COMPUTE_T)scalar_load_storage(a->sample_mask, b) < (COMPUTE_T)0.5) continue;
 
         COMPUTE_T grad_for_sample = (COMPUTE_T)0.0;
         for (uint c_local = 0; c_local < a->classes_per_chunk; c_local++) {
@@ -111,7 +111,7 @@ void PREC_FN(task_temp_gradients)(void* raw_args, uint task_index, uint thread_i
             const size_t prob_idx = prob_tile_base
                 + (size_t)module_local_idx * a->total_batch_count * a->classes_per_chunk
                 + (size_t)b * a->classes_per_chunk + c_local;
-            const COMPUTE_T prob = scalar_load_storage(a->partial_probs, prob_idx);
+            const COMPUTE_T prob = (COMPUTE_T)scalar_load_storage(a->partial_probs, prob_idx);
 
             COMPUTE_T d_loss_d_logit;
             if (a->problem_type == PROBLEM_TYPE_CCE) {
@@ -120,7 +120,7 @@ void PREC_FN(task_temp_gradients)(void* raw_args, uint task_index, uint thread_i
                     ? (prob - (COMPUTE_T)1.0) : prob;
             } else {
                 const STORAGE_T* targets_bce = (const STORAGE_T*)a->targets;
-                d_loss_d_logit = prob - scalar_load_storage(targets_bce,
+                d_loss_d_logit = prob - (COMPUTE_T)scalar_load_storage(targets_bce,
                     (size_t)b * a->padded_total_output_class_count + c_global);
             }
 
@@ -128,12 +128,12 @@ void PREC_FN(task_temp_gradients)(void* raw_args, uint task_index, uint thread_i
                 * a->padded_total_output_class_count
                 + (size_t)b * a->padded_total_output_class_count
                 + c_global;
-            grad_for_sample += d_loss_d_logit * scalar_load_storage(a->logits, logit_idx);
+            grad_for_sample += d_loss_d_logit * (COMPUTE_T)scalar_load_storage(a->logits, logit_idx);
         }
         p_grad_sum += grad_for_sample;
     }
 
-    const COMPUTE_T temp = scalar_load_state(a->temps, module_global_idx);
+    const COMPUTE_T temp = (COMPUTE_T)scalar_load_state(a->temps, module_global_idx);
     const COMPUTE_T final_grad = p_grad_sum * (-(COMPUTE_T)1.0 / (temp * temp));
 
     const size_t out_idx = (size_t)a->flat_tile_index * a->modules_per_chunk

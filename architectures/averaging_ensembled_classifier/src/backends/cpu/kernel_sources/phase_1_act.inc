@@ -116,14 +116,14 @@ void PREC_FN(task_render_logits)(void* raw_args, uint task_index, uint thread_id
     /* Sparse dot product over hidden dimension */
     const size_t h_base = (size_t)batch_global * a->padded_hidden_count;
     for (uint h = 0; h < a->hidden_count; h++) {
-        const COMPUTE_T h_mask = scalar_load_storage(a->hidden_mask, h_base + h);
+        const COMPUTE_T h_mask = (COMPUTE_T)scalar_load_storage(a->hidden_mask, h_base + h);
         if (h_mask > (COMPUTE_T)0.5) {
-            const COMPUTE_T h_val = scalar_load_storage(a->hidden_activations, h_base + h);
+            const COMPUTE_T h_val = (COMPUTE_T)scalar_load_storage(a->hidden_activations, h_base + h);
             const size_t w_idx = (size_t)module_global * a->padded_hidden_count
                                    * a->padded_total_output_class_count
                                + (size_t)h * a->padded_total_output_class_count
                                + class_global;
-            logit += h_val * scalar_load_state(a->weights_module, w_idx);
+            logit += h_val * (COMPUTE_T)scalar_load_state(a->weights_module, w_idx);
         }
     }
 

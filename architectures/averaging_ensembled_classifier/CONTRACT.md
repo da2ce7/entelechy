@@ -165,7 +165,7 @@ This article defines fixed, system-wide constants that are contractually binding
 
 - `LOCAL_MEM_BANK_PADDING`: Defined with a mandatory value of **`1`**.
 
-`PrecisionConfig` is a frozen dataclass with three independent dtype fields — `storage_dtype`, `compute_dtype`, `state_dtype` — and five derived scalar constants: `storage_fp_format_max`, `storage_fp_min_positive`, `storage_mantissa_bits`, `compute_fp_format_max`, and `compute_epsilon`. The invariant `storage_dtype.itemsize ≤ compute_dtype.itemsize` and `storage_dtype.itemsize ≤ state_dtype.itemsize` is enforced by `__post_init__`. FP8 compute and FP8 state are architecturally prohibited and raise `ValueError` at construction time. Twelve factory classmethods are defined: `float32()` (all FP32), `mixed_f16_f32()` (FP16 storage, FP32 compute, FP32 state), `float64()` (all FP64), `mixed_f32_f64_state()` (FP32 storage, FP32 compute, FP64 state), `mixed_f16_f64_state()` (FP16 storage, FP32 compute, FP64 state), `mixed_f32_f64()` (FP32 storage, FP64 compute, FP64 state), `fp8_e4m3()` (E4M3 storage, FP32 compute, FP32 state), `fp8_e5m2()` (E5M2 storage, FP32 compute, FP32 state), `fp8_e4m3_f16()` (E4M3 storage, FP16 compute, FP32 state), `fp8_e5m2_f16()` (E5M2 storage, FP16 compute, FP32 state), `fp8_e4m3_f64()` (E4M3 storage, FP64 compute, FP64 state), `fp8_e5m2_f64()` (E5M2 storage, FP64 compute, FP64 state). Additional FP8 combinations (e.g., FP16 compute + FP64 state) are constructed directly. The state role has no ordering constraint relative to compute — `state_dtype.itemsize` may be greater than, equal to, or (when storage is narrower than state) less than `compute_dtype.itemsize`. The retired fields `numpy_dtype`, `fp_format_max`, and `epsilon` do not exist in this type. The uniform `float16()` factory (all FP16) was deleted in Phase 9A — use `mixed_f16_f32()` instead. Direct construction with `state_dtype=np.float16` remains valid.
+`PrecisionConfig` is a frozen dataclass with three independent dtype fields — `storage_dtype`, `compute_dtype`, `state_dtype` — and five derived scalar constants: `storage_fp_format_max`, `storage_fp_min_positive`, `storage_mantissa_bits`, `compute_fp_format_max`, and `compute_epsilon`. The invariant `storage_dtype.itemsize ≤ compute_dtype.itemsize` and `storage_dtype.itemsize ≤ state_dtype.itemsize` is enforced by `__post_init__`. FP8 compute and FP8 state are architecturally prohibited and raise `ValueError` at construction time. Twelve factory classmethods are defined: `float32()` (all FP32), `mixed_f16_f32()` (FP16 storage, FP32 compute, FP32 state), `float64()` (all FP64), `mixed_f32_f64_state()` (FP32 storage, FP32 compute, FP64 state), `mixed_f16_f64_state()` (FP16 storage, FP32 compute, FP64 state), `mixed_f32_f64()` (FP32 storage, FP64 compute, FP64 state), `fp8_e4m3()` (E4M3 storage, FP32 compute, FP32 state), `fp8_e5m2()` (E5M2 storage, FP32 compute, FP32 state), `fp8_e4m3_f16()` (E4M3 storage, FP16 compute, FP32 state), `fp8_e5m2_f16()` (E5M2 storage, FP16 compute, FP32 state), `fp8_e4m3_f64()` (E4M3 storage, FP64 compute, FP64 state), `fp8_e5m2_f64()` (E5M2 storage, FP64 compute, FP64 state). Additional FP8 combinations (e.g., FP16 compute + FP64 state) are constructed directly. The state role has no ordering constraint relative to compute — `state_dtype.itemsize` may be greater than, equal to, or (when storage is narrower than state) less than `compute_dtype.itemsize`. The retired fields `numpy_dtype`, `fp_format_max`, and `epsilon` do not exist in this type. The uniform `float16()` factory (all FP16) was deleted in Phase 9A — FP16 state provides insufficient mantissa for EMA stability (10 bits vs. FP32's 23); for β₁ = 0.999, the per-step gradient contribution 0.001 × g rounds to zero for small gradients. Use `mixed_f16_f32()` instead. Direct construction with `state_dtype=np.float16` remains valid for experimental use.
 
 ### **Article 6: Mandatory Build-Time Symbols**
 
@@ -363,10 +363,12 @@ _Generic terms for special cases._
 
 #### **3.0 Decomposition Strategy Primitives**
 
-| Term          | Definition                                                          |
-| :------------ | :------------------------------------------------------------------ |
-| `flat_tile`   | A unit of work from the flattening of a logical grid to a 1D index. |
-| `batch_chunk` | A contiguous 1D partition of the primary batch dimension.           |
+| Term           | Definition                                                              |
+| :------------- | :---------------------------------------------------------------------- |
+| `flat_tile`    | A unit of work from the flattening of a logical grid to a 1D index.     |
+| `batch_chunk`  | A contiguous 1D partition of the primary batch dimension.               |
+| `class_chunk`  | A contiguous 1D partition of the output class dimension.                |
+| `module_chunk` | A contiguous 1D partition of the module (classifier head) dimension.    |
 
 #### **4.0 Context Modifiers**
 
@@ -390,6 +392,7 @@ _Generic terms for special cases._
 | Suffix | `_t_pre`   | A value that initial pre-process stage of a multi-stage process (e.g., processing the leaf in a reduction tree layer).                                                   |
 | Suffix | `_t_j`     | A value that is dependent on the stage j of a multi-stage process (e.g., reduction tree layer).                                                                          |
 | Suffix | `_per_item` | Denotes a per-item parameterization of a scalar quantity, providing one value per logical work-item (tile) rather than a single global scalar.                           |
+| Suffix | `_per_chunk` | Denotes a per-chunk parameterization, providing one value per decomposition chunk rather than a single global scalar.                                                   |
 
 #### **5.0 Domain and Utility Primitives**
 
@@ -408,6 +411,9 @@ _Generic terms for special cases._
 | Constraint Value     | `min_value`                                  | Scalar Context | The inclusive minimum boundary for a value.                                                                                  |
 | Constraint Value     | `max_value`                                  | Scalar Context | The inclusive maximum boundary for a value.                                                                                  |
 | Constraint Value     | `clipping_threshold`                         | Data Role      | The maximum permissible L2 norm for gradient clipping.                                                                       |
+| Reduction Engine     | `fan_in`                                     | Topology       | The number of input partials consumed by a single reduction node (the K in K-fan-in).                                        |
+| Reduction Engine     | `node`                                       | Topology       | An independent unit of work in the reduction tree; each node aggregates K partials into one output.                          |
+| Reduction Engine     | `stage`                                      | Topology       | A level in the multi-stage reduction tree; stage 0 is the leaf layer, higher stages consume prior stage outputs.            |
 
 #### **6.0 Canonical Flag Identifiers**
 

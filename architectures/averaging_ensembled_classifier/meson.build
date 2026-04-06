@@ -14,6 +14,7 @@ py = import('python').find_installation()
 backend_vulkan = get_option('aec_backend_vulkan')
 backend_cpu    = get_option('aec_backend_cpu')
 backend_opencl = get_option('aec_backend_opencl')
+feature_ticket_api = get_option('feature_ticket_api')
 
 # --- Build-time configuration (ADR-014) ---
 configure_file(
@@ -23,6 +24,7 @@ configure_file(
     'BACKEND_OPENCL': backend_opencl.allowed() ? 'True' : 'False',
     'BACKEND_VULKAN': backend_vulkan.allowed() ? 'True' : 'False',
     'BACKEND_CPU':    backend_cpu.allowed() ? 'True' : 'False',
+    'FEATURE_TICKET_API': feature_ticket_api ? 'True' : 'False',
   }),
   install: true,
   install_dir: py.get_install_dir() / 'averaging_ensembled_classifier' / 'src',

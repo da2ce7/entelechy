@@ -22,7 +22,7 @@ __kernel void backprop_shared_weights_chunk(
     uint                         src_scalar_NATURAL_batch_chunk_count,
     uint                         src_scalar_NATURAL_batch_chunk_index,
     uint                         src_scalar_NATURAL_total_batch_count,
-    uint                         src_scalar_NATURAL_num_batch_chunks_count,
+    uint                         src_scalar_NATURAL_num_batch_chunks,
     uint                         src_scalar_NATURAL_padded_input_count,
     uint                         src_scalar_NATURAL_padded_hidden_count,
     uint                         src_scalar_NATURAL_final_grad_hidden_total_element_count) {
@@ -106,7 +106,7 @@ __kernel void backprop_shared_biases_chunk(
     uint                         src_scalar_NATURAL_batch_chunk_count,
     uint                         src_scalar_NATURAL_batch_chunk_index,
     uint                         src_scalar_NATURAL_total_batch_count,
-    uint                         src_scalar_NATURAL_num_batch_chunks_count,
+    uint                         src_scalar_NATURAL_num_batch_chunks,
     uint                         src_scalar_NATURAL_padded_hidden_count,
     uint                         src_scalar_NATURAL_final_grad_hidden_total_element_count) {
 

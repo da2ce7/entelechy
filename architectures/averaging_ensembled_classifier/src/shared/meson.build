@@ -2,14 +2,24 @@
 
 shared_sources = files(
   '__init__.py',
+  'buffer_lifecycle.py',
+  'engine.py',
+  'fp8_scaling.py',
   'hardware_profile.py',
   'memory_layout.py',
   'model_spec.py',
   'parameter_space.py',
+  'plan_builder.py',
+  'plan_renderer.py',
+  'plan_types.py',
   'precision_config.py',
   'precision_suffix.py',
   'problem_type_strategy.py',
+  'reduction_tree_plan.py',
+  'retrieval_future.py',
   'stabilization_policy.py',
+  'streaming_loop_plan.py',
+  'ticket.py',
   'workload_primitives.py',
 )
 

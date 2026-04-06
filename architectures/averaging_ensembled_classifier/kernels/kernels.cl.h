@@ -133,17 +133,17 @@
 // used anywhere in the kernel sources.
 
 // --- FP8 Storage Support (ADR-025 §4, §6) ---
-// Default FP8 flags to 0 when not provided by build system.
-// These are emitted by build_compiler_flags() for all precision configs;
-// the defaults are a safety net for standalone compilation.
-#ifndef STORAGE_TYPE_IS_FP8
-#define STORAGE_TYPE_IS_FP8 0
+// FP8 flags are mandatory build-time symbols provided by build_compiler_flags().
+// Consistent with the project's strict contract philosophy: explicit failures
+// over silent defaults.
+#if !defined(STORAGE_TYPE_IS_FP8)
+#error "System Contract Violation: STORAGE_TYPE_IS_FP8 must be defined by the build system."
 #endif
-#ifndef STORAGE_TYPE_IS_E4M3
-#define STORAGE_TYPE_IS_E4M3 0
+#if !defined(STORAGE_TYPE_IS_E4M3)
+#error "System Contract Violation: STORAGE_TYPE_IS_E4M3 must be defined by the build system."
 #endif
-#ifndef STORAGE_TYPE_IS_E5M2
-#define STORAGE_TYPE_IS_E5M2 0
+#if !defined(STORAGE_TYPE_IS_E5M2)
+#error "System Contract Violation: STORAGE_TYPE_IS_E5M2 must be defined by the build system."
 #endif
 
 // --- FP8 Conversion Tables (ADR-025 §6.1) ---
@@ -345,7 +345,9 @@ static inline void store_storage(
 #if STORAGE_TYPE_IS_FP8
     store_storage_fp8((__global uchar *)buf, idx, val);
 #elif STORAGE_TYPE_IS_HALF
-    vstore_half((half)val, idx, (__global half *)buf);
+    // vstore_half accepts float/double and performs round-to-nearest-even
+    // narrowing internally; no explicit (half) pre-cast is needed.
+    vstore_half(val, idx, (__global half *)buf);
 #else
     buf[idx] = (STORAGE_TYPE)val;
 #endif
@@ -399,8 +401,14 @@ static inline void store_state_update(
     // STATE_TYPE (double) > COMPUTE_TYPE (float or half)
     typedef double ACCUM_TYPE;
     #define ACCUM_IS_WIDER_THAN_COMPUTE 1
-    #define ACCUM_ONE  ((ACCUM_TYPE)1)
-    #define ACCUM_ZERO ((ACCUM_TYPE)0)
+    #define ACCUM_ONE  1.0
+    #define ACCUM_ZERO 0.0
+#elif !STATE_TYPE_IS_HALF && !STATE_TYPE_IS_DOUBLE && COMPUTE_TYPE_IS_HALF
+    // STATE_TYPE (float) > COMPUTE_TYPE (half) — float by exclusion
+    typedef STATE_TYPE ACCUM_TYPE;
+    #define ACCUM_IS_WIDER_THAN_COMPUTE 1
+    #define ACCUM_ONE  ((ACCUM_TYPE)1.0f)
+    #define ACCUM_ZERO ((ACCUM_TYPE)0.0f)
 #else
     // STATE_TYPE <= COMPUTE_TYPE (standard case)
     typedef COMPUTE_TYPE ACCUM_TYPE;
@@ -429,7 +437,9 @@ static inline ACCUM_TYPE load_state_for_accum(
 static inline void store_state_from_accum(
     __global STATE_TYPE *buf, size_t idx, ACCUM_TYPE val)
 {
-    buf[idx] = (STATE_TYPE)val;  // Identity or widening — never narrows
+    // Narrows to STATE_TYPE when ACCUM_TYPE > STATE_TYPE (acceptable:
+    // state role defines the fidelity contract for persistent values).
+    buf[idx] = (STATE_TYPE)val;
 }
 
 // Widen compute-role value to accumulation precision (for EMA inputs)
@@ -762,7 +772,7 @@ __kernel void render_logits_chunk(
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Behavioral Invariants: "The implementation is a fused, indivisible unit for numerically stable Softmax calculation. Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; partial_probs narrowed via store_storage(); final_loss written directly in COMPUTE_TYPE (no narrowing). All arithmetic exclusively in COMPUTE_TYPE."
- *        - Idempotency: "Associatively Non-Idempotent"
+ *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Partial Renderer for probabilities output."
  *        - Kernel Bifurcation: "CONCEPT.md Principle 3(B) — separate kernel required due to incompatible type signatures,
  *          memory layouts, and DAG topology vs. Node 7 (BCE path). CONTRACT §7.0 Exception applies."
@@ -1828,13 +1838,13 @@ __kernel void backprop_shared_weights_chunk(
 
     /**
      * @param dest_buffer_GLOBAL_partial_grad_weights_shared The collection buffer for this chunk's computed weight gradients.
-     *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks_count, src_scalar_NATURAL_padded_input_count, src_scalar_NATURAL_padded_hidden_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_input_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "storage"
-     *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks_count, src_scalar_NATURAL_padded_input_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_input_count, src_scalar_NATURAL_padded_hidden_count]
      *        - Placement Contract: linear_batch(src_scalar_NATURAL_batch_chunk_index)
-     *        - Validation Preconditions: [1] The write chunk index must be valid, as proven by: src_scalar_NATURAL_batch_chunk_index < src_scalar_NATURAL_num_batch_chunks_count. [2] Host shall
-     * allocate exactly [src_scalar_NATURAL_num_batch_chunks_count * src_scalar_NATURAL_padded_input_count * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes.
+     *        - Validation Preconditions: [1] The write chunk index must be valid, as proven by: src_scalar_NATURAL_batch_chunk_index < src_scalar_NATURAL_num_batch_chunks. [2] Host shall
+     * allocate exactly [src_scalar_NATURAL_num_batch_chunks * src_scalar_NATURAL_padded_input_count * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes.
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_partial_grad_weights_shared,
 
@@ -1842,7 +1852,7 @@ __kernel void backprop_shared_weights_chunk(
     uint src_scalar_NATURAL_batch_chunk_count,
     uint src_scalar_NATURAL_batch_chunk_index,
     uint src_scalar_NATURAL_total_batch_count,
-    uint src_scalar_NATURAL_num_batch_chunks_count,
+    uint src_scalar_NATURAL_num_batch_chunks,
     uint src_scalar_NATURAL_padded_input_count,
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_final_grad_hidden_total_element_count);
@@ -1902,13 +1912,13 @@ __kernel void backprop_shared_biases_chunk(
 
     /**
      * @param dest_buffer_GLOBAL_partial_grad_biases_shared The collection buffer for this chunk's computed bias gradients.
-     *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks_count, src_scalar_NATURAL_padded_hidden_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "storage"
-     *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_hidden_count]
      *        - Placement Contract: linear_batch(src_scalar_NATURAL_batch_chunk_index)
-     *        - Validation Preconditions: [1] The write chunk index must be valid, as proven by: src_scalar_NATURAL_batch_chunk_index < src_scalar_NATURAL_num_batch_chunks_count. [2] Host shall
-     * allocate exactly [src_scalar_NATURAL_num_batch_chunks_count * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes.
+     *        - Validation Preconditions: [1] The write chunk index must be valid, as proven by: src_scalar_NATURAL_batch_chunk_index < src_scalar_NATURAL_num_batch_chunks. [2] Host shall
+     * allocate exactly [src_scalar_NATURAL_num_batch_chunks * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes.
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_partial_grad_biases_shared,
 
@@ -1916,7 +1926,7 @@ __kernel void backprop_shared_biases_chunk(
     uint src_scalar_NATURAL_batch_chunk_count,
     uint src_scalar_NATURAL_batch_chunk_index,
     uint src_scalar_NATURAL_total_batch_count,
-    uint src_scalar_NATURAL_num_batch_chunks_count,
+    uint src_scalar_NATURAL_num_batch_chunks,
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_final_grad_hidden_total_element_count);
 
@@ -2061,8 +2071,7 @@ __kernel void normalize_gradients(
  * @brief (Node 24) Applies Adam optimizer update to an entire parameter group. Single dispatch.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction
- * terms (`beta1_pow_t`, `beta2_pow_t`) to ensure long-term numerical stability. Precision Boundary Conversion: state-role moment and parameter buffers accessed via load_state()/store_state_update(); gradient consumed directly in COMPUTE_TYPE. EMA arithmetic exclusively in COMPUTE_TYPE."
+ *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction terms (`beta1_pow_t`, `beta2_pow_t`) to ensure long-term numerical stability. State-Precision Accumulation: EMA updates on m1 and m2 use ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Moment vectors loaded via load_state_for_accum(); gradients widened via widen_to_accum(); EMA arithmetic in ACCUM_TYPE; results stored via store_state_from_accum(). Bias-corrected values and the final parameter update delta are transformative operations using COMPUTE_TYPE (narrowed via narrow_from_accum()). Parameter buffer subtraction is accumulative in ACCUM_TYPE."
  *        - Idempotency: "Fundamentally Non-Idempotent (Stateful). Modifies multiple state buffers in-place."
  *        - Synchronization Model: "Stateful Optimizer Update. Consumes final gradients after the Batch Synchronization Point."
  */
@@ -2233,11 +2242,11 @@ __kernel void reduce_k_fan_in_and_clip(
     uint src_scalar_NATURAL_partial_width,
 
     /**
-     * @param src_scalar_REAL_clipping_threshold The clipping threshold for this stage.
+     * @param src_scalar_REAL_clipping_threshold_t_j The clipping threshold for this stage j.
      *        Value 0.0 disables clip (diagnostic mode).
      *        - Validation Preconditions: Must be >= 0.0.
      */
-    COMPUTE_TYPE src_scalar_REAL_clipping_threshold,
+    COMPUTE_TYPE src_scalar_REAL_clipping_threshold_t_j,
 
     /**
      * @param src_scalar_REAL_epsilon Small constant to prevent division by zero.
@@ -2340,11 +2349,11 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
     uint src_scalar_NATURAL_partial_width,
 
     /**
-     * @param src_scalar_REAL_clipping_threshold The clipping threshold for this stage.
+     * @param src_scalar_REAL_clipping_threshold_t_j The clipping threshold for this stage j.
      *        Value 0.0 disables clip (diagnostic mode).
      *        - Validation Preconditions: Must be >= 0.0.
      */
-    COMPUTE_TYPE src_scalar_REAL_clipping_threshold,
+    COMPUTE_TYPE src_scalar_REAL_clipping_threshold_t_j,
 
     /**
      * @param src_scalar_REAL_epsilon Small constant to prevent division by zero.
