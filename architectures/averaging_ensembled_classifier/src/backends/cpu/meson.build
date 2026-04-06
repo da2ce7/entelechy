@@ -49,6 +49,23 @@ if get_option('aec_cpu_debug_asserts')
     cpu_c_args += ['-DCPU_DEBUG_ASSERTS=1']
 endif
 
+# --- _Float16 detection for FP8+FP16 compute variants (ADR-025 §5.3) ---
+# The `2.0f16` literal suffix is C23-specific (_Float16 constant suffix).
+# This intentionally tests for C23-conforming _Float16 support, NOT Clang's
+# legacy __fp16 extension (which is a storage-only type without arithmetic).
+# GCC 12+ and Clang 15+ support _Float16 with -std=c2x.
+has_float16 = cc.compiles('''
+    _Float16 test_float16(_Float16 x) { return x * 2.0f16; }
+''', name: '_Float16 support check', args: ['-std=c2x'])
+
+if has_float16
+    message('_Float16 support detected — FP16 compute variants enabled')
+    cpu_c_args += ['-DHAS_FLOAT16=1']
+else
+    warning('_Float16 not supported — FP16 compute variants will be skipped')
+    cpu_c_args += ['-DHAS_FLOAT16=0']
+endif
+
 # --- Shared library target ---
 # Symbol visibility:
 #   Unix:    gnu_symbol_visibility='hidden' + CPU_KERNELS_EXPORT attribute
@@ -87,6 +104,8 @@ py.install_sources(
 # Install C kernel sources for JIT compilation on Linux/macOS
 cpu_kernel_headers_and_sources = files(
     'kernel_sources/cpu_export.h',
+    'kernel_sources/cpu_fp8.h',
+    'kernel_sources/cpu_fp8_lut.gen.h',
     'kernel_sources/cpu_kernels.c',
     'kernel_sources/cpu_kernels.h',
     'kernel_sources/cpu_precision.h',
@@ -104,4 +123,43 @@ cpu_kernel_headers_and_sources = files(
 install_data(
     cpu_kernel_headers_and_sources,
     install_dir: py.get_install_dir() / 'averaging_ensembled_classifier' / 'backends' / 'cpu' / 'kernel_sources',
+)
+
+# --- Generate _fp8_variants.py — records which FP8 variants were compiled ---
+# (ADR-025 §5.3, Step 9C.4.1)
+fp8_all_suffixes = [
+    's8e4c32x32', 's8e4c32x64', 's8e4c64x64',
+    's8e5c32x32', 's8e5c32x64', 's8e5c64x64',
+]
+fp8_c16_suffixes = [
+    's8e4c16x32', 's8e4c16x64',
+    's8e5c16x32', 's8e5c16x64',
+]
+
+if has_float16
+    fp8_all_suffixes += fp8_c16_suffixes
+endif
+
+# Build the list string for Python
+fp8_list_str = ''
+fp8_sep = ''
+foreach v : fp8_all_suffixes
+    fp8_list_str += fp8_sep + '"' + v + '"'
+    fp8_sep = ', '
+endforeach
+
+fp8_conf_data = configuration_data()
+fp8_conf_data.set('AVAILABLE_FP8_VARIANTS', '[' + fp8_list_str + ']')
+if has_float16
+    fp8_conf_data.set('HAS_FLOAT16', 'True')
+else
+    fp8_conf_data.set('HAS_FLOAT16', 'False')
+endif
+
+configure_file(
+    input: '_fp8_variants.py.in',
+    output: '_fp8_variants.py',
+    configuration: fp8_conf_data,
+    install: true,
+    install_dir: py.get_install_dir() / 'averaging_ensembled_classifier' / 'backends' / 'cpu',
 )

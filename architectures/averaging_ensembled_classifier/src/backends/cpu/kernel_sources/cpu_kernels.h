@@ -9,6 +9,7 @@
 #define CPU_KERNELS_H
 
 #include "cpu_simd.h"
+#include "cpu_fp8.h"
 #include "cpu_threads.h"
 #include "cpu_export.h"
 
@@ -376,6 +377,30 @@ DECLARE_PRECISION_STRUCTS(s32c64x32, float,    double, float)
 DECLARE_PRECISION_STRUCTS(s32c64x64, float,    double, double)
 DECLARE_PRECISION_STRUCTS(s64c64x64, double,   double, double)
 
+/* FP8 E4M3 storage variants with FP32/FP64 compute (ADR-025 §5.3) */
+DECLARE_PRECISION_STRUCTS(s8e4c32x32, cpu_fp8_e4m3, float,  float)
+DECLARE_PRECISION_STRUCTS(s8e4c32x64, cpu_fp8_e4m3, float,  double)
+DECLARE_PRECISION_STRUCTS(s8e4c64x64, cpu_fp8_e4m3, double, double)
+
+/* FP8 E5M2 storage variants with FP32/FP64 compute */
+DECLARE_PRECISION_STRUCTS(s8e5c32x32, cpu_fp8_e5m2, float,  float)
+DECLARE_PRECISION_STRUCTS(s8e5c32x64, cpu_fp8_e5m2, float,  double)
+DECLARE_PRECISION_STRUCTS(s8e5c64x64, cpu_fp8_e5m2, double, double)
+
+/* FP8 storage variants with FP16 compute — requires _Float16.
+ * Guarded by HAS_FLOAT16 (emitted by Meson — see Step 9C.4).
+ * The Meson build also skips c16 variant compilation when _Float16 is unavailable.
+ */
+#if defined(HAS_FLOAT16) && HAS_FLOAT16
+/* FP8 E4M3 storage variants with FP16 compute */
+DECLARE_PRECISION_STRUCTS(s8e4c16x32, cpu_fp8_e4m3, _Float16, float)
+DECLARE_PRECISION_STRUCTS(s8e4c16x64, cpu_fp8_e4m3, _Float16, double)
+
+/* FP8 E5M2 storage variants with FP16 compute */
+DECLARE_PRECISION_STRUCTS(s8e5c16x32, cpu_fp8_e5m2, _Float16, float)
+DECLARE_PRECISION_STRUCTS(s8e5c16x64, cpu_fp8_e5m2, _Float16, double)
+#endif /* HAS_FLOAT16 */
+
 /* ================================================================
  * Task Function Declarations — macro-generated per precision
  * Uniform signature: void*, uint, uint
@@ -463,6 +488,22 @@ DECLARE_PRECISION_FUNCTIONS(s32c32x64)
 DECLARE_PRECISION_FUNCTIONS(s32c64x32)
 DECLARE_PRECISION_FUNCTIONS(s32c64x64)
 DECLARE_PRECISION_FUNCTIONS(s64c64x64)
+
+/* FP8 E4M3/E5M2 variants with FP32/FP64 compute (ADR-025 §5.3) */
+DECLARE_PRECISION_FUNCTIONS(s8e4c32x32)
+DECLARE_PRECISION_FUNCTIONS(s8e4c32x64)
+DECLARE_PRECISION_FUNCTIONS(s8e4c64x64)
+DECLARE_PRECISION_FUNCTIONS(s8e5c32x32)
+DECLARE_PRECISION_FUNCTIONS(s8e5c32x64)
+DECLARE_PRECISION_FUNCTIONS(s8e5c64x64)
+
+/* FP8 variants with FP16 compute — requires _Float16 */
+#if defined(HAS_FLOAT16) && HAS_FLOAT16
+DECLARE_PRECISION_FUNCTIONS(s8e4c16x32)
+DECLARE_PRECISION_FUNCTIONS(s8e4c16x64)
+DECLARE_PRECISION_FUNCTIONS(s8e5c16x32)
+DECLARE_PRECISION_FUNCTIONS(s8e5c16x64)
+#endif /* HAS_FLOAT16 */
 
 /* ================================================================
  * Precision-agnostic exports

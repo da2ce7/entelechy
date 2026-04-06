@@ -1,6 +1,6 @@
 # CPU Back-End: Architecture for SIMD + Multi-Core
 
-> **Implementation Status: ✅ Complete** — Phase 3 implemented; Phase 7 mixed-precision migration complete. All components described in this document have been realized in `src/backends/cpu/` (10 Python modules, 6 C source files, 5 C headers) with a full Tier 2 test suite (17 test modules in `tests/tier2/cpu/`). The Meson `shared_library('cpu_kernels', ...)` build target produces `libcpu_kernels.so` with three precision-variant instantiations (`s32x32`, `s16x16`, `s16x32`) via the two-axis `STORAGE_T`/`STATE_T` macro system (ADR-023). See [PHASE-3A](plan/PHASE-3A-CPU-KERNEL-LIBRARY-AND-BUILD.md), [PHASE-3B](plan/PHASE-3B-CPU-FFI-AND-RENDERER.md), [PHASE-3C](plan/PHASE-3C-CPU-TIER2-TESTS.md) for base implementation and [PHASE-7C](plan/PHASE-7C-MIXED-PRECISION-CPU-VULKAN-AND-FINAL.md) for the precision migration.
+> **Implementation Status: ✅ Complete** — Phase 3 implemented; Phase 7 mixed-precision migration complete; Phase 9C FP8 CPU backend complete. All components described in this document have been realized in `src/backends/cpu/` (10 Python modules + 1 generated module, 2 C source files, 7 C headers) with a full Tier 2 test suite (19 test modules in `tests/tier2/cpu/`). The Meson `shared_library('cpu_kernels', ...)` build target produces `libcpu_kernels.so` with up to 25 precision-variant instantiations via the three-axis `STORAGE_T`/`COMPUTE_T`/`STATE_T` macro system (ADR-023, ADR-025): 15 FP16/FP32/FP64 variants (unconditional), 6 FP8 E4M3/E5M2 variants with FP32/FP64 compute (unconditional), and 4 FP8 variants with FP16 compute (conditional on `_Float16` availability). See [PHASE-3A](plan/PHASE-3A-CPU-KERNEL-LIBRARY-AND-BUILD.md), [PHASE-3B](plan/PHASE-3B-CPU-FFI-AND-RENDERER.md), [PHASE-3C](plan/PHASE-3C-CPU-TIER2-TESTS.md) for base implementation, [PHASE-7C](plan/PHASE-7C-MIXED-PRECISION-CPU-VULKAN-AND-FINAL.md) for the precision migration, and [PHASE-9C](plan/PHASE-9C-FP8-CPU-BACKEND.md) for FP8 support.
 
 ## Design Constraints
 
@@ -652,6 +652,74 @@ The C library exposes both entry points per precision suffix (`s32x32`, `s16x16`
 | `execute_reduction_tree_from_compute_<suffix>` | `COMPUTE_TYPE* partial_collection` |
 
 Both share identical algorithm, clipping logic, and output type (`COMPUTE_TYPE`). The divergence is exactly one parameter's C type.
+
+---
+
+## FP8 Support (Phase 9C, ADR-025)
+
+The CPU backend supports FP8 E4M3 (`float8_e4m3fn`) and FP8 E5M2 (`float8_e5m2`) as storage-only types. FP8 values never participate directly in arithmetic — they are widened to compute precision on load and narrowed back on store.
+
+### FP8 Type Representation
+
+FP8 values are wrapped in C structs to prevent accidental arithmetic on raw bits:
+
+```c
+// cpu_fp8.h
+typedef struct { uint8_t bits; } cpu_fp8_e4m3;  // 1+4+3, bias=7, max=448.0
+typedef struct { uint8_t bits; } cpu_fp8_e5m2;  // 1+5+2, bias=15, max=57344.0
+```
+
+**E4M3** (`float8_e4m3fn`): No infinity. Two NaN patterns (0x7F, 0xFF). Overflow saturates to ±448.0.
+**E5M2** (`float8_e5m2`): IEEE-like infinity/NaN at exponent 0x1F. Overflow saturates to ±57344.0 (max finite).
+
+### Conversion Strategy
+
+- **FP8 → float (decode):** LUT-based. Two 256-entry lookup tables (`cpu_fp8_e4m3_to_float_lut`, `cpu_fp8_e5m2_to_float_lut`) generated at build time by Phase 9A. Single table lookup per value.
+- **float → FP8 (encode):** Algorithmic with round-to-nearest-even (RTE). Handles NaN→zero, overflow→saturation, subnormal rounding. Approximately 15 integer operations per conversion.
+- **double → FP8:** Clamps to float range first, then delegates to the float→FP8 encoder.
+- **_Float16 → FP8 / FP8 → _Float16:** Conditionally compiled when `HAS_FLOAT16=1` (detected by Meson at configure time).
+
+### SIMD Dispatch
+
+No CPU architecture has native FP8 SIMD instructions. The SIMD load/store wrappers (`simd_load_real_fp8e4m3`, `simd_store_real_fp8e4m3`, etc.) perform element-wise scalar conversion in a loop:
+
+```c
+// Scalar loop through SIMD_WIDTH elements:
+//   load:  fp8[i] → LUT → float → simd_lane[i]
+//   store: simd_lane[i] → encode → fp8[i]
+```
+
+This is the correct baseline — AVX-512 has no FP8 instructions, so scalar-loop conversion is architecturally required. Future ISAs with native FP8 support would add new branches to the `#ifdef` chain in `cpu_fp8.h`.
+
+### FP8 Precision Suffix Variants
+
+FP8 introduces 10 new three-axis suffix variants (ADR-025 §5.3):
+
+| Suffix | Storage | Compute | State | Condition |
+| :--- | :--- | :--- | :--- | :--- |
+| `s8e4c32x32` | E4M3 | FP32 | FP32 | Always |
+| `s8e4c32x64` | E4M3 | FP32 | FP64 | Always |
+| `s8e4c64x64` | E4M3 | FP64 | FP64 | Always |
+| `s8e5c32x32` | E5M2 | FP32 | FP32 | Always |
+| `s8e5c32x64` | E5M2 | FP32 | FP64 | Always |
+| `s8e5c64x64` | E5M2 | FP64 | FP64 | Always |
+| `s8e4c16x32` | E4M3 | FP16 | FP32 | `_Float16` available |
+| `s8e4c16x64` | E4M3 | FP16 | FP64 | `_Float16` available |
+| `s8e5c16x32` | E5M2 | FP16 | FP32 | `_Float16` available |
+| `s8e5c16x64` | E5M2 | FP16 | FP64 | `_Float16` available |
+
+The 6 FP32/FP64 compute variants are always compiled. The 4 FP16 compute variants are conditional on `_Float16` support (C23 / GCC 12+ / Clang 15+ with `-std=c2x`), detected at Meson configure time via `cc.compiles()`.
+
+### `_Float16` Availability
+
+`_Float16` detection is the single source of truth for FP16 compute availability:
+
+1. **Meson detects** `_Float16` support via `cc.compiles('_Float16 x = 1.0f16; x = x * 2.0f16;', args: ['-std=c2x'])`
+2. **C flag:** `-DHAS_FLOAT16=1` or `-DHAS_FLOAT16=0` passed to all kernel source compilation
+3. **Generated Python:** `_fp8_variants.py` (from `_fp8_variants.py.in`) exposes `HAS_FLOAT16: bool` and `AVAILABLE_FP8_VARIANTS: list[str]` to the Python FFI layer
+4. **Runtime:** `_ffi_types.py` imports `_fp8_variants` to conditionally include the 4 FP16 compute suffixes in `ALL_PRECISION_SUFFIXES`
+
+**Cross-backend note:** A `PrecisionConfig` like `fp8_e4m3_f16()` (E4M3 storage, FP16 compute) may work on OpenCL/Vulkan but fail on CPU if the C compiler lacks `_Float16` support. The CPU backend gracefully omits these variants rather than failing at build time.
 
 ---
 

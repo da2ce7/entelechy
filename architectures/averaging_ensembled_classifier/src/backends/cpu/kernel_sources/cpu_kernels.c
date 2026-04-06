@@ -391,6 +391,296 @@
 #pragma GCC diagnostic pop
 
 /* ================================================================
+ * FP8 E4M3 storage variants (ADR-025 §5.3)
+ *
+ * Storage type is cpu_fp8_e4m3 (struct { uint8_t bits; }).
+ * SIMD load/store dispatch goes through scalar-loop wrappers
+ * defined in cpu_fp8.h (no native FP8 SIMD instructions).
+ * ================================================================ */
+
+/* --- storage=8e4m3, compute=32 ----------------------------------------- */
+
+/* s8e4c32x32: E4M3 storage, FP32 compute, FP32 state */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-conversion"
+#define STORAGE_T        cpu_fp8_e4m3
+#define STORAGE_SUFFIX   fp8e4m3
+#define COMPUTE_T        float
+#define COMPUTE_SUFFIX   fp32
+#define STATE_T          float
+#define STATE_SUFFIX     fp32
+#define PRECISION_SUFFIX s8e4c32x32
+#include "cpu_precision.h"
+#include "phase_1_act.inc"
+#include "phase_2_learn_A_production.inc"
+#include "phase_2_learn_B_processing.inc"
+#include "phase_2_learn_C_reduction.inc"
+#include "phase_2_learn_D_backprop.inc"
+#include "phase_3_update.inc"
+#undef STORAGE_T
+#undef STORAGE_SUFFIX
+#undef COMPUTE_T
+#undef COMPUTE_SUFFIX
+#undef STATE_T
+#undef STATE_SUFFIX
+#undef PRECISION_SUFFIX
+#pragma GCC diagnostic pop
+
+/* s8e4c32x64: E4M3 storage, FP32 compute, FP64 state */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-conversion"
+#define STORAGE_T        cpu_fp8_e4m3
+#define STORAGE_SUFFIX   fp8e4m3
+#define COMPUTE_T        float
+#define COMPUTE_SUFFIX   fp32
+#define STATE_T          double
+#define STATE_SUFFIX     fp64
+#define PRECISION_SUFFIX s8e4c32x64
+#include "cpu_precision.h"
+#include "phase_1_act.inc"
+#include "phase_2_learn_A_production.inc"
+#include "phase_2_learn_B_processing.inc"
+#include "phase_2_learn_C_reduction.inc"
+#include "phase_2_learn_D_backprop.inc"
+#include "phase_3_update.inc"
+#undef STORAGE_T
+#undef STORAGE_SUFFIX
+#undef COMPUTE_T
+#undef COMPUTE_SUFFIX
+#undef STATE_T
+#undef STATE_SUFFIX
+#undef PRECISION_SUFFIX
+#pragma GCC diagnostic pop
+
+/* --- storage=8e4m3, compute=64 ----------------------------------------- */
+
+/* s8e4c64x64: E4M3 storage, FP64 compute, FP64 state */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-conversion"
+#define STORAGE_T        cpu_fp8_e4m3
+#define STORAGE_SUFFIX   fp8e4m3
+#define COMPUTE_T        double
+#define COMPUTE_SUFFIX   fp64
+#define STATE_T          double
+#define STATE_SUFFIX     fp64
+#define PRECISION_SUFFIX s8e4c64x64
+#include "cpu_precision.h"
+#include "phase_1_act.inc"
+#include "phase_2_learn_A_production.inc"
+#include "phase_2_learn_B_processing.inc"
+#include "phase_2_learn_C_reduction.inc"
+#include "phase_2_learn_D_backprop.inc"
+#include "phase_3_update.inc"
+#undef STORAGE_T
+#undef STORAGE_SUFFIX
+#undef COMPUTE_T
+#undef COMPUTE_SUFFIX
+#undef STATE_T
+#undef STATE_SUFFIX
+#undef PRECISION_SUFFIX
+#pragma GCC diagnostic pop
+
+/* ================================================================
+ * FP8 E5M2 storage variants (ADR-025 §5.3)
+ * ================================================================ */
+
+/* --- storage=8e5m2, compute=32 ----------------------------------------- */
+
+/* s8e5c32x32: E5M2 storage, FP32 compute, FP32 state */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-conversion"
+#define STORAGE_T        cpu_fp8_e5m2
+#define STORAGE_SUFFIX   fp8e5m2
+#define COMPUTE_T        float
+#define COMPUTE_SUFFIX   fp32
+#define STATE_T          float
+#define STATE_SUFFIX     fp32
+#define PRECISION_SUFFIX s8e5c32x32
+#include "cpu_precision.h"
+#include "phase_1_act.inc"
+#include "phase_2_learn_A_production.inc"
+#include "phase_2_learn_B_processing.inc"
+#include "phase_2_learn_C_reduction.inc"
+#include "phase_2_learn_D_backprop.inc"
+#include "phase_3_update.inc"
+#undef STORAGE_T
+#undef STORAGE_SUFFIX
+#undef COMPUTE_T
+#undef COMPUTE_SUFFIX
+#undef STATE_T
+#undef STATE_SUFFIX
+#undef PRECISION_SUFFIX
+#pragma GCC diagnostic pop
+
+/* s8e5c32x64: E5M2 storage, FP32 compute, FP64 state */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-conversion"
+#define STORAGE_T        cpu_fp8_e5m2
+#define STORAGE_SUFFIX   fp8e5m2
+#define COMPUTE_T        float
+#define COMPUTE_SUFFIX   fp32
+#define STATE_T          double
+#define STATE_SUFFIX     fp64
+#define PRECISION_SUFFIX s8e5c32x64
+#include "cpu_precision.h"
+#include "phase_1_act.inc"
+#include "phase_2_learn_A_production.inc"
+#include "phase_2_learn_B_processing.inc"
+#include "phase_2_learn_C_reduction.inc"
+#include "phase_2_learn_D_backprop.inc"
+#include "phase_3_update.inc"
+#undef STORAGE_T
+#undef STORAGE_SUFFIX
+#undef COMPUTE_T
+#undef COMPUTE_SUFFIX
+#undef STATE_T
+#undef STATE_SUFFIX
+#undef PRECISION_SUFFIX
+#pragma GCC diagnostic pop
+
+/* --- storage=8e5m2, compute=64 ----------------------------------------- */
+
+/* s8e5c64x64: E5M2 storage, FP64 compute, FP64 state */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-conversion"
+#define STORAGE_T        cpu_fp8_e5m2
+#define STORAGE_SUFFIX   fp8e5m2
+#define COMPUTE_T        double
+#define COMPUTE_SUFFIX   fp64
+#define STATE_T          double
+#define STATE_SUFFIX     fp64
+#define PRECISION_SUFFIX s8e5c64x64
+#include "cpu_precision.h"
+#include "phase_1_act.inc"
+#include "phase_2_learn_A_production.inc"
+#include "phase_2_learn_B_processing.inc"
+#include "phase_2_learn_C_reduction.inc"
+#include "phase_2_learn_D_backprop.inc"
+#include "phase_3_update.inc"
+#undef STORAGE_T
+#undef STORAGE_SUFFIX
+#undef COMPUTE_T
+#undef COMPUTE_SUFFIX
+#undef STATE_T
+#undef STATE_SUFFIX
+#undef PRECISION_SUFFIX
+#pragma GCC diagnostic pop
+
+/* ================================================================
+ * FP8 variants with FP16 compute — requires _Float16 (ADR-025 §5.3)
+ *
+ * Guarded by HAS_FLOAT16 (emitted by Meson -DHAS_FLOAT16=1).
+ * ================================================================ */
+
+#if defined(HAS_FLOAT16) && HAS_FLOAT16
+
+/* s8e4c16x32: E4M3 storage, FP16 compute, FP32 state */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-conversion"
+#define STORAGE_T        cpu_fp8_e4m3
+#define STORAGE_SUFFIX   fp8e4m3
+#define COMPUTE_T        _Float16
+#define COMPUTE_SUFFIX   fp16
+#define STATE_T          float
+#define STATE_SUFFIX     fp32
+#define PRECISION_SUFFIX s8e4c16x32
+#include "cpu_precision.h"
+#include "phase_1_act.inc"
+#include "phase_2_learn_A_production.inc"
+#include "phase_2_learn_B_processing.inc"
+#include "phase_2_learn_C_reduction.inc"
+#include "phase_2_learn_D_backprop.inc"
+#include "phase_3_update.inc"
+#undef STORAGE_T
+#undef STORAGE_SUFFIX
+#undef COMPUTE_T
+#undef COMPUTE_SUFFIX
+#undef STATE_T
+#undef STATE_SUFFIX
+#undef PRECISION_SUFFIX
+#pragma GCC diagnostic pop
+
+/* s8e4c16x64: E4M3 storage, FP16 compute, FP64 state */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-conversion"
+#define STORAGE_T        cpu_fp8_e4m3
+#define STORAGE_SUFFIX   fp8e4m3
+#define COMPUTE_T        _Float16
+#define COMPUTE_SUFFIX   fp16
+#define STATE_T          double
+#define STATE_SUFFIX     fp64
+#define PRECISION_SUFFIX s8e4c16x64
+#include "cpu_precision.h"
+#include "phase_1_act.inc"
+#include "phase_2_learn_A_production.inc"
+#include "phase_2_learn_B_processing.inc"
+#include "phase_2_learn_C_reduction.inc"
+#include "phase_2_learn_D_backprop.inc"
+#include "phase_3_update.inc"
+#undef STORAGE_T
+#undef STORAGE_SUFFIX
+#undef COMPUTE_T
+#undef COMPUTE_SUFFIX
+#undef STATE_T
+#undef STATE_SUFFIX
+#undef PRECISION_SUFFIX
+#pragma GCC diagnostic pop
+
+/* s8e5c16x32: E5M2 storage, FP16 compute, FP32 state */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-conversion"
+#define STORAGE_T        cpu_fp8_e5m2
+#define STORAGE_SUFFIX   fp8e5m2
+#define COMPUTE_T        _Float16
+#define COMPUTE_SUFFIX   fp16
+#define STATE_T          float
+#define STATE_SUFFIX     fp32
+#define PRECISION_SUFFIX s8e5c16x32
+#include "cpu_precision.h"
+#include "phase_1_act.inc"
+#include "phase_2_learn_A_production.inc"
+#include "phase_2_learn_B_processing.inc"
+#include "phase_2_learn_C_reduction.inc"
+#include "phase_2_learn_D_backprop.inc"
+#include "phase_3_update.inc"
+#undef STORAGE_T
+#undef STORAGE_SUFFIX
+#undef COMPUTE_T
+#undef COMPUTE_SUFFIX
+#undef STATE_T
+#undef STATE_SUFFIX
+#undef PRECISION_SUFFIX
+#pragma GCC diagnostic pop
+
+/* s8e5c16x64: E5M2 storage, FP16 compute, FP64 state */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-conversion"
+#define STORAGE_T        cpu_fp8_e5m2
+#define STORAGE_SUFFIX   fp8e5m2
+#define COMPUTE_T        _Float16
+#define COMPUTE_SUFFIX   fp16
+#define STATE_T          double
+#define STATE_SUFFIX     fp64
+#define PRECISION_SUFFIX s8e5c16x64
+#include "cpu_precision.h"
+#include "phase_1_act.inc"
+#include "phase_2_learn_A_production.inc"
+#include "phase_2_learn_B_processing.inc"
+#include "phase_2_learn_C_reduction.inc"
+#include "phase_2_learn_D_backprop.inc"
+#include "phase_3_update.inc"
+#undef STORAGE_T
+#undef STORAGE_SUFFIX
+#undef COMPUTE_T
+#undef COMPUTE_SUFFIX
+#undef STATE_T
+#undef STATE_SUFFIX
+#undef PRECISION_SUFFIX
+#pragma GCC diagnostic pop
+
+#endif /* HAS_FLOAT16 — FP8+FP16 compute variants */
+
+/* ================================================================
  * Precision-agnostic exports
  * ================================================================ */
 uint get_simd_width(void) {

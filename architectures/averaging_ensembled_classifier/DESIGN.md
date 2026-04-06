@@ -314,8 +314,11 @@ averaging_ensembled_classifier/
 │   │       ├── _loader.py                   # Library loading via importlib.resources + _verify_layouts()
 │   │       ├── _dispatch_table.py           # kernel_name → (task_fn_ptr, args_struct_class) map
 │   │       ├── _compiler.py                 # JIT compiler for on-the-fly shared library builds
+│   │       ├── _fp8_variants.py.in          # Meson template → _fp8_variants.py (FP8 variant availability)
 │   │       └── kernel_sources/              # C implementations (compiled to libcpu_kernels.so)
 │   │           ├── cpu_simd.h               # SIMD abstraction (AVX-512/AVX2/SSE2/NEON/scalar)
+│   │           ├── cpu_fp8.h                # FP8 E4M3/E5M2 struct types, LUT decode, algorithmic encode (ADR-025)
+│   │           ├── cpu_fp8_lut.gen.h         # Generated LUT tables for FP8↔float conversion (Phase 9A)
 │   │           ├── cpu_threads.h            # Thread pool interface
 │   │           ├── cpu_threads.c            # Thread pool implementation (C11/pthreads)
 │   │           ├── cpu_kernels.h            # Public ABI: task prototypes, argument structs, get_struct_size_*
@@ -346,9 +349,11 @@ averaging_ensembled_classifier/
 │   │   │   ├── numpy_backprop.py            # shared weight/bias backprop
 │   │   │   └── numpy_update.py              # adam_update reference
 │   │   ├── opencl/                          # OpenCL Tier 2 tests
-│   │   └── cpu/                             # CPU Tier 2 tests (16 test modules)
+│   │   └── cpu/                             # CPU Tier 2 tests (19 test modules)
 │   │       ├── conftest.py                  # Session-scoped CPU fixtures
-│   │       └── test_cpu_*.py                # Per-kernel correctness tests
+│   │       ├── test_cpu_*.py                # Per-kernel correctness tests
+│   │       ├── test_fp8_cpu.py              # FP8 roundtrip, saturation, LUT, struct tests (Phase 9C)
+│   │       └── test_fp8_cpu_availability.py # FP8 variant availability and _Float16 detection tests
 │   └── tier3/                               # Cross-backend parity (CPU oracle)
 │
 └── adr/                                     # Architectural Decision Records (ADR-001 through ADR-018)
@@ -402,7 +407,8 @@ The following legacy service modules are dissolved into stateless plan primitive
 - **FFI types:** `src/backends/cpu/_ffi_types.py` — ctypes `Structure` subclasses mirroring `cpu_kernels.h` structs. `_loader.py` handles library discovery and `_verify_layouts()` at load time. `_dispatch_table.py` builds the `kernel_name → (task_fn_ptr, args_struct_class)` map.
 - **Layout verification:** `_verify_layouts()` at library load time asserts Python-side struct sizes match C-side `get_struct_size_*()` exports. Catches struct drift before any dispatch. Same-size field reorderings caught by Tier 2 behavioral tests.
 - **Library discovery:** `importlib.resources.files('averaging_ensembled_classifier.backends.cpu')` with platform-specific filename resolution. Falls back to JIT compilation via `_compiler.py` when pre-built library is unavailable (Linux/macOS only).
-- **Status:** ✅ **Implemented** (Phase 3 complete; Phase 7 precision migration complete). 2 C source files (`cpu_kernels.c`, `cpu_threads.c`) + 5 headers + 6 phase `.inc` files. Three precision-variant instantiations (`s32x32`, `s16x16`, `s16x32`). 10 Python FFI modules. 17 Tier 2 test modules.
+- **FP8 support (Phase 9C, ADR-025):** `cpu_fp8.h` defines `cpu_fp8_e4m3` and `cpu_fp8_e5m2` struct types with LUT-based decode and algorithmic round-to-nearest-even encode. FP8 values are storage-only — widened to compute precision on load, narrowed on store. Ten FP8 suffix variants: 6 unconditional (`s8e4c32x32`, `s8e4c32x64`, `s8e4c64x64`, `s8e5c32x32`, `s8e5c32x64`, `s8e5c64x64`) + 4 conditional on `_Float16` (`s8e4c16x32`, `s8e4c16x64`, `s8e5c16x32`, `s8e5c16x64`). `_Float16` availability detected at Meson configure time; exposed to Python via generated `_fp8_variants.py`.
+- **Status:** ✅ **Implemented** (Phase 3 complete; Phase 7 precision migration complete; Phase 9C FP8 CPU backend complete). 2 C source files (`cpu_kernels.c`, `cpu_threads.c`) + 7 headers + 6 phase `.inc` files. Up to 25 precision-variant instantiations (15 FP16/FP32/FP64 + 6 FP8 unconditional + 4 FP8 conditional on `_Float16`). 10 Python FFI modules + 1 generated `_fp8_variants.py`. 19 Tier 2 test modules.
 
 ---
 
@@ -473,7 +479,7 @@ Option names use the `aec_` prefix to namespace them within the Meson subproject
 | Tier | Scope | Execution Requirement | Gate |
 | :--- | :--- | :--- | :--- |
 | **Tier 1** | Host-side plan correctness: plan construction, contract validation, buffer lifecycle, reduction tree plan, streaming loop plan, strategy delegation, memory layout, precision config, hardware profile | None — pure Python | Always runs (12 test modules) |
-| **Tier 2** | Per-backend kernel correctness against reference fixtures | Per-backend: `_build_config.BACKEND_<NAME> is True` | Per enabled backend (CPU: 17, Vulkan: 16, OpenCL: 16 test modules) |
+| **Tier 2** | Per-backend kernel correctness against reference fixtures | Per-backend: `_build_config.BACKEND_<NAME> is True` | Per enabled backend (CPU: 19, Vulkan: 16, OpenCL: 16 test modules) |
 | **Tier 3** | Cross-backend parity with CPU as reference oracle | CPU + ≥1 other backend | Falls back to GPU-vs-GPU if CPU unavailable |
 
 ### 9.2 Tier 2 Fixtures
@@ -548,6 +554,8 @@ All phases proceed in parallel behind `_build_config.py` feature flags. Each pha
 | **User-Facing API** | `WorkTicket`, `LearnHandle`, `Engine`; parallel with Phase 4 | Tier 1 (ticket) + integration green | Not started |
 | **6: Legacy Removal** | Delete dissolved modules; system operates exclusively through plan-model dispatch | Tier 3 parity green, all backends, FP32 + FP16 | **✅ Complete** |
 | **7: Mixed Precision** | Three-role precision model (storage/compute/state); kernel spec, OpenCL, CPU, Vulkan migration; alias removal; multi-config tests | All Tier 2 tests pass for all three `PrecisionConfig` factories; zero `SCALAR_TYPE` references; Alchemist validation | **✅ Complete** |
+| **9A: FP8 Foundation** | `PrecisionConfig` FP8 factories; FP8 LUT generation; ADR-025 | Tier 1 green; LUT tables generated | **✅ Complete** |
+| **9C: FP8 CPU Backend** | `cpu_fp8.h` types/conversions; 10 FP8 kernel suffix variants; `_Float16` detection; FP8 roundtrip tests | All existing CPU tests pass; FP8 variants compile; FP8 roundtrip ≤1 ULP | **✅ Complete** |
 
 ### 11.3 Phase Dependency Graph
 
@@ -573,6 +581,13 @@ Phase 7 (Mixed Precision) ──── ✅ Complete (180 tests green)
   ├──▶ Phase 7A (Authority & Config) ─── ✅ Complete
   ├──▶ Phase 7B (Kernel Spec & OpenCL) ── ✅ Complete
   └──▶ Phase 7C (CPU, Vulkan & Final) ─── ✅ Complete
+  │
+  ▼
+Phase 9 (FP8 Support) ──── In progress
+  ├──▶ Phase 9A (Foundation & LUTs) ────── ✅ Complete
+  ├──▶ Phase 9C (CPU Backend) ──────────── ✅ Complete (118 tests green)
+  ├──▶ Phase 9B (OpenCL Backend) ────────── Not started
+  └──▶ Phase 9D (Vulkan Backend) ────────── Not started
 ```
 
 Phases 2, 3, and 5 are independent workstreams. Phase 4 has no hard dependency. Phase 6 is a join point requiring all preceding phases. Phase 7 depends on Phase 6 and is a three-sub-phase sequential chain (7A → 7B → 7C).
@@ -588,6 +603,8 @@ Phases 2, 3, and 5 are independent workstreams. Phase 4 has no hard dependency. 
 As of Phase 6 completion, all three backend flags (`aec_backend_cpu`, `aec_backend_vulkan`, `aec_backend_opencl`) are at the **Mandatory** stage (`value: 'enabled'` in `meson.options`). The build fails if any backend's toolchain is absent.
 
 As of Phase 7 completion, all three backends support the full three-role precision model (`PrecisionConfig.float32()`, `PrecisionConfig.mixed_f16_f32()`). The retired `SCALAR_TYPE`/`SCALAR_IS_HALF` aliases have been removed from all kernel sources and build systems. The uniform `PrecisionConfig.float16()` factory was deleted in Phase 9A (the factory was a common footgun for extended training); use `PrecisionConfig.mixed_f16_f32()` instead. Direct construction with FP16 state remains valid.
+
+As of Phase 9C completion, the CPU backend additionally supports FP8 E4M3/E5M2 storage precision with FP32/FP64 compute (6 unconditional suffix variants) and optionally FP16 compute (4 conditional variants requiring `_Float16`). `PrecisionConfig.fp8_e4m3()`, `.fp8_e5m2()`, and related factories are available. FP8 LUT tables were generated in Phase 9A; the CPU backend implementation was completed in Phase 9C.
 
 ### 11.5 Rollback Protocol
 

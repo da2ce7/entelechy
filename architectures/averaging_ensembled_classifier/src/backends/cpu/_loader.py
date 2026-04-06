@@ -164,7 +164,7 @@ def _set_function_signatures(lib: ctypes.CDLL) -> None:
     lib.get_simd_width.restype = c_uint32
 
     # Per-precision exports: task functions, reduction engine, layout getters
-    for suffix in ffi.PRECISION_SUFFIXES:
+    for suffix in ffi.ALL_PRECISION_SUFFIXES:
         # Reduction engine — storage-entry variant
         fn = getattr(lib, f"execute_reduction_tree_{suffix}")
         fn.argtypes = [c_void_p, c_void_p]
@@ -195,7 +195,7 @@ def _verify_layouts(lib: ctypes.CDLL) -> None:
     preventing the CPU backend from initializing with a corrupted FFI layer.
     """
     mismatches: list[str] = []
-    for suffix in ffi.PRECISION_SUFFIXES:
+    for suffix in ffi.ALL_PRECISION_SUFFIXES:
         for c_getter_name, py_struct_cls in ffi.PRECISION_LAYOUT_CHECKS[suffix]:
             c_size = getattr(lib, c_getter_name)()
             py_size = ctypes.sizeof(py_struct_cls)

@@ -195,6 +195,8 @@ The `_IS_HALF` and `_IS_DOUBLE` flags are mutually exclusive for the same role t
 
 **Cross-backend naming:** All backends (OpenCL, CPU, and Vulkan) use the canonical `STORAGE_TYPE_IS_*` / `COMPUTE_TYPE_IS_*` / `STATE_TYPE_IS_*` flag names from this article. The Vulkan backend's GLSL type macros (`STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE`) and boolean flags (`STORAGE_TYPE_IS_FP8`, `STORAGE_TYPE_IS_E4M3`, `STORAGE_TYPE_IS_E5M2`) use the same canonical names as OpenCL, injected via `glslc -D`. No backend-specific shortened names are used.
 
+**CPU backend FP8 implementation (Phase 9C):** The CPU backend represents FP8 values as C struct wrappers (`cpu_fp8_e4m3`, `cpu_fp8_e5m2`) containing a `uint8_t bits` field. Conversion between FP8 and compute types uses LUT-based decode (256-entry lookup tables from `cpu_fp8_lut.gen.h`) and algorithmic round-to-nearest-even encode (in `cpu_fp8.h`). The precision macro system uses `STORAGE_SUFFIX` token pasting: `STORAGE_SUFFIX=fp8e4m3` generates `scalar_load_real_fp8e4m3()` etc. FP16 compute variants (`s8e4c16x32`, `s8e4c16x64`, `s8e5c16x32`, `s8e5c16x64`) are conditionally compiled when `_Float16` is available, detected by Meson and exposed via `HAS_FLOAT16`.
+
 ### **Article 7: Canonical Interface Instantiation**
 
 The following formal notation illustrates the sole valid method for specifying a kernel interface in adherence to this contract.
