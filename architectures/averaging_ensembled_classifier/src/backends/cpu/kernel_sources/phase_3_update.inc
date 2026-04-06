@@ -25,6 +25,11 @@ void PREC_FN(task_normalize_gradients)(void* raw_args, uint task_index, uint thr
 
 /* ================================================================
  * task_adam_update (Node 24)
+ *
+ * State-Precision Accumulation (ADR-027):
+ *   - EMA updates and parameter subtraction in ACCUM_T = max(COMPUTE_T, STATE_T)
+ *   - Bias correction and delta computation in COMPUTE_T
+ *   - When ACCUM_T == COMPUTE_T, all casts are identity operations
  * ================================================================ */
 void PREC_FN(task_adam_update)(void* raw_args, uint task_index, uint thread_id) {
     (void)thread_id;
@@ -33,23 +38,43 @@ void PREC_FN(task_adam_update)(void* raw_args, uint task_index, uint thread_id) 
     if (task_index >= a->parameter_count)
         return;
 
-    const COMPUTE_T g      = a->final_grad[task_index];  /* COMPUTE_T* compute */
-    const COMPUTE_T m_prev = scalar_load_state(a->m1, task_index);
-    const COMPUTE_T v_prev = scalar_load_state(a->m2, task_index);
+    /* Load gradient in COMPUTE_T (precision role: compute) */
+    const COMPUTE_T g = a->final_grad[task_index];
 
-    const COMPUTE_T m_new = a->beta1 * m_prev + ((COMPUTE_T)1.0 - a->beta1) * g;
-    const COMPUTE_T v_new = a->beta2 * v_prev + ((COMPUTE_T)1.0 - a->beta2) * (g * g);
+    /* State-Precision Accumulation: load moments at full state precision */
+    const ACCUM_T m_prev = scalar_load_state_for_accum(a->m1, task_index);
+    const ACCUM_T v_prev = scalar_load_state_for_accum(a->m2, task_index);
 
-    const COMPUTE_T m_hat = m_new / ((COMPUTE_T)1.0 - a->beta1_pow_t);
-    const COMPUTE_T v_hat = v_new / ((COMPUTE_T)1.0 - a->beta2_pow_t);
+    /* EMA updates in ACCUM_T (preserves state precision) */
+    const ACCUM_T g_accum     = scalar_widen_to_accum(g);
+    const ACCUM_T beta1_accum = scalar_widen_to_accum(a->beta1);
+    const ACCUM_T beta2_accum = scalar_widen_to_accum(a->beta2);
 
+    /* First moment: m_new = β₁ · m_prev + (1 - β₁) · g */
+    const ACCUM_T m_new = beta1_accum * m_prev +
+                          ((ACCUM_T)1.0 - beta1_accum) * g_accum;
+
+    /* Second moment: v_new = β₂ · v_prev + (1 - β₂) · g² */
+    const ACCUM_T v_new = beta2_accum * v_prev +
+                          ((ACCUM_T)1.0 - beta2_accum) * (g_accum * g_accum);
+
+    /* Store updated moments at state precision */
+    scalar_store_state_from_accum(a->m1, task_index, m_new);
+    scalar_store_state_from_accum(a->m2, task_index, v_new);
+
+    /* Bias correction in COMPUTE_T (transformative) */
+    const COMPUTE_T m_hat = scalar_narrow_from_accum(m_new) /
+                            ((COMPUTE_T)1.0 - a->beta1_pow_t);
+    const COMPUTE_T v_hat = scalar_narrow_from_accum(v_new) /
+                            ((COMPUTE_T)1.0 - a->beta2_pow_t);
+
+    /* Parameter update: delta in COMPUTE_T, subtraction in ACCUM_T (accumulative) */
     const COMPUTE_T update = a->learning_rate * m_hat
         / (COMPUTE_SQRT(v_hat) + a->epsilon);
 
-    const COMPUTE_T param_val = scalar_load_state(a->parameters, task_index);
-    scalar_store_state(a->parameters, task_index, param_val - update);
-    scalar_store_state(a->m1, task_index, m_new);
-    scalar_store_state(a->m2, task_index, v_new);
+    const ACCUM_T param_val = scalar_load_state_for_accum(a->parameters, task_index);
+    scalar_store_state_from_accum(a->parameters, task_index,
+                                  param_val - scalar_widen_to_accum(update));
 }
 
 /* ================================================================

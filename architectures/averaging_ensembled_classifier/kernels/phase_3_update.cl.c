@@ -40,11 +40,17 @@ __kernel void normalize_gradients(
 }
 
 // --- Implementation: adam_update (Node 24) ---
-// Strategy: A stateful, embarrassingly parallel "map" kernel. Each work-item is assigned
-// to update a single parameter and its corresponding moment vectors. Its most critical
-// feature is its strict adherence to the behavioral contract forbidding on-device power
-// calculations. By accepting pre-computed bias correction terms from the host, this kernel
-// guarantees long-term numerical stability for training runs of any length.
+// Strategy: A stateful, embarrassingly parallel "map" kernel. Each work-item
+// updates a single parameter and its corresponding moment vectors.
+//
+// Key behavioral contract:
+// - State-Precision Accumulation: EMA updates and parameter subtraction in
+//   ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE)
+// - Bias correction and parameter delta computation in COMPUTE_TYPE
+// - Host provides pre-computed beta powers for numerical stability
+//
+// When ACCUM_TYPE == COMPUTE_TYPE (the common case), all widen/narrow casts
+// are identity operations eliminated by the compiler — zero overhead.
 __kernel void adam_update(
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_final_grad,
     __global STATE_TYPE         *update_buffer_GLOBAL_parameters,
@@ -59,40 +65,54 @@ __kernel void adam_update(
     uint                         src_scalar_NATURAL_parameter_count) {
 
     // --- 1. Work-Item to Parameter Mapping ---
-    // A 1D dispatch where each thread operates on one parameter. This is the most
-    // efficient parallelization strategy for this independent operation.
     const uint i = get_global_id(0);
     if (i >= src_scalar_NATURAL_parameter_count) {
         return;
     }
 
-    // --- 2. Load Current State ---
-    const COMPUTE_TYPE g      = src_buffer_GLOBAL_final_grad[i];
-    const COMPUTE_TYPE m_prev = load_state(update_buffer_GLOBAL_m1, i);
-    const COMPUTE_TYPE v_prev = load_state(update_buffer_GLOBAL_m2, i);
+    // --- 2. Load Inputs ---
+    // Gradient in COMPUTE_TYPE (precision role: compute)
+    const COMPUTE_TYPE g = src_buffer_GLOBAL_final_grad[i];
 
-    // --- 3. Update Biased Moment Estimates ---
-    // Update the first moment (moving average of the gradients).
-    const COMPUTE_TYPE m_new = src_scalar_REAL_beta1 * m_prev + (1.0f - src_scalar_REAL_beta1) * g;
-    // Update the second moment (moving average of the squared gradients).
-    const COMPUTE_TYPE v_new = src_scalar_REAL_beta2 * v_prev + (1.0f - src_scalar_REAL_beta2) * (g * g);
+    // State-Precision Accumulation: load moments at full state precision
+    // When ACCUM_TYPE > COMPUTE_TYPE, preserves FP64 fidelity
+    const ACCUM_TYPE m_prev = load_state_for_accum(update_buffer_GLOBAL_m1, i);
+    const ACCUM_TYPE v_prev = load_state_for_accum(update_buffer_GLOBAL_m2, i);
 
-    // --- 4. Compute Bias-Corrected Estimates ---
-    // The kernel performs the final division using pre-computed powers of beta.
-    // This offloads the sensitive `beta**t` calculation to the host, which can use
-    // high-precision arithmetic to prevent underflow, thus guaranteeing stability.
-    const COMPUTE_TYPE m_hat = m_new / (1.0f - src_scalar_REAL_beta1_pow_t);
-    const COMPUTE_TYPE v_hat = v_new / (1.0f - src_scalar_REAL_beta2_pow_t);
+    // --- 3. EMA Updates in ACCUM_TYPE (preserves state precision) ---
+    // Widen gradient and hyperparameters to accumulation precision
+    const ACCUM_TYPE g_accum     = widen_to_accum(g);
+    const ACCUM_TYPE beta1_accum = widen_to_accum(src_scalar_REAL_beta1);
+    const ACCUM_TYPE beta2_accum = widen_to_accum(src_scalar_REAL_beta2);
 
-    // --- 5. Compute Final Parameter Update ---
-    const COMPUTE_TYPE param_update = src_scalar_REAL_learning_rate * m_hat / (MATH_FN sqrt(v_hat) + src_scalar_REAL_epsilon);
+    // First moment: m_new = β₁ · m_prev + (1 - β₁) · g
+    const ACCUM_TYPE m_new = beta1_accum * m_prev +
+                             (ACCUM_ONE - beta1_accum) * g_accum;
 
-    // --- 6. Atomically Apply Updates ---
-    // Update the parameter and its corresponding moment vectors in-place.
-    const COMPUTE_TYPE current_param = load_state(update_buffer_GLOBAL_parameters, i);
-    store_state_update(update_buffer_GLOBAL_parameters, i, current_param - param_update);
-    store_state_update(update_buffer_GLOBAL_m1, i, m_new);
-    store_state_update(update_buffer_GLOBAL_m2, i, v_new);
+    // Second moment: v_new = β₂ · v_prev + (1 - β₂) · g²
+    const ACCUM_TYPE v_new = beta2_accum * v_prev +
+                             (ACCUM_ONE - beta2_accum) * (g_accum * g_accum);
+
+    // Store updated moments at state precision
+    store_state_from_accum(update_buffer_GLOBAL_m1, i, m_new);
+    store_state_from_accum(update_buffer_GLOBAL_m2, i, v_new);
+
+    // --- 4. Bias Correction in COMPUTE_TYPE ---
+    // Transformative operations — bounded by compute precision, not state
+    const COMPUTE_TYPE m_hat = narrow_from_accum(m_new) /
+                               (COMPUTE_ONE - src_scalar_REAL_beta1_pow_t);
+    const COMPUTE_TYPE v_hat = narrow_from_accum(v_new) /
+                               (COMPUTE_ONE - src_scalar_REAL_beta2_pow_t);
+
+    // --- 5. Parameter Update in ACCUM_TYPE (accumulative) ---
+    // The delta is transformative (computed fresh each step), but the subtraction
+    // p -= delta is accumulative — p refines over unbounded training steps.
+    const COMPUTE_TYPE param_delta = src_scalar_REAL_learning_rate * m_hat /
+                                     (MATH_FN sqrt(v_hat) + src_scalar_REAL_epsilon);
+
+    const ACCUM_TYPE current_param = load_state_for_accum(update_buffer_GLOBAL_parameters, i);
+    store_state_from_accum(update_buffer_GLOBAL_parameters, i,
+                           current_param - widen_to_accum(param_delta));
 }
 
 // --- Implementation: clamp_temperatures (Node 25) ---

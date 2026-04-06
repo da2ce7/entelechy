@@ -35,6 +35,9 @@
 #ifndef COMPUTE_TYPE_IS_DOUBLE
 #define COMPUTE_TYPE_IS_DOUBLE 0
 #endif
+#ifndef STATE_TYPE_IS_DOUBLE
+#define STATE_TYPE_IS_DOUBLE 0
+#endif
 
 // ── Extension Enables ──────────────────────────────────────────────────
 
@@ -318,6 +321,28 @@ STORAGE_TYPE write_storage(COMPUTE_TYPE val) { return NARROW_STORAGE(val); }
 
 COMPUTE_TYPE read_state(STATE_TYPE val) { return WIDEN_STATE(val); }
 STATE_TYPE write_state(COMPUTE_TYPE val) { return NARROW_STATE(val); }
+
+// ── Accumulation Precision Type (ADR-027) ─────────────────────────────
+// ACCUM_FLOAT = max(COMPUTE_TYPE, STATE_TYPE). When STATE_TYPE > COMPUTE_TYPE
+// (e.g., FP64 state + FP32 compute), EMA arithmetic uses STATE_TYPE precision
+// to prevent erosion over unbounded training steps.
+//
+// When STATE_TYPE <= COMPUTE_TYPE, ACCUM_FLOAT == COMPUTE_TYPE and all casts
+// are identity operations eliminated by the SPIR-V compiler.
+
+#if STATE_TYPE_IS_DOUBLE && !COMPUTE_TYPE_IS_DOUBLE
+    #define ACCUM_FLOAT double
+    #define ACCUM_IS_WIDER 1
+#else
+    #define ACCUM_FLOAT COMPUTE_TYPE
+    #define ACCUM_IS_WIDER 0
+#endif
+
+// Accumulation abstractions (value-semantics wrappers for state-precision accumulation)
+#define LOAD_STATE_FOR_ACCUM(val) ACCUM_FLOAT(val)
+#define STORE_STATE_FROM_ACCUM(val) STATE_TYPE(val)
+#define WIDEN_TO_ACCUM(val) ACCUM_FLOAT(val)
+#define NARROW_FROM_ACCUM(val) COMPUTE_TYPE(val)
 
 // ── Transcendental Wrappers (ADR-024 §5.1) ────────────────────────────
 // GLSL exp/log only accept float.  We always round-trip through float:

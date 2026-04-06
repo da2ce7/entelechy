@@ -52,6 +52,9 @@ adam_update_contract = KernelContract(
         behavioral_invariants=(
             "Forbidden from using pown or equivalent.",
             "Host provides pre-computed bias correction terms.",
+            "State-Precision Accumulation: Moment EMA updates (m_new, v_new) and parameter "
+            "update (p - δ) in ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Bias-corrected "
+            "estimates (m_hat, v_hat) and parameter delta in COMPUTE_TYPE.",
         ),
     ),
     buffer_params=(
@@ -107,7 +110,11 @@ clamp_temperatures_contract = KernelContract(
         holistic_constraints="All constraints are defined by the parameter commentary blocks.",
         idempotency="Fundamentally Non-Idempotent (Stateful)",
         synchronization_model="Finalizer Utility",
-        behavioral_invariants=("Enforces temps = clamp(temps, min_value, max_value) for each element.",),
+        behavioral_invariants=(
+            "Enforces temps = clamp(temps, min_value, max_value) for each element.",
+            "Transformative operation — Precision Boundary Conversion applies. "
+            "State-Precision Accumulation does not apply (no cross-invocation accumulation).",
+        ),
     ),
     buffer_params=(
         BufferParamSpec(

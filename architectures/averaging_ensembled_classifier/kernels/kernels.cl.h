@@ -106,10 +106,13 @@
 // Compute-role zero literal
 #if COMPUTE_TYPE_IS_DOUBLE
 #define COMPUTE_ZERO 0.0
+#define COMPUTE_ONE  1.0
 #elif COMPUTE_TYPE_IS_HALF
 #define COMPUTE_ZERO ((COMPUTE_TYPE)0.0h)
+#define COMPUTE_ONE  ((COMPUTE_TYPE)1.0h)
 #else
 #define COMPUTE_ZERO ((COMPUTE_TYPE)0.0f)
+#define COMPUTE_ONE  ((COMPUTE_TYPE)1.0f)
 #endif
 
 // Define standard kernel attributes for OpenCL environment
@@ -382,6 +385,65 @@ static inline void store_state_update(
 {
     buf[idx] = (STATE_TYPE)val;
 }
+
+// === Accumulation Precision Type (ADR-027) ===
+//
+// Stateful-update kernels perform EMA accumulation in ACCUM_TYPE, defined as
+// max(COMPUTE_TYPE, STATE_TYPE). This preserves full state precision when
+// STATE_TYPE > COMPUTE_TYPE, preventing erosion over unbounded training steps.
+//
+// When STATE_TYPE <= COMPUTE_TYPE, ACCUM_TYPE == COMPUTE_TYPE and all casts
+// are identity operations eliminated by the compiler.
+
+#if STATE_TYPE_IS_DOUBLE && !COMPUTE_TYPE_IS_DOUBLE
+    // STATE_TYPE (double) > COMPUTE_TYPE (float or half)
+    typedef double ACCUM_TYPE;
+    #define ACCUM_IS_WIDER_THAN_COMPUTE 1
+    #define ACCUM_ONE  ((ACCUM_TYPE)1)
+    #define ACCUM_ZERO ((ACCUM_TYPE)0)
+#else
+    // STATE_TYPE <= COMPUTE_TYPE (standard case)
+    typedef COMPUTE_TYPE ACCUM_TYPE;
+    #define ACCUM_IS_WIDER_THAN_COMPUTE 0
+    #define ACCUM_ONE  COMPUTE_ONE
+    #define ACCUM_ZERO COMPUTE_ZERO
+#endif
+
+// --- State-Precision Accumulation Abstractions ---
+
+// Load state value at accumulation precision (preserves full STATE_TYPE bits)
+static inline ACCUM_TYPE load_state_for_accum(
+    __global const STATE_TYPE *buf, size_t idx)
+{
+#if ACCUM_IS_WIDER_THAN_COMPUTE
+    return buf[idx];  // No narrowing — direct STATE_TYPE read as ACCUM_TYPE
+#else
+    return (ACCUM_TYPE)buf[idx];  // Widening or identity
+#endif
+}
+
+// Store accumulation result to state buffer.
+// Supersedes store_state_update() for accumulative operations; the existing
+// store_state_update() (ADR-024 §3.2) remains valid for transformative
+// in-place state mutations (e.g., clamp_temperatures).
+static inline void store_state_from_accum(
+    __global STATE_TYPE *buf, size_t idx, ACCUM_TYPE val)
+{
+    buf[idx] = (STATE_TYPE)val;  // Identity or widening — never narrows
+}
+
+// Widen compute-role value to accumulation precision (for EMA inputs)
+static inline ACCUM_TYPE widen_to_accum(COMPUTE_TYPE val)
+{
+    return (ACCUM_TYPE)val;  // Widening or identity
+}
+
+// Narrow accumulation result to compute precision (for bias-corrected values)
+static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
+{
+    return (COMPUTE_TYPE)val;  // Narrowing or identity
+}
+
 // --- End Precision Boundary Abstractions ---------------------------------
 
 #else
@@ -445,6 +507,9 @@ static inline void store_state_update(
 #ifndef COMPUTE_ZERO
 #define COMPUTE_ZERO 0.0f
 #endif
+#ifndef COMPUTE_ONE
+#define COMPUTE_ONE 1.0f
+#endif
 #ifndef SIMD_WIDTH
 #define SIMD_WIDTH 1
 #endif
@@ -481,6 +546,24 @@ inline void store_state(STATE_TYPE *buf, size_t idx, COMPUTE_TYPE val) { buf[idx
 // Semantically distinct from store_state(): marks an in-place optimizer
 // state mutation. Currently identical; exists for future extensibility.
 inline void store_state_update(STATE_TYPE *buf, size_t idx, COMPUTE_TYPE val) { buf[idx] = (STATE_TYPE)val; }
+// Host-mode accumulation-precision stubs (ADR-027)
+// In host mode, STATE_TYPE == COMPUTE_TYPE == float, so ACCUM_TYPE = COMPUTE_TYPE
+#ifndef ACCUM_TYPE
+#define ACCUM_TYPE COMPUTE_TYPE
+#endif
+#ifndef ACCUM_IS_WIDER_THAN_COMPUTE
+#define ACCUM_IS_WIDER_THAN_COMPUTE 0
+#endif
+#ifndef ACCUM_ONE
+#define ACCUM_ONE 1.0f
+#endif
+#ifndef ACCUM_ZERO
+#define ACCUM_ZERO 0.0f
+#endif
+inline ACCUM_TYPE load_state_for_accum(const STATE_TYPE *buf, size_t idx) { return (ACCUM_TYPE)buf[idx]; }
+inline void store_state_from_accum(STATE_TYPE *buf, size_t idx, ACCUM_TYPE val) { buf[idx] = (STATE_TYPE)val; }
+inline ACCUM_TYPE widen_to_accum(COMPUTE_TYPE val) { return (ACCUM_TYPE)val; }
+inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val) { return (COMPUTE_TYPE)val; }
 #endif // __OPENCL_VERSION__
 
 // --- Host-configurable Flags and Enums ---

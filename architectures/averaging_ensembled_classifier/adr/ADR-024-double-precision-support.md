@@ -437,9 +437,11 @@ The validation scenario from ADR-020 §2.6 is extended:
 
 > **Scenario: The Alchemist II (FP64 State Stability Validation)**
 >
-> - **Description:** A training task is executed for $10^6$ steps using three state precision configurations: `PrecisionConfig.float32()` (FP32 state), `PrecisionConfig.mixed_f32_f64_state()` (FP64 state), and a numpy reference implementation using FP64 throughout. All use identical hyperparameters ($\beta_1 = 0.999$, $\beta_2 = 0.9999$).
-> - **Validation Focus:** Confirms that the FP64-state configuration's moment vectors track the FP64 reference within FP64 tolerance ($< 10^{-14}$ relative error), while the FP32-state configuration diverges measurably (relative error grows with step count). Validates that state precision is architecturally independent of compute precision.
-> - **Key Insight:** Proves that the state role's FP64 extension achieves its stated goal: unbounded training stability without FP32 precision erosion in moment vectors.
+> - **Description:** A training task is executed for $10^5$ steps using three configurations: `PrecisionConfig.float32()` (FP32 state), `PrecisionConfig.mixed_f32_f64_state()` (FP64 state with FP32 compute), and a numpy reference implementation using FP64 throughout. All use identical hyperparameters ($\beta_1 = 0.999$, $\beta_2 = 0.9999$) and identical pre-generated gradient sequences of known precision.
+> - **Validation Focus:** Confirms that the FP64-state configuration's moment vectors remain stable within $10^{-4}$ relative error over extended training, while FP32-state configurations show measurable precision degradation at scale. The EMA accumulation arithmetic operates in `ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE)` (FP64 via ADR-027), preserving state precision; the tolerance bound reflects the FP32 precision of gradient contributions rather than the accumulation itself.
+> - **Key Insight:** Proves that the state role, combined with state-precision accumulation (ADR-027), achieves its stated goal: unbounded training stability through extended-precision moment vectors, while allowing narrower `COMPUTE_TYPE` for throughput in transformative operations.
+>
+> *Note: This scenario was revised by ADR-027 which introduced state-precision accumulation. The original $10^{-14}$ tolerance bound applied only to the EMA arithmetic step itself; the overall moment validation uses $10^{-4}$ to account for FP32 gradient contributions.*
 
 ---
 

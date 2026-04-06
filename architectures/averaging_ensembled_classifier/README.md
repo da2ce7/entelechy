@@ -141,6 +141,24 @@ Non-default combinations (e.g., FP16 compute + FP64 state) are created via const
 - Debugging numerical issues (use FP32 for reproducibility)
 - Workloads with extreme dynamic range (E5M2 may help, or use FP16)
 
+#### State-Precision Accumulation (Extended Training Stability)
+
+For unbounded training runs, Adam's EMA updates ($\beta_1 \cdot m + (1 - \beta_1) \cdot g$) can accumulate precision erosion. With $\beta_1 = 0.999$, each gradient contributes only 0.1% of its magnitude per step — a tiny increment that FP32's 23-bit mantissa may round away over millions of steps.
+
+The architecture supports **state-precision accumulation**: when `STATE_TYPE > COMPUTE_TYPE`, the adam_update kernel performs EMA arithmetic in `ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE)`, preserving full state precision across unbounded training:
+
+```python
+from shared.precision_config import PrecisionConfig
+
+# FP32 compute with FP64 optimizer state — EMA updates preserve FP64 precision
+cfg = PrecisionConfig.mixed_f32_f64_state()
+
+# FP8 storage with FP32 compute and FP64 state
+cfg = PrecisionConfig(storage="fp8_e4m3", compute="fp32", state="fp64")
+```
+
+When `STATE_TYPE ≤ COMPUTE_TYPE` (the common case), all widening casts are identity operations eliminated by the compiler — zero overhead.
+
 ---
 
 ### The Canonical Archives
