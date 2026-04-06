@@ -17,7 +17,7 @@ def build_compiler_flags(
 
     Generates flags for all CONTRACT.md Article 6 mandatory symbols (amended by ADR-020 §3.6, ADR-024 §2, ADR-025 §3):
     STORAGE_TYPE, COMPUTE_TYPE, STATE_TYPE, STORAGE_TYPE_IS_HALF, COMPUTE_TYPE_IS_HALF,
-    COMPUTE_TYPE_IS_DOUBLE, STATE_TYPE_IS_DOUBLE,
+    COMPUTE_TYPE_IS_DOUBLE, STATE_TYPE_IS_HALF, STATE_TYPE_IS_DOUBLE,
     STORAGE_TYPE_IS_FP8, STORAGE_TYPE_IS_E4M3, STORAGE_TYPE_IS_E5M2,
     SIMD_WIDTH, C_TILE_SIZE, NUMERICAL_STABILITY_EPSILON, LOCAL_MEM_BANK_PADDING.
     """
@@ -27,6 +27,7 @@ def build_compiler_flags(
     storage_is_half = 1 if precision.storage_dtype == np.dtype(np.float16) else 0
     compute_is_half = 1 if precision.compute_dtype == np.dtype(np.float16) else 0
     compute_is_double = 1 if precision.compute_dtype == np.dtype(np.float64) else 0
+    state_is_half = 1 if precision.state_dtype == np.dtype(np.float16) else 0
     state_is_double = 1 if precision.state_dtype == np.dtype(np.float64) else 0
     is_fp8 = precision.storage_dtype in FP8_DTYPES
     is_e4m3 = 1 if precision.storage_dtype == FP8_E4M3 else 0
@@ -40,6 +41,7 @@ def build_compiler_flags(
         f"-DSTORAGE_TYPE_IS_HALF={storage_is_half}",
         f"-DCOMPUTE_TYPE_IS_HALF={compute_is_half}",
         f"-DCOMPUTE_TYPE_IS_DOUBLE={compute_is_double}",
+        f"-DSTATE_TYPE_IS_HALF={state_is_half}",
         f"-DSTATE_TYPE_IS_DOUBLE={state_is_double}",
         f"-DSTORAGE_TYPE_IS_FP8={1 if is_fp8 else 0}",
         f"-DSTORAGE_TYPE_IS_E4M3={is_e4m3}",

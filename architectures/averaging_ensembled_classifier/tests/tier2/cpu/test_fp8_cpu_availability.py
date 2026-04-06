@@ -36,6 +36,9 @@ class TestFP8VariantAvailability:
         fp16_variants = [
             "s8e4c16x32", "s8e4c16x64",
             "s8e5c16x32", "s8e5c16x64",
+            # FP16 state variants (also require _Float16)
+            "s8e4c16x16", "s8e4c32x16", "s8e4c64x16",
+            "s8e5c16x16", "s8e5c32x16", "s8e5c64x16",
         ]
         for suffix in fp16_variants:
             assert suffix in AVAILABLE_FP8_VARIANTS, (
@@ -48,6 +51,9 @@ class TestFP8VariantAvailability:
         fp16_variants = [
             "s8e4c16x32", "s8e4c16x64",
             "s8e5c16x32", "s8e5c16x64",
+            # FP16 state variants (also require _Float16)
+            "s8e4c16x16", "s8e4c32x16", "s8e4c64x16",
+            "s8e5c16x16", "s8e5c32x16", "s8e5c64x16",
         ]
         for suffix in fp16_variants:
             assert suffix not in AVAILABLE_FP8_VARIANTS, (
@@ -77,6 +83,6 @@ class TestFP16ComputeAvailability:
     def test_c16_suffix_in_available_variants(self):
         """When _Float16 available, c16 suffixes are listed."""
         c16_variants = [v for v in AVAILABLE_FP8_VARIANTS if "c16" in v]
-        assert len(c16_variants) == 4, (
-            f"Expected 4 c16 variants with _Float16: {c16_variants}"
+        assert len(c16_variants) == 6, (
+            f"Expected 6 c16 variants with _Float16: {c16_variants}"
         )

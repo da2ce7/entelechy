@@ -53,6 +53,23 @@ precision_variants = [
     ['_s32c64x64', ['-DCOMPUTE_TYPE=double', '-DSTATE_TYPE=double', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
     # storage=64
     ['_s64c64x64', ['-DSTORAGE_TYPE=double', '-DCOMPUTE_TYPE=double', '-DSTATE_TYPE=double', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
+    # FP8 E4M3 storage (ADR-025 §7.2) — no -DSTORAGE_TYPE flag (uint8_t via STORAGE_TYPE_IS_FP8 in common.glsl)
+    ['_s8e4c32x32', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E4M3=1', '-DCOMPUTE_TYPE_IS_FLOAT=1']],
+    ['_s8e4c32x64', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E4M3=1', '-DCOMPUTE_TYPE_IS_FLOAT=1', '-DSTATE_TYPE=double', '-DENABLE_FP64_EXTENSION=1']],
+    ['_s8e4c16x32', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E4M3=1', '-DCOMPUTE_TYPE=float16_t', '-DCOMPUTE_TYPE_IS_HALF=1', '-DENABLE_FP16_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-3']],
+    ['_s8e4c64x64', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E4M3=1', '-DCOMPUTE_TYPE=double', '-DCOMPUTE_TYPE_IS_DOUBLE=1', '-DSTATE_TYPE=double', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
+    # FP8 E5M2 storage (ADR-025 §7.2)
+    ['_s8e5c32x32', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E5M2=1', '-DCOMPUTE_TYPE_IS_FLOAT=1']],
+    ['_s8e5c32x64', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E5M2=1', '-DCOMPUTE_TYPE_IS_FLOAT=1', '-DSTATE_TYPE=double', '-DENABLE_FP64_EXTENSION=1']],
+    ['_s8e5c16x32', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E5M2=1', '-DCOMPUTE_TYPE=float16_t', '-DCOMPUTE_TYPE_IS_HALF=1', '-DENABLE_FP16_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-3']],
+    ['_s8e5c64x64', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E5M2=1', '-DCOMPUTE_TYPE=double', '-DCOMPUTE_TYPE_IS_DOUBLE=1', '-DSTATE_TYPE=double', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
+    # FP8 + FP16 state variants (ADR-024, FP8+FP16 state)
+    ['_s8e4c16x16', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E4M3=1', '-DCOMPUTE_TYPE=float16_t', '-DCOMPUTE_TYPE_IS_HALF=1', '-DSTATE_TYPE=float16_t', '-DSTATE_TYPE_IS_HALF=1', '-DENABLE_FP16_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-3']],
+    ['_s8e4c32x16', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E4M3=1', '-DCOMPUTE_TYPE_IS_FLOAT=1', '-DSTATE_TYPE=float16_t', '-DSTATE_TYPE_IS_HALF=1', '-DENABLE_FP16_EXTENSION=1']],
+    ['_s8e4c64x16', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E4M3=1', '-DCOMPUTE_TYPE=double', '-DCOMPUTE_TYPE_IS_DOUBLE=1', '-DSTATE_TYPE=float16_t', '-DSTATE_TYPE_IS_HALF=1', '-DENABLE_FP16_EXTENSION=1', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
+    ['_s8e5c16x16', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E5M2=1', '-DCOMPUTE_TYPE=float16_t', '-DCOMPUTE_TYPE_IS_HALF=1', '-DSTATE_TYPE=float16_t', '-DSTATE_TYPE_IS_HALF=1', '-DENABLE_FP16_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-3']],
+    ['_s8e5c32x16', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E5M2=1', '-DCOMPUTE_TYPE_IS_FLOAT=1', '-DSTATE_TYPE=float16_t', '-DSTATE_TYPE_IS_HALF=1', '-DENABLE_FP16_EXTENSION=1']],
+    ['_s8e5c64x16', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E5M2=1', '-DCOMPUTE_TYPE=double', '-DCOMPUTE_TYPE_IS_DOUBLE=1', '-DSTATE_TYPE=float16_t', '-DSTATE_TYPE_IS_HALF=1', '-DENABLE_FP16_EXTENSION=1', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
 ]
 
 spirv_targets = []
@@ -91,6 +108,44 @@ foreach variant : compute_only_variants
     suffix = variant[0]
     extra_flags = variant[1]
     foreach shader : compute_only_shaders
+        stem = shader.replace('.comp', '')
+        spirv_targets += custom_target(
+            stem + suffix + '.spv',
+            input: shader,
+            output: stem + suffix + '.spv',
+            command: [glslc,
+                      '--target-env=vulkan1.1',
+                      '-I', meson.current_source_dir(),
+                      extra_flags,
+                      '-o', '@OUTPUT@',
+                      '@INPUT@'],
+            install: true,
+            install_dir: py.get_install_dir() / 'averaging_ensembled_classifier' / 'backends' / 'vulkan' / 'kernel_sources',
+        )
+    endforeach
+endforeach
+
+# FP8 test shaders — compiled only with FP8 variants (ADR-025 §9.2).
+fp8_test_shaders = [
+    'fp8_roundtrip.comp',
+]
+
+# FP8 variant definitions for test shaders.
+# These use the same flag scheme as FP8 entries in precision_variants,
+# but are only needed for roundtrip testing.
+fp8_test_variants = [
+    ['_s8e4c32x32', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E4M3=1', '-DCOMPUTE_TYPE_IS_FLOAT=1']],
+    ['_s8e4c16x32', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E4M3=1', '-DCOMPUTE_TYPE=float16_t', '-DCOMPUTE_TYPE_IS_HALF=1', '-DENABLE_FP16_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-3']],
+    ['_s8e4c64x64', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E4M3=1', '-DCOMPUTE_TYPE=double', '-DCOMPUTE_TYPE_IS_DOUBLE=1', '-DSTATE_TYPE=double', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
+    ['_s8e5c32x32', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E5M2=1', '-DCOMPUTE_TYPE_IS_FLOAT=1']],
+    ['_s8e5c16x32', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E5M2=1', '-DCOMPUTE_TYPE=float16_t', '-DCOMPUTE_TYPE_IS_HALF=1', '-DENABLE_FP16_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-3']],
+    ['_s8e5c64x64', ['-DSTORAGE_TYPE_IS_FP8=1', '-DSTORAGE_TYPE_IS_E5M2=1', '-DCOMPUTE_TYPE=double', '-DCOMPUTE_TYPE_IS_DOUBLE=1', '-DSTATE_TYPE=double', '-DENABLE_FP64_EXTENSION=1', '-DNUMERICAL_EPSILON_VALUE=1e-15']],
+]
+
+foreach variant : fp8_test_variants
+    suffix = variant[0]
+    extra_flags = variant[1]
+    foreach shader : fp8_test_shaders
         stem = shader.replace('.comp', '')
         spirv_targets += custom_target(
             stem + suffix + '.spv',

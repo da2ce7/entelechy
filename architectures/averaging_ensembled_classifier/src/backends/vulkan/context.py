@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     import vulkan as vk  # type: ignore[import-untyped]
 
+    from ...shared.precision_config import PrecisionConfig
+
     _VULKAN_AVAILABLE = True
 else:
     try:
@@ -53,6 +55,8 @@ class VulkanContext:
         self._vkCmdPushDescriptorSetKHR: object = None
 
         self._device_features: object = None
+        self._available_extensions: set[str] = set()
+        self._enabled_extensions: set[str] = set()
 
         self._init_instance()
         self._select_physical_device()
@@ -166,6 +170,49 @@ class VulkanContext:
             return False
         return bool(getattr(self._device_features, "shaderFloat64", False))
 
+    def supports_8bit_storage(self) -> bool:
+        """Check if VK_KHR_8bit_storage is available (required for FP8)."""
+        return "VK_KHR_8bit_storage" in self._enabled_extensions
+
+    def supports_float16_int8(self) -> bool:
+        """Check if VK_KHR_shader_float16_int8 is available (required for FP16 compute)."""
+        return "VK_KHR_shader_float16_int8" in self._enabled_extensions
+
+    def check_precision_requirements(self, precision: "PrecisionConfig") -> None:
+        """Validate device supports required features for precision config (ADR-025 §7).
+
+        Raises RuntimeError with a clear message if the device lacks
+        required extensions or features for the given precision.
+        """
+        from ...shared.precision_config import FP8_DTYPES  # noqa: PLC0415
+
+        import numpy as np  # noqa: PLC0415
+
+        # FP8 storage requires VK_KHR_8bit_storage
+        if precision.storage_dtype in FP8_DTYPES:
+            if not self.supports_8bit_storage():
+                raise RuntimeError(
+                    "FP8 storage requires VK_KHR_8bit_storage extension. "
+                    "This device does not support it. "
+                    "Use float32() or mixed_f16_f32() instead."
+                )
+
+        # FP16 compute requires VK_KHR_shader_float16_int8
+        if precision.compute_dtype == np.dtype(np.float16):
+            if not self.supports_float16_int8():
+                raise RuntimeError(
+                    "FP16 compute requires VK_KHR_shader_float16_int8 extension. "
+                    "Use fp8_e4m3() (FP32 compute) instead of fp8_e4m3_f16()."
+                )
+
+        # FP64 compute requires shaderFloat64 device feature
+        if precision.compute_dtype == np.dtype(np.float64):
+            if not self.supports_float64():
+                raise RuntimeError(
+                    "FP64 compute requested but shaderFloat64 feature not supported. "
+                    "Use fp8_e4m3() (FP32 compute) instead of fp8_e4m3_f64()."
+                )
+
     def _create_logical_device(self) -> None:
         queue_create = vk.VkDeviceQueueCreateInfo(
             queueFamilyIndex=self._queue_family_index,
@@ -173,17 +220,30 @@ class VulkanContext:
             pQueuePriorities=[1.0],
         )
 
-        # Request push descriptor extension if available
+        # Query available extensions
         extensions: list[str] = []
         available_exts = vk.vkEnumerateDeviceExtensionProperties(
             self._physical_device, None
         )
         available_ext_names = {e.extensionName for e in available_exts}
+        self._available_extensions = available_ext_names
+
+        # Push descriptors
         self._has_push_descriptors = (
             "VK_KHR_push_descriptor" in available_ext_names
         )
         if self._has_push_descriptors:
             extensions.append("VK_KHR_push_descriptor")
+
+        # FP8 storage: VK_KHR_8bit_storage (ADR-025 §7)
+        if "VK_KHR_8bit_storage" in available_ext_names:
+            extensions.append("VK_KHR_8bit_storage")
+
+        # FP16 compute: VK_KHR_shader_float16_int8
+        if "VK_KHR_shader_float16_int8" in available_ext_names:
+            extensions.append("VK_KHR_shader_float16_int8")
+
+        self._enabled_extensions = set(extensions)
 
         # Enable device features, including shaderFloat64 if available
         enabled_features = vk.VkPhysicalDeviceFeatures(

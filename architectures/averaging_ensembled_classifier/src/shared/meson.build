@@ -7,6 +7,7 @@ shared_sources = files(
   'model_spec.py',
   'parameter_space.py',
   'precision_config.py',
+  'precision_suffix.py',
   'problem_type_strategy.py',
   'stabilization_policy.py',
   'workload_primitives.py',

@@ -1,12 +1,13 @@
 # Phase 9D: FP8 Support — Vulkan Backend Implementation
 
-**Status: NOT STARTED**  
+**Status: ✅ COMPLETE**  
 **Phase:** 9D of 9  
 **Prerequisite:** Phase 9A complete and rollback gate passed (Phases 9B/9C/9D are fully parallelizable since LUT generation is in 9A.1.5).  
 **Objective:** Implement FP8 software conversion in Vulkan shaders. Extend specialization constants, add FP8 conversion functions to `common.glsl` supporting both FP16 and FP32 compute, generate shader variants. The phase ends when FP8 shader variants compile and pass roundtrip tests.  
 **Governing ADR:** ADR-025 (§7)  
-**Rollback gate:** All existing Vulkan tests pass. FP8 shader compilation succeeds. FP8 roundtrip tests pass with ≤1 ULP error.  
-**Dependencies:** Phase 9A (PrecisionConfig extension) complete.
+**Rollback gate:** All existing Vulkan tests pass (91/91). FP8 shader compilation succeeds (150/150 SPIR-V targets). FP8 roundtrip tests pass with ≤1 ULP error (35/35, including 6 GPU dispatch tests). Total: 126 passed, 2 skipped (FP64 tests skipped when `shaderFloat64` unavailable).  
+**Dependencies:** Phase 9A (PrecisionConfig extension) complete.  
+**Completed:** 2026-04-06
 
 ---
 

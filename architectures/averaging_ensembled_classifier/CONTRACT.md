@@ -182,6 +182,7 @@ This article defines symbols that must be provided by the host build environment
 | `STORAGE_TYPE_IS_E5M2` | `int` (0 or 1) | 1 when `STORAGE_TYPE` is specifically E5M2; selects E5M2 conversion logic and lookup tables |
 | `COMPUTE_TYPE_IS_HALF` | `int` (0 or 1) | 1 when `COMPUTE_TYPE == half`; enables FP16 arithmetic extension if required |
 | `COMPUTE_TYPE_IS_DOUBLE` | `int` (0 or 1) | 1 when `COMPUTE_TYPE == double`; gates `cl_khr_fp64` extension and FP64 arithmetic paths |
+| `STATE_TYPE_IS_HALF` | `int` (0 or 1) | 1 when `STATE_TYPE == half`; gates `cl_khr_fp16` extension for state-role FP16 buffers |
 | `STATE_TYPE_IS_DOUBLE` | `int` (0 or 1) | 1 when `STATE_TYPE == double`; gates FP64 load/store mechanics for state buffers |
 | `SIMD_WIDTH` | `int` | Hardware SIMD lane count from `HardwareProfile` |
 | `C_TILE_SIZE` | `int` | Column tile size for the module-chunking strategy |

@@ -134,6 +134,9 @@ fp8_all_suffixes = [
 fp8_c16_suffixes = [
     's8e4c16x32', 's8e4c16x64',
     's8e5c16x32', 's8e5c16x64',
+    # FP16 state variants (ADR-024, FP8+FP16 state)
+    's8e4c16x16', 's8e4c32x16', 's8e4c64x16',
+    's8e5c16x16', 's8e5c32x16', 's8e5c64x16',
 ]
 
 if has_float16

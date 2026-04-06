@@ -1,6 +1,6 @@
 # ADR-025: FP8 (E4M3/E5M2) Storage Precision Support
 
-**Status:** PROPOSED
+**Status:** ACCEPTED
 **Date:** 2026-04-02
 **Deciders:** —
 **Triggered by:** ADR-020 identified FP8 as the motivating case for the three-role precision model

@@ -395,10 +395,18 @@ DECLARE_PRECISION_STRUCTS(s8e5c64x64, cpu_fp8_e5m2, double, double)
 /* FP8 E4M3 storage variants with FP16 compute */
 DECLARE_PRECISION_STRUCTS(s8e4c16x32, cpu_fp8_e4m3, _Float16, float)
 DECLARE_PRECISION_STRUCTS(s8e4c16x64, cpu_fp8_e4m3, _Float16, double)
+DECLARE_PRECISION_STRUCTS(s8e4c16x16, cpu_fp8_e4m3, _Float16, _Float16)
 
 /* FP8 E5M2 storage variants with FP16 compute */
 DECLARE_PRECISION_STRUCTS(s8e5c16x32, cpu_fp8_e5m2, _Float16, float)
 DECLARE_PRECISION_STRUCTS(s8e5c16x64, cpu_fp8_e5m2, _Float16, double)
+DECLARE_PRECISION_STRUCTS(s8e5c16x16, cpu_fp8_e5m2, _Float16, _Float16)
+
+/* FP8 storage variants with FP16 state, FP32/FP64 compute */
+DECLARE_PRECISION_STRUCTS(s8e4c32x16, cpu_fp8_e4m3, float,    _Float16)
+DECLARE_PRECISION_STRUCTS(s8e4c64x16, cpu_fp8_e4m3, double,   _Float16)
+DECLARE_PRECISION_STRUCTS(s8e5c32x16, cpu_fp8_e5m2, float,    _Float16)
+DECLARE_PRECISION_STRUCTS(s8e5c64x16, cpu_fp8_e5m2, double,   _Float16)
 #endif /* HAS_FLOAT16 */
 
 /* ================================================================
@@ -501,8 +509,15 @@ DECLARE_PRECISION_FUNCTIONS(s8e5c64x64)
 #if defined(HAS_FLOAT16) && HAS_FLOAT16
 DECLARE_PRECISION_FUNCTIONS(s8e4c16x32)
 DECLARE_PRECISION_FUNCTIONS(s8e4c16x64)
+DECLARE_PRECISION_FUNCTIONS(s8e4c16x16)
 DECLARE_PRECISION_FUNCTIONS(s8e5c16x32)
 DECLARE_PRECISION_FUNCTIONS(s8e5c16x64)
+DECLARE_PRECISION_FUNCTIONS(s8e5c16x16)
+/* FP8 storage with FP16 state, FP32/FP64 compute */
+DECLARE_PRECISION_FUNCTIONS(s8e4c32x16)
+DECLARE_PRECISION_FUNCTIONS(s8e4c64x16)
+DECLARE_PRECISION_FUNCTIONS(s8e5c32x16)
+DECLARE_PRECISION_FUNCTIONS(s8e5c64x16)
 #endif /* HAS_FLOAT16 */
 
 /* ================================================================

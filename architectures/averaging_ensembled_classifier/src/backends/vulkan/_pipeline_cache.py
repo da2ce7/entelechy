@@ -15,7 +15,11 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ...shared.precision_config import PrecisionConfig
+from ...shared.precision_config import FP8_DTYPES, FP8_E4M3, FP8_E5M2, PrecisionConfig
+from ...shared.precision_suffix import (
+    compute_only_suffix as _compute_only_suffix_bare,
+    precision_to_suffix,
+)
 from .context import VulkanContext
 
 # Shaders with only compute-role buffers — use compute-only suffix.
@@ -25,43 +29,20 @@ _COMPUTE_ONLY_SHADERS = frozenset({
     "aggregate_partials_from_compute",
 })
 
-# Three-axis suffix map: (storage_dtype.type, compute_dtype.type, state_dtype.type) → suffix
-_SUFFIX_MAP: dict[tuple[type, type, type], str] = {
-    (np.float16, np.float16, np.float32): "_s16c16x32",
-    (np.float16, np.float16, np.float64): "_s16c16x64",
-    (np.float16, np.float32, np.float32): "_s16c32x32",
-    (np.float16, np.float32, np.float64): "_s16c32x64",
-    (np.float16, np.float64, np.float64): "_s16c64x64",
-    (np.float32, np.float32, np.float32): "_s32c32x32",
-    (np.float32, np.float32, np.float64): "_s32c32x64",
-    (np.float32, np.float64, np.float64): "_s32c64x64",
-    (np.float64, np.float64, np.float64): "_s64c64x64",
-}
-
 
 def _spv_variant_suffix(precision: PrecisionConfig) -> str:
-    """Map a PrecisionConfig to the SPIR-V variant suffix (ADR-024 §5.5)."""
-    key = (
-        precision.storage_dtype.type,
-        precision.compute_dtype.type,
-        precision.state_dtype.type,
+    """Map a PrecisionConfig to the SPIR-V variant suffix (ADR-024 §5.5, ADR-025 §7).
+
+    Returns the canonical suffix with a leading underscore, e.g. ``"_s32c32x32"``.
+    """
+    return "_" + precision_to_suffix(
+        precision.storage_dtype, precision.compute_dtype, precision.state_dtype,
     )
-    suffix = _SUFFIX_MAP.get(key)
-    if suffix is None:
-        raise ValueError(
-            f"No Vulkan SPIR-V variant for storage={precision.storage_dtype}, "
-            f"compute={precision.compute_dtype}, state={precision.state_dtype}"
-        )
-    return suffix
 
 
 def _compute_only_suffix(precision: PrecisionConfig) -> str:
     """Map a PrecisionConfig to the compute-only SPIR-V variant suffix."""
-    if precision.compute_dtype == np.dtype(np.float64):
-        return "_c64"
-    if precision.compute_dtype == np.dtype(np.float16):
-        return "_c16"
-    return "_c32"
+    return "_" + _compute_only_suffix_bare(precision.compute_dtype)
 
 
 if TYPE_CHECKING:

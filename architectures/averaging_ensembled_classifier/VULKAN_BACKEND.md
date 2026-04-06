@@ -1,6 +1,6 @@
 # Vulkan Back-End: Architecture for Explicit GPU Compute
 
-> **Implementation Status: ✅ Complete** — Phase 5 implemented; Phase 7 mixed-precision migration complete. All components described in this document have been realized in `src/backends/vulkan/` with a Vulkan renderer, GLSL compute shaders compiled to SPIR-V (three precision variants per storage/state-role-bearing shader: `_fp32`, `_s16fp32`, `_fp16`), and Tier 2/3 test coverage. The Meson build target produces the Vulkan shared library. See [PHASE-5A](plan/PHASE-5A-VULKAN-SHADER-LIBRARY-AND-BUILD.md), [PHASE-5B](plan/PHASE-5B-VULKAN-RENDERER-AND-INFRASTRUCTURE.md), [PHASE-5C](plan/PHASE-5C-VULKAN-TIER2-TESTS.md) for base implementation and [PHASE-7C](plan/PHASE-7C-MIXED-PRECISION-CPU-VULKAN-AND-FINAL.md) for the precision migration. Dispatch geometry for `linear_generic` placement strategy kernels (`normalize_gradients`, `adam_update`, `clamp_temperatures`, `stabilize_reduce_grad_h`) uses per-kernel workgroup count resolvers rather than `tile_count`.
+> **Implementation Status: ✅ Complete** — Phase 5 implemented; Phase 7 mixed-precision migration complete; Phase 9D FP8 Vulkan backend complete. All components described in this document have been realized in `src/backends/vulkan/` with a Vulkan renderer, GLSL compute shaders compiled to SPIR-V (three precision variants per storage/state-role-bearing shader: `_fp32`, `_s16fp32`, `_fp16`, plus eight FP8 variants: `_s8e4c32x32`, `_s8e4c16x32`, `_s8e4c32x64`, `_s8e4c64x64`, `_s8e5c32x32`, `_s8e5c16x32`, `_s8e5c32x64`, `_s8e5c64x64`), and Tier 2/3 test coverage. The Meson build target produces the Vulkan shared library. See [PHASE-5A](plan/PHASE-5A-VULKAN-SHADER-LIBRARY-AND-BUILD.md), [PHASE-5B](plan/PHASE-5B-VULKAN-RENDERER-AND-INFRASTRUCTURE.md), [PHASE-5C](plan/PHASE-5C-VULKAN-TIER2-TESTS.md) for base implementation, [PHASE-7C](plan/PHASE-7C-MIXED-PRECISION-CPU-VULKAN-AND-FINAL.md) for the precision migration, and [PHASE-9D](plan/PHASE-9D-FP8-VULKAN-BACKEND.md) for FP8 support. Dispatch geometry for `linear_generic` placement strategy kernels (`normalize_gradients`, `adam_update`, `clamp_temperatures`, `stabilize_reduce_grad_h`) uses per-kernel workgroup count resolvers rather than `tile_count`.
 
 ## Design Constraints
 
@@ -401,6 +401,56 @@ else
 
 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
 ```
+
+### FP8 Software Conversion (Phase 9D, ADR-025 §7)
+
+GLSL and SPIR-V have no native FP8 type. FP8 storage buffers use `uint8_t` (via `VK_KHR_8bit_storage` extension) with software conversion to `COMPUTE_TYPE` in the shader. The conversion is arithmetic (~12–15 ALU ops per value), not LUT-based — GLSL lacks OpenCL's `__constant` memory for embedding lookup tables, and the cost is negligible for bandwidth-bound workloads.
+
+**Vulkan extension requirements:**
+
+| Extension / Feature | Role |
+| :--- | :--- |
+| `VK_KHR_8bit_storage` | `uint8_t` in storage buffer declarations |
+| `VK_KHR_shader_float16_int8` | `uint8_t` in function parameters/returns; required when `COMPUTE_TYPE_IS_HALF` |
+| `shaderFloat64` device feature | Required when `COMPUTE_TYPE_IS_DOUBLE` |
+
+`VulkanContext` detects and enables these extensions at device creation. `check_precision_requirements(precision)` validates device capabilities before dispatch, raising `RuntimeError` with a clear message if requirements are unmet.
+
+**Compile-time flag scheme:**
+
+FP8 variants are selected by `-D` flags injected via `glslc`, not specialization constants (the GLSL preprocessor cannot evaluate specialization constants):
+
+```
+-DSTORAGE_TYPE_IS_FP8=1 -DSTORAGE_TYPE_IS_E4M3=1 -DCOMPUTE_TYPE_IS_FLOAT=1
+```
+
+When `STORAGE_TYPE_IS_FP8=1`, `common.glsl`:
+- Enables `GL_EXT_shader_8bit_storage` and `GL_EXT_shader_explicit_arithmetic_types_int8`
+- Defines `STORAGE_TYPE` as `uint8_t` (instead of `float`/`float16_t`/`double`)
+- Overrides `read_storage()` and `write_storage()` to route through `load_storage_fp8()` and `store_storage_fp8()`
+- No `.comp` files were modified — the existing `{ STORAGE_TYPE data[]; }` buffer declarations and `read_storage()`/`write_storage()` abstractions handle FP8 transparently
+
+**SPIR-V variant suffixes:**
+
+| Suffix | Storage | Compute | State |
+| :--- | :--- | :--- | :--- |
+| `_s8e4c32x32` | E4M3 | FP32 | FP32 |
+| `_s8e4c16x32` | E4M3 | FP16 | FP32 |
+| `_s8e4c32x64` | E4M3 | FP32 | FP64 |
+| `_s8e4c64x64` | E4M3 | FP64 | FP64 |
+| `_s8e5c32x32` | E5M2 | FP32 | FP32 |
+| `_s8e5c16x32` | E5M2 | FP16 | FP32 |
+| `_s8e5c32x64` | E5M2 | FP32 | FP64 |
+| `_s8e5c64x64` | E5M2 | FP64 | FP64 |
+
+**Conversion characteristics:**
+- **E4M3:** sign(1) + exponent(4) + mantissa(3), bias=7, max=448, min subnormal=2⁻⁹
+- **E5M2:** sign(1) + exponent(5) + mantissa(2), bias=15, max=57344, min subnormal=2⁻¹⁶
+- **Rounding:** Round-to-nearest-even on store
+- **Overflow:** Saturates to format max (±448 for E4M3, ±57344 for E5M2)
+- **NaN handling:** NaN inputs store as zero (E4M3 has no NaN; E5M2 preserves NaN only for inf/NaN inputs)
+
+`_pipeline_cache.py` maps `PrecisionConfig` → SPIR-V variant suffix via `precision_to_suffix()` from `src/shared/precision_suffix.py`, keyed by `(storage_dtype, compute_dtype, state_dtype)`.
 
 ### Push Constant Design
 

@@ -13,14 +13,22 @@ Phase 6: Rewritten to use plan-model dispatch exclusively (Option B:
 direct PlanRenderer). No legacy module references remain.
 """
 
+import warnings
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 
+from .shared.fp8_scaling import (
+    FP8ScaleInfo,
+    FP8_SCALES_VERSION,
+    compute_fp8_scale,
+    apply_fp8_scale,
+    unapply_fp8_scale,
+)
 from .shared.model_spec import ModelSpec
 from .shared.parameter_space import ParameterSpace
-from .shared.precision_config import PrecisionConfig
+from .shared.precision_config import PrecisionConfig, FP8_DTYPES
 from .shared.hardware_profile import HardwareProfile
 from .shared.stabilization_policy import StabilizationPolicy
 from .shared.plan_builder import build_act_plan, build_learn_plan
@@ -88,6 +96,128 @@ class TrainingOrchestrator:
             compute_fp_format_max=model_spec.precision.compute_fp_format_max,
         )
 
+        # FP8 support (ADR-025 §8)
+        self.is_fp8_storage = model_spec.precision.storage_dtype in FP8_DTYPES
+        # Per-buffer scale tracking (for FP8).
+        # CONSTRAINT: Keys must be static buffer names derived from plan node names
+        # (deterministic and bounded). Do NOT use per-step or per-iteration keys —
+        # that would cause unbounded memory growth. There is intentionally no
+        # eviction policy; the dict size is bounded by the number of plan nodes.
+        self._activation_scales: dict[str, FP8ScaleInfo] = {}
+
+    # ------------------------------------------------------------------
+    # FP8 scaling helpers (ADR-025 §8)
+    # ------------------------------------------------------------------
+
+    def _prepare_storage_buffer(
+        self,
+        name: str,
+        tensor: np.ndarray,
+        precision_role: str,
+    ) -> np.ndarray:
+        """Prepare tensor for storage-role buffer.
+
+        For FP8, applies scaling if needed and tracks scale for inverse.
+        """
+        if precision_role != "storage":
+            return tensor
+
+        if not self.is_fp8_storage:
+            return tensor
+
+        # Compute and apply FP8 scaling
+        scale_info = compute_fp8_scale(tensor, self.model_spec.precision)
+        self._activation_scales[name] = scale_info
+
+        # Invariant: compute_fp8_scale returns scale=1.0 as a Python float literal
+        # (identity path), so this exact-equality check is safe — no floating-point
+        # rounding can produce a near-1.0 value that should be treated as identity.
+        if scale_info.scale != 1.0:
+            return apply_fp8_scale(tensor, scale_info)
+        return tensor
+
+    def _restore_from_storage(
+        self,
+        name: str,
+        tensor: np.ndarray,
+    ) -> np.ndarray:
+        """Restore tensor values after reading from storage-role buffer."""
+        if name not in self._activation_scales:
+            return tensor
+
+        scale_info = self._activation_scales[name]
+        # Same invariant as _prepare_storage_buffer: inv_scale=1.0 is exact identity.
+        if scale_info.inv_scale != 1.0:
+            return unapply_fp8_scale(tensor, scale_info)
+        return tensor
+
+    def _validate_gradient_fits_fp8(self, gradient: np.ndarray) -> None:
+        """Assert gradients are within FP8 range (should pass due to QSP)."""
+        if not self.is_fp8_storage:
+            return
+
+        max_grad = np.abs(gradient).max()
+        storage_max = self.model_spec.precision.storage_fp_format_max
+
+        if max_grad > storage_max:
+            # This should not happen under correct Quadratic Scaling Policy
+            warnings.warn(
+                f"Gradient max {max_grad:.2e} exceeds FP8 max {storage_max}. "
+                f"Values will saturate. Check stabilization policy."
+            )
+
+    # ------------------------------------------------------------------
+    # Checkpoint support (ADR-025 §8)
+    # ------------------------------------------------------------------
+
+    def checkpoint_state(self) -> dict:
+        """Export state for checkpointing."""
+        state: dict = {
+            "training_step": getattr(self, '_training_step', 0),
+        }
+        if self.is_fp8_storage:
+            # Convert NamedTuple to dict for JSON/pickle serialization
+            # Embed version INSIDE the fp8_scales dict (not as sibling key) for atomicity
+            state["fp8_scales"] = {
+                "_version": FP8_SCALES_VERSION,  # Reserved metadata key (leading underscore)
+                "scales": {
+                    name: info._asdict() for name, info in self._activation_scales.items()
+                },
+            }
+        return state
+
+    def restore_state(self, state: dict) -> None:
+        """Restore state from checkpoint."""
+        self._training_step = state.get("training_step", 0)
+
+        # Restore FP8 scales with version checking and structure validation
+        if "fp8_scales" in state:
+            fp8_data = state["fp8_scales"]
+            checkpoint_version = fp8_data.get("_version", 0)
+
+            if checkpoint_version != FP8_SCALES_VERSION:
+                warnings.warn(
+                    f"FP8 scale format mismatch: checkpoint v{checkpoint_version}, "
+                    f"current v{FP8_SCALES_VERSION}. Scales will be recomputed."
+                )
+                self._activation_scales = {}  # Recompute on next forward pass
+            else:
+                # Defensive construction: catch TypeError if FP8ScaleInfo structure changed
+                try:
+                    scales_dict = fp8_data.get("scales", {})
+                    self._activation_scales = {
+                        name: FP8ScaleInfo(**info) for name, info in scales_dict.items()
+                    }
+                except TypeError as e:
+                    warnings.warn(
+                        f"FP8ScaleInfo structure incompatible with checkpoint: {e}. "
+                        f"Scales will be recomputed."
+                    )
+                    self._activation_scales = {}
+        else:
+            # Pre-FP8 checkpoint (Phase 8 or earlier) — no fp8_scales key is valid
+            self._activation_scales = {}
+
     def train(self, X_train: np.ndarray, y_train: np.ndarray) -> np.ndarray:
         """Run the training loop, returning final-epoch class probabilities.
 
@@ -108,8 +238,8 @@ class TrainingOrchestrator:
             act_futures = self.renderer.render(act_plan)
 
             # Extract probabilities from Act phase
-            if "final_probs" in act_futures:
-                final_probs = act_futures["final_probs"].result()
+            if "inference_event" in act_futures:
+                final_probs = act_futures["inference_event"].result()
 
             # Learn phase: gradient computation + parameter update
             learn_plan = build_learn_plan(

@@ -1,0 +1,31 @@
+// fp8_roundtrip.comp — FP8 roundtrip test shader (ADR-025 §9.2)
+//
+// Test-only shader: reads COMPUTE_TYPE input, stores to STORAGE_TYPE (FP8),
+// loads back to COMPUTE_TYPE, and writes to output buffer.
+// Used to verify FP8 conversion functions produce correct results.
+//
+// Dispatch: vkCmdDispatch(ceil(count / SIMD_WIDTH), 1, 1)
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+} push;
+
+layout(set = 0, binding = 0) readonly buffer InputBuf  { COMPUTE_TYPE data[]; } src_input;
+layout(set = 0, binding = 1) buffer StorageBuf         { STORAGE_TYPE data[]; } storage_buf;
+layout(set = 0, binding = 2) writeonly buffer OutputBuf { COMPUTE_TYPE data[]; } dest_output;
+
+void main() {
+    uint i = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (i >= push.count) return;
+
+    // Store: COMPUTE_TYPE → STORAGE_TYPE (FP8 quantization via write_storage)
+    storage_buf.data[i] = write_storage(src_input.data[i]);
+
+    // Load: STORAGE_TYPE → COMPUTE_TYPE (FP8 dequantization via read_storage)
+    dest_output.data[i] = read_storage(storage_buf.data[i]);
+}

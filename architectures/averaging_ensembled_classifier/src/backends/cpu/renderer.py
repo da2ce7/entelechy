@@ -21,11 +21,14 @@ from ...shared.plan_types import (
 )
 from ...shared.retrieval_future import RetrievalFuture
 from ._dispatch_table import build_dispatch_table
-from ._ffi_types import PRECISION_C_TYPES, PRECISION_STRUCTS, PRECISION_SUFFIXES
+from ._ffi_types import ALL_PRECISION_SUFFIXES, PRECISION_C_TYPES, PRECISION_STRUCTS
 from ._loader import load_cpu_library
 from .buffer_allocator import CPUBufferAllocator
 from .discovery import detect_thread_count
 from .retrieval import CPURetrievalFuture
+
+from ...shared.precision_config import FP8_DTYPES, FP8_E4M3, FP8_E5M2
+from ...shared.precision_suffix import precision_to_suffix
 
 c_uint_p = POINTER(c_uint32)
 c_int_p = POINTER(c_int32)
@@ -55,28 +58,9 @@ def _get_precision_suffix(
 ) -> str:
     """Map three-axis precision configuration to kernel suffix (ADR-024 §4.1).
 
-    Returns one of the 9 valid s{s}c{c}x{x} suffixes.
+    Delegates to the shared ``precision_to_suffix`` implementation.
     """
-    _SUFFIX_MAP: dict[tuple[type, type, type], str] = {
-        (np.float16, np.float16, np.float32): "s16c16x32",
-        (np.float16, np.float16, np.float64): "s16c16x64",
-        (np.float16, np.float32, np.float32): "s16c32x32",
-        (np.float16, np.float32, np.float64): "s16c32x64",
-        (np.float16, np.float64, np.float64): "s16c64x64",
-        (np.float32, np.float32, np.float32): "s32c32x32",
-        (np.float32, np.float32, np.float64): "s32c32x64",
-        (np.float32, np.float64, np.float64): "s32c64x64",
-        (np.float64, np.float64, np.float64): "s64c64x64",
-    }
-    key = (storage_dtype.type, compute_dtype.type, state_dtype.type)
-    suffix = _SUFFIX_MAP.get(key)
-    if suffix is None:
-        raise ValueError(
-            f"No CPU kernel instantiation for "
-            f"storage={storage_dtype}, compute={compute_dtype}, "
-            f"state={state_dtype}"
-        )
-    return suffix
+    return precision_to_suffix(storage_dtype, compute_dtype, state_dtype)
 
 
 class CPUPlanRenderer:
@@ -90,7 +74,7 @@ class CPUPlanRenderer:
         self._lib = load_cpu_library()
         self._dispatch_tables = {
             suffix: build_dispatch_table(self._lib, suffix)
-            for suffix in PRECISION_SUFFIXES
+            for suffix in ALL_PRECISION_SUFFIXES
         }
 
         if thread_count is None:

@@ -77,6 +77,18 @@ def pytest_addoption(parser):
         default=False,
         help="Run Tier 3 parity tests with all-pairs comparison (GPU-vs-GPU in addition to oracle)",
     )
+    parser.addoption(
+        "--calibration-mode",
+        action="store_true",
+        default=False,
+        help="Enable FP8 tolerance calibration mode (verbose error stats)",
+    )
+
+
+@pytest.fixture
+def calibration_mode(request):
+    """Return True if running in calibration mode."""
+    return request.config.getoption("--calibration-mode")
 
 
 def pytest_collection_modifyitems(config, items):

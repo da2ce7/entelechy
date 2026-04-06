@@ -59,6 +59,9 @@
 #ifndef COMPUTE_TYPE_IS_DOUBLE
 #error "System Contract Violation: COMPUTE_TYPE_IS_DOUBLE must be defined by the host build system."
 #endif
+#ifndef STATE_TYPE_IS_HALF
+#error "System Contract Violation: STATE_TYPE_IS_HALF must be defined by the host build system."
+#endif
 #ifndef STATE_TYPE_IS_DOUBLE
 #error "System Contract Violation: STATE_TYPE_IS_DOUBLE must be defined by the host build system."
 #endif
@@ -82,6 +85,12 @@
 #if COMPUTE_TYPE_IS_HALF && !STORAGE_TYPE_IS_HALF
 #if !defined(cl_khr_fp16)
 #error "FP16 extension (cl_khr_fp16) required for half precision compute but not supported by device"
+#endif
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#endif
+#if STATE_TYPE_IS_HALF && !STORAGE_TYPE_IS_HALF && !COMPUTE_TYPE_IS_HALF
+#if !defined(cl_khr_fp16)
+#error "FP16 extension (cl_khr_fp16) required for half precision state but not supported by device"
 #endif
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #endif
@@ -348,11 +357,11 @@ static inline void store_storage(
 // When STATE_TYPE = double and COMPUTE_TYPE = double:
 //   Both casts are identity operations, eliminated by the compiler.
 //
-// STATE_TYPE = half Note (ADR-024 invariant):
-//   STATE_TYPE = half is architecturally valid only when STORAGE_TYPE is also
-//   half (enforced by PrecisionConfig.__post_init__), guaranteeing cl_khr_fp16
-//   is enabled. Plain array access on half* is valid when the extension is
-//   active, so no vload_half/vstore_half path is required here.
+// STATE_TYPE = half Note (ADR-024):
+//   When STATE_TYPE = half, cl_khr_fp16 must be active. This is guaranteed
+//   because the extension is enabled when any role type is half (storage,
+//   compute, or state). Plain array access on half* is valid when the
+//   extension is active, so no vload_half/vstore_half path is required here.
 
 static inline COMPUTE_TYPE load_state(
     __global const STATE_TYPE *buf, size_t idx)
@@ -417,6 +426,9 @@ static inline void store_state_update(
 #endif
 #ifndef COMPUTE_TYPE_IS_DOUBLE
 #define COMPUTE_TYPE_IS_DOUBLE 0
+#endif
+#ifndef STATE_TYPE_IS_HALF
+#define STATE_TYPE_IS_HALF 0
 #endif
 #ifndef STATE_TYPE_IS_DOUBLE
 #define STATE_TYPE_IS_DOUBLE 0

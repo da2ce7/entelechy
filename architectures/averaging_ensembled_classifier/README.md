@@ -87,10 +87,59 @@ The engine executes through a **plan-as-data-structure** model: a shared orchest
 | Backend | Status | Execution Primitives |
 | :--- | :--- | :--- |
 | **OpenCL** | Reference implementation | `clEnqueueNDRange` + `cl.Event` synchronization |
-| **CPU** | ✅ **Implemented** | SIMD-vectorized C kernels (`libcpu_kernels.so`) + persistent thread pool via `pool_dispatch_and_wait` |
-| **Vulkan** | ✅ **Implemented** | SPIR-V compute shaders via `vkCmdDispatch` + pipeline barriers |
+| **CPU** | ✅ **Implemented** (FP8 support) | SIMD-vectorized C kernels (`libcpu_kernels.so`) + persistent thread pool via `pool_dispatch_and_wait` |
+| **Vulkan** | ✅ **Implemented** (FP8 support) | SPIR-V compute shaders via `vkCmdDispatch` + pipeline barriers |
+
+All three backends support the three-role precision model (storage/compute/state). The CPU and Vulkan backends additionally support FP8 (E4M3/E5M2) storage precision with FP16/FP32/FP64 compute, achieving 4× bandwidth compression vs. FP32.
 
 The CPU backend requires zero additional Python dependencies beyond `ctypes` (stdlib). It supports AVX-512, AVX2, SSE2, ARM NEON, and a scalar fallback, auto-detecting the optimal ISA at compile time. See [`CPU_BACKEND.md`](./CPU_BACKEND.md) for the full architecture.
+
+### Precision Configuration
+
+#### FP8 Storage (Maximum Bandwidth)
+
+For bandwidth-limited workloads, FP8 storage achieves 4× compression vs. FP32:
+
+```python
+from shared.precision_config import PrecisionConfig
+
+# E4M3: 3 mantissa bits, max value 448
+cfg = PrecisionConfig.fp8_e4m3()
+
+# E5M2: 2 mantissa bits, max value 57344 (wider range)
+cfg = PrecisionConfig.fp8_e5m2()
+
+# E4M3 with FP64 compute + FP64 optimizer state for extended stability
+cfg = PrecisionConfig.fp8_e4m3_f64()
+```
+
+FP8 is **storage-role only** — compute uses FP16, FP32, or FP64; state uses FP32 or FP64.
+Attempting FP8 compute or state raises `ValueError`.
+
+#### Compute precision options
+
+| Factory | Storage | Compute | State | Use Case |
+|:---|:---|:---|:---|:---|
+| `fp8_e4m3()` | E4M3 | FP32 | FP32 | Standard bandwidth-optimized training |
+| `fp8_e4m3_f16()` | E4M3 | FP16 | FP32 | Maximum throughput on FP16-accelerated hardware |
+| `fp8_e4m3_f64()` | E4M3 | FP64 | FP64 | Extended stability for long training runs |
+| `fp8_e5m2()` | E5M2 | FP32 | FP32 | Wider range (57344 max) for gradient outliers |
+| `fp8_e5m2_f16()` | E5M2 | FP16 | FP32 | Wider range + FP16 compute throughput |
+| `fp8_e5m2_f64()` | E5M2 | FP64 | FP64 | Wider range + extended stability |
+
+Non-default combinations (e.g., FP16 compute + FP64 state) are created via constructor.
+
+#### When to use FP8
+
+- Memory bandwidth is the bottleneck
+- Activations and gradients are well-conditioned (no extreme outliers)
+- 448 (E4M3) or 57344 (E5M2) max value is sufficient
+
+#### When NOT to use FP8
+
+- Training large models where state precision matters (use `fp8_e4m3_f64()`)
+- Debugging numerical issues (use FP32 for reproducibility)
+- Workloads with extreme dynamic range (E5M2 may help, or use FP16)
 
 ---
 

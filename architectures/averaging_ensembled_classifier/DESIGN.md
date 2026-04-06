@@ -1,7 +1,7 @@
 # Design Document: Averaging Ensembled Classifier
 
-**Revision:** 2.4 — Post-ADR-026  
-**Last Updated:** 2026-04-03  
+**Revision:** 2.5 — Post-Phase-9D  
+**Last Updated:** 2026-04-06  
 **Scope:** Implementation design for the multi-backend averaging ensembled classifier architecture.
 
 ---
@@ -271,6 +271,7 @@ averaging_ensembled_classifier/
 │   │   ├── stabilization_policy.py          # Threshold scheduling
 │   │   ├── workload_primitives.py           # Tiling and chunk decomposition
 │   │   ├── problem_type_strategy.py         # CCE/BCE strategy delegation (ADR-011)
+│   │   ├── fp8_scaling.py                   # FP8 host-side scaling utilities (ADR-025 §8)
 │   │   └── kernel_contracts/                # KernelContract frozen dataclasses (ADR-007)
 │   │       ├── __init__.py
 │   │       ├── phase_1_act.py
@@ -301,7 +302,8 @@ averaging_ensembled_classifier/
 │   │   │   ├── _pipeline_cache.py           # Compute pipeline creation and caching
 │   │   │   ├── _push_constants.py           # Push constant struct packing
 │   │   │   └── kernel_sources/              # GLSL compute shaders (*.comp)
-│   │   │       └── common.glsl              # Shared specialization constant declarations
+│   │       ├── common.glsl              # Shared specialization constant declarations, FP8 conversion
+│   │       └── fp8_roundtrip.comp       # Test-only shader for FP8 roundtrip verification
 │   │   │
 │   │   └── cpu/                             # ctypes FFI backend — compiled C shared library
 │   │       ├── __init__.py                  # Public exports: CPUPlanRenderer, discover_hardware, etc.
@@ -336,9 +338,10 @@ averaging_ensembled_classifier/
 │   └── main_orchestrator.py                 # Training orchestration (migrating to Engine)
 │
 ├── tests/                                   # Tiered test framework (ADR-016)
-│   ├── conftest.py                          # _build_config-driven skip logic
+│   ├── conftest.py                          # _build_config-driven skip logic, --calibration-mode
 │   ├── tolerance_config.py                  # Per-kernel tolerance tables (FP32 + backend-specific)
-│   ├── tier1/                               # Host-side plan correctness (140 tests)
+│   ├── tier1/                               # Host-side plan correctness
+│   │   └── test_fp8_memory.py               # FP8 memory allocation validation (Phase 9E)
 │   ├── tier2/                               # Per-backend kernel correctness
 │   │   ├── fixtures/                        # Analytical + numpy reference implementations (shared)
 │   │   │   ├── analytical.py                # Closed-form reference: clamp, normalize, clip, mask
@@ -349,12 +352,19 @@ averaging_ensembled_classifier/
 │   │   │   ├── numpy_backprop.py            # shared weight/bias backprop
 │   │   │   └── numpy_update.py              # adam_update reference
 │   │   ├── opencl/                          # OpenCL Tier 2 tests
+│   │   ├── vulkan/                          # Vulkan Tier 2 tests (17 test modules)
+│   │   │   ├── conftest.py                  # Session-scoped Vulkan fixtures
+│   │   │   ├── test_vulkan_*.py             # Per-kernel correctness tests
+│   │   │   └── test_fp8_vulkan.py           # FP8 roundtrip, suffix mapping, GPU dispatch tests (Phase 9D)
 │   │   └── cpu/                             # CPU Tier 2 tests (19 test modules)
 │   │       ├── conftest.py                  # Session-scoped CPU fixtures
 │   │       ├── test_cpu_*.py                # Per-kernel correctness tests
 │   │       ├── test_fp8_cpu.py              # FP8 roundtrip, saturation, LUT, struct tests (Phase 9C)
 │   │       └── test_fp8_cpu_availability.py # FP8 variant availability and _Float16 detection tests
 │   └── tier3/                               # Cross-backend parity (CPU oracle)
+│       ├── test_fp8_integration.py          # Bandwidth Extremist FP8 validation (Phase 9E, ADR-025 §9.1)
+│       ├── test_fp8_cross_backend.py        # Cross-backend FP8 bit-exact consistency (Phase 9E)
+│       └── test_checkpoint_migration.py     # FP8 checkpoint version migration (Phase 9E)
 │
 └── adr/                                     # Architectural Decision Records (ADR-001 through ADR-018)
 ```
@@ -396,7 +406,8 @@ The following legacy service modules are dissolved into stateless plan primitive
 - **Local memory:** `shared` qualifier, compile-time sized via specialization constants.
 - **Build-time constants:** Vulkan specialization constants replace `-D` preprocessor flags.
 - **Parameter passing:** Push constants via `_push_constants.py` for scalar parameters; descriptor sets for buffer bindings.
-- **Status:** ✅ **Implemented** (Phase 5 complete; Phase 7 precision migration complete). 20 GLSL compute shaders (three SPIR-V variants each for storage/state-role-bearing shaders). 11 Python modules. 16 Tier 2 test modules.
+- **Status:** ✅ **Implemented** (Phase 5 complete; Phase 7 precision migration complete; Phase 9D FP8 Vulkan backend complete). 21 GLSL compute shaders (three SPIR-V variants each for storage/state-role-bearing shaders, plus eight FP8 variants per shader). 11 Python modules. 17 Tier 2 test modules.
+- **FP8 support (Phase 9D, ADR-025 §7):** `common.glsl` defines arithmetic FP8↔float conversion functions (~12–15 ALU ops). FP8 buffers use `uint8_t` via `VK_KHR_8bit_storage`; conversion to `COMPUTE_TYPE` happens in-shader via `read_storage()`/`write_storage()` overrides. No `.comp` files modified — the existing `STORAGE_TYPE` abstraction handles FP8 transparently. Eight FP8 SPIR-V suffix variants: `_s8e4c32x32`, `_s8e4c16x32`, `_s8e4c32x64`, `_s8e4c64x64`, `_s8e5c32x32`, `_s8e5c16x32`, `_s8e5c32x64`, `_s8e5c64x64`. Extension detection and `check_precision_requirements()` in `context.py`. Suffix mapping via `precision_to_suffix()` in `src/shared/precision_suffix.py`.
 
 ### 7.3 CPU Backend (ADR-015)
 
@@ -556,6 +567,8 @@ All phases proceed in parallel behind `_build_config.py` feature flags. Each pha
 | **7: Mixed Precision** | Three-role precision model (storage/compute/state); kernel spec, OpenCL, CPU, Vulkan migration; alias removal; multi-config tests | All Tier 2 tests pass for all three `PrecisionConfig` factories; zero `SCALAR_TYPE` references; Alchemist validation | **✅ Complete** |
 | **9A: FP8 Foundation** | `PrecisionConfig` FP8 factories; FP8 LUT generation; ADR-025 | Tier 1 green; LUT tables generated | **✅ Complete** |
 | **9C: FP8 CPU Backend** | `cpu_fp8.h` types/conversions; 10 FP8 kernel suffix variants; `_Float16` detection; FP8 roundtrip tests | All existing CPU tests pass; FP8 variants compile; FP8 roundtrip ≤1 ULP | **✅ Complete** |
+| **9D: FP8 Vulkan Backend** | FP8 conversion in `common.glsl`; 8 FP8 SPIR-V variants; extension detection; FP8 roundtrip tests | All existing Vulkan tests pass (91/91); FP8 SPIR-V compilation succeeds (150/150); FP8 roundtrip ≤1 ULP (35/35 incl. 6 GPU dispatch) | **✅ Complete** |
+| **9E: FP8 Host Integration** | Host-side FP8 scaling (`fp8_scaling.py`); orchestrator FP8 integration; checkpoint migration; Bandwidth Extremist validation | All existing tests pass; FP8 storage buffers ½ FP16 size; checkpoint roundtrip preserves scales | **✅ Complete** |
 
 ### 11.3 Phase Dependency Graph
 
@@ -583,11 +596,12 @@ Phase 7 (Mixed Precision) ──── ✅ Complete (180 tests green)
   └──▶ Phase 7C (CPU, Vulkan & Final) ─── ✅ Complete
   │
   ▼
-Phase 9 (FP8 Support) ──── In progress
+Phase 9 (FP8 Support) ──── In progress (9B remaining)
   ├──▶ Phase 9A (Foundation & LUTs) ────── ✅ Complete
   ├──▶ Phase 9C (CPU Backend) ──────────── ✅ Complete (118 tests green)
-  ├──▶ Phase 9B (OpenCL Backend) ────────── Not started
-  └──▶ Phase 9D (Vulkan Backend) ────────── Not started
+  ├──▶ Phase 9D (Vulkan Backend) ──────── ✅ Complete (126 passed, 2 skipped)
+  ├──▶ Phase 9E (Host Integration) ────── ✅ Complete
+  └──▶ Phase 9B (OpenCL Backend) ──────── Not started
 ```
 
 Phases 2, 3, and 5 are independent workstreams. Phase 4 has no hard dependency. Phase 6 is a join point requiring all preceding phases. Phase 7 depends on Phase 6 and is a three-sub-phase sequential chain (7A → 7B → 7C).
@@ -605,6 +619,10 @@ As of Phase 6 completion, all three backend flags (`aec_backend_cpu`, `aec_backe
 As of Phase 7 completion, all three backends support the full three-role precision model (`PrecisionConfig.float32()`, `PrecisionConfig.mixed_f16_f32()`). The retired `SCALAR_TYPE`/`SCALAR_IS_HALF` aliases have been removed from all kernel sources and build systems. The uniform `PrecisionConfig.float16()` factory was deleted in Phase 9A (the factory was a common footgun for extended training); use `PrecisionConfig.mixed_f16_f32()` instead. Direct construction with FP16 state remains valid.
 
 As of Phase 9C completion, the CPU backend additionally supports FP8 E4M3/E5M2 storage precision with FP32/FP64 compute (6 unconditional suffix variants) and optionally FP16 compute (4 conditional variants requiring `_Float16`). `PrecisionConfig.fp8_e4m3()`, `.fp8_e5m2()`, and related factories are available. FP8 LUT tables were generated in Phase 9A; the CPU backend implementation was completed in Phase 9C.
+
+As of Phase 9D completion, the Vulkan backend additionally supports FP8 E4M3/E5M2 storage precision with FP16/FP32/FP64 compute via arithmetic software conversion in GLSL shaders. Eight FP8 SPIR-V suffix variants are compiled per storage/state-role-bearing shader. FP8 buffers use `uint8_t` via `VK_KHR_8bit_storage`; `VulkanContext.check_precision_requirements()` validates device extension support before dispatch. No `.comp` shader files were modified — the existing `STORAGE_TYPE`/`read_storage()`/`write_storage()` abstraction in `common.glsl` handles FP8 transparently.
+
+As of Phase 9E completion, host-side FP8 scaling is implemented in `src/shared/fp8_scaling.py` (ADR-025 §8). The `TrainingOrchestrator` integrates FP8 storage buffers via `_prepare_storage_buffer()` and `_restore_from_storage()`, with per-tensor activation scales tracked in `_activation_scales`. Checkpoint serialization embeds `FP8_SCALES_VERSION` for forward-compatible migration. The "Bandwidth Extremist" validation scenario (ADR-025 §9.1) confirms FP8 storage produces convergent training within tolerance of FP16 baseline. `conftest.py` adds `--calibration-mode` for diagnostic error-distribution logging.
 
 ### 11.5 Rollback Protocol
 
