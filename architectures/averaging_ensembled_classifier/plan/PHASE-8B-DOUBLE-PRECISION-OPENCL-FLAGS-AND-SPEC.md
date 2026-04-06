@@ -1,6 +1,6 @@
 # Phase 8B: Double Precision — OpenCL Kernel Specification & Compiler Flags
 
-**Status: NOT STARTED**  
+**Status: ✅ COMPLETED**  
 **Phase:** 8B of 8  
 **Prerequisite:** Phase 8A complete and rollback gate passed.  
 **Objective:** Extend the OpenCL kernel specification (`kernels.cl.h`) and all OpenCL implementation files (`phase_*.cl.c`) with FP64 support. Add the `cl_khr_fp64` extension guard. Emit `_IS_DOUBLE` flags from the OpenCL type-mapping layer. Extend `COMPUTE_ZERO` for FP64. Update the precision boundary abstraction functions (`load_state`, `store_state`) to handle FP64↔FP32 narrowing/widening. The phase ends when `PrecisionConfig.float32()` produces identical Tier 2 test results (no regression), and the OpenCL compilation succeeds when invoked with FP64 flags.  

@@ -1,6 +1,6 @@
 # Phase 8A: Double Precision — Authority Documents, PrecisionConfig Extension & Shared Infrastructure
 
-**Status: NOT STARTED**  
+**Status: ✅ COMPLETED**  
 **Phase:** 8A of 8  
 **Prerequisite:** Phase 7C complete and rollback gate passed.  
 **Objective:** Amend the authority documents (CONCEPT.md, CONTRACT.md) with FP64 additions. Extend `PrecisionConfig` with four new factory classmethods and update the `__post_init__` invariants. Cascade the FP64 derived constants (`_IS_DOUBLE` flags, `compute_epsilon` for FP64) through the shared configuration, plan, and host layers. Extend `StabilizationPolicy` safety ceiling commentary for FP64. Update test fixtures. No kernel sources, no backend-native code, no build system changes. The phase ends when all existing tests pass against the new `PrecisionConfig` interface and the four new factories construct without error.  

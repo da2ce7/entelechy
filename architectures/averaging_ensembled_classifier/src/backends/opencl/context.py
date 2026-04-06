@@ -46,13 +46,23 @@ def load_and_compile_kernels(
     installed or run from a source tree.
     """
     import importlib.resources
+    import os
     package = importlib.resources.files("averaging_ensembled_classifier.kernels")
     sources: list[str] = []
     for fname in _KERNEL_FILES:
         sources.append(package.joinpath(fname).read_text())
 
+    # Add -I for the kernels directory so #include directives resolve
+    # (e.g., fp8_lut.gen.h for FP8 storage, ADR-025 §6.1)
+    include_flags = []
+    pkg_str = str(package)
+    if os.path.isdir(pkg_str):
+        include_flags.append(f"-I{pkg_str}")
+
     program = cl.Program(context, "\n".join(sources))
-    program.build(options=" ".join(compiler_flags), devices=[device])
+    program.build(
+        options=" ".join(include_flags + compiler_flags), devices=[device],
+    )
     return program
 
 
@@ -73,6 +83,12 @@ def load_and_compile_kernels_from_path(
     for fname in _KERNEL_FILES:
         sources.append((kernel_dir_path / fname).read_text())
 
+    # Add -I for the kernels directory so #include directives resolve
+    # (e.g., fp8_lut.gen.h for FP8 storage, ADR-025 §6.1)
+    include_flags = [f"-I{kernel_dir_path}"]
+
     program = cl.Program(context, "\n".join(sources))
-    program.build(options=" ".join(compiler_flags), devices=[device])
+    program.build(
+        options=" ".join(include_flags + compiler_flags), devices=[device],
+    )
     return program

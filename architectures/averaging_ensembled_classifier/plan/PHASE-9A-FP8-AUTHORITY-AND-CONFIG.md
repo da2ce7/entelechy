@@ -1,6 +1,6 @@
 # Phase 9A: FP8 Support — Authority Documents, PrecisionConfig Extension & Shared Infrastructure
 
-**Status: NOT STARTED**  
+**Status: ✅ COMPLETED**  
 **Phase:** 9A of 9  
 **Prerequisite:** Phase 8E complete and rollback gate passed.  
 **Objective:** Amend the authority documents (CONCEPT.md, CONTRACT.md) with FP8 additions. Add `ml_dtypes` dependency. Extend `PrecisionConfig` with six new FP8 factory classmethods (`fp8_e4m3()`, `fp8_e5m2()`, `fp8_e4m3_f16()`, `fp8_e5m2_f16()`, `fp8_e4m3_f64()`, `fp8_e5m2_f64()`), enforce the storage-only constraint in `__post_init__`, and add FP8-specific derived constants. Update test fixtures. No kernel sources, no backend-native code, no build system changes. The phase ends when all existing tests pass against the new `PrecisionConfig` interface and the FP8 factories construct without error.  
