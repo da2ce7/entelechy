@@ -45,7 +45,7 @@ class TestFP64PrecisionConfig:
         assert p.compute_dtype == np.dtype(np.float64)
         assert p.state_dtype == np.dtype(np.float64)
         assert p.compute_fp_format_max == float(np.finfo(np.float64).max)
-        assert p.compute_epsilon == 1e-15
+        assert p.compute_epsilon == float(np.finfo(np.float64).eps)
 
     def test_mixed_f32_f64_state_factory(self) -> None:
         p = PrecisionConfig.mixed_f32_f64_state()
@@ -66,16 +66,18 @@ class TestFP64PrecisionConfig:
         assert p.compute_dtype == np.dtype(np.float64)
         assert p.state_dtype == np.dtype(np.float64)
         assert p.compute_fp_format_max == float(np.finfo(np.float64).max)
-        assert p.compute_epsilon == 1e-15
+        assert p.compute_epsilon == float(np.finfo(np.float64).eps)
 
     def test_invalid_fp64_storage_fp32_compute_rejected(self) -> None:
         """FP64 storage with FP32 compute violates storage <= compute invariant."""
-        with pytest.raises(AssertionError, match="storage precision must not be wider"):
+        with pytest.raises(ValueError, match="cannot be wider than"):
             PrecisionConfig(
                 storage_dtype=np.dtype(np.float64),
                 compute_dtype=np.dtype(np.float32),
                 state_dtype=np.dtype(np.float64),
                 storage_fp_format_max=float(np.finfo(np.float64).max),
+                storage_fp_min_positive=float(np.finfo(np.float64).smallest_subnormal),
+                storage_mantissa_bits=np.finfo(np.float64).nmant,
                 compute_fp_format_max=float(np.finfo(np.float32).max),
                 compute_epsilon=float(np.finfo(np.float32).eps),
             )
@@ -90,8 +92,8 @@ class TestFP64PrecisionConfig:
         p32 = PrecisionConfig.float32()
         assert p32.compute_fp_format_max == float(np.finfo(np.float32).max)
         assert p32.compute_epsilon == float(np.finfo(np.float32).eps)
-        p16 = PrecisionConfig.float16()
-        assert p16.compute_fp_format_max == float(np.finfo(np.float16).max)
+        p_mixed = PrecisionConfig.mixed_f16_f32()
+        assert p_mixed.compute_fp_format_max == float(np.finfo(np.float32).max)
 
     @pytest.mark.parametrize("factory", FP64_PRECISION_CONFIGS)
     def test_storage_not_wider_than_compute(self, factory) -> None:
@@ -447,7 +449,7 @@ class TestAllPrecisionsCombined:
         strategy = PlanCceStrategy()
         orders = []
         for factory_fn in [
-            ModelSpec.float32, ModelSpec.float16, ModelSpec.mixed_f16_f32,
+            ModelSpec.float32, ModelSpec.mixed_f16_f32,
             ModelSpec.float64, ModelSpec.mixed_f32_f64_state,
             ModelSpec.mixed_f16_f64_state, ModelSpec.mixed_f32_f64,
         ]:

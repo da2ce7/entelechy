@@ -223,8 +223,8 @@ static inline cpu_fp8_e4m3 cpu_float_to_fp8_e4m3(float val) {
     
     /* Handle special cases */
     if (isnan(val)) {
-        /* E4M3 has no NaN representation — all 256 bit patterns are finite values.
-         * This is a design choice in the ml_dtypes FP8 formats (ADR-025 §1).
+        /* E4M3 has no infinities but does have 2 NaN patterns (0x7F, 0xFF).
+         * The store path never writes NaN; we map NaN→zero defensively.
          * 
          * We map NaN→zero rather than NaN→max because:
          * 1. NaN in gradients typically indicates upstream numerical instability
@@ -1032,7 +1032,7 @@ The FP32→FP8 conversion implements round-to-nearest-even. This matches the `ml
 
 ### NaN handling
 
-**E4M3** (`float8_e4m3fn`) has no NaN or infinity representation — all 256 bit patterns map to finite values. **E5M2** follows IEEE-like conventions: exponent 0x1F encodes ±infinity (mantissa = 0) and NaN (mantissa ≠ 0), giving 248 finite patterns. However, the **store path** for both formats saturates to the maximum finite value; it never writes inf/NaN bit patterns to storage buffers.
+**E4M3** (`float8_e4m3fn`) has no infinity representation but reserves 2 bit patterns for NaN (0x7F, 0xFF), leaving 254 finite values. **E5M2** follows IEEE-like conventions: exponent 0x1F encodes ±infinity (mantissa = 0) and NaN (mantissa ≠ 0), giving 248 finite patterns. However, the **store path** for both formats saturates to the maximum finite value; it never writes inf/NaN bit patterns to storage buffers.
 
 When the input float is NaN, both conversion functions map it to **zero**:
 

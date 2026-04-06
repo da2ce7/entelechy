@@ -6,7 +6,8 @@
 **Triggered by:** Discovered contradiction between the state role's stability mandate (CONCEPT §11, ADR-024) and the Precision Boundary Conversion invariant (ADR-020 §3.5) in accumulative operations  
 **Depends on:** ADR-020 (Three-Role Precision Model), ADR-024 (FP64 Support)  
 **Amends:** ADR-020 §3.5 (Behavioral Invariants Vocabulary), ADR-024 §8.2 (Alchemist II scenario)  
-**Constrains:** Node 24 (`adam_update`), Node 25 (`clamp_temperatures`), and all future stateful-update kernels
+**Constrains:** Node 24 (`adam_update`) and all future accumulative stateful-update kernels  
+**Classifies:** Node 25 (`clamp_temperatures`) as transformative (unchanged)
 
 ---
 
@@ -141,7 +142,7 @@ Is replaced by:
 >
 > 1. **Host-side bias correction.** The host computes `beta1**t` and `beta2**t` in FP64 regardless of `COMPUTE_TYPE`, avoiding precision erosion in these geometrically-decaying terms. This is the established practice formalized by the three-role model.
 >
-> 2. **State-precision accumulation.** Stateful-update kernels (Node 24, Node 25) perform EMA updates in `ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE)`, ensuring moment vectors preserve state precision across unbounded training steps. When `STATE_TYPE > COMPUTE_TYPE`, the kernel widens gradients to state precision for the EMA computation rather than narrowing state values to compute precision.
+> 2. **State-precision accumulation.** Stateful-update kernels with accumulative operations (Node 24) perform EMA updates in `ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE)`, ensuring moment vectors preserve state precision across unbounded training steps. When `STATE_TYPE > COMPUTE_TYPE`, the kernel widens gradients to state precision for the EMA computation rather than narrowing state values to compute precision. (Node 25's clamping is transformative, not accumulative — standard precision boundary conversion applies.)
 >
 > Adam's EMA update ($\beta_1 \cdot m + (1 - \beta_1) \cdot g$) requires that the format represent the small difference $(1 - \beta_1) \cdot g$ without rounding it away. For $\beta_1 = 0.999$, the gradient contributes only $0.001$ of its magnitude per step. When state precision exceeds compute precision, state-precision accumulation ensures this contribution is captured at full state fidelity. FP64's 52-bit mantissa provides an order-of-magnitude more headroom than FP32's 23 bits — headroom that the architecture now preserves.
 
@@ -179,8 +180,8 @@ The precision boundary abstraction block (currently lines 140–180) is extended
     // STATE_TYPE (double) > COMPUTE_TYPE (float or half)
     typedef double ACCUM_TYPE;
     #define ACCUM_IS_WIDER_THAN_COMPUTE 1
-    #define ACCUM_ONE  1.0
-    #define ACCUM_ZERO 0.0
+    #define ACCUM_ONE  ((ACCUM_TYPE)1)
+    #define ACCUM_ZERO ((ACCUM_TYPE)0)
 #else
     // STATE_TYPE <= COMPUTE_TYPE (standard case)
     typedef COMPUTE_TYPE ACCUM_TYPE;
@@ -198,15 +199,18 @@ static inline ACCUM_TYPE load_state_for_accum(
 #if ACCUM_IS_WIDER_THAN_COMPUTE
     return buf[idx];  // No narrowing — direct STATE_TYPE read as ACCUM_TYPE
 #else
-    return (ACCUM_TYPE)buf[idx];  // Cast to COMPUTE_TYPE (may narrow or identity)
+    return (ACCUM_TYPE)buf[idx];  // Widening or identity — STATE_TYPE ≤ COMPUTE_TYPE here
 #endif
 }
 
-// Store accumulation result to state buffer
+// Store accumulation result to state buffer.
+// Supersedes store_state_update() for accumulative operations; the existing
+// store_state_update() (ADR-024 §3.2) remains valid for transformative
+// in-place state mutations (e.g., clamp_temperatures).
 static inline void store_state_from_accum(
     __global STATE_TYPE *buf, size_t idx, ACCUM_TYPE val)
 {
-    buf[idx] = (STATE_TYPE)val;  // Identity or widening — never narrows
+    buf[idx] = (STATE_TYPE)val;  // Identity or widening — never narrows (requires STATE_TYPE ≥ COMPUTE_TYPE)
 }
 
 // Widen compute-role value to accumulation precision (for EMA inputs)
@@ -242,7 +246,7 @@ The kernel contract's Behavioral Invariants are revised.
 > "EMA arithmetic exclusively in COMPUTE_TYPE."
 
 **Revised:**
-> "State-Precision Accumulation: Moment EMA updates (`m_new`, `v_new`) performed exclusively in `ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE)`. Bias-corrected estimates (`m_hat`, `v_hat`) and final parameter update computed in `COMPUTE_TYPE`. Precision Boundary Conversion: gradient consumed in `COMPUTE_TYPE`, widened to `ACCUM_TYPE` for EMA; parameter update narrowed from `COMPUTE_TYPE` to `STATE_TYPE`."
+> "State-Precision Accumulation: Moment EMA updates (`m_new`, `v_new`) and parameter update (`p - δ`) performed exclusively in `ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE)`. Bias-corrected estimates (`m_hat`, `v_hat`) and parameter update delta computed in `COMPUTE_TYPE`. Precision Boundary Conversion: gradient consumed in `COMPUTE_TYPE`, widened to `ACCUM_TYPE` for EMA; parameter delta widened from `COMPUTE_TYPE` to `ACCUM_TYPE` for accumulative subtraction."
 
 ---
 
@@ -256,8 +260,9 @@ The implementation in `phase_3_update.cl.c` is revised:
 // updates a single parameter and its corresponding moment vectors.
 //
 // Key behavioral contract:
-// - State-Precision Accumulation: EMA updates in ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE)
-// - Bias correction and parameter update in COMPUTE_TYPE
+// - State-Precision Accumulation: EMA updates and parameter subtraction in
+//   ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE)
+// - Bias correction and parameter delta computation in COMPUTE_TYPE
 // - Host provides pre-computed beta powers for numerical stability
 //
 // When ACCUM_TYPE == COMPUTE_TYPE (the common case), all widen/narrow casts
@@ -316,15 +321,17 @@ __kernel void adam_update(
     const COMPUTE_TYPE v_hat = narrow_from_accum(v_new) / 
                                (COMPUTE_ONE - src_scalar_REAL_beta2_pow_t);
 
-    // --- 5. Parameter Update ---
+    // --- 5. Parameter Update in ACCUM_TYPE (accumulative) ---
+    // The delta is transformative (computed fresh each step), but the subtraction
+    // p -= delta is accumulative — p refines over unbounded training steps.
+    // Bias correction and delta computation stay in COMPUTE_TYPE; the subtraction
+    // from the parameter is performed in ACCUM_TYPE to preserve state precision.
     const COMPUTE_TYPE param_delta = src_scalar_REAL_learning_rate * m_hat / 
                                      (MATH_FN sqrt(v_hat) + src_scalar_REAL_epsilon);
 
-    // Load current parameter, apply update, store back
-    const COMPUTE_TYPE current_param = narrow_from_accum(
-        load_state_for_accum(update_buffer_GLOBAL_parameters, i));
+    const ACCUM_TYPE current_param = load_state_for_accum(update_buffer_GLOBAL_parameters, i);
     store_state_from_accum(update_buffer_GLOBAL_parameters, i, 
-                           widen_to_accum(current_param - param_delta));
+                           current_param - widen_to_accum(param_delta));
 }
 ```
 
@@ -348,7 +355,7 @@ The `clamp_temperatures` kernel also performs in-place state modification. Its c
 > "Enforces `temps = clamp(temps, min_value, max_value)` for each element. Precision Boundary Conversion: state-role buffer accessed via load_state()/store_state_update(); clamp arithmetic exclusively in COMPUTE_TYPE."
 
 **Revised:**
-> "Enforces `temps = clamp(temps, min_value, max_value)` for each element. **Note:** Clamping is a transformative operation (not accumulative) — precision boundary conversion applies. State-role buffer accessed via load_state()/store_state(); clamp arithmetic in COMPUTE_TYPE; result widened on store. State-Precision Accumulation does not apply — clamp has no cross-invocation precision accumulation."
+> "Enforces `temps = clamp(temps, min_value, max_value)` for each element. **Note:** Clamping is a transformative operation (not accumulative) — precision boundary conversion applies. State-role buffer accessed via load_state()/store_state_update(); clamp arithmetic in COMPUTE_TYPE; result widened on store. State-Precision Accumulation does not apply — clamp has no cross-invocation precision accumulation."
 
 The distinction is deliberate: `clamp_temperatures` reads a value, transforms it, and writes back. It does not accumulate state across invocations. The value is bounded by the clamp range, not by prior state history. Standard precision boundary conversion applies.
 
@@ -362,7 +369,7 @@ The scenario in CONCEPT.md §11 is revised:
 > "Confirms that the FP64-state configuration's moment vectors track the FP64 reference within FP64 tolerance ($< 10^{-14}$ relative error)."
 
 **Revised Validation Focus:**
-> - **Validation Focus:** Confirms that the FP64-state configuration's moment vectors track the FP64 reference within FP64 tolerance ($< 10^{-14}$ relative error) **for the EMA update step** under State-Precision Accumulation. The bias-corrected values (`m_hat`, `v_hat`) and parameter updates are bounded by `COMPUTE_TYPE` precision. Validates that state-precision accumulation correctly isolates moment fidelity from compute-path throughput.
+> - **Validation Focus:** Confirms that the FP64-state configuration's moment vectors track the FP64 reference within FP64 tolerance ($< 10^{-14}$ relative error) **for the EMA update step** under State-Precision Accumulation. The test feeds identical pre-computed gradient sequences to all three configurations, isolating accumulation precision from input-precision divergence. The bias-corrected values (`m_hat`, `v_hat`) and parameter updates are bounded by `COMPUTE_TYPE` precision. Validates that state-precision accumulation correctly isolates moment fidelity from compute-path throughput.
 
 **Revised Key Insight:**
 > - **Key Insight:** Proves that the state role, combined with state-precision accumulation, achieves its stated goal: unbounded training stability through extended-precision moment vectors, while allowing narrower `COMPUTE_TYPE` for throughput in transformative operations. The configuration `mixed_f32_f64_state()` provides a distinct tradeoff from `mixed_f32_f64()`: the former preserves FP64 only where erosion compounds (moments), the latter uses FP64 throughout (higher fidelity, lower throughput).
@@ -388,10 +395,30 @@ The CPU backend's `cpu_precision.h` is extended with accumulation-precision macr
 
 ```c
 // === CPU Accumulation Precision Abstractions (ADR-027) ===
+//
+// Derives a boolean from the existing suffix tokens via preprocessor lookup.
+// The _PREC_IS_F64_* table goes inside the include guard (defined once);
+// the per-inclusion macros below are outside the guard, re-evaluated each
+// time STATE_SUFFIX / COMPUTE_SUFFIX change — mirroring the existing
+// storage-role and state-role pattern.
 
-#if STATE_SUFFIX == f64 && COMPUTE_SUFFIX != f64
+#ifndef _PREC_IS_F64_DEFINED
+#define _PREC_IS_F64_DEFINED
+#define _PREC_IS_F64_f16 0
+#define _PREC_IS_F64_f32 0
+#define _PREC_IS_F64_f64 1
+#endif
+
+#undef ACCUM_T
+#undef ACCUM_IS_WIDER_THAN_COMPUTE
+#undef scalar_load_state_for_accum
+#undef scalar_store_state_from_accum
+#undef scalar_widen_to_accum
+#undef scalar_narrow_from_accum
+
+#if _PREC_CAT2(_PREC_IS_F64, STATE_SUFFIX) && !_PREC_CAT2(_PREC_IS_F64, COMPUTE_SUFFIX)
     // STATE_TYPE (double) > COMPUTE_TYPE (float)
-    typedef double cpu_accum_t;
+    #define ACCUM_T double
     #define ACCUM_IS_WIDER_THAN_COMPUTE 1
     
     #define scalar_load_state_for_accum(ptr, idx) ((ptr)[(idx)])
@@ -400,7 +427,7 @@ The CPU backend's `cpu_precision.h` is extended with accumulation-precision macr
     #define scalar_narrow_from_accum(val) ((COMPUTE_T)(val))
 #else
     // STATE_TYPE <= COMPUTE_TYPE (standard case)
-    typedef COMPUTE_T cpu_accum_t;
+    #define ACCUM_T COMPUTE_T
     #define ACCUM_IS_WIDER_THAN_COMPUTE 0
     
     #define scalar_load_state_for_accum(ptr, idx) scalar_load_state((ptr), (idx))
@@ -410,7 +437,7 @@ The CPU backend's `cpu_precision.h` is extended with accumulation-precision macr
 #endif
 ```
 
-The CPU `adam_update` implementation uses these macros, mirroring the OpenCL kernel structure. When `ACCUM_IS_WIDER_THAN_COMPUTE == 0`, all macros expand to identity operations.
+The CPU `adam_update` implementation in `phase_3_update.inc` is revised to mirror the OpenCL kernel's structure: EMA updates and the parameter subtraction (`p -= delta`) use `ACCUM_T` via the `scalar_*_accum` macros; bias correction and delta computation remain in `COMPUTE_T`. When `ACCUM_IS_WIDER_THAN_COMPUTE == 0`, all macros expand to identity operations — the generated code is identical to the prior implementation.
 
 ---
 
@@ -420,8 +447,11 @@ The Vulkan backend's `common.glsl` is extended:
 
 ```glsl
 // === Accumulation Precision Type (ADR-027) ===
+//
+// Uses the boolean flags STATE_TYPE_IS_DOUBLE and COMPUTE_TYPE_IS_DOUBLE
+// established by ADR-024 §5.3 for the Vulkan backend.
 
-#if defined(STATE_TYPE) && STATE_TYPE == double && COMPUTE_TYPE != double
+#if STATE_TYPE_IS_DOUBLE && !COMPUTE_TYPE_IS_DOUBLE
     #define ACCUM_FLOAT double
     #define ACCUM_IS_WIDER 1
 #else
@@ -482,5 +512,5 @@ When `STATE_TYPE == double` requires `GL_EXT_shader_explicit_arithmetic_types_fl
 - CONCEPT.md §11 — Host Orchestrator, Alchemist II scenario
 - ADR-020 — Three-Role Precision Model, §3.5 Behavioral Invariants
 - ADR-024 — Double Precision Support, §3.2 load_state/store_state, §8.2 Alchemist II  
-- ADR-025 — FP8 Support (confirms storage-only constraint; state is always FP32+)
+- ADR-025 — FP8 Support (FP8 is storage-role only; compute may be FP16/FP32/FP64; state may be FP16/FP32/FP64)
 - ADR-026 — Precision-Typed Kernel Variants (establishes variant-rather-than-branch pattern)

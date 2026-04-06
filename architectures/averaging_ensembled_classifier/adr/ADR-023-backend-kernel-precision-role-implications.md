@@ -492,7 +492,7 @@ Per ADR-021 §5 (extended here to cover all backends), the following obligations
    - `grep -r 'float data\[\]' architectures/averaging_ensembled_classifier/src/backends/vulkan/kernel_sources/` returns no results for any storage-role or state-role buffer binding.
    - `grep -r fp64 architectures/averaging_ensembled_classifier/src/backends/cpu/` returns no results in non-comment code.
 
-4. **Multi-configuration Tier 2 coverage:** Per ADR-020 §4.6, Tier 2 tests run against `PrecisionConfig.float32()`, `PrecisionConfig.float16()`, and `PrecisionConfig.mixed_f16_f32()` for each backend. The Vulkan backend's pipeline cache must select distinct SPIR-V variants for the FP32 and mixed configurations (verified by asserting different kernel file paths are loaded).
+4. **Multi-configuration Tier 2 coverage:** Per ADR-020 §4.6, Tier 2 tests run against `PrecisionConfig.float32()` and `PrecisionConfig.mixed_f16_f32()` for each backend. The Vulkan backend's pipeline cache must select distinct SPIR-V variants for the FP32 and mixed configurations (verified by asserting different kernel file paths are loaded).
 
 ---
 

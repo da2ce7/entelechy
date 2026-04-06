@@ -50,7 +50,6 @@ def _make_policy(precision: PrecisionConfig) -> StabilizationPolicy:
 
 ALL_PRECISIONS = [
     pytest.param(PrecisionConfig.float32(), id="fp32"),
-    pytest.param(PrecisionConfig.float16(), id="fp16"),
     pytest.param(PrecisionConfig.mixed_f16_f32(), id="mixed_f16_f32"),
 ]
 
@@ -128,7 +127,7 @@ class TestPlanBuildingMultiPrecision:
     def test_precision_label_helper(self, precision: PrecisionConfig):
         """precision_label_from_config returns a valid label string."""
         label = precision_label_from_config(precision)
-        assert label in ("fp32", "fp16", "mixed")
+        assert label in ("fp32", "mixed")
 
 
 # =========================================================================
@@ -222,4 +221,3 @@ class TestAlchemistMixedPrecisionFidelity:
         """Mixed config is identified as 'mixed' by the tolerance helper."""
         assert precision_label_from_config(PrecisionConfig.mixed_f16_f32()) == "mixed"
         assert precision_label_from_config(PrecisionConfig.float32()) == "fp32"
-        assert precision_label_from_config(PrecisionConfig.float16()) == "fp16"

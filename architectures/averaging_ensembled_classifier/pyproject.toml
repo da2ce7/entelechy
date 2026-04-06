@@ -22,7 +22,7 @@ requires-python = ">=3.11"
 
 # == Core Runtime Dependencies ==
 # These are the non-negotiable packages required for the orchestrator to function.
-dependencies = ["numpy", "pyopencl", "scikit-learn"]
+dependencies = ["numpy", "pyopencl", "scikit-learn", "ml_dtypes>=0.2.0"]
 
 [project.optional-dependencies]
 # == Development & Validation Dependencies ==

@@ -90,8 +90,9 @@ The existing factories are unchanged:
 | Factory | `storage_dtype` | `compute_dtype` | `state_dtype` |
 |:---|:---|:---|:---|
 | `PrecisionConfig.float32()` | `float32` | `float32` | `float32` |
-| `PrecisionConfig.float16()` | `float16` | `float16` | `float16` |
 | `PrecisionConfig.mixed_f16_f32()` | `float16` | `float32` | `float32` |
+
+> **Note:** `PrecisionConfig.float16()` was deleted in Phase 9A. FP16 state remains permitted via direct construction but is not recommended for extended training. Use `PrecisionConfig.mixed_f16_f32()` for the standard FP16-storage configuration.
 
 #### §1.2: Construction Invariants (amended)
 
@@ -213,25 +214,23 @@ The valid combinations are constrained by the `PrecisionConfig` invariants (§1.
 
 Additionally, on the CPU backend, compute is restricted to FP32 or FP64 — FP16 compute requires native hardware support that is not universally available on CPUs.
 
-**Note:** `PrecisionConfig.float16()` specifies FP16 for all roles including compute. On GPU backends (OpenCL, Vulkan) with native FP16 ALU support, this is honored. On the CPU backend, FP16 compute is not supported — `PrecisionConfig.float16()` maps to suffix `s16c32x16` (FP32 compute). This is a backend-specific promotion, not an architectural prohibition.
+**Note:** `PrecisionConfig.float16()` was deleted in Phase 9A. FP16 state remains permitted via direct construction but is not recommended for extended training. Use `PrecisionConfig.mixed_f16_f32()` for FP16 storage with FP32 compute and state.
 
 **Complete enumeration of valid CPU suffixes:**
 
 | Suffix | `STORAGE_T` | `COMPUTE_T` | `STATE_T` | Use Case |
 |:---|:---|:---|:---|:---|
-| `s16c32x16` | `_Float16` | `float` | `_Float16` | `PrecisionConfig.float16()` on CPU |
+| `s16c16x32` | `_Float16` | `_Float16` | `float` | FP16 compute, FP32 state |
+| `s16c16x64` | `_Float16` | `_Float16` | `double` | FP16 compute, FP64 state |
 | `s16c32x32` | `_Float16` | `float` | `float` | Mixed FP16/FP32 (bandwidth) |
 | `s16c32x64` | `_Float16` | `float` | `double` | Maximum bandwidth + maximum stability |
-| `s16c64x16` | `_Float16` | `double` | `_Float16` | FP64 compute validation, FP16 state |
-| `s16c64x32` | `_Float16` | `double` | `float` | FP64 compute validation, FP32 state |
 | `s16c64x64` | `_Float16` | `double` | `double` | FP64 compute + stability, FP16 bandwidth |
 | `s32c32x32` | `float` | `float` | `float` | Uniform FP32 |
 | `s32c32x64` | `float` | `float` | `double` | FP64 state (stability) |
-| `s32c64x32` | `float` | `double` | `float` | FP64 compute validation |
 | `s32c64x64` | `float` | `double` | `double` | High-fidelity compute + stability |
 | `s64c64x64` | `double` | `double` | `double` | Uniform FP64 (reference) |
 
-All 11 valid combinations are instantiated. Compile time is trivial; completeness eliminates runtime discovery of missing instantiations.
+All 9 valid combinations are instantiated. Compile time is trivial; completeness eliminates runtime discovery of missing instantiations.
 
 The `DECLARE_PRECISION_STRUCTS` macro gains a third parameter:
 

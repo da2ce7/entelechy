@@ -27,18 +27,13 @@ _COMPUTE_ONLY_SHADERS = frozenset({
 
 # Three-axis suffix map: (storage_dtype.type, compute_dtype.type, state_dtype.type) → suffix
 _SUFFIX_MAP: dict[tuple[type, type, type], str] = {
-    (np.float16, np.float16, np.float16): "_s16c16x16",
     (np.float16, np.float16, np.float32): "_s16c16x32",
     (np.float16, np.float16, np.float64): "_s16c16x64",
-    (np.float16, np.float32, np.float16): "_s16c32x16",
     (np.float16, np.float32, np.float32): "_s16c32x32",
     (np.float16, np.float32, np.float64): "_s16c32x64",
-    (np.float16, np.float64, np.float16): "_s16c64x16",
-    (np.float16, np.float64, np.float32): "_s16c64x32",
     (np.float16, np.float64, np.float64): "_s16c64x64",
     (np.float32, np.float32, np.float32): "_s32c32x32",
     (np.float32, np.float32, np.float64): "_s32c32x64",
-    (np.float32, np.float64, np.float32): "_s32c64x32",
     (np.float32, np.float64, np.float64): "_s32c64x64",
     (np.float64, np.float64, np.float64): "_s64c64x64",
 }

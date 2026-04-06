@@ -17,7 +17,7 @@ def precision_fp32():
 
 @pytest.fixture
 def precision_fp16():
-    return PrecisionConfig.float16()
+    return PrecisionConfig.mixed_f16_f32()
 
 
 @pytest.fixture

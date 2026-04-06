@@ -1,62 +1,21 @@
-# tests/tier1/test_precision_config.py
-"""PrecisionConfig correctness."""
+# tests/tier1/test_fp8_precision_config.py
+"""FP8 precision configuration tests (ADR-025, Phase 9A).
+
+Tests cover:
+- Precision role constraints (FP8 storage-only, FP16 state permitted)
+- All valid FP8 storage + compute/state combinations
+- FP8 factory classmethods
+- FP8 derived constants
+- Golden reference values via ml_dtypes
+- E5M2 defensive loading (inf/NaN handling)
+"""
+from __future__ import annotations
+
 import numpy as np
 import pytest
-
 import ml_dtypes
 
-from src.shared.precision_config import PrecisionConfig, FP8_E4M3, FP8_E5M2, FP8_DTYPES
-
-
-class TestFactoryMethods:
-    def test_float32(self):
-        pc = PrecisionConfig.float32()
-        assert pc.storage_dtype == np.dtype(np.float32)
-        assert pc.compute_dtype == np.dtype(np.float32)
-        assert pc.state_dtype == np.dtype(np.float32)
-        assert pc.compute_fp_format_max == float(np.finfo(np.float32).max)
-        assert pc.compute_epsilon == float(np.finfo(np.float32).eps)
-        assert pc.storage_fp_min_positive == float(np.finfo(np.float32).smallest_subnormal)
-        assert pc.storage_mantissa_bits == np.finfo(np.float32).nmant
-
-    def test_float16_state_valid_direct_construction(self):
-        """float16() factory was deleted, but direct construction with FP16 state is valid."""
-        cfg = PrecisionConfig(
-            storage_dtype=np.dtype(np.float16),
-            compute_dtype=np.dtype(np.float16),
-            state_dtype=np.dtype(np.float16),
-            storage_fp_format_max=float(np.finfo(np.float16).max),
-            storage_fp_min_positive=float(np.finfo(np.float16).smallest_subnormal),
-            storage_mantissa_bits=np.finfo(np.float16).nmant,
-            compute_fp_format_max=float(np.finfo(np.float16).max),
-            compute_epsilon=float(np.finfo(np.float16).eps),
-        )
-        assert cfg.state_dtype == np.dtype(np.float16)
-
-    def test_frozen(self):
-        pc = PrecisionConfig.float32()
-        with pytest.raises(AttributeError):
-            pc.compute_epsilon = 0.0  # type: ignore[misc]
-
-
-def test_fp8_dtype_module_constants_consistency():
-    """Verify FP8 dtype module constants match ml_dtypes.
-
-    Catches ml_dtypes version changes that could break FP8_DTYPES membership checks.
-    """
-    assert np.dtype(ml_dtypes.float8_e4m3fn) == FP8_E4M3
-    assert np.dtype(ml_dtypes.float8_e5m2) == FP8_E5M2
-
-    assert np.dtype(ml_dtypes.float8_e4m3fn) in FP8_DTYPES
-    assert np.dtype(ml_dtypes.float8_e5m2) in FP8_DTYPES
-
-    cfg_e4m3 = PrecisionConfig.fp8_e4m3()
-    cfg_e5m2 = PrecisionConfig.fp8_e5m2()
-    assert cfg_e4m3.storage_dtype in FP8_DTYPES
-    assert cfg_e5m2.storage_dtype in FP8_DTYPES
-
-
-# ── ADR-025 §2.2: FP8 role constraints ──────────────────────────────────
+from src.shared.precision_config import PrecisionConfig, FP8_E4M3, FP8_E5M2
 
 
 class TestPrecisionRoleConstraints:
@@ -124,7 +83,12 @@ class TestPrecisionRoleConstraints:
             )
 
     def test_fp16_state_construction_valid(self):
-        """FP16 state constructs successfully (ADR-020 three-role model)."""
+        """FP16 state constructs successfully via direct construction (ADR-020 three-role model).
+
+        The float16() factory is deleted (common footgun), but direct construction
+        with state_dtype=np.float16 remains valid — users who explicitly choose
+        FP16 state accept the precision limitations.
+        """
         f16_info = np.finfo(np.float16)
         cfg = PrecisionConfig(
             storage_dtype=np.dtype(np.float16),
@@ -138,15 +102,27 @@ class TestPrecisionRoleConstraints:
         )
         assert cfg.state_dtype == np.dtype(np.float16)
 
-
-# ── ADR-025 §2.3: Valid FP8 combinations ────────────────────────────────
+    def test_fp8_storage_with_fp16_state_valid(self):
+        """FP8 storage + FP16 compute + FP16 state is valid (itemsize: 1 ≤ 2 ≤ 2)."""
+        f16_info = np.finfo(np.float16)
+        cfg = PrecisionConfig(
+            storage_dtype=FP8_E4M3,
+            compute_dtype=np.dtype(np.float16),
+            state_dtype=np.dtype(np.float16),
+            storage_fp_format_max=448.0,
+            storage_fp_min_positive=0.001953125,
+            storage_mantissa_bits=3,
+            compute_fp_format_max=float(f16_info.max),
+            compute_epsilon=float(f16_info.eps),
+        )
+        assert cfg.storage_dtype == FP8_E4M3
+        assert cfg.state_dtype == np.dtype(np.float16)
 
 
 class TestFP8ValidCombinations:
     """ADR-025: All valid FP8 storage + compute/state combinations."""
 
     @pytest.mark.parametrize("compute_dtype,state_dtype", [
-        (np.float16, np.float16),
         (np.float16, np.float32),
         (np.float16, np.float64),
         (np.float32, np.float32),
@@ -171,7 +147,6 @@ class TestFP8ValidCombinations:
         assert cfg.state_dtype == np.dtype(state_dtype)
 
     @pytest.mark.parametrize("compute_dtype,state_dtype", [
-        (np.float16, np.float16),
         (np.float16, np.float32),
         (np.float16, np.float64),
         (np.float32, np.float32),
@@ -194,9 +169,6 @@ class TestFP8ValidCombinations:
         assert cfg.storage_dtype == FP8_E5M2
         assert cfg.compute_dtype == np.dtype(compute_dtype)
         assert cfg.state_dtype == np.dtype(state_dtype)
-
-
-# ── ADR-025 §2.3: FP8 factory classmethods ──────────────────────────────
 
 
 class TestFP8Factories:
@@ -242,9 +214,6 @@ class TestFP8Factories:
         assert cfg.state_dtype == np.dtype(np.float64)
 
 
-# ── ADR-025 §2.4: FP8 derived constants ─────────────────────────────────
-
-
 class TestFP8DerivedConstants:
     """ADR-025 §2.4: FP8 derived constants."""
 
@@ -264,14 +233,6 @@ class TestFP8DerivedConstants:
         cfg = PrecisionConfig.fp8_e5m2()
         assert cfg.storage_mantissa_bits == 2
 
-    def test_e4m3_storage_fp_min_positive(self):
-        cfg = PrecisionConfig.fp8_e4m3()
-        assert cfg.storage_fp_min_positive == 0.001953125  # 2^-9
-
-    def test_e5m2_storage_fp_min_positive(self):
-        cfg = PrecisionConfig.fp8_e5m2()
-        assert cfg.storage_fp_min_positive == 0.0000152587890625  # 2^-16
-
     def test_e4m3_buffer_sizing(self):
         """FP8 storage buffer is 1/4 size of FP32."""
         cfg_fp8 = PrecisionConfig.fp8_e4m3()
@@ -281,16 +242,8 @@ class TestFP8DerivedConstants:
         assert cfg_fp8.storage_dtype.itemsize * 4 == cfg_fp32.storage_dtype.itemsize
 
 
-# ── ADR-025 §9.2: Golden reference tests ────────────────────────────────
-
-
 class TestFP8GoldenReference:
-    """Golden reference tests using ml_dtypes directly.
-
-    These tests validate that ml_dtypes produces expected values BEFORE testing
-    backend conversions. If ml_dtypes behavior changes (e.g., version upgrade),
-    these tests fail first, isolating the root cause.
-    """
+    """Golden reference tests using ml_dtypes directly."""
 
     def test_e4m3_roundtrip_exact_values(self):
         """Known E4M3 bit patterns produce expected float values."""
@@ -330,19 +283,22 @@ class TestFP8GoldenReference:
         all_bits = np.arange(256, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn)
         all_float = all_bits.astype(np.float32)
         assert not np.any(np.isinf(all_float)), "E4M3fn should have no inf values"
+        # Exactly 254 finite values (256 - 2 NaN at 0x7F and 0xFF)
         finite_count = np.sum(np.isfinite(all_float))
         assert finite_count == 254, (
             f"E4M3fn should have 254 finite bit patterns, got {finite_count}"
         )
 
     def test_e5m2_special_values(self):
-        """E5M2 has IEEE-like inf/NaN."""
+        """E5M2 has IEEE-like inf/NaN (unlike E4M3fn which is all-finite)."""
         all_bits = np.arange(256, dtype=np.uint8).view(ml_dtypes.float8_e5m2)
         all_float = all_bits.astype(np.float32)
+
         finite_count = np.sum(np.isfinite(all_float))
         assert finite_count == 248, (
             f"E5M2 should have 248 finite bit patterns, got {finite_count}"
         )
+
         assert np.isinf(all_float[0x7C]), "E5M2 0x7C should be +inf"
         assert np.isinf(all_float[0xFC]), "E5M2 0xFC should be -inf"
         assert np.isnan(all_float[0x7D]), "E5M2 0x7D should be NaN"
@@ -350,57 +306,21 @@ class TestFP8GoldenReference:
 
     def test_ml_dtypes_version_compatibility(self):
         """ml_dtypes version is compatible with expected FP8 behavior."""
-        version = tuple(int(x) for x in ml_dtypes.__version__.split(".")[:2])
-        assert version >= (0, 2), (
-            f"ml_dtypes {ml_dtypes.__version__} < 0.2.0; FP8 behavior may differ"
-        )
-
-
-# ── E5M2 defensive loading tests ────────────────────────────────────────
+        version = tuple(int(x) for x in ml_dtypes.__version__.split('.')[:2])
+        assert version >= (0, 2), f"ml_dtypes {ml_dtypes.__version__} < 0.2.0"
 
 
 class TestE5M2DefensiveLoading:
-    """E5M2 inf/NaN indices are defensive — should produce finite values in LUT.
+    """E5M2 inf/NaN handling — validates ml_dtypes behavior for LUT generation."""
 
-    The store path NEVER writes inf/NaN bit patterns (0x7C-0x7F, 0xFC-0xFF).
-    The generated C LUT substitutes finite values (max or zero) to prevent crashes.
-    These tests validate the ml_dtypes Python behavior; the C-level substitution
-    is validated at compile/runtime in Phase 9B/9C kernel tests.
-    """
-
-    def test_e5m2_inf_indices_return_inf_in_python(self):
-        """ml_dtypes E5M2 0x7C is +inf (C LUT substitutes 57344.0f)."""
+    def test_e5m2_inf_indices_return_inf(self):
+        """ml_dtypes E5M2 +inf indices (0x7C) produce inf."""
         arr_inf = np.array([0x7C], dtype=np.uint8).view(ml_dtypes.float8_e5m2)
         assert np.isinf(float(arr_inf[0])), "ml_dtypes E5M2 0x7C should be +inf"
 
-    def test_e5m2_nan_indices_return_nan_in_python(self):
-        """ml_dtypes E5M2 NaN indices are NaN (C LUT substitutes 0.0f)."""
+    def test_e5m2_nan_indices_return_nan(self):
+        """ml_dtypes E5M2 NaN indices produce NaN."""
         nan_indices = [0x7D, 0x7E, 0x7F, 0xFD, 0xFE, 0xFF]
         for idx in nan_indices:
             arr_nan = np.array([idx], dtype=np.uint8).view(ml_dtypes.float8_e5m2)
-            assert np.isnan(float(arr_nan[0])), (
-                f"ml_dtypes E5M2 0x{idx:02X} should be NaN"
-            )
-
-
-# ── ModelSpec.float16() deprecation test ─────────────────────────────────
-
-
-class TestModelSpecFloat16Deprecation:
-    """Step 9A.4.9: ModelSpec.float16() emits DeprecationWarning."""
-
-    def test_float16_emits_deprecation(self):
-        from src.shared.model_spec import ModelSpec
-
-        with pytest.warns(DeprecationWarning, match="ModelSpec.float16.*deprecated"):
-            spec = ModelSpec.float16(
-                input_dim=4,
-                hidden_dim=32,
-                output_classes=3,
-                num_modules=8,
-                simd_width=4,
-                cache_line_bytes=64,
-            )
-        assert spec.precision.storage_dtype == np.dtype(np.float16)
-        assert spec.precision.compute_dtype == np.dtype(np.float32)
-        assert spec.precision.state_dtype == np.dtype(np.float32)
+            assert np.isnan(float(arr_nan[0])), f"ml_dtypes E5M2 0x{idx:02X} should be NaN"

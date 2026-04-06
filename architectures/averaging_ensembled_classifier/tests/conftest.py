@@ -41,6 +41,7 @@ if os.path.isdir(_builddir) and _builddir not in sys.modules["src"].__path__:
 # ---------------------------------------------------------------------------
 from src.shared.model_spec import ModelSpec  # noqa: E402
 from src.shared.parameter_space import ParameterSpace  # noqa: E402
+from src.shared.precision_config import FP8_DTYPES  # noqa: E402
 from src.shared.stabilization_policy import StabilizationPolicy  # noqa: E402
 from src.shared.workload_primitives import TilingScheme  # noqa: E402
 
@@ -96,6 +97,27 @@ def pytest_collection_modifyitems(config, items):
                     reason=f"Tier 3 requires >= 2 backends ({available} available)",
                 ))
 
+        # FP8: skip backend tests until FP8 kernel support lands (Phase 9B/9C/9D)
+        if hasattr(item, "callspec"):
+            params = item.callspec.params
+            precision = params.get("precision") or params.get("precision_config")
+            if precision is not None and callable(precision):
+                try:
+                    precision = precision()
+                except Exception:
+                    continue
+            if (
+                precision is not None
+                and getattr(precision, "storage_dtype", None) in FP8_DTYPES
+            ):
+                backend_name = params.get("backend") or params.get("backend_name")
+                if backend_name is not None or any(
+                    b in item.keywords for b in ("opencl", "vulkan", "cpu")
+                ):
+                    item.add_marker(pytest.mark.skip(
+                        reason="FP8 backend support not yet implemented (Phase 9B/9C/9D)",
+                    ))
+
 
 # =========================================================================
 # Canonical "Iris-like" Small Model Configuration
@@ -125,8 +147,8 @@ def fp32_iris_spec() -> ModelSpec:
 
 @pytest.fixture
 def fp16_iris_spec() -> ModelSpec:
-    """A small FP16 model spec modeled after the Iris validation scenario."""
-    return ModelSpec.float16(
+    """A small FP16-storage / FP32-compute model spec (Iris scenario)."""
+    return ModelSpec.mixed_f16_f32(
         input_dim=IRIS_INPUT_DIM,
         hidden_dim=IRIS_HIDDEN_DIM,
         output_classes=IRIS_OUTPUT_CLASSES,

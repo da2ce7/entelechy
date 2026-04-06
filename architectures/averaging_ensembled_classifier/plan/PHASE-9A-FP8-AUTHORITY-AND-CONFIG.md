@@ -5,7 +5,7 @@
 **Prerequisite:** Phase 8E complete and rollback gate passed.  
 **Objective:** Amend the authority documents (CONCEPT.md, CONTRACT.md) with FP8 additions. Add `ml_dtypes` dependency. Extend `PrecisionConfig` with six new FP8 factory classmethods (`fp8_e4m3()`, `fp8_e5m2()`, `fp8_e4m3_f16()`, `fp8_e5m2_f16()`, `fp8_e4m3_f64()`, `fp8_e5m2_f64()`), enforce the storage-only constraint in `__post_init__`, and add FP8-specific derived constants. Update test fixtures. No kernel sources, no backend-native code, no build system changes. The phase ends when all existing tests pass against the new `PrecisionConfig` interface and the FP8 factories construct without error.  
 **Governing ADR:** ADR-025 (§§1–4, §9)  
-**Rollback gate:** All tests that passed before Phase 9A must pass after **migration** (Step 9A.5.0). This phase introduces a **breaking change**: `PrecisionConfig.float16()` is deleted and FP16 state is prohibited. Tests using `float16()` must migrate to `mixed_f16_f32()` first. After migration, existing `PrecisionConfig` factories remain identical. The new FP8 factories construct without error and satisfy the storage-only invariant. Attempting FP8 compute or state raises `ValueError`. Failing any existing Tier 2 test (post-migration) is a blocking regression.  
+**Rollback gate:** All tests that passed before Phase 9A must pass after **migration** (Step 9A.5.0). This phase introduces a **breaking change**: `PrecisionConfig.float16()` is deleted. Tests using `float16()` must migrate to `mixed_f16_f32()` first. After migration, existing `PrecisionConfig` factories remain identical. The new FP8 factories construct without error and satisfy the storage-only invariant. Attempting FP8 compute or state raises `ValueError`. Direct construction with `state_dtype=np.float16` remains valid. Failing any existing Tier 2 test (post-migration) is a blocking regression.  
 **Dependencies:** Phase 8E (double-precision tests and validation) complete.
 
 ---
@@ -54,26 +54,27 @@
 
 The FP8 storage-only constraint is **enforced at construction time**. Unlike FP16 which permits compute-role usage (with degraded fidelity), FP8 compute and FP8 state are **architecturally prohibited** — they produce non-functional training (see ADR-025 Context). The `__post_init__` invariant raises `ValueError` for any FP8 dtype in compute or state roles. This is not a recommendation; it is a hard error.
 
-### Breaking change: FP16 state prohibition
+### Breaking change: `float16()` factory deletion
 
-**This phase introduces a breaking change.** The `__post_init__` invariant now also rejects FP16 in the `state_dtype` role. FP16 state lacks sufficient precision for EMA updates over extended training — the same precision erosion that disqualifies FP8 state applies (to a lesser degree) to FP16 state.
+**This phase introduces a breaking change.** The `PrecisionConfig.float16()` factory classmethod is deleted. It produced all-FP16 configurations (storage, compute, AND state) which are a common footgun — FP16 state lacks sufficient precision for EMA updates over extended training. The factory name was also misleading since `mixed_f16_f32()` is the recommended FP16-storage configuration.
+
+**Important:** This is a factory deletion, not a state-role prohibition. Direct construction with `state_dtype=np.float16` remains valid — the three-role precision model (ADR-020) defines FP16 as a valid state dtype. Users who explicitly choose FP16 state accept the precision limitations.
 
 **Affected code:**
-- `PrecisionConfig.float16()` — Currently constructs with all-FP16 (storage, compute, AND state). **This factory is deleted in this phase.**
-- Any direct `PrecisionConfig(..., state_dtype=np.float16)` construction — **raises `ValueError`.**
+- `PrecisionConfig.float16()` — **deleted** in Step 9A.4.7.
 
 **Unaffected code:**
 - `PrecisionConfig.mixed_f16_f32()` — Constructs FP16 storage, FP16 compute, **FP32 state**. This remains valid and is the recommended replacement.
+- `PrecisionConfig(storage_dtype=np.float16, compute_dtype=np.float16, state_dtype=np.float16, ...)` — Direct construction with FP16 state remains valid.
 
 **Migration path:**
 - Replace `PrecisionConfig.float16()` with `PrecisionConfig.mixed_f16_f32()`.
 - **Semantic difference:** `mixed_f16_f32()` promotes **both compute and state** to FP32. The old `float16()` used FP16 for all three roles (storage/compute/state); `mixed_f16_f32()` uses FP16 storage, FP32 compute, FP32 state. This changes compute behavior, not just state stability.
 - If FP16 compute + FP32 state is specifically needed (rare), construct directly: `PrecisionConfig(storage_dtype=np.float16, compute_dtype=np.float16, state_dtype=np.float32, ...)`. No factory is provided for this combination.
-- The `float16()` factory is **deleted** in Step 9A.4.7; it was architecturally unsound.
+- If uniform FP16 (including state) is specifically needed, construct directly: `PrecisionConfig(storage_dtype=np.float16, compute_dtype=np.float16, state_dtype=np.float16, ...)`. This is permitted but not recommended for extended training.
 
 **Test migration:**
 - All tests using `PrecisionConfig.float16()` must be updated to use `mixed_f16_f32()` (Step 9A.5.0).
-- The test `test_fp16_state_rejection` validates the new constraint.
 
 ---
 
@@ -178,10 +179,11 @@ def generate_e5m2_lut() -> list[float]:
 def format_c_float(v: float) -> str:
     """Format a float for C, handling inf/NaN specially.
     
-    Note: E5M2 includes inf/NaN bit patterns (indices 0x7C-0x7F, 0xFC-0xFF),
-    but the store path NEVER writes these. We use max finite value as a
-    defensive fallback — loading these indices returns a finite value rather
-    than crashing or producing undefined behavior.
+    Note: Both E4M3fn (indices 0x7F, 0xFF) and E5M2 (indices 0x7C-0x7F,
+    0xFC-0xFF) include NaN and/or inf bit patterns, but the store path
+    NEVER writes these. We use defensive substitution (NaN→0.0f,
+    inf→max finite) so loading these indices returns a finite value
+    rather than crashing or producing undefined behavior.
     """
     import math
     if math.isnan(v):
@@ -232,16 +234,20 @@ def generate_header(e4m3_values: list[float], e5m2_values: list[float],
 #ifndef {guard}
 #define {guard}
 
-/* E4M3: sign(1) + exp(4) + mantissa(3), bias=7, max=448, no inf/nan
+/* E4M3: sign(1) + exp(4) + mantissa(3), bias=7, max=448, no inf
+ * Note: float8_e4m3fn has 2 NaN patterns (0x7F, 0xFF) and 254 finite values.
+ * The store path never writes NaN patterns; the LUT maps them to 0.0f defensively.
  * 
  * Index derivation examples:
  *   0x00 = 0b00000000 → sign=0, exp=0, mant=0 → subnormal 0 × 2^(-6) = 0.0
  *   0x38 = 0b00111000 → sign=0, exp=7, mant=0 → 2^(7-7) × 1.0 = 1.0
  *   0x3C = 0b00111100 → sign=0, exp=7, mant=4 → 2^(7-7) × 1.5 = 1.5
  *   0x7E = 0b01111110 → sign=0, exp=15, mant=6 → 2^(15-7) × 1.75 = 448.0 (max)
+ *   0x7F = 0b01111111 → NaN (mapped to 0.0f in LUT)
  *   0x80 = 0b10000000 → sign=1, exp=0, mant=0 → -0.0
  *   0xB8 = 0b10111000 → sign=1, exp=7, mant=0 → -1.0
  *   0xFE = 0b11111110 → sign=1, exp=15, mant=6 → -448.0 (min)
+ *   0xFF = 0b11111111 → NaN (mapped to 0.0f in LUT)
  */
 {format_c_array(f"{array_prefix}fp8_e4m3_to_float_lut", e4m3_values, is_opencl)}
 
@@ -275,6 +281,10 @@ def generate_header(e4m3_values: list[float], e5m2_values: list[float],
 def validate_tables(e4m3: list[float], e5m2: list[float]) -> None:
     """Validate LUT correctness against known values.
     
+    Note on E4M3fn NaN entries (indices 0x7F, 0xFF):
+    E4M3fn has no infinity but reserves 2 bit patterns for NaN.
+    The generated C LUT replaces NaN→0.0f defensively.
+    
     Note on E5M2 inf/NaN entries (indices 0x7C–0x7F, 0xFC–0xFF):
     These entries ARE included in the LUT for completeness, but the store path
     NEVER writes these bit patterns — it saturates to 0x7B/0xFB (max finite)
@@ -286,6 +296,11 @@ def validate_tables(e4m3: list[float], e5m2: list[float]) -> None:
     assert abs(e4m3[0x38] - 1.0) < 1e-6, f"E4M3 index 0x38 should be 1.0, got {e4m3[0x38]}"
     # 0x7E = 0b01111110 → sign=0, exp=15, mant=6 → 2^8 × 1.75 = 448.0
     assert abs(e4m3[0x7E] - 448.0) < 1e-6, f"E4M3 index 0x7E should be 448.0 (max), got {e4m3[0x7E]}"
+    
+    # E4M3fn NaN patterns (0x7F, 0xFF)
+    import math
+    assert math.isnan(e4m3[0x7F]), f"E4M3 index 0x7F should be NaN, got {e4m3[0x7F]}"
+    assert math.isnan(e4m3[0xFF]), f"E4M3 index 0xFF should be NaN, got {e4m3[0xFF]}"
     
     # E4M3 negative values (sign bit is MSB)
     # 0x80 = -0.0 (sign=1, rest=0)
@@ -449,7 +464,7 @@ Append to the existing mixed-precision paragraph (added by Phase 7A):
 
 Append to the existing `PrecisionConfig` description:
 
-> FP8 storage (E4M3 or E5M2) is supported for maximum bandwidth efficiency. Two FP8 variants are provided: **E4M3** (4 exponent bits, 3 mantissa bits, max value 448) prioritizes precision; **E5M2** (5 exponent bits, 2 mantissa bits, max value 57344) prioritizes dynamic range. E4M3 is the primary target for gradient and activation storage. The two formats differ in special-value semantics: **E4M3** (`float8_e4m3fn`) repurposes all 256 bit patterns for finite values — no infinity or NaN. **E5M2** follows IEEE-like conventions: exponent 0x1F encodes ±infinity (mantissa = 0) and NaN (mantissa ≠ 0), leaving 248 finite bit patterns. The store path saturates to the maximum finite value in both formats, so infinity and NaN bit patterns are never written to storage buffers. The host is responsible for scaling values to fit within FP8's representable range before storage; the existing Quadratic Scaling Policy already constrains gradients well below FP8 limits. `PrecisionConfig.fp8_e4m3()` provides E4M3 storage with FP32 compute and FP32 state; `PrecisionConfig.fp8_e4m3_f64()` adds FP64 compute and state for extended stability.
+> FP8 storage (E4M3 or E5M2) is supported for maximum bandwidth efficiency. Two FP8 variants are provided: **E4M3** (4 exponent bits, 3 mantissa bits, max value 448) prioritizes precision; **E5M2** (5 exponent bits, 2 mantissa bits, max value 57344) prioritizes dynamic range. E4M3 is the primary target for gradient and activation storage. The two formats differ in special-value semantics: **E4M3** (`float8_e4m3fn`) has no infinity representation but reserves 2 bit patterns for NaN (0x7F, 0xFF), leaving 254 finite values. **E5M2** follows IEEE-like conventions: exponent 0x1F encodes ±infinity (mantissa = 0) and NaN (mantissa ≠ 0), leaving 248 finite bit patterns. The store path saturates to the maximum finite value in both formats, so infinity and NaN bit patterns are never written to storage buffers. The host is responsible for scaling values to fit within FP8's representable range before storage; the existing Quadratic Scaling Policy already constrains gradients well below FP8 limits. `PrecisionConfig.fp8_e4m3()` provides E4M3 storage with FP32 compute and FP32 state; `PrecisionConfig.fp8_e4m3_f64()` adds FP64 compute and state for extended stability.
 
 #### Amendment 9A.2.3 — Add Validation Scenario: The Bandwidth Extremist
 
@@ -494,7 +509,7 @@ Append to the symbol table notes section:
 
 Update the `PrecisionConfig` paragraph to reference the new factories:
 
-> Factory classmethods provide common configurations. For FP8 storage, any valid combination of compute (FP16/FP32/FP64) and state (FP32/FP64) precision is permitted via direct construction. FP8 is permitted only in the storage role; FP8 compute and FP8 state raise `ValueError`. FP16 state is also prohibited (EMA updates require FP32+ precision for stability).
+> Factory classmethods provide common configurations. For FP8 storage, any valid combination of compute (FP16/FP32/FP64) and state (FP16/FP32/FP64) precision is permitted via direct construction. FP8 is permitted only in the storage role; FP8 compute and FP8 state raise `ValueError`.
 >
 > **FP8 factory methods:** `fp8_e4m3()`, `fp8_e5m2()` (FP32 compute/state), `fp8_e4m3_f16()`, `fp8_e5m2_f16()` (FP16 compute, FP32 state), `fp8_e4m3_f64()`, `fp8_e5m2_f64()` (FP64 compute/state). Additional combinations (e.g., FP16 compute + FP64 state) are constructed directly.
 
@@ -520,10 +535,9 @@ Update the `PrecisionConfig` paragraph to reference the new factories:
 > | 5 | 9A.5.0a | Migrate authority doc references | — |
 > | 6 | 9A.4.9 | Migrate `ModelSpec.float16()` internal call | — |
 > | 7 | — | **Run full test suite — must pass** | Blocking |
-> | 8 | 9A.4.3 | Add FP8/FP16 rejection to `__post_init__` | — |
+> | 8 | 9A.4.3 | Add FP8 rejection to `__post_init__` | — |
 > | 9 | 9A.4.7 | Delete `float16()` factory | — |
-> | 10 | 9A.5.0b | Remove dead FP16-state suffix variants | — |
-> | 11 | — | **Run full test suite — must pass** | Blocking |
+> | 10 | — | **Run full test suite — must pass** | Blocking |
 >
 > **Do not reorder.** Steps 8–9 break code that Steps 4–6 fix.
 
@@ -555,11 +569,11 @@ FP8_DTYPES = frozenset({FP8_E4M3, FP8_E5M2})
 #### 9A.4.3: Extend `__post_init__` with FP8 rejection
 
 > **⚠️ DEPENDENCY: Execute Step 9A.5.0 (migrate `float16()` usages) and Step 9A.4.9
-> (migrate `ModelSpec.float16()`) BEFORE applying this change.** The FP16 state rejection
-> added here will break any code still calling `PrecisionConfig.float16()`. See the
+> (migrate `ModelSpec.float16()`) BEFORE applying this change.** The `float16()` factory
+> deletion in Step 9A.4.7 will break any code still calling it. See the
 > execution order in [Step 9A.5](#step-9a5-update-test-fixtures).
 
-Add FP8 and FP16 state rejection logic **before** the existing itemsize invariants.
+Add FP8 rejection logic **before** the existing itemsize invariants.
 
 > **Why this ordering matters:** These checks must precede itemsize invariants because
 > FP8's 1-byte itemsize would *pass* the `storage ≤ compute` check (1 ≤ 4), but FP8
@@ -567,7 +581,7 @@ Add FP8 and FP16 state rejection logic **before** the existing itemsize invarian
 > before validating size relationships.
 >
 > **FP8 itemsize note:** For valid FP8 configurations, the itemsize invariants naturally
-> hold: FP8 storage (1 byte) ≤ FP32 compute (4 bytes) ≤ FP32/FP64 state (4/8 bytes).
+> hold: FP8 storage (1 byte) ≤ FP16/FP32 compute (2/4 bytes) ≤ FP16/FP32/FP64 state (2/4/8 bytes).
 > No special handling is needed — the existing checks pass.
 
 ```python
@@ -594,14 +608,6 @@ def __post_init__(self) -> None:
             f"FP8 state is architecturally prohibited: "
             f"EMA updates round to zero for β > 0.9. "
             f"Got state_dtype={self.state_dtype}"
-        )
-    
-    # FP16 state is also prohibited (EMA precision erosion)
-    if self.state_dtype == np.float16:
-        raise ValueError(
-            f"FP16 state is architecturally prohibited: "
-            f"EMA updates lose precision over extended training. "
-            f"Use FP32 or FP64 for state_dtype."
         )
     
     # Existing invariants (storage ≤ compute, storage ≤ state)
@@ -851,8 +857,8 @@ def mixed_f32_f64(cls) -> "PrecisionConfig":
 
 #### 9A.4.6: Add FP8 factory classmethods
 
-FP8 storage supports any valid compute (FP16/FP32/FP64) and state (FP32/FP64) combination.
-The following table shows valid FP8 combinations:
+FP8 storage supports any valid compute (FP16/FP32/FP64) and state (FP16/FP32/FP64) combination.
+The following table shows common FP8 combinations (FP16 state combinations are also valid via direct construction but omitted for brevity):
 
 | Storage | Compute | State | Factory Method | Suffix |
 |:---|:---|:---|:---|:---|
@@ -1001,7 +1007,7 @@ def fp8_e5m2_f64(cls) -> "PrecisionConfig":
 
 #### 9A.4.7: Delete `float16()` factory
 
-**Remove** the `float16()` classmethod entirely. It produced architecturally unsound configurations (FP16 state). Users should use `mixed_f16_f32()` instead.
+**Remove** the `float16()` classmethod entirely. It produced all-FP16 configurations (including FP16 state) which are a common footgun for extended training, and the name is misleading since `mixed_f16_f32()` is the recommended FP16-storage configuration. Direct construction with `state_dtype=np.float16` remains valid for users who explicitly need uniform FP16.
 
 ```python
 # DELETE this method:
@@ -1056,7 +1062,7 @@ cfg = PrecisionConfig(
 - `PrecisionConfig.fp8_e5m2_f64()` constructs without error
 - `PrecisionConfig(storage_dtype=..., compute_dtype=FP8_E4M3, state_dtype=...)` raises `ValueError`
 - `PrecisionConfig(storage_dtype=..., compute_dtype=..., state_dtype=FP8_E4M3)` raises `ValueError`
-- `PrecisionConfig(storage_dtype=..., compute_dtype=..., state_dtype=np.float16)` raises `ValueError`
+- `PrecisionConfig(storage_dtype=np.float16, compute_dtype=np.float16, state_dtype=np.float16, ...)` constructs without error (FP16 state is permitted)
 - `fp8_e4m3().storage_dtype.itemsize == 1`
 - `fp8_e4m3().storage_fp_format_max == 448.0`
 
@@ -1064,10 +1070,10 @@ cfg = PrecisionConfig(
 
 #### 9A.4.9: Migrate `ModelSpec.float16()` factory
 
-**Governing authority:** ADR-025 §2.2 (FP16 state prohibition)  
+**Governing authority:** ADR-025 §2.3 (`float16()` factory deletion)  
 **File:** `src/shared/model_spec.py`
 
-The `ModelSpec` class has a `float16()` factory that internally calls `PrecisionConfig.float16()`. This must be updated to emit a `DeprecationWarning` and delegate to `mixed_f16_f32()`. The name `float16()` is misleading now that it returns FP32 compute/state, so deprecation guides users to the correctly-named factory.
+The `ModelSpec` class has a `float16()` factory that internally calls `PrecisionConfig.float16()`. Since that factory is deleted in Step 9A.4.7, `ModelSpec.float16()` must be updated to emit a `DeprecationWarning` and delegate to `mixed_f16_f32()`. The name `float16()` is misleading now that it returns FP32 compute/state, so deprecation guides users to the correctly-named factory.
 
 ```python
 # BEFORE (will break — PrecisionConfig.float16() is deleted)
@@ -1153,11 +1159,11 @@ def test_fp8_dtype_module_constants_consistency():
 > (config changes together, test changes together), not execution order.
 >
 > The `float16()` factory migration (Step 9A.5.0) **must be completed before**
-> the FP16 state rejection is added to `__post_init__` (Step 9A.4.3) and the
-> `float16()` factory is deleted (Step 9A.4.7). If the `__post_init__` change
-> lands first, any code that imports or calls `PrecisionConfig.float16()` at
+> the FP8 rejection is added to `__post_init__` (Step 9A.4.3) and the
+> `float16()` factory is deleted (Step 9A.4.7). If the factory is deleted
+> first, any code that imports or calls `PrecisionConfig.float16()` at
 > module scope (including `conftest.py` fixtures and `ModelSpec.float16()`)
-> will raise `ValueError` during import, making it impossible to run the test
+> will raise `AttributeError` during import, making it impossible to run the test
 > suite to validate the migration.
 >
 > **Execution order:**
@@ -1167,7 +1173,7 @@ def test_fp8_dtype_module_constants_consistency():
 > 4. **Step 9A.5.0a** — Migrate authority document references
 > 5. **Step 9A.4.9** — Migrate `ModelSpec.float16()` internal call
 > 6. **Run tests** — Verify everything passes with old `__post_init__`
-> 7. **Step 9A.4.3** — Add FP8/FP16 rejection to `__post_init__`
+> 7. **Step 9A.4.3** — Add FP8 rejection to `__post_init__`
 > 8. **Step 9A.4.7** — Delete `float16()` factory
 > 9. **Run tests** — Verify rejection tests pass, no regressions
 
@@ -1179,7 +1185,7 @@ Before adding FP8 fixtures, update all existing test usages of `PrecisionConfig.
 # Find all factory usages
 grep -r "PrecisionConfig.float16()" tests/ src/tests/
 
-# Also find direct constructions with FP16 state (these will also break)
+# Also find direct constructions with FP16 state (review if any should migrate)
 grep -r "state_dtype=np.float16" tests/ src/tests/ src/shared/
 grep -r "state_dtype=.*float16" tests/ src/tests/ src/shared/
 
@@ -1226,9 +1232,8 @@ grep -r "state_dtype=.*float16" tests/ src/tests/ src/shared/
 #       """FP16 storage with FP32 compute and state.
 #       
 #       Note: Renamed semantics in Phase 9A. Previously used uniform FP16
-#       (including FP16 state), which is now architecturally prohibited.
-#       This factory now returns FP16 storage + FP32 compute + FP32 state,
-#       matching PrecisionConfig.mixed_f16_f32().
+#       (including FP16 state). This factory now returns FP16 storage +
+#       FP32 compute + FP32 state, matching PrecisionConfig.mixed_f16_f32().
 #       """
 #       return cls(..., precision=PrecisionConfig.mixed_f16_f32())
 #
@@ -1246,8 +1251,8 @@ grep -r "state_dtype=.*float16" tests/ src/tests/ src/shared/
 
 **Migration:**
 - Replace `PrecisionConfig.float16()` → `PrecisionConfig.mixed_f16_f32()`
-- Replace direct `state_dtype=np.float16` constructions with `state_dtype=np.float32`
-- If test specifically validated uniform FP16, convert to rejection test
+- Direct `state_dtype=np.float16` constructions remain valid but should be reviewed — consider whether `state_dtype=np.float32` is more appropriate for the test's intent
+- If test specifically validated uniform FP16, keep as-is with direct construction or convert to use `mixed_f16_f32()`
 - Update `ModelSpec.float16()` to use `mixed_f16_f32()` internally
 
 > **⚠️ Suffix assertion changes (not a mechanical find-replace):**
@@ -1256,41 +1261,10 @@ grep -r "state_dtype=.*float16" tests/ src/tests/ src/shared/
 >
 > | Before | After | Why |
 > |:---|:---|:---|
-> | `_spv_variant_suffix(PrecisionConfig.float16()) == "_s16c16x16"` | Delete test or convert to rejection test | `float16()` no longer exists; `_s16c16x16` is unreachable (FP16 state prohibited) |
+> | `_spv_variant_suffix(PrecisionConfig.float16()) == "_s16c16x16"` | Update to use direct construction: `PrecisionConfig(storage_dtype=np.float16, compute_dtype=np.float16, state_dtype=np.float16, ...)` | `float16()` factory is deleted; the suffix `_s16c16x16` remains reachable via direct construction |
 > | `_spv_variant_suffix(PrecisionConfig.mixed_f16_f32()) == "_s16c32x32"` | Already correct — no change needed | `mixed_f16_f32()` produces storage=FP16, compute=FP32, state=FP32 |
 >
-> Specifically, `src/tests/test_mixed_precision.py` line 502 asserts `_spv_variant_suffix(PrecisionConfig.float16()) == "_s16c16x16"`. This test (`test_fp16_selects_s16c16x16_variant`) must be **deleted or converted to a rejection test** — there is no valid factory that can reach the `_s16c16x16` suffix anymore.
-
-#### Step 9A.5.0b: Remove dead FP16-state suffix variants
-
-With FP16 state prohibited (`__post_init__` rejects `state_dtype.itemsize < 4`), several suffix entries in `_SUFFIX_MAP` and their corresponding compiled shader/kernel variants become unreachable dead code. Clean them up:
-
-**Dead entries in `src/backends/vulkan/_pipeline_cache.py` `_SUFFIX_MAP`:**
-
-```python
-# REMOVE — FP16 state is prohibited by ADR-025 §2.2:
-(np.float16, np.float16, np.float16): "_s16c16x16",  # was float16()
-(np.float16, np.float32, np.float16): "_s16c32x16",  # was (storage=f16, compute=f32, state=f16)
-(np.float16, np.float64, np.float16): "_s16c64x16",  # FP16 state + FP64 compute
-
-# REMOVE — compute.itemsize > state.itemsize (also rejected by __post_init__):
-(np.float16, np.float64, np.float32): "_s16c64x32",  # FP64 compute requires FP64 state
-(np.float32, np.float64, np.float32): "_s32c64x32",  # FP64 compute requires FP64 state
-```
-
-**Also remove corresponding:**
-- Pre-compiled `.spv` shader files for `_s16c16x16`, `_s16c32x16`, `_s16c64x16`, `_s16c64x32`, `_s32c64x32` suffixes (if they exist in `kernels/`)
-- Any CPU kernel suffix variants that encoded FP16 state (check Meson build definitions in `meson.build` — remove variant dicts with `'state_double': false` and FP16 state, and any `.so`/`.o` build outputs for those suffixes)
-- OpenCL kernel builder suffix maps in `src/backends/opencl/kernel_builder.py` (or equivalent) — remove any entries that map to FP16-state combinations
-
-**Verification:** After cleanup, confirm no remaining references to dead suffixes:
-
-```bash
-grep -rn 's16c16x16\|s16c32x16\|s16c64x16\|s16c64x32\|s32c64x32' \
-    src/backends/ kernels/
-```
-
-Expected: zero matches (or only references in deletion commentary).
+> Specifically, `src/tests/test_mixed_precision.py` line 502 asserts `_spv_variant_suffix(PrecisionConfig.float16()) == "_s16c16x16"`. This test (`test_fp16_selects_s16c16x16_variant`) must be updated to construct the config directly instead of using the deleted factory.
 
 #### Step 9A.5.0a: Migrate authority document references
 
@@ -1304,7 +1278,7 @@ The following non-code files reference `PrecisionConfig.float16()` or describe i
 | `ADR-023-backend-kernel-precision-role-implications.md` | Multi-configuration Tier 2 coverage |
 | `ADR-024-double-precision-support.md` | Factory table, CPU promotion note, suffix table |
 
-For each file: replace `float16()` references with `mixed_f16_f32()` and add a note that uniform FP16 (including state) is no longer supported per ADR-025.
+For each file: replace `float16()` factory references with `mixed_f16_f32()` and add a note that the `float16()` factory is deleted per ADR-025. Direct construction with uniform FP16 remains valid.
 
 **Verification:** After edits, confirm no remaining references to `PrecisionConfig.float16()` in authority documents:
 
@@ -1316,7 +1290,7 @@ Expected output: zero matches (or only references inside deletion/migration comm
 
 **`ModelSpec.float16()` migration:** Handled in **Step 9A.4.9** (deprecation warning + delegation to `mixed_f16_f32()`). The `ModelSpec.float16()` factory emits a `DeprecationWarning` and delegates to `ModelSpec.mixed_f16_f32()`, matching the `PrecisionConfig` migration strategy. See Step 9A.4.9 for the full implementation and verification steps.
 
-**Rationale:** FP16 state was always architecturally unsound — EMA updates lose precision over extended training. The `float16()` factory existed for API completeness but produced unstable training for long runs. The three-role model (ADR-020) should have prohibited this from the start. The deprecation approach (rather than immediate deletion) gives downstream consumers a migration window while making the architectural constraint visible at call sites.
+**Rationale:** The `float16()` factory was a common footgun — it produced all-FP16 configurations (including FP16 state), which lose EMA precision over extended training. The `mixed_f16_f32()` factory is the recommended FP16-storage configuration. The factory deletion (rather than state-role prohibition) preserves the flexibility of the three-role model (ADR-020) for users who explicitly construct with `state_dtype=np.float16`. The deprecation approach for `ModelSpec.float16()` (rather than immediate deletion) gives downstream consumers a migration window while making the factory rename visible at call sites.
 
 #### 9A.5.1: Extend `PRECISION_CONFIGS` fixture
 
@@ -1531,7 +1505,7 @@ import ml_dtypes
 from shared.precision_config import PrecisionConfig, FP8_E4M3, FP8_E5M2
 
 class TestPrecisionRoleConstraints:
-    """ADR-025 §2.2: Precision role constraints (FP8 storage-only, FP16 state prohibited)."""
+    """ADR-025 §2.2: Precision role constraints (FP8 storage-only)."""
 
     # Helper: default field values for rejection tests.
     # The rejected field triggers ValueError in __post_init__ before other
@@ -1598,49 +1572,53 @@ class TestPrecisionRoleConstraints:
                 compute_epsilon=self._F32_EPS,
             )
 
-    def test_fp16_state_rejection(self):
-        """FP16 state raises ValueError (EMA precision erosion).
+    def test_fp16_state_construction_valid(self):
+        """FP16 state constructs successfully (ADR-020 three-role model).
         
-        Note: This constraint applies to ALL configurations, not just FP8.
-        FP16 state lacks sufficient precision for EMA updates over extended training.
+        Note: FP16 state is permitted but not recommended for extended training.
+        The float16() factory is deleted (common footgun), but direct construction
+        with state_dtype=np.float16 remains valid.
         """
         f16_info = np.finfo(np.float16)
-        with pytest.raises(ValueError, match="FP16 state is architecturally prohibited"):
-            PrecisionConfig(
-                storage_dtype=np.dtype(np.float16),
-                compute_dtype=np.dtype(np.float16),
-                state_dtype=np.dtype(np.float16),
-                storage_fp_format_max=float(f16_info.max),
-                storage_fp_min_positive=float(f16_info.smallest_subnormal),
-                storage_mantissa_bits=f16_info.nmant,
-                compute_fp_format_max=float(f16_info.max),
-                compute_epsilon=float(f16_info.eps),
-            )
+        cfg = PrecisionConfig(
+            storage_dtype=np.dtype(np.float16),
+            compute_dtype=np.dtype(np.float16),
+            state_dtype=np.dtype(np.float16),
+            storage_fp_format_max=float(f16_info.max),
+            storage_fp_min_positive=float(f16_info.smallest_subnormal),
+            storage_mantissa_bits=f16_info.nmant,
+            compute_fp_format_max=float(f16_info.max),
+            compute_epsilon=float(f16_info.eps),
+        )
+        assert cfg.state_dtype == np.dtype(np.float16)
 
-    def test_fp16_state_rejection_with_fp32_storage(self):
-        """FP16 state rejected even with FP32 storage.
+    def test_fp16_state_with_fp32_storage_valid(self):
+        """FP16 state permitted with FP32 storage.
         
-        Note: This test complements test_fp16_state_rejection() by verifying
-        the constraint applies regardless of storage/compute precision — the
-        FP16 state prohibition is universal, not FP8-specific.
+        Note: This validates that FP16 state is not rejected regardless of the
+        storage/compute precision. The itemsize invariant (storage ≤ state) still
+        applies — FP32 storage (4 bytes) > FP16 state (2 bytes) would be rejected
+        by the itemsize check, so we use FP16 storage + FP16 compute + FP16 state.
         """
-        with pytest.raises(ValueError, match="FP16 state is architecturally prohibited"):
-            PrecisionConfig(
-                storage_dtype=self._F32,
-                compute_dtype=self._F32,
-                state_dtype=np.dtype(np.float16),
-                storage_fp_format_max=self._F32_MAX,
-                storage_fp_min_positive=self._F32_MIN_POS,
-                storage_mantissa_bits=23,
-                compute_fp_format_max=self._F32_MAX,
-                compute_epsilon=self._F32_EPS,
-            )
+        f16_info = np.finfo(np.float16)
+        cfg = PrecisionConfig(
+            storage_dtype=np.dtype(np.float16),
+            compute_dtype=np.dtype(np.float16),
+            state_dtype=np.dtype(np.float16),
+            storage_fp_format_max=float(f16_info.max),
+            storage_fp_min_positive=float(f16_info.smallest_subnormal),
+            storage_mantissa_bits=f16_info.nmant,
+            compute_fp_format_max=float(f16_info.max),
+            compute_epsilon=float(f16_info.eps),
+        )
+        assert cfg.state_dtype == np.dtype(np.float16)
 
 
 class TestFP8ValidCombinations:
     """ADR-025: All valid FP8 storage + compute/state combinations."""
 
     @pytest.mark.parametrize("compute_dtype,state_dtype", [
+        (np.float16, np.float16),
         (np.float16, np.float32),
         (np.float16, np.float64),
         (np.float32, np.float32),
@@ -1665,6 +1643,7 @@ class TestFP8ValidCombinations:
         assert cfg.state_dtype == np.dtype(state_dtype)
 
     @pytest.mark.parametrize("compute_dtype,state_dtype", [
+        (np.float16, np.float16),
         (np.float16, np.float32),
         (np.float16, np.float64),
         (np.float32, np.float32),
@@ -1802,14 +1781,19 @@ class TestFP8GoldenReference:
             actual = float(arr[0])
             assert actual == expected, f"E5M2 0x{bits:02X}: expected {expected}, got {actual}"
 
-    def test_e4m3_all_256_patterns_finite(self):
-        """All 256 E4M3 bit patterns produce finite float values (no NaN/inf)."""
+    def test_e4m3_no_infinities(self):
+        """E4M3fn has no infinities (only 2 NaN patterns: 0x7F, 0xFF)."""
         all_bits = np.arange(256, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn)
         all_float = all_bits.astype(np.float32)
-        assert np.all(np.isfinite(all_float)), "E4M3 should have no NaN/inf values"
+        assert not np.any(np.isinf(all_float)), "E4M3fn should have no inf values"
+        # Exactly 254 finite values (256 - 2 NaN at 0x7F and 0xFF)
+        finite_count = np.sum(np.isfinite(all_float))
+        assert finite_count == 254, (
+            f"E4M3fn should have 254 finite bit patterns, got {finite_count}"
+        )
 
     def test_e5m2_special_values(self):
-        """E5M2 has IEEE-like inf/NaN (unlike E4M3fn which is all-finite).
+        """E5M2 has IEEE-like inf/NaN.
         
         E5M2 uses exponent 0x1F for special values:
           - mantissa=0 → ±inf (bit patterns 0x7C, 0xFC)
@@ -1934,7 +1918,7 @@ Backend implementation (Phases 9B–9D) depends on the `PrecisionConfig` FP8 fac
 | FP8 dtype handling differs from native NumPy dtypes | Medium | Medium | FP8-specific code paths for derived constants. No `np.finfo()` calls on FP8 dtypes. |
 | Parametrized tests fail with FP8 configs before backend support | High | Low | Explicit `skipif` markers for FP8 configs in backend tests until Phase 9B/9C/9D. |
 | User confusion about storage-only constraint | Low | Low | Clear error messages in `ValueError`. Documentation in CONCEPT.md and docstrings. |
-| **FP16 state prohibition breaks `float16()` factory** | **High** | **Medium** | Breaking change is intentional. Migration path documented. Tests must be updated to use `mixed_f16_f32()`. The `float16()` factory is removed; equivalent functionality via `mixed_f16_f32()` (FP16 storage/compute, FP32 state). |
+| **`float16()` factory deletion breaks dependent code** | **High** | **Medium** | Breaking change is intentional. Migration path documented. Tests must be updated to use `mixed_f16_f32()`. Direct construction with FP16 state remains valid. The `float16()` factory is removed; `mixed_f16_f32()` is the recommended replacement (FP16 storage/compute, FP32 state). |
 
 ---
 

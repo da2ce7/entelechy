@@ -14,6 +14,7 @@ direct PlanRenderer). No legacy module references remain.
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
@@ -63,7 +64,7 @@ class TrainingOrchestrator:
         hyperparams: TrainingHyperparams,
         problem_type_name: str,
         batch_size: int,
-        activation_lifecycle: str = "recompute",
+        activation_lifecycle: Literal["cache", "recompute"] = "recompute",
     ):
         self.model_spec = model_spec
         self.param_space = ParameterSpace(spec=model_spec)
@@ -71,7 +72,7 @@ class TrainingOrchestrator:
         self.renderer = renderer
         self.hyperparams = hyperparams
         self.batch_size = batch_size
-        self.activation_lifecycle = activation_lifecycle
+        self.activation_lifecycle: Literal["cache", "recompute"] = activation_lifecycle
 
         self.strategy: PlanProblemTypeStrategy
         if problem_type_name == "CCE":

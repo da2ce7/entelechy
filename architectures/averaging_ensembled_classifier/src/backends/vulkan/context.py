@@ -164,7 +164,7 @@ class VulkanContext:
         """Check if the Vulkan device supports FP64 shader operations."""
         if self._device_features is None:
             return False
-        return bool(self._device_features.shaderFloat64)
+        return bool(getattr(self._device_features, "shaderFloat64", False))
 
     def _create_logical_device(self) -> None:
         queue_create = vk.VkDeviceQueueCreateInfo(

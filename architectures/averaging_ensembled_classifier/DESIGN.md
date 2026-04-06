@@ -150,7 +150,7 @@ class PrecisionConfig:
     compute_epsilon: float
 ```
 
-Constructed via `PrecisionConfig.float32()`, `PrecisionConfig.float16()`, and `PrecisionConfig.mixed_f16_f32()` classmethods. The invariant `storage_dtype.itemsize ≤ compute_dtype.itemsize` and `storage_dtype.itemsize ≤ state_dtype.itemsize` is enforced at construction. `ModelSpec` consumes `PrecisionConfig` via composition; factory classmethods `ModelSpec.float32()` / `ModelSpec.float16()` are the sole construction API.
+Constructed via factory classmethods: `PrecisionConfig.float32()`, `PrecisionConfig.mixed_f16_f32()`, `PrecisionConfig.fp8_e4m3()`, `PrecisionConfig.fp8_e5m2()`, and others. The invariant `storage_dtype.itemsize ≤ compute_dtype.itemsize` and `storage_dtype.itemsize ≤ state_dtype.itemsize` is enforced at construction. FP8 is permitted only in the storage role. `ModelSpec` consumes `PrecisionConfig` via composition; factory classmethods `ModelSpec.float32()` / `ModelSpec.mixed_f16_f32()` are the primary construction API.
 
 The three-role decomposition enables FP16-storage/FP32-compute pipelines without mode flags or conditional compilation — a configuration where all roles share a type is a parameterization, not a distinct mode.
 
@@ -587,7 +587,7 @@ Phases 2, 3, and 5 are independent workstreams. Phase 4 has no hard dependency. 
 
 As of Phase 6 completion, all three backend flags (`aec_backend_cpu`, `aec_backend_vulkan`, `aec_backend_opencl`) are at the **Mandatory** stage (`value: 'enabled'` in `meson.options`). The build fails if any backend's toolchain is absent.
 
-As of Phase 7 completion, all three backends support the full three-role precision model (`PrecisionConfig.float32()`, `PrecisionConfig.float16()`, `PrecisionConfig.mixed_f16_f32()`). The retired `SCALAR_TYPE`/`SCALAR_IS_HALF` aliases have been removed from all kernel sources and build systems.
+As of Phase 7 completion, all three backends support the full three-role precision model (`PrecisionConfig.float32()`, `PrecisionConfig.mixed_f16_f32()`). The retired `SCALAR_TYPE`/`SCALAR_IS_HALF` aliases have been removed from all kernel sources and build systems. The uniform `PrecisionConfig.float16()` factory was deleted in Phase 9A (the factory was a common footgun for extended training); use `PrecisionConfig.mixed_f16_f32()` instead. Direct construction with FP16 state remains valid.
 
 ### 11.5 Rollback Protocol
 

@@ -5,7 +5,7 @@ Unit tests for ModelSpec: padding calculations and precision contracts.
 Bug-hunting focus:
 * padded_input_dim, padded_hidden_dim, padded_class_dim, padded_module_dim
   must each be ≥ the logical dim and an appropriate multiple.
-* ModelSpec.float32() and ModelSpec.float16() must produce different padding when
+* ModelSpec.float32() and ModelSpec.mixed_f16_f32() must produce different padding when
   cache_line_bytes causes different per-element byte strides.
 """
 from __future__ import annotations
@@ -69,7 +69,7 @@ class TestPaddingCalculations:
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )
-        fp16 = ModelSpec.float16(
+        fp16 = ModelSpec.mixed_f16_f32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )
@@ -83,7 +83,7 @@ class TestPaddingCalculations:
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )
-        fp16 = ModelSpec.float16(
+        fp16 = ModelSpec.mixed_f16_f32(
             input_dim=4, hidden_dim=32, output_classes=3,
             num_modules=8, simd_width=4, cache_line_bytes=64,
         )

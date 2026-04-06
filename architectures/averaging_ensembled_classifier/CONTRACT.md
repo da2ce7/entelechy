@@ -165,7 +165,7 @@ This article defines fixed, system-wide constants that are contractually binding
 
 - `LOCAL_MEM_BANK_PADDING`: Defined with a mandatory value of **`1`**.
 
-`PrecisionConfig` is a frozen dataclass with three independent dtype fields — `storage_dtype`, `compute_dtype`, `state_dtype` — and three derived scalar constants: `storage_fp_format_max`, `compute_fp_format_max`, and `compute_epsilon`. The invariant `storage_dtype.itemsize ≤ compute_dtype.itemsize` and `storage_dtype.itemsize ≤ state_dtype.itemsize` is enforced by `__post_init__`. Seven factory classmethods are defined: `float32()` (all FP32), `float16()` (all FP16), `mixed_f16_f32()` (FP16 storage, FP32 compute, FP32 state), `float64()` (all FP64), `mixed_f32_f64_state()` (FP32 storage, FP32 compute, FP64 state), `mixed_f16_f64_state()` (FP16 storage, FP32 compute, FP64 state), `mixed_f32_f64()` (FP32 storage, FP64 compute, FP64 state). The state role has no ordering constraint relative to compute — `state_dtype.itemsize` may be greater than, equal to, or (when storage is narrower than state) less than `compute_dtype.itemsize`. The retired fields `numpy_dtype`, `fp_format_max`, and `epsilon` do not exist in this type.
+`PrecisionConfig` is a frozen dataclass with three independent dtype fields — `storage_dtype`, `compute_dtype`, `state_dtype` — and five derived scalar constants: `storage_fp_format_max`, `storage_fp_min_positive`, `storage_mantissa_bits`, `compute_fp_format_max`, and `compute_epsilon`. The invariant `storage_dtype.itemsize ≤ compute_dtype.itemsize` and `storage_dtype.itemsize ≤ state_dtype.itemsize` is enforced by `__post_init__`. FP8 compute and FP8 state are architecturally prohibited and raise `ValueError` at construction time. Twelve factory classmethods are defined: `float32()` (all FP32), `mixed_f16_f32()` (FP16 storage, FP32 compute, FP32 state), `float64()` (all FP64), `mixed_f32_f64_state()` (FP32 storage, FP32 compute, FP64 state), `mixed_f16_f64_state()` (FP16 storage, FP32 compute, FP64 state), `mixed_f32_f64()` (FP32 storage, FP64 compute, FP64 state), `fp8_e4m3()` (E4M3 storage, FP32 compute, FP32 state), `fp8_e5m2()` (E5M2 storage, FP32 compute, FP32 state), `fp8_e4m3_f16()` (E4M3 storage, FP16 compute, FP32 state), `fp8_e5m2_f16()` (E5M2 storage, FP16 compute, FP32 state), `fp8_e4m3_f64()` (E4M3 storage, FP64 compute, FP64 state), `fp8_e5m2_f64()` (E5M2 storage, FP64 compute, FP64 state). Additional FP8 combinations (e.g., FP16 compute + FP64 state) are constructed directly. The state role has no ordering constraint relative to compute — `state_dtype.itemsize` may be greater than, equal to, or (when storage is narrower than state) less than `compute_dtype.itemsize`. The retired fields `numpy_dtype`, `fp_format_max`, and `epsilon` do not exist in this type. The uniform `float16()` factory (all FP16) was deleted in Phase 9A — use `mixed_f16_f32()` instead. Direct construction with `state_dtype=np.float16` remains valid.
 
 ### **Article 6: Mandatory Build-Time Symbols**
 
@@ -177,6 +177,9 @@ This article defines symbols that must be provided by the host build environment
 | `COMPUTE_TYPE` | OpenCL/C type name | Element type for arithmetic and compute-role buffers |
 | `STATE_TYPE` | OpenCL/C type name | Element type for state-role buffers |
 | `STORAGE_TYPE_IS_HALF` | `int` (0 or 1) | 1 when `STORAGE_TYPE == half`; gates `cl_khr_fp16` extension and `vload_half`/`vstore_half` |
+| `STORAGE_TYPE_IS_FP8` | `int` (0 or 1) | 1 when `STORAGE_TYPE` is an 8-bit floating-point format (E4M3 or E5M2); gates FP8-specific load/store mechanics |
+| `STORAGE_TYPE_IS_E4M3` | `int` (0 or 1) | 1 when `STORAGE_TYPE` is specifically E4M3; selects E4M3 conversion logic and lookup tables |
+| `STORAGE_TYPE_IS_E5M2` | `int` (0 or 1) | 1 when `STORAGE_TYPE` is specifically E5M2; selects E5M2 conversion logic and lookup tables |
 | `COMPUTE_TYPE_IS_HALF` | `int` (0 or 1) | 1 when `COMPUTE_TYPE == half`; enables FP16 arithmetic extension if required |
 | `COMPUTE_TYPE_IS_DOUBLE` | `int` (0 or 1) | 1 when `COMPUTE_TYPE == double`; gates `cl_khr_fp64` extension and FP64 arithmetic paths |
 | `STATE_TYPE_IS_DOUBLE` | `int` (0 or 1) | 1 when `STATE_TYPE == double`; gates FP64 load/store mechanics for state buffers |
@@ -187,6 +190,10 @@ This article defines symbols that must be provided by the host build environment
 The symbols `SCALAR_TYPE` and `SCALAR_IS_HALF` are **retired**. They do not appear in any kernel source file; all kernel signatures use the three-role precision model (`STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE`).
 
 The `_IS_HALF` and `_IS_DOUBLE` flags are mutually exclusive for the same role type. When `COMPUTE_TYPE = float`, both `COMPUTE_TYPE_IS_HALF = 0` and `COMPUTE_TYPE_IS_DOUBLE = 0`. A `_IS_HALF = 1` and `_IS_DOUBLE = 1` combination for the same role is a build-system error.
+
+**FP8 is storage-role only.** The symbols `COMPUTE_TYPE_IS_FP8` and `STATE_TYPE_IS_FP8` are **not defined** because FP8 compute and FP8 state are architecturally prohibited. The build system does not emit these symbols. Attempting to configure FP8 for compute or state roles raises `ValueError` at `PrecisionConfig` construction time.
+
+**Cross-backend naming:** All backends (OpenCL, CPU, and Vulkan) use the canonical `STORAGE_TYPE_IS_*` / `COMPUTE_TYPE_IS_*` / `STATE_TYPE_IS_*` flag names from this article. The Vulkan backend's GLSL type macros (`STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE`) and boolean flags (`STORAGE_TYPE_IS_FP8`, `STORAGE_TYPE_IS_E4M3`, `STORAGE_TYPE_IS_E5M2`) use the same canonical names as OpenCL, injected via `glslc -D`. No backend-specific shortened names are used.
 
 ### **Article 7: Canonical Interface Instantiation**
 

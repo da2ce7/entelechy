@@ -23,7 +23,7 @@ if "src" not in sys.modules:
 
 from src.shared.model_spec import ModelSpec
 from src.shared.parameter_space import ParameterSpace
-from src.shared.precision_config import PrecisionConfig
+from src.shared.precision_config import PrecisionConfig, FP8_E4M3, FP8_E5M2
 from src.shared.workload_primitives import TilingScheme
 from src.shared.stabilization_policy import StabilizationPolicy
 
@@ -32,7 +32,6 @@ from src.shared.stabilization_policy import StabilizationPolicy
 
 PRECISION_CONFIGS = [
     pytest.param(PrecisionConfig.float32, id="fp32"),
-    pytest.param(PrecisionConfig.float16, id="fp16"),
     pytest.param(PrecisionConfig.mixed_f16_f32, id="mixed_f16_f32"),
 ]
 
@@ -43,11 +42,58 @@ FP64_PRECISION_CONFIGS = [
     pytest.param(PrecisionConfig.mixed_f32_f64, id="mixed_f32_f64"),
 ]
 
-ALL_PRECISION_CONFIGS = PRECISION_CONFIGS + FP64_PRECISION_CONFIGS
+FP8_PRECISION_CONFIGS = [
+    pytest.param(PrecisionConfig.fp8_e4m3, id="fp8_e4m3"),
+    pytest.param(PrecisionConfig.fp8_e4m3_f16, id="fp8_e4m3_f16"),
+    pytest.param(PrecisionConfig.fp8_e4m3_f64, id="fp8_e4m3_f64"),
+    pytest.param(PrecisionConfig.fp8_e5m2, id="fp8_e5m2"),
+    pytest.param(PrecisionConfig.fp8_e5m2_f16, id="fp8_e5m2_f16"),
+    pytest.param(PrecisionConfig.fp8_e5m2_f64, id="fp8_e5m2_f64"),
+]
+
+# Direct-construction FP8 configs for mixed compute/state combinations
+# not covered by factory classmethods (ADR-025 §2.3).
+_f16_info = np.finfo(np.float16)
+_f32_info = np.finfo(np.float32)
+
+
+def _fp8_e4m3_f16_f64() -> PrecisionConfig:
+    """E4M3 storage, FP16 compute, FP64 state (direct construction)."""
+    return PrecisionConfig(
+        storage_dtype=FP8_E4M3,
+        compute_dtype=np.dtype(np.float16),
+        state_dtype=np.dtype(np.float64),
+        storage_fp_format_max=448.0,
+        storage_fp_min_positive=0.001953125,
+        storage_mantissa_bits=3,
+        compute_fp_format_max=float(_f16_info.max),
+        compute_epsilon=float(_f16_info.eps),
+    )
+
+
+def _fp8_e4m3_f32_f64() -> PrecisionConfig:
+    """E4M3 storage, FP32 compute, FP64 state (direct construction)."""
+    return PrecisionConfig(
+        storage_dtype=FP8_E4M3,
+        compute_dtype=np.dtype(np.float32),
+        state_dtype=np.dtype(np.float64),
+        storage_fp_format_max=448.0,
+        storage_fp_min_positive=0.001953125,
+        storage_mantissa_bits=3,
+        compute_fp_format_max=float(_f32_info.max),
+        compute_epsilon=float(_f32_info.eps),
+    )
+
+
+FP8_DIRECT_CONSTRUCTION_CONFIGS = [
+    pytest.param(_fp8_e4m3_f16_f64, id="fp8_e4m3_f16_f64"),
+    pytest.param(_fp8_e4m3_f32_f64, id="fp8_e4m3_f32_f64"),
+]
+
+ALL_PRECISION_CONFIGS = PRECISION_CONFIGS + FP64_PRECISION_CONFIGS + FP8_PRECISION_CONFIGS + FP8_DIRECT_CONSTRUCTION_CONFIGS
 
 MODEL_SPEC_FACTORIES = [
     pytest.param(ModelSpec.float32, id="fp32"),
-    pytest.param(ModelSpec.float16, id="fp16"),
     pytest.param(ModelSpec.mixed_f16_f32, id="mixed_f16_f32"),
 ]
 

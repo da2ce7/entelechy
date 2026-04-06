@@ -55,21 +55,16 @@ def _get_precision_suffix(
 ) -> str:
     """Map three-axis precision configuration to kernel suffix (ADR-024 §4.1).
 
-    Returns one of the 11 valid s{s}c{c}x{x} suffixes.
+    Returns one of the 9 valid s{s}c{c}x{x} suffixes.
     """
     _SUFFIX_MAP: dict[tuple[type, type, type], str] = {
-        (np.float16, np.float16, np.float16): "s16c16x16",
         (np.float16, np.float16, np.float32): "s16c16x32",
         (np.float16, np.float16, np.float64): "s16c16x64",
-        (np.float16, np.float32, np.float16): "s16c32x16",
         (np.float16, np.float32, np.float32): "s16c32x32",
         (np.float16, np.float32, np.float64): "s16c32x64",
-        (np.float16, np.float64, np.float16): "s16c64x16",
-        (np.float16, np.float64, np.float32): "s16c64x32",
         (np.float16, np.float64, np.float64): "s16c64x64",
         (np.float32, np.float32, np.float32): "s32c32x32",
         (np.float32, np.float32, np.float64): "s32c32x64",
-        (np.float32, np.float64, np.float32): "s32c64x32",
         (np.float32, np.float64, np.float64): "s32c64x64",
         (np.float64, np.float64, np.float64): "s64c64x64",
     }

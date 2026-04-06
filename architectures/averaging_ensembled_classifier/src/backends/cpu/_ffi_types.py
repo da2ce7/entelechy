@@ -31,32 +31,27 @@ c_int_p = POINTER(c_int32)
 
 # Three-axis precision suffixes s{storage}c{compute}x{state} (ADR-024 §4.1)
 PRECISION_SUFFIXES = (
-    "s16c16x16", "s16c16x32", "s16c16x64",
-    "s16c32x16", "s16c32x32", "s16c32x64",
-    "s16c64x16", "s16c64x32", "s16c64x64",
+    "s16c16x32", "s16c16x64",
+    "s16c32x32", "s16c32x64",
+    "s16c64x64",
     "s32c32x32", "s32c32x64",
-    "s32c64x32", "s32c64x64",
+    "s32c64x64",
     "s64c64x64",
 )
 
 # Two-axis aliases for backward compatibility (old suffix → new suffix).
-_SUFFIX_ALIASES = {"s16x16": "s16c32x16", "s32x32": "s32c32x32", "s16x32": "s16c32x32"}
+_SUFFIX_ALIASES = {"s32x32": "s32c32x32", "s16x32": "s16c32x32"}
 
 # (c_storage, c_storage_p, c_compute, c_compute_p, c_state, c_state_p) per suffix.
 # FP16 uses c_uint16 because ctypes has no _Float16; both are 2-byte types.
 PRECISION_C_TYPES: dict[str, tuple[type, type, type, type, type, type]] = {
-    "s16c16x16": (c_uint16, POINTER(c_uint16), c_uint16, POINTER(c_uint16), c_uint16, POINTER(c_uint16)),
     "s16c16x32": (c_uint16, POINTER(c_uint16), c_uint16, POINTER(c_uint16), c_float, POINTER(c_float)),
     "s16c16x64": (c_uint16, POINTER(c_uint16), c_uint16, POINTER(c_uint16), c_double, POINTER(c_double)),
-    "s16c32x16": (c_uint16, POINTER(c_uint16), c_float, POINTER(c_float), c_uint16, POINTER(c_uint16)),
     "s16c32x32": (c_uint16, POINTER(c_uint16), c_float, POINTER(c_float), c_float, POINTER(c_float)),
     "s16c32x64": (c_uint16, POINTER(c_uint16), c_float, POINTER(c_float), c_double, POINTER(c_double)),
-    "s16c64x16": (c_uint16, POINTER(c_uint16), c_double, POINTER(c_double), c_uint16, POINTER(c_uint16)),
-    "s16c64x32": (c_uint16, POINTER(c_uint16), c_double, POINTER(c_double), c_float, POINTER(c_float)),
     "s16c64x64": (c_uint16, POINTER(c_uint16), c_double, POINTER(c_double), c_double, POINTER(c_double)),
     "s32c32x32": (c_float, POINTER(c_float), c_float, POINTER(c_float), c_float, POINTER(c_float)),
     "s32c32x64": (c_float, POINTER(c_float), c_float, POINTER(c_float), c_double, POINTER(c_double)),
-    "s32c64x32": (c_float, POINTER(c_float), c_double, POINTER(c_double), c_float, POINTER(c_float)),
     "s32c64x64": (c_float, POINTER(c_float), c_double, POINTER(c_double), c_double, POINTER(c_double)),
     "s64c64x64": (c_double, POINTER(c_double), c_double, POINTER(c_double), c_double, POINTER(c_double)),
 }
@@ -470,6 +465,7 @@ ClampTemperaturesArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["ClampTemperaturesArg
 LAYOUT_CHECKS: list[tuple[str, type]] = PRECISION_LAYOUT_CHECKS[_DEFAULT_SUFFIX]
 
 # Two-axis suffix aliases for callers that haven't migrated yet
+_old = _new = ""
 for _old, _new in _SUFFIX_ALIASES.items():
     PRECISION_STRUCTS[_old] = PRECISION_STRUCTS[_new]
     PRECISION_LAYOUT_CHECKS[_old] = PRECISION_LAYOUT_CHECKS[_new]

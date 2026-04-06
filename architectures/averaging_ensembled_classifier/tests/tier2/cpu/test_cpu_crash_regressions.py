@@ -43,7 +43,7 @@ from src.shared.stabilization_policy import StabilizationPolicy  # noqa: E402
 # =========================================================================
 
 _PREC_FP32 = PrecisionConfig.float32()
-_PREC_FP16 = PrecisionConfig.float16()
+_PREC_FP16 = PrecisionConfig.mixed_f16_f32()
 
 
 @pytest.fixture(scope="module")

@@ -27,7 +27,7 @@ IEEE 754 does not define 8-bit floating-point. Two de facto standards have emerg
 | **E4M3** | 1 | 4 | 3 | 7 | 448 | 2⁻⁹ ≈ 0.00195 | Activations, gradients (range-limited) |
 | **E5M2** | 1 | 5 | 2 | 15 | 57344 | 2⁻¹⁶ ≈ 0.0000153 | Wider dynamic range, lower precision |
 
-E4M3 provides 3 mantissa bits (8 distinct values per exponent binade) with a maximum representable value of 448. E5M2 provides 2 mantissa bits (4 distinct values per binade) but extends the dynamic range to 57344. The two formats differ in special-value semantics: **E4M3** (`float8_e4m3fn`) repurposes all 256 bit patterns for finite values — no infinity or NaN. **E5M2** follows IEEE-like conventions: exponent 0x1F encodes ±infinity (mantissa = 0) and NaN (mantissa ≠ 0), leaving 248 finite bit patterns. In practice this distinction is invisible to the training loop because the store path saturates to the maximum finite value in both formats, so infinity and NaN bit patterns are never written to storage buffers.
+E4M3 provides 3 mantissa bits (8 distinct values per exponent binade) with a maximum representable value of 448. E5M2 provides 2 mantissa bits (4 distinct values per binade) but extends the dynamic range to 57344. The two formats differ in special-value semantics: **E4M3** (`float8_e4m3fn`) has no infinity representation but reserves 2 bit patterns for NaN (0x7F, 0xFF), leaving 254 finite values. **E5M2** follows IEEE-like conventions: exponent 0x1F encodes ±infinity (mantissa = 0) and NaN (mantissa ≠ 0), leaving 248 finite bit patterns. In practice this distinction is invisible to the training loop because the store path saturates to the maximum finite value in both formats, so infinity and NaN bit patterns are never written to storage buffers.
 
 **E4M3 is the primary target.** Its higher precision (3 mantissa bits vs. 2) better preserves gradient direction vectors and activation magnitudes. The 448 maximum is manageable under the architecture's existing Quadratic Scaling Policy — gradients are already scaled to prevent overflow at `COMPUTE_FP_FORMAT_MAX / K`, and post-scaling values fit within E4M3's range for practical K values.
 
@@ -100,7 +100,7 @@ The `ml_dtypes` package (maintained by the JAX team) provides NumPy-compatible F
 import ml_dtypes
 import numpy as np
 
-# E4M3 (no infinity, no NaN — all bit patterns are finite)
+# E4M3 (no infinity; 2 NaN patterns at 0x7F and 0xFF, 254 finite values)
 FP8_E4M3 = ml_dtypes.float8_e4m3fn
 
 # E5M2 (standard ML definition)
@@ -127,7 +127,9 @@ class PrecisionConfig:
     compute_dtype: np.dtype   # float16, float32, float64 (FP8 compute prohibited)
                               # Note: FP16 compute on CPU requires _Float16 (C23 / GCC 12+ / Clang 15+).
                               # See §5.3 for conditional CPU suffix variants.
-    state_dtype: np.dtype     # float32, float64 (FP8 and FP16 state prohibited)
+    state_dtype: np.dtype     # float16, float32, float64 (FP8 state prohibited)
+                              # Note: FP16 state is permitted but not recommended for
+                              # extended training — see §2.2 note on precision erosion.
 ```
 
 #### §2.2: Construction Invariants (amended)
@@ -146,14 +148,6 @@ def __post_init__(self) -> None:
         raise ValueError(
             "FP8 state is architecturally prohibited: "
             "EMA updates round to zero for β > 0.9"
-        )
-    
-    # FP16 state is also prohibited (EMA precision erosion over extended training)
-    if self.state_dtype == np.float16:
-        raise ValueError(
-            "FP16 state is architecturally prohibited: "
-            "EMA updates lose precision over extended training. "
-            "Use FP32 or FP64 for state_dtype."
         )
     
     # Existing invariants (storage ≤ compute, storage ≤ state) still apply

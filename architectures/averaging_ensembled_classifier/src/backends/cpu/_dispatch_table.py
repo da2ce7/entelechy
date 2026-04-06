@@ -18,7 +18,7 @@ def build_dispatch_table(
     """Build the kernel_name → (task_fn_ptr, args_struct_class) mapping.
 
     *suffix* selects the precision variant using three-axis suffixes
-    (e.g. ``"s32c32x32"``, ``"s16c32x16"``, ``"s64c64x64"``).
+    (e.g. ``"s32c32x32"``, ``"s16c32x32"``, ``"s64c64x64"``).
     C function names and struct classes are resolved accordingly.
 
     Strategy A kernels (Nodes 8, 9, 10): CCE and BCE variants map to

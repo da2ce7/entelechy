@@ -8,6 +8,7 @@ The deprecated SCALAR_NP_TYPE and SCALAR_C_TYPE_NAME properties have been
 removed under the three-role precision model (ADR-022 §2.2).
 """
 
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -83,7 +84,21 @@ class ModelSpec:
 
     @classmethod
     def float16(cls, **kwargs: Any) -> "ModelSpec":
-        return cls(precision=PrecisionConfig.float16(), **kwargs)
+        """FP16 storage with FP32 compute and FP32 state.
+
+        .. deprecated::
+            Use ``ModelSpec.mixed_f16_f32()`` instead. This factory will be
+            removed in a future release. The name ``float16`` is misleading
+            because compute and state are FP32, not FP16.
+        """
+        warnings.warn(
+            "ModelSpec.float16() is deprecated and will be removed. "
+            "Use ModelSpec.mixed_f16_f32() instead "
+            "(FP16 storage, FP32 compute, FP32 state).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return cls(precision=PrecisionConfig.mixed_f16_f32(), **kwargs)
 
     @classmethod
     def mixed_f16_f32(cls, **kwargs: Any) -> "ModelSpec":

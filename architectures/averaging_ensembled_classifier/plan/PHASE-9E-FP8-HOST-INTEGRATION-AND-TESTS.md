@@ -1362,7 +1362,7 @@ Before marking Phase 9 complete:
 - [ ] All Phase 8E tests still pass (no regression)
 - [ ] FP8 factories construct without error
 - [ ] FP8 compute/state raises `ValueError`
-- [ ] FP16 state raises `ValueError` (all configs)
+- [ ] FP16 state constructs successfully (direct construction permitted)
 - [ ] OpenCL FP8 roundtrip tests pass (Phase 9B)
 - [ ] CPU FP8 roundtrip tests pass (Phase 9C)
 - [ ] Vulkan FP8 roundtrip tests pass (Phase 9D)

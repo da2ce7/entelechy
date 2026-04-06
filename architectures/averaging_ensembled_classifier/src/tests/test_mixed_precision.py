@@ -70,9 +70,10 @@ class TestPrecisionConfigInvariants:
         assert pc.storage_dtype == np.dtype(np.float32)
 
     def test_float16_uniform(self) -> None:
-        pc = PrecisionConfig.float16()
-        assert pc.storage_dtype == pc.compute_dtype == pc.state_dtype
+        pc = PrecisionConfig.mixed_f16_f32()
         assert pc.storage_dtype == np.dtype(np.float16)
+        assert pc.compute_dtype == np.dtype(np.float32)
+        assert pc.state_dtype == np.dtype(np.float32)
 
     def test_mixed_f16_f32_split(self) -> None:
         pc = PrecisionConfig.mixed_f16_f32()
@@ -82,12 +83,14 @@ class TestPrecisionConfigInvariants:
 
     def test_invalid_config_rejected(self) -> None:
         """storage wider than compute must be rejected."""
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError, match="cannot be wider than"):
             PrecisionConfig(
                 storage_dtype=np.dtype(np.float32),
                 compute_dtype=np.dtype(np.float16),
                 state_dtype=np.dtype(np.float32),
                 storage_fp_format_max=float(np.finfo(np.float32).max),
+                storage_fp_min_positive=float(np.finfo(np.float32).smallest_subnormal),
+                storage_mantissa_bits=np.finfo(np.float32).nmant,
                 compute_fp_format_max=float(np.finfo(np.float16).max),
                 compute_epsilon=float(np.finfo(np.float16).eps),
             )
@@ -121,17 +124,14 @@ class TestModelSpecMultiPrecision:
     def test_fp16_wider_element_count_than_fp32(self) -> None:
         """FP16 storage needs more elements per cache line → wider padded dims."""
         fp32 = ModelSpec.float32(**IRIS)
-        fp16 = ModelSpec.float16(**IRIS)
+        fp16 = ModelSpec.mixed_f16_f32(**IRIS)
         # 2-byte elements need 32 per 64-byte line vs 16 for 4-byte elements
         assert fp16.padded_input_dim >= fp32.padded_input_dim
 
     def test_mixed_uses_storage_dtype_for_padding(self) -> None:
-        """mixed_f16_f32 pads using storage_dtype (FP16), same as float16."""
-        fp16 = ModelSpec.float16(**IRIS)
+        """mixed_f16_f32 pads using storage_dtype (FP16)."""
         mixed = ModelSpec.mixed_f16_f32(**IRIS)
-        assert mixed.padded_input_dim == fp16.padded_input_dim
-        assert mixed.padded_class_dim == fp16.padded_class_dim
-        assert mixed.padded_module_dim == fp16.padded_module_dim
+        assert mixed.precision.storage_dtype == np.dtype(np.float16)
 
 
 # =========================================================================
@@ -315,7 +315,7 @@ class TestAlchemistMixedPrecisionFidelity:
     def test_three_configs_are_parameterizations_not_modes(self) -> None:
         """All three configs produce plans with identical DAG topology."""
         fp32_plan = self._build_plan(ModelSpec.float32(**IRIS))
-        fp16_plan = self._build_plan(ModelSpec.float16(**IRIS))
+        fp16_plan = self._build_plan(ModelSpec.mixed_f16_f32(**IRIS))
         mixed_plan = self._build_plan(ModelSpec.mixed_f16_f32(**IRIS))
 
         assert fp32_plan.topological_order == fp16_plan.topological_order == mixed_plan.topological_order, (
@@ -495,11 +495,11 @@ class TestVulkanPipelineVariantSelection:
 
         assert _spv_variant_suffix(PrecisionConfig.mixed_f16_f32()) == "_s16c32x32"
 
-    def test_fp16_selects_s16c16x16_variant(self) -> None:
-        """Uniform FP16 (compute=float16) selects the s16c16x16 variant."""
+    def test_fp16_selects_s16c32x32_variant(self) -> None:
+        """mixed_f16_f32 (FP16 storage, FP32 compute) selects the s16c32x32 variant."""
         from src.backends.vulkan._pipeline_cache import _spv_variant_suffix
 
-        assert _spv_variant_suffix(PrecisionConfig.float16()) == "_s16c16x16"
+        assert _spv_variant_suffix(PrecisionConfig.mixed_f16_f32()) == "_s16c32x32"
 
     def test_fp32_and_mixed_select_different_variants(self) -> None:
         from src.backends.vulkan._pipeline_cache import _spv_variant_suffix
@@ -530,10 +530,10 @@ class TestCPUDispatchSuffix:
         assert result == expected_suffix
         assert result in PRECISION_SUFFIXES
 
-    def test_float16_uniform_selects_s16c16x16(self) -> None:
-        """Uniform FP16 (compute=float16) selects the s16c16x16 suffix."""
+    def test_float16_storage_selects_s16c32x32(self) -> None:
+        """mixed_f16_f32 (FP16 storage, FP32 compute) selects the s16c32x32 suffix."""
         from src.backends.cpu.renderer import _get_precision_suffix
 
-        pc = PrecisionConfig.float16()
+        pc = PrecisionConfig.mixed_f16_f32()
         result = _get_precision_suffix(pc.storage_dtype, pc.compute_dtype, pc.state_dtype)
-        assert result == "s16c16x16"
+        assert result == "s16c32x32"

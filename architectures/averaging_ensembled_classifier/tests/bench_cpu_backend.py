@@ -113,7 +113,7 @@ def renderer_single() -> CPUPlanRenderer:
 # =========================================================================
 
 _PREC_FP32: PrecisionConfig = PrecisionConfig.float32()  # type: ignore[reportCallIssue]
-_PREC_FP16: PrecisionConfig = PrecisionConfig.float16()  # type: ignore[reportCallIssue]
+_PREC_FP16: PrecisionConfig = PrecisionConfig.mixed_f16_f32()  # type: ignore[reportCallIssue]
 
 
 def _make_hw(profile: HardwareProfile) -> HardwareProfile:

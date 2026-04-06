@@ -18,6 +18,8 @@ mccabe==0.7.0
     # via flake8
 mypy==1.16.1
     # via averaging_ensembled_classifier (pyproject.toml)
+ml_dtypes>=0.2.0
+    # via averaging_ensembled_classifier (pyproject.toml)
 mypy-extensions==1.1.0
     # via
     #   black

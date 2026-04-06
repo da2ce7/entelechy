@@ -388,7 +388,7 @@ The migration is complete when:
 1. `grep -r SCALAR_TYPE architectures/averaging_ensembled_classifier/kernels/` returns no results.
 2. `grep -r SCALAR_TYPE architectures/averaging_ensembled_classifier/src/backends/` returns no results.
 3. The transitional alias block is absent from all Meson build configuration files.
-4. Tier 2 tests pass for `PrecisionConfig.float32()`, `PrecisionConfig.float16()`, and `PrecisionConfig.mixed_f16_f32()`.
+4. Tier 2 tests pass for `PrecisionConfig.float32()` and `PrecisionConfig.mixed_f16_f32()`.
 
 ---
 

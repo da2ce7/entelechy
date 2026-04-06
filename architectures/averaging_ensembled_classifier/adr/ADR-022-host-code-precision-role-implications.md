@@ -69,8 +69,9 @@ Three factory classmethods replace the existing two:
 | Factory | `storage_dtype` | `compute_dtype` | `state_dtype` |
 |:---|:---|:---|:---|
 | `PrecisionConfig.float32()` | `float32` | `float32` | `float32` |
-| `PrecisionConfig.float16()` | `float16` | `float16` | `float16` |
 | `PrecisionConfig.mixed_f16_f32()` | `float16` | `float32` | `float32` |
+
+> **Note:** `PrecisionConfig.float16()` (uniform FP16 for all roles) was deleted in Phase 9A. FP16 state remains permitted via direct construction but is not recommended for extended training — EMA updates lose precision over long runs. Use `PrecisionConfig.mixed_f16_f32()` instead.
 
 The retired fields `numpy_dtype`, `fp_format_max`, and `epsilon` are removed. No compatibility shim is provided — all consumers are updated in the same migration. `ModelSpec` factories delegate to the new `PrecisionConfig` factories unchanged (`PrecisionConfig.float32()` etc. continue to exist by name).
 
@@ -268,8 +269,7 @@ All `StabilizationPolicy(..., fp_format_max=...)` constructions are updated. The
 Per ADR-020 §4.6, Tier 2 tests must execute against all active `PrecisionConfig` factory configurations, including at least one configuration where roles diverge. Concretely:
 
 - `PrecisionConfig.float32()` — existing coverage
-- `PrecisionConfig.float16()` — existing coverage (FP16 tests)
-- `PrecisionConfig.mixed_f16_f32()` — **new: must be added**
+- `PrecisionConfig.mixed_f16_f32()` — existing coverage (FP16 storage, FP32 compute/state)
 
 Any test that parameterises over a `PrecisionConfig` instance must include `PrecisionConfig.mixed_f16_f32()` as a test case. Numerical tolerance for mixed-precision comparison is derived from `compute_dtype` (FP32 in `mixed_f16_f32`), not from `storage_dtype`.
 
