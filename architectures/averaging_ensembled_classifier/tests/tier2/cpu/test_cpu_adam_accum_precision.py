@@ -93,17 +93,19 @@ def _ref_adam_update_correct_accum(
     m2_new = beta2_accum * m2 + (np.float32(1.0) - beta2_accum) * (g_accum * g_accum)
     
     # Bias correction in FP16 (compute type) — narrow from accum
-    m_hat_f16 = (m1_new.astype(np.float16) / 
-                 np.float16(1.0 - np.float16(beta1_pow_t)))
-    v_hat_f16 = (m2_new.astype(np.float16) / 
-                 np.float16(1.0 - np.float16(beta2_pow_t)))
-    
-    # Parameter delta in FP16
-    delta_f16 = (np.float16(lr) * m_hat_f16 / 
-                 (np.sqrt(v_hat_f16.astype(np.float32)).astype(np.float16) + np.float16(epsilon)))
-    
-    # Final subtraction in FP32 (accumulative)
-    params_new = params - delta_f16.astype(np.float32)
+    # Use errstate to suppress expected edge-case warnings (e.g., t=1 → divide by zero)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m_hat_f16 = (m1_new.astype(np.float16) / 
+                     np.float16(1.0 - np.float16(beta1_pow_t)))
+        v_hat_f16 = (m2_new.astype(np.float16) / 
+                     np.float16(1.0 - np.float16(beta2_pow_t)))
+        
+        # Parameter delta in FP16
+        delta_f16 = (np.float16(lr) * m_hat_f16 / 
+                     (np.sqrt(v_hat_f16.astype(np.float32)).astype(np.float16) + np.float16(epsilon)))
+        
+        # Final subtraction in FP32 (accumulative)
+        params_new = params - delta_f16.astype(np.float32)
     
     return params_new, m1_new, m2_new
 
@@ -141,15 +143,17 @@ def _ref_adam_update_buggy_accum(
     m2_new = m2_new_f16.astype(np.float32)
     
     # Bias correction in FP16
-    m_hat = m1_new_f16 / np.float16(1.0 - np.float16(beta1_pow_t))
-    v_hat = m2_new_f16 / np.float16(1.0 - np.float16(beta2_pow_t))
-    
-    # Parameter delta
-    delta = (np.float16(lr) * m_hat / 
-             (np.sqrt(v_hat.astype(np.float32)).astype(np.float16) + np.float16(epsilon)))
-    
-    # Final subtraction
-    params_new = params - delta.astype(np.float32)
+    # Use errstate to suppress expected edge-case warnings (e.g., t=1 → divide by zero)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m_hat = m1_new_f16 / np.float16(1.0 - np.float16(beta1_pow_t))
+        v_hat = m2_new_f16 / np.float16(1.0 - np.float16(beta2_pow_t))
+        
+        # Parameter delta
+        delta = (np.float16(lr) * m_hat / 
+                 (np.sqrt(v_hat.astype(np.float32)).astype(np.float16) + np.float16(epsilon)))
+        
+        # Final subtraction
+        params_new = params - delta.astype(np.float32)
     
     return params_new, m1_new, m2_new
 

@@ -42,7 +42,21 @@ def ref_clip_l2_norm(
 
     Used by clip_partial_gradients, clip_intermediate_grad,
     clip_shared_gradients.
+
+    Threshold semantics (ADR-019, ADR-026):
+      - threshold < 0: bypass clipping (diagnostic mode), return unchanged
+      - threshold = 0: clip to zero norm (zeros all gradients)
+      - threshold > 0: standard L2-norm clipping
     """
+    # Negative threshold: diagnostic bypass
+    if threshold < 0.0:
+        return grads.copy()
+
+    # Zero threshold: clip to zero norm
+    if threshold == 0.0:
+        return np.zeros_like(grads)
+
+    # Positive threshold: standard L2-norm clipping
     norm = np.sqrt(np.sum(grads * grads))
     if norm > threshold:
         return grads * (threshold / (norm + epsilon))
@@ -73,7 +87,22 @@ def ref_clip_shared_gradients(
     threshold: float,
     epsilon: float = 1e-7,
 ) -> tuple[NDArray[np.floating[Any]], NDArray[np.floating[Any]]]:
-    """Reference: clip_shared_gradients — joint L2-norm clip on concatenated grads."""
+    """Reference: clip_shared_gradients — joint L2-norm clip on concatenated grads.
+
+    Threshold semantics (ADR-019, ADR-026):
+      - threshold < 0: bypass clipping (diagnostic mode), return unchanged
+      - threshold = 0: clip to zero norm (zeros all gradients)
+      - threshold > 0: standard L2-norm clipping
+    """
+    # Negative threshold: diagnostic bypass
+    if threshold < 0.0:
+        return grad_sw.copy(), grad_sb.copy()
+
+    # Zero threshold: clip to zero norm
+    if threshold == 0.0:
+        return np.zeros_like(grad_sw), np.zeros_like(grad_sb)
+
+    # Positive threshold: standard L2-norm clipping
     combined = np.concatenate([grad_sw.ravel(), grad_sb.ravel()])
     norm = np.sqrt(np.sum(combined * combined))
     if norm > threshold:

@@ -164,6 +164,11 @@ void PREC_FN(task_clip_intermediate)(void* raw_args, uint task_index, uint threa
     }
 
     COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
+
+    /* Diagnostic bypass: negative threshold skips all clipping */
+    if (a->clipping_threshold_t_j < (COMPUTE_T)0.0)
+        return;
+
     if (norm <= a->clipping_threshold_t_j)
         return;
 

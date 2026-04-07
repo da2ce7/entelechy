@@ -285,16 +285,24 @@ __kernel void compute_probs_loss_cce_chunk(
         }
     }
 
-    // --- 6. Final Loss Calculation (Scatter-Write) ---
-    // It is critical to re-calculate the probability for the true class, as it may not
-    // have been within the partial chunk this thread wrote out. This is cheap as the
-    // expensive reduction parameters (max_logit, inv_sum_exp) are already computed.
-    const int          true_class_idx   = src_buffer_GLOBAL_targets[batch_idx];
-    const COMPUTE_TYPE logit_true_class = load_storage(src_buffer_GLOBAL_logits, base_logits_idx + true_class_idx);
-    const COMPUTE_TYPE prob_true_class  = MATH_FN exp((logit_true_class * temp_inv) - max_scaled_logit) * inv_sum_exp;
+    // --- 6. Final Loss Calculation (Scatter-Write with Write Predicate) ---
+    // Loss Write Predicate: Only the tile whose class chunk contains the target class
+    // index writes to the loss buffer. All other tiles skip the write.
+    // This prevents data races under OpenCL/Vulkan memory models when num_class_chunks > 1.
+    // The ZERO_REQUIRED initialization contract ensures unwritten positions are zero.
+    const int  true_class_idx       = src_buffer_GLOBAL_targets[batch_idx];
+    const uint class_chunk_end      = class_offset + src_scalar_NATURAL_classes_per_chunk;
+    const int  target_in_this_chunk = ((uint)true_class_idx >= class_offset) && ((uint)true_class_idx < class_chunk_end);
 
-    // The argument to log is bounded by the system's epsilon.
-    store_storage(dest_buffer_GLOBAL_final_loss, loss_out_idx, -MATH_FN log(fmax(prob_true_class, (COMPUTE_TYPE)NUMERICAL_STABILITY_EPSILON)));
+    if (target_in_this_chunk) {
+        // Re-calculate the probability for the true class. This is cheap as the
+        // expensive reduction parameters (max_logit, inv_sum_exp) are already computed.
+        const COMPUTE_TYPE logit_true_class = load_storage(src_buffer_GLOBAL_logits, base_logits_idx + true_class_idx);
+        const COMPUTE_TYPE prob_true_class  = MATH_FN exp((logit_true_class * temp_inv) - max_scaled_logit) * inv_sum_exp;
+
+        // The argument to log is bounded by the system's epsilon.
+        store_storage(dest_buffer_GLOBAL_final_loss, loss_out_idx, -MATH_FN log(fmax(prob_true_class, (COMPUTE_TYPE)NUMERICAL_STABILITY_EPSILON)));
+    }
 }
 
 // --- Implementation: compute_probs_loss_bce_chunk (Node 7) ---

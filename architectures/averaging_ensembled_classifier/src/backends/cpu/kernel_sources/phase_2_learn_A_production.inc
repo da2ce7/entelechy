@@ -82,7 +82,14 @@ void PREC_FN(task_cce_probs_loss)(void* raw_args, uint task_index, uint thread_i
     const int   true_class_idx = a->targets[batch_idx];
     const COMPUTE_T logit_true     = scalar_load_storage(a->logits, base_logits_idx + (uint)true_class_idx);
     const COMPUTE_T prob_true      = COMPUTE_EXP(logit_true * inv_temp - max_scaled_logit) * inv_sum_exp;
-    a->final_loss[loss_out_idx] = -COMPUTE_LOG(COMPUTE_FMAX(prob_true, (COMPUTE_T)NUMERICAL_STABILITY_EPSILON));  /* compute-role */
+
+    /* Only the tile containing the target class writes the loss (scatter-write predicate).
+     * This prevents data races when multiple class chunks process the same (module, batch) pair. */
+    const bool target_in_this_chunk = ((uint)true_class_idx >= class_offset &&
+                                       (uint)true_class_idx < class_offset + a->classes_per_chunk);
+    if (target_in_this_chunk) {
+        a->final_loss[loss_out_idx] = -COMPUTE_LOG(COMPUTE_FMAX(prob_true, (COMPUTE_T)NUMERICAL_STABILITY_EPSILON));  /* compute-role */
+    }
 }
 
 /* ================================================================

@@ -46,6 +46,8 @@ class OpenCLPlanRenderer:
         self._bindings = kernel_bindings
         self._hardware = hardware
         self._allocator = OpenCLBufferAllocator(context, queue)
+        # Kernel cache to avoid repeated kernel retrieval (RepeatedKernelRetrieval warning)
+        self._kernel_cache: dict[str, cl.Kernel] = {}
         # Reduction engine bindings (set externally after construction)
         # Storage-entry variants (existing)
         self._register_reduce_binding: Any | None = None
@@ -86,6 +88,12 @@ class OpenCLPlanRenderer:
     @property
     def allocator(self) -> OpenCLBufferAllocator:
         return self._allocator
+
+    def _get_kernel(self, name: str) -> cl.Kernel:
+        """Get a cached kernel instance, creating it if needed."""
+        if name not in self._kernel_cache:
+            self._kernel_cache[name] = cl.Kernel(self._program, name)
+        return self._kernel_cache[name]
 
     def render(self, plan: ExecutionPlan) -> dict[str, RetrievalFuture]:
         """Render an execution plan using PyOpenCL's imperative dispatch model."""
@@ -186,7 +194,7 @@ class OpenCLPlanRenderer:
     ) -> cl.Event:
         """Dispatch a KernelDispatchNode via per-tile imperative enqueue."""
         binding = self._bindings[node.kernel_name]
-        kernel = getattr(self._program, binding.get_kernel_name())
+        kernel = self._get_kernel(binding.get_kernel_name())
 
         # Inject hardware-derived scalars that bindings may need
         scalar_params = self._enrich_scalar_params(node.scalar_params)
@@ -317,7 +325,7 @@ class OpenCLPlanRenderer:
             else:
                 raise RuntimeError("Reduction bindings not registered")
 
-        kernel = getattr(self._program, binding.get_kernel_name())
+        kernel = self._get_kernel(binding.get_kernel_name())
         args = binding.marshal_args_reduction(
             source=self._allocator.get_buffer(plan.source_buffer),
             offset_list=offset_buf,
@@ -342,7 +350,7 @@ class OpenCLPlanRenderer:
                 and plan.threshold_schedule[0] is not None
                 and self._clip_intermediate_binding is not None):
             clip_binding = self._clip_intermediate_binding
-            clip_kernel = getattr(self._program, clip_binding.get_kernel_name())
+            clip_kernel = self._get_kernel(clip_binding.get_kernel_name())
             clip_args = clip_binding.marshal_args_clip(
                 buffer=ping,
                 threshold=plan.threshold_schedule[0],
@@ -435,10 +443,12 @@ class OpenCLPlanRenderer:
             else:
                 fan_in_binding = compute_binding
 
-            fan_in_kernel = getattr(self._program, fan_in_binding.get_kernel_name())
+            fan_in_kernel = self._get_kernel(fan_in_binding.get_kernel_name())
 
             # Determine clipping threshold for this stage
-            threshold = 0.0
+            # Negative value bypasses clipping (diagnostic mode); must not default to 0.0
+            # which would clip all gradients to zero norm.
+            threshold = -1.0
             if (plan.tree_variant == "sum_and_clip"
                     and stage < len(plan.threshold_schedule)
                     and plan.threshold_schedule[stage] is not None):
@@ -531,7 +541,7 @@ class OpenCLPlanRenderer:
                 )
 
                 binding = self._bindings[body_node.kernel_name]
-                kernel = getattr(self._program, binding.get_kernel_name())
+                kernel = self._get_kernel(binding.get_kernel_name())
 
                 tile_events: list[cl.Event] = []
                 for tile_idx in range(body_node.tile_count):

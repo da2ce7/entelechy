@@ -146,6 +146,17 @@
 #error "System Contract Violation: STORAGE_TYPE_IS_E5M2 must be defined by the build system."
 #endif
 
+// --- FP8 Format Mutual Exclusivity Checks (CONTRACT.md Article 6) ---
+#if STORAGE_TYPE_IS_E4M3 && STORAGE_TYPE_IS_E5M2
+#error "System Contract Violation: E4M3 and E5M2 are mutually exclusive."
+#endif
+#if STORAGE_TYPE_IS_FP8 && !STORAGE_TYPE_IS_E4M3 && !STORAGE_TYPE_IS_E5M2
+#error "System Contract Violation: STORAGE_TYPE_IS_FP8 requires exactly one of E4M3 or E5M2."
+#endif
+#if !STORAGE_TYPE_IS_FP8 && (STORAGE_TYPE_IS_E4M3 || STORAGE_TYPE_IS_E5M2)
+#error "System Contract Violation: E4M3/E5M2 flags require STORAGE_TYPE_IS_FP8=1."
+#endif
+
 // --- FP8 Conversion Tables (ADR-025 §6.1) ---
 // Software emulation path for FP8 storage.
 // Tables store FP32 values; FP16 compute narrows via (half) cast, FP64 widens.
@@ -239,6 +250,7 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
         mant32 = (mant32 | 0x800000) >> shift;
         exp8 = 0;
     } else if (exp8 > 15) {
+        // Defense-in-depth: unreachable for well-formed floats.
         // exp8 > 15 overflows the 4-bit exponent field; saturate.
         // (exp8 == 15 is valid: values 256–448.)
         buf[idx] = sign ? 0xFE : 0x7E;
@@ -367,6 +379,15 @@ static inline void store_storage(
 //   because the extension is enabled when any role type is half (storage,
 //   compute, or state). Plain array access on half* is valid when the
 //   extension is active, so no vload_half/vstore_half path is required here.
+//
+// Intentional Asymmetry Note:
+//   load_storage() uses vload_half() for half-precision storage, while
+//   load_state() uses plain array access. This asymmetry is intentional:
+//   vload_half() was historically required because some OpenCL 1.x
+//   implementations supported half storage but not half arithmetic—
+//   vload_half() returns float without requiring full cl_khr_fp16 support.
+//   With cl_khr_fp16 active (required when any role type is half), plain
+//   access works identically for state buffers. Both approaches are correct.
 
 static inline COMPUTE_TYPE load_state(
     __global const STATE_TYPE *buf, size_t idx)
@@ -513,6 +534,12 @@ static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
 #endif
 #ifndef STORAGE_TYPE_IS_E5M2
 #define STORAGE_TYPE_IS_E5M2 0
+#endif
+// Host-mode FP8 guard: FP8 storage requires the full OpenCL backend's
+// LUT-based decode and algorithmic encode paths. Host-mode stubs do not
+// support FP8.
+#if STORAGE_TYPE_IS_FP8
+#error "FP8 storage is not supported in host-mode stubs. Use the CPU backend."
 #endif
 #ifndef COMPUTE_ZERO
 #define COMPUTE_ZERO 0.0f
@@ -691,7 +718,7 @@ __kernel void forward_pass(
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Idempotency: "Strictly Idempotent"
- *        - Synchronization Model: "Monolithic Slice Renderer. Consumes chunked inputs to render a final slice of a monolithic output buffer."
+ *        - Synchronization Model: "Slice Renderer. Consumes chunked inputs to render a final slice of a monolithic output buffer."
  *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; logit output narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Sparsity-Aware Dot Product: The `hidden_mask` parameter is used as a branch predicate to elide dot-product terms corresponding to ReLU-zeroed hidden units. For each hidden dimension where `hidden_mask[b][h] < 0.5`, the activation and weight reads are skipped entirely. This is a performance optimization exploiting upstream ReLU sparsity; it does not affect mathematical correctness. This optimization is non-mandatory: an implementation that unconditionally evaluates all hidden dimensions produces identical results. The mask's presence in the interface enables but does not require the sparsity exploitation."
  */
 __kernel void render_logits_chunk(
@@ -771,7 +798,7 @@ __kernel void render_logits_chunk(
  * @brief (Node 6) Fused kernel to compute probabilities and final CCE loss for a tile.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "The implementation is a fused, indivisible unit for numerically stable Softmax calculation. Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; partial_probs narrowed via store_storage(); final_loss written directly in COMPUTE_TYPE (no narrowing). All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Behavioral Invariants: "The implementation is a fused, indivisible unit for numerically stable Softmax calculation. Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; partial_probs narrowed via store_storage(); final_loss written directly in COMPUTE_TYPE (no narrowing). All arithmetic exclusively in COMPUTE_TYPE. Loss Write Predicate: The kernel writes to dest_buffer_GLOBAL_final_loss[module][sample] only when the target class index for the sample falls within the current tile's class chunk range [class_chunk_offset, class_chunk_offset + classes_per_chunk). All other tiles skip the loss write, relying on the ZERO_REQUIRED initialization."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Partial Renderer for probabilities output."
  *        - Kernel Bifurcation: "CONCEPT.md Principle 3(B) — separate kernel required due to incompatible type signatures,
@@ -796,7 +823,7 @@ __kernel void compute_probs_loss_cce_chunk(
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count]
-     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_total_modules_count * sizeof(STATE_TYPE)] bytes for this buffer.
+     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_modules_count * sizeof(STATE_TYPE)] bytes for this buffer. [2] All values must be strictly positive and finite (guaranteed by host initialization and Node 25 post-update enforcement).
      */
     __global const STATE_TYPE *src_buffer_GLOBAL_CONST_temps,
 
@@ -884,7 +911,7 @@ __kernel void compute_probs_loss_bce_chunk(
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count]
      *        - Validation Preconditions: [1] The tile access must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] Host shall allocate exactly
-     * [src_scalar_NATURAL_total_modules_count * sizeof(STATE_TYPE)] bytes for this buffer.
+     * [src_scalar_NATURAL_total_modules_count * sizeof(STATE_TYPE)] bytes for this buffer. [3] All values must be strictly positive and finite (guaranteed by host initialization and Node 25 post-update enforcement).
      */
     __global const STATE_TYPE *src_buffer_GLOBAL_CONST_temps,
 
@@ -1054,7 +1081,7 @@ __kernel void calculate_module_param_grads_chunk(
 /**
  * @brief (Node 9) Computes the partial upstream gradient for the hidden layer (Grad_H) for a tile.
  * @kernel_contract
- *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
+ *        - Holistic Constraints: "This kernel processes the complete batch dimension in a single dispatch. Batch-chunking parameters (batch_chunk_offset, batch_chunk_count) are intentionally absent because the downstream Item Synchronization Point (Node 13) requires a monolithic collection buffer."
  *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened upon load; storage-role output narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Partial Renderer for a monolithic intermediate buffer."
@@ -2071,7 +2098,7 @@ __kernel void normalize_gradients(
  * @brief (Node 24) Applies Adam optimizer update to an entire parameter group. Single dispatch.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction terms (`beta1_pow_t`, `beta2_pow_t`) to ensure long-term numerical stability. State-Precision Accumulation: EMA updates on m1 and m2 use ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Moment vectors loaded via load_state_for_accum(); gradients widened via widen_to_accum(); EMA arithmetic in ACCUM_TYPE; results stored via store_state_from_accum(). Bias-corrected values and the final parameter update delta are transformative operations using COMPUTE_TYPE (narrowed via narrow_from_accum()). Parameter buffer subtraction is accumulative in ACCUM_TYPE."
+ *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction terms (`beta1_pow_t`, `beta2_pow_t`) to ensure long-term numerical stability. State-Precision Accumulation: EMA updates on m1 and m2 use ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Moment vectors loaded via load_state_for_accum(); gradients widened via widen_to_accum(); EMA arithmetic in ACCUM_TYPE; results stored via store_state_from_accum(). Bias-corrected values and the final parameter update delta are transformative operations using COMPUTE_TYPE (narrowed via narrow_from_accum()). Parameter buffer subtraction is accumulative in ACCUM_TYPE. Hyperparameter Precision Note: Hyperparameter scalars (β₁, β₂, ε, lr) are received in COMPUTE_TYPE and widened to ACCUM_TYPE for EMA arithmetic. The widening preserves only COMPUTE_TYPE precision for these constants. For β₁ = 0.999 with COMPUTE_TYPE = float, the contribution factor (1 − β₁) carries ~7 significant digits regardless of ACCUM_TYPE."
  *        - Idempotency: "Fundamentally Non-Idempotent (Stateful). Modifies multiple state buffers in-place."
  *        - Synchronization Model: "Stateful Optimizer Update. Consumes final gradients after the Batch Synchronization Point."
  */
@@ -2165,9 +2192,10 @@ __kernel void clamp_temperatures(
  *          offset list, sums them, optionally clips the result per-node, and
  *          writes one output vector of partial_width elements. Supports absent
  *          partials via sentinel offset 0xFFFFFFFF for the tail node."
- *        - Behavioral Invariants: "When clipping_threshold > 0, per-node L2
+ *        - Behavioral Invariants: "When clipping_threshold >= 0, per-node L2
  *          clip is applied: scale = threshold / (norm + epsilon). When
- *          clipping_threshold == 0, clip is bypassed (diagnostic mode).
+ *          clipping_threshold < 0, clip is bypassed (diagnostic mode).
+ *          Zero threshold clips to zero norm (zeroes all gradients).
  *          Epsilon prevents division by zero. Precision Boundary Conversion: storage-role partials widened via load_storage(); compute-role outputs written directly; LOCAL scratch uses COMPUTE_TYPE. All arithmetic exclusively in COMPUTE_TYPE."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Reduction Engine Stage"
@@ -2243,8 +2271,8 @@ __kernel void reduce_k_fan_in_and_clip(
 
     /**
      * @param src_scalar_REAL_clipping_threshold_t_j The clipping threshold for this stage j.
-     *        Value 0.0 disables clip (diagnostic mode).
-     *        - Validation Preconditions: Must be >= 0.0.
+     *        Value < 0 disables clip (diagnostic mode). Value 0 clips to zero norm.
+     *        - Validation Preconditions: Negative values bypass clipping; non-negative values enable it.
      */
     COMPUTE_TYPE src_scalar_REAL_clipping_threshold_t_j,
 
@@ -2264,9 +2292,10 @@ __kernel void reduce_k_fan_in_and_clip(
  *          offset list, sums them, optionally clips the result per-node, and
  *          writes one output vector of partial_width elements. Supports absent
  *          partials via sentinel offset 0xFFFFFFFF for the tail node."
- *        - Behavioral Invariants: "When clipping_threshold > 0, per-node L2
+ *        - Behavioral Invariants: "When clipping_threshold >= 0, per-node L2
  *          clip is applied: scale = threshold / (norm + epsilon). When
- *          clipping_threshold == 0, clip is bypassed (diagnostic mode).
+ *          clipping_threshold < 0, clip is bypassed (diagnostic mode).
+ *          Zero threshold clips to zero norm (zeroes all gradients).
  *          Epsilon prevents division by zero. All buffers are compute-role;
  *          no precision boundary conversion is required. All arithmetic
  *          exclusively in COMPUTE_TYPE."
@@ -2350,8 +2379,8 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
 
     /**
      * @param src_scalar_REAL_clipping_threshold_t_j The clipping threshold for this stage j.
-     *        Value 0.0 disables clip (diagnostic mode).
-     *        - Validation Preconditions: Must be >= 0.0.
+     *        Value < 0 disables clip (diagnostic mode). Value 0 clips to zero norm.
+     *        - Validation Preconditions: Negative values bypass clipping; non-negative values enable it.
      */
     COMPUTE_TYPE src_scalar_REAL_clipping_threshold_t_j,
 

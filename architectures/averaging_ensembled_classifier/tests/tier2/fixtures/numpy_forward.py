@@ -54,11 +54,15 @@ def _softmax(logits: NDArray[np.floating[Any]]) -> NDArray[np.floating[Any]]:
 
 def _sigmoid(logits: NDArray[np.floating[Any]]) -> NDArray[np.floating[Any]]:
     """Numerically stable sigmoid."""
-    return np.where(
-        logits >= 0,
-        1.0 / (1.0 + np.exp(-logits)),
-        np.exp(logits) / (1.0 + np.exp(logits)),
-    )
+    result = np.empty_like(logits)
+    pos_mask = logits >= 0
+    neg_mask = ~pos_mask
+    # For logits >= 0: 1 / (1 + exp(-x)) avoids overflow in exp(-x)
+    result[pos_mask] = 1.0 / (1.0 + np.exp(-logits[pos_mask]))
+    # For logits < 0: exp(x) / (1 + exp(x)) avoids overflow in exp(x)
+    exp_neg = np.exp(logits[neg_mask])
+    result[neg_mask] = exp_neg / (1.0 + exp_neg)
+    return result
 
 
 def ref_compute_probs_loss_cce(

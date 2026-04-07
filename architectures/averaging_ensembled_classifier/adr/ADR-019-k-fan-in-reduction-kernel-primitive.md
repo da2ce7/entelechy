@@ -225,7 +225,7 @@ If $\text{norm}_n > T_j$ (the stage's clipping threshold), scale the vector:
 
 $$\text{sum}_n[e] \leftarrow \text{sum}_n[e] \cdot \frac{T_j}{\text{norm}_n + \varepsilon}$$
 
-If $T_j = 0$ (sentinel for diagnostic trees), skip the clip entirely.
+If $T_j < 0$ (sentinel for diagnostic trees), skip the clip entirely. If $T_j = 0$, all gradients are zeroed (clip to zero norm).
 
 3. **Write output.** Write the (possibly clipped) sum vector to the destination buffer at offset `n * partial_width`.
 
@@ -241,9 +241,10 @@ If $T_j = 0$ (sentinel for diagnostic trees), skip the clip entirely.
  *          offset list, sums them, optionally clips the result per-node, and
  *          writes one output vector of partial_width elements. Supports absent
  *          partials via sentinel offset 0xFFFFFFFF for the tail node."
- *        - Behavioral Invariants: "When clipping_threshold > 0, per-node L2
+ *        - Behavioral Invariants: "When clipping_threshold >= 0, per-node L2
  *          clip is applied: scale = threshold / (norm + epsilon). When
- *          clipping_threshold == 0, clip is bypassed (diagnostic mode).
+ *          clipping_threshold < 0, clip is bypassed (diagnostic mode).
+ *          Zero threshold clips to zero norm (zeroes all gradients).
  *          Epsilon prevents division by zero."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Reduction Engine Stage"
@@ -275,7 +276,7 @@ __kernel void reduce_k_fan_in_and_clip(
 | `fan_in_K` | NATURAL | `>= 2` |
 | `node_count` | NATURAL | `>= 1` |
 | `partial_width` | NATURAL | `>= 1` |
-| `clipping_threshold` | REAL | `>= 0.0`. Value `0.0` disables clip (diagnostic mode). |
+| `clipping_threshold` | REAL | `< 0` bypasses clip (diagnostic mode). `= 0` zeros all gradients. `> 0` clips to that norm. |
 | `epsilon` | REAL | Small positive constant (e.g., `1e-7`). |
 
 **Dispatch grid:**
@@ -339,9 +340,10 @@ reduce_k_fan_in_and_clip_contract = KernelContract(
         idempotency="Associatively Non-Idempotent",
         synchronization_model="Reduction Engine Stage",
         behavioral_invariants=(
-            "Per-node L2 clip when clipping_threshold > 0: "
+            "Per-node L2 clip when clipping_threshold >= 0: "
             "scale = threshold / (norm + epsilon).",
-            "Clip bypassed when clipping_threshold == 0 (diagnostic mode).",
+            "Clip bypassed when clipping_threshold < 0 (diagnostic mode).",
+            "Zero threshold clips to zero norm (zeroes all gradients).",
             "Sentinel offset 0xFFFFFFFF skips absent partials in tail node.",
         ),
     ),
@@ -431,7 +433,7 @@ The semantic alignment is now explicit:
 
 - **New kernel implementation and testing across 3 backends.** The OpenCL C and GLSL implementations must be written and validated. The CPU already implements the semantic, but a formal `KernelContract` alignment ensures the C function's parameter names and ordering match the contract.
 - **Tiered variants may be needed.** For small K (≤ crossover), a register-only variant of the fused kernel may be desirable to avoid local memory overhead. Whether to implement one or two tiers is a Phase B rendering decision — the contract supports both.
-- **Diagnostic sentinel.** The `clipping_threshold == 0.0` sentinel for disabling clip is a minor semantic overload. An explicit `operation_type` flag (as in the existing aggregate kernels) would be purer but adds a parameter for a distinction that matters only to diagnostic trees (which are typically single-stage anyway).
+- **Diagnostic sentinel.** Negative values for `clipping_threshold` serve as the diagnostic bypass sentinel. This reserves `0.0` for its natural mathematical meaning (clip to zero norm), while keeping the interface simple with a single scalar parameter rather than an additional flag.
 
 ### Implementation phases
 

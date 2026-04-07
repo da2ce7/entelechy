@@ -91,7 +91,7 @@ The CPU's `execute_reduction_tree` correctly implemented genuine multi-stage K-f
 
 **ADR-019** (K-Fan-In Reduction Kernel Primitive) resolved this by:
 
-1. **New kernel:** `reduce_k_fan_in_and_clip` added to `kernels/phase_2_learn_C_reduction.cl.c` and specified in `kernels/kernels.cl.h`. One work-group per reduction node. Each node gathers K partials via a flat offset list (with sentinel `0xFFFFFFFF` for absent tail-node partials), sums them, computes a per-node L2 norm, and conditionally clips. Threshold `0.0` bypasses clip for diagnostic trees.
+1. **New kernel:** `reduce_k_fan_in_and_clip` added to `kernels/phase_2_learn_C_reduction.cl.c` and specified in `kernels/kernels.cl.h`. One work-group per reduction node. Each node gathers K partials via a flat offset list (with sentinel `0xFFFFFFFF` for absent tail-node partials), sums them, computes a per-node L2 norm, and conditionally clips. Negative threshold bypasses clip for diagnostic trees.
 
 2. **Renderer split:** `_render_reduction_tree` in `src/backends/opencl/renderer.py` now dispatches:
    - **Single-stage trees** (`num_stages == 1`): existing `aggregate_*` + `clip_intermediate_grad` path (unchanged, correct, optimal).

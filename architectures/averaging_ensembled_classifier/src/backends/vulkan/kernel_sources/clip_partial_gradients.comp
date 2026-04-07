@@ -77,6 +77,7 @@ void main() {
     COMPUTE_TYPE total_sq = workgroup_reduce_add(local_sq_sum);
 
     // Compute scale factor
+    // Negative threshold bypasses clipping (diagnostic mode)
     if (lid == 0) {
         COMPUTE_TYPE threshold;
         if (push.use_per_item_norm == 1) {
@@ -87,7 +88,8 @@ void main() {
 
         COMPUTE_TYPE norm = sqrt(total_sq);
         COMPUTE_TYPE scale = COMPUTE_TYPE(1.0);
-        if (norm > threshold) {
+        // Only clip if threshold is non-negative; negative threshold = bypass
+        if (threshold >= COMPUTE_TYPE(0.0) && norm > threshold) {
             scale = threshold / (norm + COMPUTE_TYPE(push.epsilon));
         }
         _clip_scale = scale;

@@ -14,7 +14,7 @@
 layout(local_size_x_id = 0) in;
 
 layout(push_constant) uniform PushConstants {
-    float clipping_threshold;
+    float clipping_threshold;  // < 0 bypasses clipping (diagnostic mode)
     float epsilon;
     uint  weights_parameter_count;
     uint  biases_parameter_count;
@@ -32,6 +32,19 @@ void main() {
     uint lid   = gl_LocalInvocationID.x;
     uint lsize = gl_WorkGroupSize.x;
     uint total_elements = push.weights_parameter_count + push.biases_parameter_count;
+
+    // Diagnostic bypass: negative threshold copies without clipping
+    if (push.clipping_threshold < 0.0) {
+        for (uint i = lid; i < total_elements; i += lsize) {
+            if (i < push.weights_parameter_count) {
+                dst_grad_w.data[push.weights_write_offset + i] = src_grad_w.data[i];
+            } else {
+                uint rel = i - push.weights_parameter_count;
+                dst_grad_b.data[push.biases_write_offset + rel] = src_grad_b.data[rel];
+            }
+        }
+        return;
+    }
 
     // ── Pass 1: Compute sum of squares for joint L2 norm ──
     COMPUTE_TYPE local_sq_sum = COMPUTE_TYPE(0.0);

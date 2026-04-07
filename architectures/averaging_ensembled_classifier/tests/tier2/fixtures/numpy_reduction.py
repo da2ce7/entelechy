@@ -33,6 +33,11 @@ def ref_reduction_tree_sum_and_clip(
 
     Simulates the staged reduction with per-stage clipping.
 
+    Threshold semantics (ADR-019, ADR-026):
+      - threshold < 0: bypass clipping (diagnostic mode)
+      - threshold = 0: clip to zero norm (zeros all gradients)
+      - threshold > 0: standard L2-norm clipping
+
     Returns: single reduced and clipped result array
     """
     current = list(partials)
@@ -47,13 +52,21 @@ def ref_reduction_tree_sum_and_clip(
         # Apply clip if threshold is defined for this stage
         if stage < len(threshold_schedule) and threshold_schedule[stage] is not None:
             threshold = threshold_schedule[stage]
-            clipped: list[NDArray[np.floating[Any]]] = []
-            for arr in next_level:
-                norm = np.sqrt(np.sum(arr * arr))
-                if norm > threshold:
-                    arr = arr * (threshold / (norm + epsilon))
-                clipped.append(arr)
-            next_level = clipped
+            # Negative threshold: bypass clipping
+            if threshold < 0.0:
+                pass  # no-op, keep next_level unchanged
+            # Zero threshold: clip to zero norm
+            elif threshold == 0.0:
+                next_level = [np.zeros_like(arr) for arr in next_level]
+            # Positive threshold: standard L2-norm clipping
+            else:
+                clipped: list[NDArray[np.floating[Any]]] = []
+                for arr in next_level:
+                    norm = np.sqrt(np.sum(arr * arr))
+                    if norm > threshold:
+                        arr = arr * (threshold / (norm + epsilon))
+                    clipped.append(arr)
+                next_level = clipped
 
         current = next_level
         stage += 1

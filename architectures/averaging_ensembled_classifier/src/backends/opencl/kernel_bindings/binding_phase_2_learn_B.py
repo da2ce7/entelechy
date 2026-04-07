@@ -52,7 +52,8 @@ class ClipPartialGradientsBinding(KernelBinding):
             get_buffer(buffer_bindings["clipped_partial_grad_temps"]),
             get_buffer(buffer_bindings["clipped_partial_grad_hidden_activations_aos"]),
             np.uint32(scalar_params.get("use_per_item_norm", 0)),
-            np.float32(scalar_params.get("clipping_threshold_t_pre", 0.0)),
+            # Negative threshold bypasses clipping (diagnostic mode); do not default to 0.0
+            np.float32(scalar_params.get("clipping_threshold_t_pre", -1.0)),
             np.float32(scalar_params["epsilon"]),
             np.uint32(tile_index),
             np.uint32(scalar_params["num_class_chunks"]),

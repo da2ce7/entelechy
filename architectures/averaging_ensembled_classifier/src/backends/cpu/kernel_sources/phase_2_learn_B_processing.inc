@@ -189,7 +189,8 @@ void PREC_FN(task_clip_partial_grads)(void* raw_args, uint task_index, uint thre
 
     COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
     COMPUTE_T scale = (COMPUTE_T)1.0;
-    if (norm > threshold) {
+    /* Diagnostic bypass: negative threshold skips all clipping */
+    if (threshold >= (COMPUTE_T)0.0 && norm > threshold) {
         scale = threshold / (norm + (COMPUTE_T)a->epsilon);
     }
 

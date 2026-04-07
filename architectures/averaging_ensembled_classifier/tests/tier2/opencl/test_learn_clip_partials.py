@@ -68,3 +68,40 @@ class TestClipPartialGradients:
         assert not np.allclose(ref, wrong_result, atol=1e-5), (
             "Clipped result should differ from sqrt(norm² + eps) formula"
         )
+
+    # ----------------------------------------------------------------
+    # Threshold semantics tests (ADR-019, ADR-026)
+    # ----------------------------------------------------------------
+
+    def test_negative_threshold_bypasses_clipping(self):
+        """Negative threshold bypasses clipping (diagnostic mode).
+
+        Contract: clipping_threshold < 0 returns gradients unchanged.
+        """
+        rng = make_rng(seed=200)
+        grads = rng.standard_normal(64).astype(np.float32) * 10.0
+        threshold = -1.0
+        ref = ref_clip_l2_norm(grads, threshold)
+        np.testing.assert_array_equal(ref, grads)
+
+    def test_zero_threshold_zeros_all_gradients(self):
+        """Zero threshold clips to zero norm (zeros all gradients).
+
+        Contract: clipping_threshold == 0 produces all-zero output.
+        """
+        rng = make_rng(seed=201)
+        grads = rng.standard_normal(64).astype(np.float32) * 10.0
+        threshold = 0.0
+        ref = ref_clip_l2_norm(grads, threshold)
+        np.testing.assert_array_equal(ref, np.zeros_like(grads))
+
+    def test_various_negative_thresholds_bypass(self):
+        """Any negative threshold value bypasses clipping."""
+        rng = make_rng(seed=202)
+        grads = rng.standard_normal(32).astype(np.float32) * 5.0
+        for threshold in [-1.0, -0.001, -100.0, -1e-10]:
+            ref = ref_clip_l2_norm(grads, threshold)
+            np.testing.assert_array_equal(
+                ref, grads,
+                err_msg=f"Threshold={threshold} should bypass"
+            )

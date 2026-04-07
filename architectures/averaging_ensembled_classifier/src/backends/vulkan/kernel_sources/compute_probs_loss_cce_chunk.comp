@@ -106,8 +106,15 @@ void main() {
     }
 
     // Loss: CCE = -log(prob_true_class)
-    int   true_class   = src_targets.data[batch_idx];
-    COMPUTE_TYPE logit_true   = read_storage(src_logits.data[base_logits + true_class]);
-    COMPUTE_TYPE prob_true    = COMPUTE_EXP(logit_true * temp_inv - max_scaled_logit) * inv_sum_exp;
-    dest_loss.data[loss_out_idx] = -COMPUTE_LOG(max(prob_true, NUMERICAL_STABILITY_EPSILON));
+    // Loss Write Predicate: Only the tile whose class chunk contains the target class
+    // index writes to the loss buffer. Other tiles skip to avoid data races.
+    int true_class = src_targets.data[batch_idx];
+    uint class_chunk_end = class_offset + push.classes_per_chunk;
+    bool target_in_this_chunk = (uint(true_class) >= class_offset) && (uint(true_class) < class_chunk_end);
+
+    if (target_in_this_chunk) {
+        COMPUTE_TYPE logit_true = read_storage(src_logits.data[base_logits + true_class]);
+        COMPUTE_TYPE prob_true  = COMPUTE_EXP(logit_true * temp_inv - max_scaled_logit) * inv_sum_exp;
+        dest_loss.data[loss_out_idx] = -COMPUTE_LOG(max(prob_true, NUMERICAL_STABILITY_EPSILON));
+    }
 }

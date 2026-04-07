@@ -187,8 +187,13 @@ This article defines symbols that must be provided by the host build environment
 | `SIMD_WIDTH` | `int` | Hardware SIMD lane count from `HardwareProfile` |
 | `C_TILE_SIZE` | `int` | Column tile size for the module-chunking strategy |
 | `NUMERICAL_STABILITY_EPSILON` | float literal | Epsilon for numerical stability guards; derived from `compute_epsilon` |
-| `ACCUM_TYPE` | OpenCL/C type name | Derived: Element type for accumulative operations in stateful-update kernels. Equals `max(COMPUTE_TYPE, STATE_TYPE)`. When `STATE_TYPE > COMPUTE_TYPE`, this is `STATE_TYPE`; otherwise `COMPUTE_TYPE`. |
-| `ACCUM_IS_WIDER_THAN_COMPUTE` | `int` (0 or 1) | Derived: 1 when `STATE_TYPE > COMPUTE_TYPE`, indicating that accumulation uses the wider state type rather than compute type; otherwise 0. |
+
+**Kernel-Internal Derived Constants.** The following symbols are derived *within the kernel source* (`kernels.cl.h`) from the primary precision-role symbols above. **The build system MUST NOT provide these via `-D` flags.** They are listed here for documentation completeness:
+
+| Symbol | Type | Meaning |
+|:---|:---|:---|
+| `ACCUM_TYPE` | OpenCL/C type name | Element type for accumulative operations in stateful-update kernels. Equals `max(COMPUTE_TYPE, STATE_TYPE)`. When `STATE_TYPE > COMPUTE_TYPE`, this is `STATE_TYPE`; otherwise `COMPUTE_TYPE`. |
+| `ACCUM_IS_WIDER_THAN_COMPUTE` | `int` (0 or 1) | 1 when `STATE_TYPE > COMPUTE_TYPE`, indicating that accumulation uses the wider state type rather than compute type; otherwise 0. |
 
 The symbols `SCALAR_TYPE` and `SCALAR_IS_HALF` are **retired**. They do not appear in any kernel source file; all kernel signatures use the three-role precision model (`STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE`).
 

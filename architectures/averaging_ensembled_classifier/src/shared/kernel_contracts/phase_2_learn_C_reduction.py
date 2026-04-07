@@ -225,9 +225,10 @@ reduce_k_fan_in_and_clip_contract = KernelContract(
         idempotency="Associatively Non-Idempotent",
         synchronization_model="Reduction Engine Stage",
         behavioral_invariants=(
-            "Per-node L2 clip when clipping_threshold > 0: "
+            "Per-node L2 clip when clipping_threshold >= 0: "
             "scale = threshold / (norm + epsilon).",
-            "Clip bypassed when clipping_threshold == 0 (diagnostic mode).",
+            "Clip bypassed when clipping_threshold < 0 (diagnostic mode).",
+            "Zero threshold clips to zero norm (zeroes all gradients).",
             "Sentinel offset 0xFFFFFFFF skips absent partials in tail node.",
         ),
     ),

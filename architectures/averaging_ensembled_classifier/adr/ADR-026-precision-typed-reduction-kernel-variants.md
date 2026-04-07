@@ -108,9 +108,10 @@ The `source_role` for stage 0 is the precision role of the original partial coll
  *          offset list, sums them, optionally clips the result per-node, and
  *          writes one output vector of partial_width elements. Supports absent
  *          partials via sentinel offset 0xFFFFFFFF for the tail node."
- *        - Behavioral Invariants: "When clipping_threshold > 0, per-node L2
+ *        - Behavioral Invariants: "When clipping_threshold >= 0, per-node L2
  *          clip is applied: scale = threshold / (norm + epsilon). When
- *          clipping_threshold == 0, clip is bypassed (diagnostic mode).
+ *          clipping_threshold < 0, clip is bypassed (diagnostic mode).
+ *          Zero threshold clips to zero norm (zeroes all gradients).
  *          Epsilon prevents division by zero. All buffers are compute-role;
  *          no precision boundary conversion is required. All arithmetic
  *          exclusively in COMPUTE_TYPE."

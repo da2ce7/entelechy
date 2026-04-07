@@ -118,6 +118,12 @@ __kernel void clip_intermediate_grad(
     COMPUTE_TYPE           src_scalar_REAL_epsilon,
     uint                   src_scalar_NATURAL_parameter_count) {
 
+    // Diagnostic bypass: negative threshold skips all clipping (ADR-019).
+    // This allows inspection of raw gradients without modification.
+    if (src_scalar_REAL_clipping_threshold_t_j < COMPUTE_ZERO) {
+        return;
+    }
+
     const uint lid   = get_local_id(0);
     const uint lsize = get_local_size(0);
     // This kernel assumes a 1D work-group dispatch.
@@ -360,8 +366,10 @@ __kernel void reduce_k_fan_in_and_clip(
     }
 
     // --- Phase 2: Per-Node L2 Norm via Local Memory Parallel Reduction ---
-    // Skip the norm/clip entirely if threshold == 0 (diagnostic mode).
-    if (src_scalar_REAL_clipping_threshold > COMPUTE_ZERO) {
+    // Clipping is enabled for any non-negative threshold. Negative values
+    // (e.g., -1.0) bypass clipping entirely (diagnostic mode). Zero means
+    // "clip to zero norm", which zeroes all gradients — valid but destructive.
+    if (src_scalar_REAL_clipping_threshold >= COMPUTE_ZERO) {
         update_buffer_LOCAL_reduction_tile[lid] = local_sq_sum;
         barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -531,7 +539,9 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
     }
 
     // Phase 2: Per-node L2 norm via local memory parallel reduction.
-    if (src_scalar_REAL_clipping_threshold > COMPUTE_ZERO) {
+    // Clipping is enabled for any non-negative threshold. Negative values
+    // bypass clipping entirely (diagnostic mode).
+    if (src_scalar_REAL_clipping_threshold >= COMPUTE_ZERO) {
         update_buffer_LOCAL_reduction_tile[lid] = local_sq_sum;
         barrier(CLK_LOCAL_MEM_FENCE);
 
