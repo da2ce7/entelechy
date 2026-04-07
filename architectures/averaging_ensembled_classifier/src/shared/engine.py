@@ -57,7 +57,7 @@ def _default_renderer_factory(
     """
     # Import build config to determine available backends
     try:
-        from src._build_config import BACKEND_CPU, BACKEND_OPENCL, BACKEND_VULKAN
+        from src._build_config import BACKEND_CPU, BACKEND_OPENCL, BACKEND_VULKAN  # type: ignore[import-not-found]
     except ImportError:
         raise RuntimeError(
             "_build_config.py not found. Run 'meson setup builddir' and then "

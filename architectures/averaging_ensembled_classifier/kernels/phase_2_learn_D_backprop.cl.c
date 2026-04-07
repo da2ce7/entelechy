@@ -25,7 +25,7 @@ __kernel void backprop_shared_weights_chunk(
     uint                         src_scalar_NATURAL_num_batch_chunks,
     uint                         src_scalar_NATURAL_padded_input_count,
     uint                         src_scalar_NATURAL_padded_hidden_count,
-    uint                         src_scalar_NATURAL_final_grad_hidden_total_element_count) {
+    uint                         src_scalar_NATURAL_final_grad_hidden_activations_total_count) {
 
     // --- 1. Work-Group to Gradient Component Mapping ---
     // The 2D work-group ID maps to a coordinate in the shared weight matrix (input_dim, hidden_dim).
@@ -108,7 +108,7 @@ __kernel void backprop_shared_biases_chunk(
     uint                         src_scalar_NATURAL_total_batch_count,
     uint                         src_scalar_NATURAL_num_batch_chunks,
     uint                         src_scalar_NATURAL_padded_hidden_count,
-    uint                         src_scalar_NATURAL_final_grad_hidden_total_element_count) {
+    uint                         src_scalar_NATURAL_final_grad_hidden_activations_total_count) {
 
     // --- 1. Work-Group to Gradient Component Mapping ---
     // The 1D work-group ID maps to an index in the shared bias vector.
@@ -184,8 +184,8 @@ __kernel void clip_shared_gradients_chunk(
     COMPUTE_TYPE                 src_scalar_REAL_epsilon,
     uint                         src_scalar_NATURAL_weights_parameter_count,
     uint                         src_scalar_NATURAL_biases_parameter_count,
-    uint                         dest_scalar_NATURAL_weights_write_offset_elements,
-    uint                         dest_scalar_NATURAL_biases_write_offset_elements,
+    uint                         dest_scalar_NATURAL_weights_write_offset,
+    uint                         dest_scalar_NATURAL_biases_write_offset,
     uint                         src_scalar_NATURAL_num_batch_chunks) {
 
     // --- 1. Setup ---
@@ -244,11 +244,11 @@ __kernel void clip_shared_gradients_chunk(
             const COMPUTE_TYPE val = load_storage(src_buffer_GLOBAL_partial_grad_weights_shared, i);
             // This write operation is the fulfillment of the placement contract. The host provides the
             // exact base offset, and this kernel simply adds the element's relative index.
-            store_storage(dest_buffer_GLOBAL_clipped_partial_grad_weights_shared, dest_scalar_NATURAL_weights_write_offset_elements + i, val * scale_factor);
+            store_storage(dest_buffer_GLOBAL_clipped_partial_grad_weights_shared, dest_scalar_NATURAL_weights_write_offset + i, val * scale_factor);
         } else {
             const uint         relative_idx = i - src_scalar_NATURAL_weights_parameter_count;
             const COMPUTE_TYPE val          = load_storage(src_buffer_GLOBAL_partial_grad_biases_shared, relative_idx);
-            store_storage(dest_buffer_GLOBAL_clipped_partial_grad_biases_shared, dest_scalar_NATURAL_biases_write_offset_elements + relative_idx, val * scale_factor);
+            store_storage(dest_buffer_GLOBAL_clipped_partial_grad_biases_shared, dest_scalar_NATURAL_biases_write_offset + relative_idx, val * scale_factor);
         }
     }
 }

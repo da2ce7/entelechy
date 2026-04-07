@@ -157,6 +157,17 @@
 #error "System Contract Violation: E4M3/E5M2 flags require STORAGE_TYPE_IS_FP8=1."
 #endif
 
+// --- Precision Role Mutual Exclusivity (CONTRACT.md Article 6) ---
+#if STORAGE_TYPE_IS_HALF && STORAGE_TYPE_IS_DOUBLE
+#error "System Contract Violation: STORAGE_TYPE _IS_HALF and _IS_DOUBLE are mutually exclusive."
+#endif
+#if COMPUTE_TYPE_IS_HALF && COMPUTE_TYPE_IS_DOUBLE
+#error "System Contract Violation: COMPUTE_TYPE _IS_HALF and _IS_DOUBLE are mutually exclusive."
+#endif
+#if STATE_TYPE_IS_HALF && STATE_TYPE_IS_DOUBLE
+#error "System Contract Violation: STATE_TYPE _IS_HALF and _IS_DOUBLE are mutually exclusive."
+#endif
+
 // --- FP8 Conversion Tables (ADR-025 §6.1) ---
 // Software emulation path for FP8 storage.
 // Tables store FP32 values; FP16 compute narrows via (half) cast, FP64 widens.
@@ -241,6 +252,8 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
     int exp8 = exp32 + 7;  // E4M3 bias = 7
     
     // Handle subnormals
+    // NOTE: Subnormal rounding omits shifted-out bits from sticky calculation.
+    // Max error: 1 ULP of FP8 subnormal (2^-9). Below quantization floor; no fix required.
     if (exp8 <= 0) {
         int shift = 1 - exp8;
         if (shift >= 24) {
@@ -1018,6 +1031,7 @@ __kernel void calculate_module_param_grads_chunk(
      * @param src_buffer_GLOBAL_targets The ground truth labels (type-punned pointer).
      *        - Tensor Shape: Varies based on problem type flag.
      *        - Padding Contract: Varies.
+     *        - Precision Role: "Conditional — storage-role when src_scalar_FLAG_problem_type == BCE; integer-typed (exempt) when CCE. BCE path widens to COMPUTE_TYPE upon load."
      *        - Calculability Proof: Dependent on problem type flag.
      *        - Validation Preconditions: [1] This is a type-punned pointer (`void*`). [2] Host is contractually obligated to provide the correct target buffer whose layout, type, and total size
      * correspond to the value of `src_scalar_FLAG_problem_type`. [3] The kernel implementation will cast this pointer internally based on the flag.
@@ -1103,6 +1117,7 @@ __kernel void backprop_error_to_hidden_chunk(
      * @param src_buffer_GLOBAL_targets The ground truth labels (type-punned pointer).
      *        - Tensor Shape: Varies based on problem type flag.
      *        - Padding Contract: Varies.
+     *        - Precision Role: "Conditional — storage-role when src_scalar_FLAG_problem_type == BCE; integer-typed (exempt) when CCE. BCE path widens to COMPUTE_TYPE upon load."
      *        - Calculability Proof: Dependent on problem type flag.
      *        - Validation Preconditions: [1] This is a type-punned pointer (`void*`). [2] Host is contractually obligated to provide the correct target buffer whose layout, type, and total size
      * correspond to the value of `src_scalar_FLAG_problem_type`.
@@ -1204,6 +1219,7 @@ __kernel void calculate_chunk_temp_gradients(
      * @param src_buffer_GLOBAL_targets The ground truth labels (type-punned pointer).
      *        - Tensor Shape: Varies based on problem type flag.
      *        - Padding Contract: Varies.
+     *        - Precision Role: "Conditional — storage-role when src_scalar_FLAG_problem_type == BCE; integer-typed (exempt) when CCE. BCE path widens to COMPUTE_TYPE upon load."
      *        - Calculability Proof: Dependent on problem type flag.
      *        - Validation Preconditions: [1] This is a type-punned pointer (`void*`). [2] Host is contractually obligated to provide the correct target buffer whose layout, type, and total size
      * correspond to the value of `src_scalar_FLAG_problem_type`.
@@ -1843,12 +1859,12 @@ __kernel void backprop_shared_weights_chunk(
 
     /**
      * @param src_buffer_GLOBAL_summed_grad_hidden_activations The final, consolidated upstream gradient from Node 16.
-     *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_total_element_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_activations_total_count)
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "compute"
-     *        - Calculability Proof: [src_scalar_NATURAL_final_grad_hidden_total_element_count]
+     *        - Calculability Proof: [src_scalar_NATURAL_final_grad_hidden_activations_total_count]
      *        - Validation Preconditions: The logical shape assumed by this kernel must match the physical size of the provided buffer, as proven by: (src_scalar_NATURAL_total_batch_count *
-     * src_scalar_NATURAL_padded_hidden_count) == src_scalar_NATURAL_final_grad_hidden_total_element_count.
+     * src_scalar_NATURAL_padded_hidden_count) == src_scalar_NATURAL_final_grad_hidden_activations_total_count.
      */
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_summed_grad_hidden_activations,
 
@@ -1882,7 +1898,7 @@ __kernel void backprop_shared_weights_chunk(
     uint src_scalar_NATURAL_num_batch_chunks,
     uint src_scalar_NATURAL_padded_input_count,
     uint src_scalar_NATURAL_padded_hidden_count,
-    uint src_scalar_NATURAL_final_grad_hidden_total_element_count);
+    uint src_scalar_NATURAL_final_grad_hidden_activations_total_count);
 
 /**
  * @brief (Node 18) Computes partial gradients for shared layer biases from a batch chunk.
@@ -1917,12 +1933,12 @@ __kernel void backprop_shared_biases_chunk(
 
     /**
      * @param src_buffer_GLOBAL_summed_grad_hidden_activations The final, consolidated upstream gradient from Node 16.
-     *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_total_element_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_activations_total_count)
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "compute"
-     *        - Calculability Proof: [src_scalar_NATURAL_final_grad_hidden_total_element_count]
+     *        - Calculability Proof: [src_scalar_NATURAL_final_grad_hidden_activations_total_count]
      *        - Validation Preconditions: The logical shape assumed by this kernel must match the physical size of the provided buffer, as proven by: (src_scalar_NATURAL_total_batch_count *
-     * src_scalar_NATURAL_padded_hidden_count) == src_scalar_NATURAL_final_grad_hidden_total_element_count.
+     * src_scalar_NATURAL_padded_hidden_count) == src_scalar_NATURAL_final_grad_hidden_activations_total_count.
      */
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_summed_grad_hidden_activations,
 
@@ -1955,7 +1971,7 @@ __kernel void backprop_shared_biases_chunk(
     uint src_scalar_NATURAL_total_batch_count,
     uint src_scalar_NATURAL_num_batch_chunks,
     uint src_scalar_NATURAL_padded_hidden_count,
-    uint src_scalar_NATURAL_final_grad_hidden_total_element_count);
+    uint src_scalar_NATURAL_final_grad_hidden_activations_total_count);
 
 /**
  * @brief (Node 19) [Utility Kernel] Computes the L2 Norm for a single SHARED GRADIENT
@@ -2015,7 +2031,7 @@ __kernel void clip_shared_gradients_chunk(
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_weights_parameter_count]
      *        - Validation Preconditions: The Host is responsible for providing a valid
-     *          `dest_scalar_NATURAL_weights_write_offset_elements` such that the write operation
+     *          `dest_scalar_NATURAL_weights_write_offset` such that the write operation
      *          remains within the bounds of this collection buffer.
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_weights_shared,
@@ -2028,7 +2044,7 @@ __kernel void clip_shared_gradients_chunk(
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_biases_parameter_count]
      *        - Validation Preconditions: The Host is responsible for providing a valid
-     *          `dest_scalar_NATURAL_biases_write_offset_elements` such that the write operation
+     *          `dest_scalar_NATURAL_biases_write_offset` such that the write operation
      *          remains within the bounds of this collection buffer.
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_biases_shared,
@@ -2037,8 +2053,8 @@ __kernel void clip_shared_gradients_chunk(
     COMPUTE_TYPE src_scalar_REAL_epsilon,
     uint        src_scalar_NATURAL_weights_parameter_count,
     uint        src_scalar_NATURAL_biases_parameter_count,
-    uint        dest_scalar_NATURAL_weights_write_offset_elements,
-    uint        dest_scalar_NATURAL_biases_write_offset_elements,
+    uint        dest_scalar_NATURAL_weights_write_offset,
+    uint        dest_scalar_NATURAL_biases_write_offset,
     uint        src_scalar_NATURAL_num_batch_chunks);
 
 // --- Phase 21-25: Finalization & Updates ---

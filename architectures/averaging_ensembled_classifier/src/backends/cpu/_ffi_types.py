@@ -384,7 +384,7 @@ def make_precision_types(
         ("num_batch_chunks", c_uint32),
         ("padded_input_count", c_uint32),
         ("padded_hidden_count", c_uint32),
-        ("final_grad_hidden_total_element_count", c_uint32),
+        ("final_grad_hidden_activations_total_count", c_uint32),
     ])
 
     structs["BackpropSharedBiasesArgs"] = _s("BackpropSharedBiasesArgs", [
@@ -398,7 +398,7 @@ def make_precision_types(
         ("total_batch_count", c_uint32),
         ("num_batch_chunks", c_uint32),
         ("padded_hidden_count", c_uint32),
-        ("final_grad_hidden_total_element_count", c_uint32),
+        ("final_grad_hidden_activations_total_count", c_uint32),
     ])
 
     structs["ClipSharedGradsArgs"] = _s("ClipSharedGradsArgs", [
@@ -410,8 +410,8 @@ def make_precision_types(
         ("epsilon", c_float),
         ("weights_parameter_count", c_uint32),
         ("biases_parameter_count", c_uint32),
-        ("weights_write_offset_elements", c_uint32),
-        ("biases_write_offset_elements", c_uint32),
+        ("weights_write_offset", c_uint32),
+        ("biases_write_offset", c_uint32),
         ("num_batch_chunks", c_uint32),
     ])
 

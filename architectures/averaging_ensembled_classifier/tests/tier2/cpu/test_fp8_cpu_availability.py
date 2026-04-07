@@ -10,7 +10,7 @@ if not BACKEND_CPU:
     pytest.skip("CPU backend not available", allow_module_level=True)
 
 try:
-    from src.backends.cpu._fp8_variants import AVAILABLE_FP8_VARIANTS, HAS_FLOAT16
+    from src.backends.cpu._fp8_variants import AVAILABLE_FP8_VARIANTS, HAS_FLOAT16  # type: ignore[import-not-found]
 except ImportError:
     AVAILABLE_FP8_VARIANTS: list[str] = []
     HAS_FLOAT16: bool = False

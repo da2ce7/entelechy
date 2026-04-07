@@ -15,7 +15,7 @@ import pytest
 
 # Skip entire module if feature flag is disabled or CPU backend unavailable
 try:
-    from src._build_config import BACKEND_CPU, FEATURE_TICKET_API
+    from src._build_config import BACKEND_CPU, FEATURE_TICKET_API  # type: ignore[import-not-found]
 except ImportError:
     BACKEND_CPU = False
     FEATURE_TICKET_API = False

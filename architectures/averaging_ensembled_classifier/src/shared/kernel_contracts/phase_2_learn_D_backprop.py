@@ -32,9 +32,9 @@ backprop_shared_weights_contract = KernelContract(
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_summed_grad_hidden_activations", flow="src", memory_scope="GLOBAL",
-            tensor_shape=("final_grad_hidden_total_element_count",),
+            tensor_shape=("final_grad_hidden_activations_total_count",),
             padding_contract=PaddingContract("NONE", None),
-            calculability_proof=("final_grad_hidden_total_element_count",),
+            calculability_proof=("final_grad_hidden_activations_total_count",),
             validation_preconditions=("logical shape matches physical size",),
             precision_role="compute",
         ),
@@ -63,7 +63,7 @@ backprop_shared_weights_contract = KernelContract(
         ScalarParamSpec("num_batch_chunks", "src", "NATURAL"),
         ScalarParamSpec("padded_input_count", "src", "NATURAL"),
         ScalarParamSpec("padded_hidden_count", "src", "NATURAL"),
-        ScalarParamSpec("final_grad_hidden_total_element_count", "src", "NATURAL"),
+        ScalarParamSpec("final_grad_hidden_activations_total_count", "src", "NATURAL"),
     ),
     local_memory=(
         LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
@@ -90,9 +90,9 @@ backprop_shared_biases_contract = KernelContract(
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_summed_grad_hidden_activations", flow="src", memory_scope="GLOBAL",
-            tensor_shape=("final_grad_hidden_total_element_count",),
+            tensor_shape=("final_grad_hidden_activations_total_count",),
             padding_contract=PaddingContract("NONE", None),
-            calculability_proof=("final_grad_hidden_total_element_count",),
+            calculability_proof=("final_grad_hidden_activations_total_count",),
             validation_preconditions=("logical shape matches physical size",),
             precision_role="compute",
         ),
@@ -120,7 +120,7 @@ backprop_shared_biases_contract = KernelContract(
         ScalarParamSpec("total_batch_count", "src", "NATURAL"),
         ScalarParamSpec("num_batch_chunks", "src", "NATURAL"),
         ScalarParamSpec("padded_hidden_count", "src", "NATURAL"),
-        ScalarParamSpec("final_grad_hidden_total_element_count", "src", "NATURAL"),
+        ScalarParamSpec("final_grad_hidden_activations_total_count", "src", "NATURAL"),
     ),
     local_memory=(
         LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
@@ -178,8 +178,8 @@ clip_shared_gradients_contract = KernelContract(
         ScalarParamSpec("epsilon", "src", "REAL"),
         ScalarParamSpec("weights_parameter_count", "src", "NATURAL"),
         ScalarParamSpec("biases_parameter_count", "src", "NATURAL"),
-        ScalarParamSpec("weights_write_offset_elements", "dest", "NATURAL"),
-        ScalarParamSpec("biases_write_offset_elements", "dest", "NATURAL"),
+        ScalarParamSpec("weights_write_offset", "dest", "NATURAL"),
+        ScalarParamSpec("biases_write_offset", "dest", "NATURAL"),
         ScalarParamSpec("num_batch_chunks", "src", "NATURAL"),
     ),
     local_memory=(

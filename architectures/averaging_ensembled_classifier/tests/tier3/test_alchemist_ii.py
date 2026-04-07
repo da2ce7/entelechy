@@ -331,7 +331,7 @@ class TestAlchemistII:
         # float32() config: ACCUM_T == COMPUTE_T == STATE_T == FP32
         m_result, v_result, param_result = _simulate_adam_kernel_state_precision(
             m_init.copy(), v_init.copy(), param_init.copy(), grad,
-            beta1, beta2, np.float32(0.9), np.float32(0.999), lr, eps,
+            float(beta1), float(beta2), float(np.float32(0.9)), float(np.float32(0.999)), float(lr), float(eps),
             accum_dtype=np.dtype(np.float32),
             compute_dtype=np.dtype(np.float32),
             state_dtype=np.dtype(np.float32),

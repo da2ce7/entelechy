@@ -138,7 +138,7 @@ class SharedBackpropWeightsPush(ctypes.Structure):
         ("num_batch_chunks", ctypes.c_uint32),
         ("padded_input_count", ctypes.c_uint32),
         ("padded_hidden_count", ctypes.c_uint32),
-        ("final_grad_hidden_total_element_count", ctypes.c_uint32),
+        ("final_grad_hidden_activations_total_count", ctypes.c_uint32),
     ]
 
 
@@ -150,7 +150,7 @@ class SharedBackpropBiasesPush(ctypes.Structure):
         ("total_batch_count", ctypes.c_uint32),
         ("num_batch_chunks", ctypes.c_uint32),
         ("padded_hidden_count", ctypes.c_uint32),
-        ("final_grad_hidden_total_element_count", ctypes.c_uint32),
+        ("final_grad_hidden_activations_total_count", ctypes.c_uint32),
     ]
 
 

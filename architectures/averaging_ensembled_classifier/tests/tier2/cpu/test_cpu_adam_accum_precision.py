@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 try:
-    from src._build_config import BACKEND_CPU
+    from src._build_config import BACKEND_CPU  # type: ignore[import-not-found]
 except ImportError:
     BACKEND_CPU = False
 

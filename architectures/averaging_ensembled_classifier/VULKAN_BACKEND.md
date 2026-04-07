@@ -1236,7 +1236,7 @@ typedef struct {
     uint32_t num_batch_chunks;
     uint32_t padded_input_count;
     uint32_t padded_hidden_count;
-    uint32_t final_grad_hidden_total_element_count;
+    uint32_t final_grad_hidden_activations_total_count;
 } SharedBackpropWeightsPush;
 
 typedef struct {
@@ -1246,7 +1246,7 @@ typedef struct {
     uint32_t total_batch_count;
     uint32_t num_batch_chunks;
     uint32_t padded_hidden_count;
-    uint32_t final_grad_hidden_total_element_count;
+    uint32_t final_grad_hidden_activations_total_count;
 } SharedBackpropBiasesPush;
 
 typedef struct {

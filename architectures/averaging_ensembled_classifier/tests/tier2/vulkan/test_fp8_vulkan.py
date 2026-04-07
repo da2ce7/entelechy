@@ -45,10 +45,10 @@ def _get_vulkan_extensions() -> tuple[set[str], int]:
             return set(), 0
 
         props = vk.vkGetPhysicalDeviceProperties(devices[0])
-        api_version = props.apiVersion
+        api_version: int = props.apiVersion  # type: ignore[assignment]
 
         extensions = vk.vkEnumerateDeviceExtensionProperties(devices[0], None)
-        ext_names = {ext.extensionName for ext in extensions}
+        ext_names: set[str] = {str(ext.extensionName) for ext in extensions}
 
         vk.vkDestroyInstance(instance, None)
         return ext_names, api_version
@@ -79,8 +79,8 @@ def _get_vulkan_features() -> dict[str, bool]:
 
         features = vk.vkGetPhysicalDeviceFeatures(devices[0])
         result = {
-            "shaderFloat64": bool(features.shaderFloat64),
-            "shaderInt16": bool(features.shaderInt16),
+            "shaderFloat64": bool(features.shaderFloat64),  # type: ignore[attr-defined]
+            "shaderInt16": bool(features.shaderInt16),  # type: ignore[attr-defined]
         }
 
         vk.vkDestroyInstance(instance, None)
@@ -603,13 +603,13 @@ def _dispatch_roundtrip(
         buf = vk.vkCreateBuffer(device, buf_info, None)
         mem_req = vk.vkGetBufferMemoryRequirements(device, buf)
         mem_props = vk.vkGetPhysicalDeviceMemoryProperties(context.physical_device)
-        mem_idx = _find_memory_type(mem_props, mem_req.memoryTypeBits, memory_bits)
+        mem_idx = _find_memory_type(mem_props, mem_req.memoryTypeBits, memory_bits)  # type: ignore[attr-defined]
         alloc_info = vk.VkMemoryAllocateInfo(
-            allocationSize=mem_req.size, memoryTypeIndex=mem_idx
+            allocationSize=mem_req.size, memoryTypeIndex=mem_idx  # type: ignore[attr-defined]
         )
         mem = vk.vkAllocateMemory(device, alloc_info, None)
         vk.vkBindBufferMemory(device, buf, mem, 0)
-        return buf, mem, mem_req.size
+        return buf, mem, mem_req.size  # type: ignore[attr-defined]
 
     host_visible = (
         vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT

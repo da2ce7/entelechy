@@ -926,7 +926,7 @@ def build_learn_plan(
          "num_batch_chunks": batch_size,
          "padded_input_count": model_spec.padded_input_dim,
          "padded_hidden_count": model_spec.padded_hidden_dim,
-         "final_grad_hidden_total_element_count": grad_h_total},
+         "final_grad_hidden_activations_total_count": grad_h_total},
         tile_count=1, placement_strategy="linear_batch",
     )
     nodes[n17.node_id] = n17
@@ -949,7 +949,7 @@ def build_learn_plan(
          "total_batch_count": batch_size,
          "num_batch_chunks": batch_size,
          "padded_hidden_count": model_spec.padded_hidden_dim,
-         "final_grad_hidden_total_element_count": grad_h_total},
+         "final_grad_hidden_activations_total_count": grad_h_total},
         tile_count=1, placement_strategy="linear_batch",
     )
     nodes[n18.node_id] = n18
@@ -971,8 +971,8 @@ def build_learn_plan(
          "epsilon": model_spec.precision.compute_epsilon,
          "weights_parameter_count": shared_w_param_count,
          "biases_parameter_count": shared_b_param_count,
-         "weights_write_offset_elements": 0,
-         "biases_write_offset_elements": 0,
+         "weights_write_offset": 0,
+         "biases_write_offset": 0,
          "num_batch_chunks": batch_size},
         tile_count=1, placement_strategy="linear_batch",
     )
@@ -994,9 +994,9 @@ def build_learn_plan(
         parameter_strides=(
             ParameterStride("batch_chunk_offset", base=0, stride=1),
             ParameterStride("batch_chunk_index", base=0, stride=1),
-            ParameterStride("weights_write_offset_elements",
+            ParameterStride("weights_write_offset",
                             base=0, stride=shared_w_param_count),
-            ParameterStride("biases_write_offset_elements",
+            ParameterStride("biases_write_offset",
                             base=0, stride=shared_b_param_count),
         ),
         scratch_buffers=(),

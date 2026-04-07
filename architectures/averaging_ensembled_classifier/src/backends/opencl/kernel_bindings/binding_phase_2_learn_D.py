@@ -49,7 +49,7 @@ class BackpropSharedWeightsBinding(KernelBinding):
             np.uint32(scalar_params["num_batch_chunks"]),
             np.uint32(scalar_params["padded_input_count"]),
             np.uint32(scalar_params["padded_hidden_count"]),
-            np.uint32(scalar_params["final_grad_hidden_total_element_count"]),
+            np.uint32(scalar_params["final_grad_hidden_activations_total_count"]),
         ]
 
 
@@ -84,7 +84,7 @@ class BackpropSharedBiasesBinding(KernelBinding):
             np.uint32(scalar_params["total_batch_count"]),
             np.uint32(scalar_params["num_batch_chunks"]),
             np.uint32(scalar_params["padded_hidden_count"]),
-            np.uint32(scalar_params["final_grad_hidden_total_element_count"]),
+            np.uint32(scalar_params["final_grad_hidden_activations_total_count"]),
         ]
 
 
@@ -119,7 +119,7 @@ class ClipSharedGradientsBinding(KernelBinding):
             np.float32(scalar_params["epsilon"]),
             np.uint32(scalar_params["weights_parameter_count"]),
             np.uint32(scalar_params["biases_parameter_count"]),
-            np.uint32(scalar_params["weights_write_offset_elements"]),
-            np.uint32(scalar_params["biases_write_offset_elements"]),
+            np.uint32(scalar_params["weights_write_offset"]),
+            np.uint32(scalar_params["biases_write_offset"]),
             np.uint32(scalar_params["num_batch_chunks"]),
         ]

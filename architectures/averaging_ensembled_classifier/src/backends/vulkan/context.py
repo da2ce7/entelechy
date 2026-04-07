@@ -225,7 +225,7 @@ class VulkanContext:
         available_exts = vk.vkEnumerateDeviceExtensionProperties(
             self._physical_device, None
         )
-        available_ext_names = {e.extensionName for e in available_exts}
+        available_ext_names = {str(e.extensionName) for e in available_exts}
         self._available_extensions = available_ext_names
 
         # Push descriptors

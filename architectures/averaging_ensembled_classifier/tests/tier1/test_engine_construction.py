@@ -21,7 +21,7 @@ from src.shared.stabilization_policy import StabilizationPolicy
 
 # Skip entire module if feature flag is disabled
 try:
-    from src._build_config import FEATURE_TICKET_API
+    from src._build_config import FEATURE_TICKET_API  # type: ignore[import-not-found]
 except ImportError:
     FEATURE_TICKET_API = False
 

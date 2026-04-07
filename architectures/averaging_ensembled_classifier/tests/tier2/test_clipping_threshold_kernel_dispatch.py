@@ -162,7 +162,7 @@ class TestCPUClipThresholdSemantics:
     def cpu_lib(self):
         """Load CPU kernel library and get FP32 struct definitions."""
         try:
-            from src._build_config import BACKEND_CPU
+            from src._build_config import BACKEND_CPU  # type: ignore[import-not-found]
             if not BACKEND_CPU:
                 pytest.skip("CPU backend not available")
         except ImportError:
@@ -280,7 +280,7 @@ class TestCrossBackendClipConsistency:
     def cpu_env(self):
         """Set up CPU environment."""
         try:
-            from src._build_config import BACKEND_CPU
+            from src._build_config import BACKEND_CPU  # type: ignore[import-not-found]
             if not BACKEND_CPU:
                 pytest.skip("CPU backend not available")
         except ImportError:

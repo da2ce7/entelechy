@@ -52,6 +52,7 @@ def ref_reduction_tree_sum_and_clip(
         # Apply clip if threshold is defined for this stage
         if stage < len(threshold_schedule) and threshold_schedule[stage] is not None:
             threshold = threshold_schedule[stage]
+            assert threshold is not None  # narrowing for type checker
             # Negative threshold: bypass clipping
             if threshold < 0.0:
                 pass  # no-op, keep next_level unchanged
