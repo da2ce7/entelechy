@@ -95,7 +95,9 @@ The `Padding Contract` field `Type` key accepts the following string literals:
 | `CACHE`                   | Padding to align data to a hardware cache line boundary.                 |
 | `BANK_CONFLICT_AVOIDANCE` | Padding to the stride of a local memory array to prevent bank conflicts. |
 | `SIMD`                    | Padding to align a dimension to the natural SIMD vector width.           |
-| `NONE`                    | No padding is required or applied.                                       |
+| `NONE`                    | No independent padding strategy is applied to this buffer. The buffer's allocation dimensions may incorporate padding from `padded_*` dimension parameters, which are host-computed scalars satisfying the union of alignment constraints across all buffers sharing those dimensions. When `padded_*` parameters appear in the Tensor Shape, the padding is fully determined by those parameter values; no additional buffer-specific padding calculation is required. |
+
+*When a buffer has multiple independently padded dimensions, the `Type` field declares the primary padding motivation for the buffer's characteristic access pattern. Secondary padding on other dimensions is expressed through `padded_*` parameters in the Tensor Shape and may be documented in the `Formula` field. A future revision may extend the Padding Contract to per-dimension specifications.*
 
 **3.1.1. Initialization Contract Specification**
 

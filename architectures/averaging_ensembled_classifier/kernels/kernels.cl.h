@@ -806,7 +806,7 @@ __kernel void render_logits_chunk(
     /**
      * @param src_buffer_GLOBAL_CONST_weights_module The learnable weights for all classifier modules.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
-     *        - Padding Contract: {Type: SIMD, Formula: "output_class_count padded for SIMD/Cache alignment"}
+     *        - Padding Contract: {Type: SIMD, Formula: "output_class_count padded to SIMD_WIDTH; host ensures cache-line alignment is jointly satisfied"}
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
      *        - Validation Preconditions: [1] The module and class slices must be within bounds, as proven by: [(src_scalar_NATURAL_module_chunk_offset + src_scalar_NATURAL_module_chunk_count) <=
@@ -1192,7 +1192,7 @@ __kernel void backprop_error_to_hidden_chunk(
     /**
      * @param src_buffer_GLOBAL_CONST_weights_module The learnable weights for all classifier modules.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
-     *        - Padding Contract: {Type: CACHE, Formula: "output_class_count padded for alignment"}
+     *        - Padding Contract: {Type: SIMD, Formula: "output_class_count padded to SIMD_WIDTH; host ensures cache-line alignment is jointly satisfied"}
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
      *        - Validation Preconditions: [1] The overarching tile index must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] Host shall allocate
@@ -1512,6 +1512,7 @@ __kernel void gather_and_permute_grad_hidden_activations(
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Trailing dimension (`total_modules_count`) is Host-padded to `padded_total_modules_count` for alignment."}
      *        - Precision Role: "storage"
+     *        - Initialization Contract: {Type: ZERO_REQUIRED}
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count]
      *        - Validation Preconditions: Host shall allocate exactly [(src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count) * src_scalar_NATURAL_padded_total_modules_count *
      * sizeof(STORAGE_TYPE)] bytes.
