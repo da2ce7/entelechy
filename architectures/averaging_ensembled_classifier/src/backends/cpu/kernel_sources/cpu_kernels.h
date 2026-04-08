@@ -352,14 +352,18 @@ typedef struct {                                                               \
     COMPUTE_T        beta1;                                                    \
     COMPUTE_T        beta2;                                                    \
     COMPUTE_T        epsilon;                                                  \
+    uint             parameter_offset;                                         \
     uint             parameter_count;                                          \
+    uint             total_parameter_count;                                    \
 } AdamUpdateArgs_##SUFFIX;                                                     \
                                                                                \
 typedef struct {                                                               \
     STATE_T*         temperatures;                                             \
     COMPUTE_T        min_value;                                                \
     COMPUTE_T        max_value;                                                \
-    uint             total_modules_count;                                      \
+    uint             parameter_offset;                                         \
+    uint             parameter_count;                                          \
+    uint             total_parameter_count;                                    \
 } ClampTemperaturesArgs_##SUFFIX;
 
 /* Instantiate structs for all 14 three-axis precision combinations (ADR-024 §4.1):

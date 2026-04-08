@@ -30,6 +30,9 @@ void PREC_FN(task_normalize_gradients)(void* raw_args, uint task_index, uint thr
  *   - EMA updates and parameter subtraction in ACCUM_T = max(COMPUTE_T, STATE_T)
  *   - Bias correction and delta computation in COMPUTE_T
  *   - When ACCUM_T == COMPUTE_T, all casts are identity operations
+ *
+ * ADR-030: State-role buffers are indexed via [parameter_offset + i].
+ * The slice access invariant ensures no out-of-bounds access.
  * ================================================================ */
 void PREC_FN(task_adam_update)(void* raw_args, uint task_index, uint thread_id) {
     (void)thread_id;
@@ -38,12 +41,15 @@ void PREC_FN(task_adam_update)(void* raw_args, uint task_index, uint thread_id) 
     if (task_index >= a->parameter_count)
         return;
 
-    /* Load gradient in COMPUTE_T (precision role: compute) */
+    /* ADR-030: Compute the actual index into state-role buffers */
+    const uint state_idx = a->parameter_offset + task_index;
+
+    /* Load gradient in COMPUTE_T (precision role: compute) — zero-indexed per-dispatch */
     const COMPUTE_T g = a->final_grad[task_index];
 
     /* State-Precision Accumulation: load moments at full state precision */
-    const ACCUM_T m_prev = scalar_load_state_for_accum(a->m1, task_index);
-    const ACCUM_T v_prev = scalar_load_state_for_accum(a->m2, task_index);
+    const ACCUM_T m_prev = scalar_load_state_for_accum(a->m1, state_idx);
+    const ACCUM_T v_prev = scalar_load_state_for_accum(a->m2, state_idx);
 
     /* EMA updates in ACCUM_T (preserves state precision) */
     const ACCUM_T g_accum     = scalar_widen_to_accum(g);
@@ -59,8 +65,8 @@ void PREC_FN(task_adam_update)(void* raw_args, uint task_index, uint thread_id) 
                           ((ACCUM_T)1.0 - beta2_accum) * (g_accum * g_accum);
 
     /* Store updated moments at state precision */
-    scalar_store_state_from_accum(a->m1, task_index, m_new);
-    scalar_store_state_from_accum(a->m2, task_index, v_new);
+    scalar_store_state_from_accum(a->m1, state_idx, m_new);
+    scalar_store_state_from_accum(a->m2, state_idx, v_new);
 
     /* Bias correction in COMPUTE_T (transformative) */
     const COMPUTE_T m_hat = scalar_narrow_from_accum(m_new) /
@@ -72,25 +78,30 @@ void PREC_FN(task_adam_update)(void* raw_args, uint task_index, uint thread_id) 
     const COMPUTE_T update = a->learning_rate * m_hat
         / (COMPUTE_SQRT(v_hat) + a->epsilon);
 
-    const ACCUM_T param_val = scalar_load_state_for_accum(a->parameters, task_index);
-    scalar_store_state_from_accum(a->parameters, task_index,
+    const ACCUM_T param_val = scalar_load_state_for_accum(a->parameters, state_idx);
+    scalar_store_state_from_accum(a->parameters, state_idx,
                                   param_val - scalar_widen_to_accum(update));
 }
 
 /* ================================================================
  * task_clamp_temperatures (Node 25)
+ *
+ * ADR-030: Buffer is indexed via [parameter_offset + i].
  * ================================================================ */
 void PREC_FN(task_clamp_temperatures)(void* raw_args, uint task_index, uint thread_id) {
     (void)thread_id;
     PREC_TY(ClampTemperaturesArgs)* a = (PREC_TY(ClampTemperaturesArgs)*)raw_args;
 
-    if (task_index >= a->total_modules_count)
+    if (task_index >= a->parameter_count)
         return;
 
-    COMPUTE_T val = scalar_load_state(a->temperatures, task_index);
+    /* ADR-030: Compute the actual index into the state buffer */
+    const uint state_idx = a->parameter_offset + task_index;
+
+    COMPUTE_T val = scalar_load_state(a->temperatures, state_idx);
     if (val < a->min_value) val = a->min_value;
     if (val > a->max_value) val = a->max_value;
-    scalar_store_state(a->temperatures, task_index, val);
+    scalar_store_state(a->temperatures, state_idx, val);
 }
 
 /* ================================================================

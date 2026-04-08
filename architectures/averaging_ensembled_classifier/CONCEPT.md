@@ -86,6 +86,10 @@ It is critical to note that this 'Engine' is not a monolithic kernel. It is an e
 
 This indirection-based model is a cornerstone of the **Primacy of Memory Strategy**. By providing the aggregation kernels with a list of memory offsets (`offset_list`), the Host Orchestrator eliminates the need for intermediate device-to-device memory copies at every stage of the reduction, maximizing bandwidth for computation.
 
+**Module-Chunk Isolation Invariant (ADR-030).** For parameter-gradient reduction trees (Nodes 15 and associated optimizer paths), the offset lists constructed by the Host Orchestrator SHALL contain only tile offsets belonging to a **single module chunk**. Cross-module-chunk reduction is architecturally prohibited because it conflates gradients for disjoint parameter sets. This invariant is structurally enforced by the `ModuleChunkGather` primitive, which produces offset lists scoped to a single module chunk's tiles. When `num_module_chunks == 1`, the invariant is trivially satisfied — all tiles belong to the single module chunk.
+
+`TiledGather` remains the correct primitive for non-parameter-gradient reductions (Node 14), where the output layout encodes the correct final position per tile and cross-module-chunk summation is mathematically valid. The hidden-gradient reduction (Node 16) is also exempt: it operates on a permuted SoA buffer that has already collapsed the module dimension via Node 13's class-chunk summation.
+
 #### **3. Gradient Stabilization**
 
 ##### **3.1. The Methods of Gradient Clipping**
@@ -522,8 +526,9 @@ This architecture defines two distinct and fundamental types of synchronization 
 - **Item Synchronization Point:** A barrier that resolves a data dependency _within the execution of a single learning item_. It ensures that all necessary partial results for that one item are available before a subsequent algorithmic step can proceed. Its purpose is to enforce the correctness of the core algorithm (e.g., backpropagation).
   - **Canonical Example:** Node **(13) `gather_and_permute_grad_h`** — represented as a `KernelDispatchNode` whose completion gates the Item Synchronization `BarrierNode`.
 
-- **Batch Synchronization Point:** A barrier that resolves a data dependency _between multiple independent learning items_ that constitute a single logical batch. It ensures that the parallel-processed, fully-reduced, and normalized gradients for all items are ready before the final, collective state-update step is performed. Its purpose is to enforce the correctness of the parallel training paradigm (e.g., mini-batch gradient descent).
-  - **Canonical Example:** Node **(22) Batch Synchronization Point** — represented as a `BarrierNode` that gates all `adam_update` dispatches.
+- **Batch Synchronization Point:** A synchronization property ensuring that parameter updates occur only after their gradient dependencies are fully resolved. When the module dimension is decomposed into chunks, this property is satisfied by per-sub-graph dependency edges rather than a single monolithic barrier: each `adam_update` dispatch's dependency on its own `normalize_gradients` output expresses the synchronization contract directly in the DAG structure. When `num_module_chunks == 1`, the property is trivially satisfied — a single dependency edge from each normalized gradient to its corresponding `adam_update` is equivalent to the former barrier.
+  - The `final_batch_event` `RetrievalNode` remains the sole plan-wide synchronization point, collecting all terminal update nodes. It is the observable successor of the former Node 22 barrier.
+  - **Canonical Example:** The per-module-chunk dependency edges from `normalize_gradients[m]` to `adam_update[m]` for each parameter group and module chunk index `m`, converging at `final_batch_event`.
 
 The two host-visible synchronization events are represented as `RetrievalNode`s: `inference_event` (signaled after diagnostic aggregation, enabling host observation of `Final Probs`) and `final_batch_event` (signaled after all parameter updates complete).
 

@@ -36,6 +36,9 @@ class AdamUpdateBinding(KernelBinding):
 
     Host MUST pre-compute beta1_pow_t and beta2_pow_t in float64 to prevent
     on-device precision loss during long training runs.
+
+    The kernel operates on a slice [parameter_offset, parameter_offset + parameter_count)
+    within state buffers (m1, m2) of total_parameter_count length.
     """
 
     def get_kernel_name(self) -> str:
@@ -57,18 +60,24 @@ class AdamUpdateBinding(KernelBinding):
             np.float32(scalar_params["beta1"]),
             np.float32(scalar_params["beta2"]),
             np.float32(scalar_params["epsilon"]),
+            np.uint32(scalar_params["parameter_offset"]),
             np.uint32(scalar_params["parameter_count"]),
+            np.uint32(scalar_params["total_parameter_count"]),
         ]
 
 
 class ClampTemperaturesBinding(KernelBinding):
-    """Binding for clamp_temperatures (Node 25)."""
+    """Binding for clamp_temperatures (Node 25).
+
+    The kernel operates on a slice [parameter_offset, parameter_offset + parameter_count)
+    within the temperatures buffer of total_parameter_count length.
+    """
 
     def get_kernel_name(self) -> str:
         return "clamp_temperatures"
 
     def compute_grid(self, tile_index: int, scalar_params: dict[str, int | float], hardware_simd_width: int) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
-        element_count = int(scalar_params["total_modules_count"])
+        element_count = int(scalar_params["parameter_count"])
         return (element_count,), None
 
     def marshal_args(self, get_buffer: Callable[[BufferHandle], cl.Buffer], buffer_bindings: dict[str, BufferHandle], scalar_params: dict[str, int | float], tile_index: int) -> list[Any]:
@@ -76,5 +85,7 @@ class ClampTemperaturesBinding(KernelBinding):
             get_buffer(buffer_bindings["temperatures"]),
             np.float32(scalar_params["min_value"]),
             np.float32(scalar_params["max_value"]),
-            np.uint32(scalar_params["total_modules_count"]),
+            np.uint32(scalar_params["parameter_offset"]),
+            np.uint32(scalar_params["parameter_count"]),
+            np.uint32(scalar_params["total_parameter_count"]),
         ]

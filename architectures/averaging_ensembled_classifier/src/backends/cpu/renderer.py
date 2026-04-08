@@ -311,7 +311,7 @@ class CPUPlanRenderer:
         # Phase 3 — Update
         "normalize_gradients": lambda s: int(s["parameter_count"]),
         "adam_update": lambda s: int(s["parameter_count"]),
-        "clamp_temperatures": lambda s: int(s["total_modules_count"]),
+        "clamp_temperatures": lambda s: int(s["parameter_count"]),
     }
 
     def _resolve_task_count(self, node: KernelDispatchNode) -> int:

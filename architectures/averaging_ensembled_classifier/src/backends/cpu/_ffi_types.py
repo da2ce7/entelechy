@@ -438,14 +438,18 @@ def make_precision_types(
         ("beta1", c_compute),
         ("beta2", c_compute),
         ("epsilon", c_compute),
+        ("parameter_offset", c_uint32),
         ("parameter_count", c_uint32),
+        ("total_parameter_count", c_uint32),
     ])
 
     structs["ClampTemperaturesArgs"] = _s("ClampTemperaturesArgs", [
         ("temperatures", c_state_p),
         ("min_value", c_compute),
         ("max_value", c_compute),
-        ("total_modules_count", c_uint32),
+        ("parameter_offset", c_uint32),
+        ("parameter_count", c_uint32),
+        ("total_parameter_count", c_uint32),
     ])
 
     # Build layout checks with suffixed getter names

@@ -49,6 +49,9 @@ __kernel void normalize_gradients(
 // - Bias correction and parameter delta computation in COMPUTE_TYPE
 // - Host provides pre-computed beta powers for numerical stability
 //
+// ADR-030: State-role buffers are indexed via [parameter_offset + i].
+// The slice access invariant ensures no out-of-bounds access.
+//
 // When ACCUM_TYPE == COMPUTE_TYPE (the common case), all widen/narrow casts
 // are identity operations eliminated by the compiler — zero overhead.
 __kernel void adam_update(
@@ -62,7 +65,9 @@ __kernel void adam_update(
     COMPUTE_TYPE                 src_scalar_REAL_beta1,
     COMPUTE_TYPE                 src_scalar_REAL_beta2,
     COMPUTE_TYPE                 src_scalar_REAL_epsilon,
-    uint                         src_scalar_NATURAL_parameter_count) {
+    uint                         src_scalar_NATURAL_parameter_offset,
+    uint                         src_scalar_NATURAL_parameter_count,
+    uint                         src_scalar_NATURAL_total_parameter_count) {
 
     // --- 1. Work-Item to Parameter Mapping ---
     const uint i = get_global_id(0);
@@ -70,14 +75,17 @@ __kernel void adam_update(
         return;
     }
 
+    // ADR-030: Compute the actual index into state-role buffers
+    const uint state_idx = src_scalar_NATURAL_parameter_offset + i;
+
     // --- 2. Load Inputs ---
-    // Gradient in COMPUTE_TYPE (precision role: compute)
+    // Gradient in COMPUTE_TYPE (precision role: compute) — zero-indexed per-dispatch
     const COMPUTE_TYPE g = src_buffer_GLOBAL_final_grad[i];
 
     // State-Precision Accumulation: load moments at full state precision
     // When ACCUM_TYPE > COMPUTE_TYPE, preserves FP64 fidelity
-    const ACCUM_TYPE m_prev = load_state_for_accum(update_buffer_GLOBAL_m1, i);
-    const ACCUM_TYPE v_prev = load_state_for_accum(update_buffer_GLOBAL_m2, i);
+    const ACCUM_TYPE m_prev = load_state_for_accum(update_buffer_GLOBAL_m1, state_idx);
+    const ACCUM_TYPE v_prev = load_state_for_accum(update_buffer_GLOBAL_m2, state_idx);
 
     // --- 3. EMA Updates in ACCUM_TYPE (preserves state precision) ---
     // Widen gradient and hyperparameters to accumulation precision
@@ -94,8 +102,8 @@ __kernel void adam_update(
                              (ACCUM_ONE - beta2_accum) * (g_accum * g_accum);
 
     // Store updated moments at state precision
-    store_state_from_accum(update_buffer_GLOBAL_m1, i, m_new);
-    store_state_from_accum(update_buffer_GLOBAL_m2, i, v_new);
+    store_state_from_accum(update_buffer_GLOBAL_m1, state_idx, m_new);
+    store_state_from_accum(update_buffer_GLOBAL_m2, state_idx, v_new);
 
     // --- 4. Bias Correction in COMPUTE_TYPE ---
     // Transformative operations — bounded by compute precision, not state
@@ -110,8 +118,8 @@ __kernel void adam_update(
     const COMPUTE_TYPE param_delta = src_scalar_REAL_learning_rate * m_hat /
                                      (MATH_FN sqrt(v_hat) + src_scalar_REAL_epsilon);
 
-    const ACCUM_TYPE current_param = load_state_for_accum(update_buffer_GLOBAL_parameters, i);
-    store_state_from_accum(update_buffer_GLOBAL_parameters, i,
+    const ACCUM_TYPE current_param = load_state_for_accum(update_buffer_GLOBAL_parameters, state_idx);
+    store_state_from_accum(update_buffer_GLOBAL_parameters, state_idx,
                            current_param - widen_to_accum(param_delta));
 }
 
@@ -122,26 +130,33 @@ __kernel void adam_update(
 // Its architectural role is that of a "parameter governor," applying a final,
 // domain-specific constraint to ensure the learnable temperatures remain in a
 // stable and meaningful range.
+//
+// ADR-030: Buffer is indexed via [parameter_offset + i].
 __kernel void clamp_temperatures(
     __global STATE_TYPE *update_buffer_GLOBAL_temps,
     COMPUTE_TYPE         src_scalar_REAL_min_value,
     COMPUTE_TYPE         src_scalar_REAL_max_value,
-    uint                 src_scalar_NATURAL_total_modules_count) {
+    uint                 src_scalar_NATURAL_parameter_offset,
+    uint                 src_scalar_NATURAL_parameter_count,
+    uint                 src_scalar_NATURAL_total_parameter_count) {
 
     // --- 1. Work-Item to Parameter Mapping ---
     // A 1D dispatch where each thread operates on one temperature parameter.
     const uint idx = get_global_id(0);
 
     // Standard boundary check.
-    if (idx >= src_scalar_NATURAL_total_modules_count) {
+    if (idx >= src_scalar_NATURAL_parameter_count) {
         return;
     }
+
+    // ADR-030: Compute the actual index into the state buffer
+    const uint state_idx = src_scalar_NATURAL_parameter_offset + idx;
 
     // --- 2. In-Place Clamping Operation ---
     // This single operation enforces the physical constraints on the temperature
     // parameter. It prevents the value from becoming negative or excessively large,
     // which could lead to numerical instability in the Softmax/Sigmoid functions.
     // The `clamp` intrinsic is a highly optimized, standard OpenCL function.
-    const COMPUTE_TYPE current_val = load_state(update_buffer_GLOBAL_temps, idx);
-    store_state_update(update_buffer_GLOBAL_temps, idx, clamp(current_val, src_scalar_REAL_min_value, src_scalar_REAL_max_value));
+    const COMPUTE_TYPE current_val = load_state(update_buffer_GLOBAL_temps, state_idx);
+    store_state_update(update_buffer_GLOBAL_temps, state_idx, clamp(current_val, src_scalar_REAL_min_value, src_scalar_REAL_max_value));
 }

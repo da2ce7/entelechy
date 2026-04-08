@@ -12,6 +12,7 @@ They are foundational "Layer 1" artifacts, serving as the vocabulary for the
 higher-level components.
 """
 import abc
+import enum
 from dataclasses import dataclass
 
 import numpy as np
@@ -19,6 +20,20 @@ import numpy as np
 # --- Local Type Imports ---
 # These are defined here for clarity and to avoid circular dependencies.
 SCALAR_UINT_TYPE = np.uint32
+
+
+# === Section 0: Module Buffer Identification (ADR-030) ===
+
+
+class ModuleBufferKind(enum.Enum):
+    """Identifies the parameter-gradient buffer for elements_per_tile dispatch.
+
+    ADR-030 §1: Used by ModuleChunkGather to compute the correct element count
+    for each buffer type within a module chunk.
+    """
+    WEIGHTS = "weights"   # modules_per_chunk × padded_hidden_count × padded_total_output_class_count
+    BIASES  = "biases"    # modules_per_chunk × padded_total_output_class_count
+    TEMPS   = "temps"     # modules_per_chunk
 
 
 # === Section 1: Workload Partitioning (Tiling) Primitives ===
@@ -42,16 +57,38 @@ class WorkTile:
 class TilingScheme:
     """
     A factory for producing WorkTile objects that partition a 2D problem space.
+
+    Extended with module-chunk geometry fields (ADR-030) to support the
+    elements_per_tile() method used by ModuleChunkGather.
     """
 
     num_module_chunks: int
     num_class_chunks: int
     total_modules: int
     total_classes: int
+    # ADR-030: Module-chunk geometry for ModuleChunkGather
+    padded_hidden_count: int = 0
+    padded_total_output_class_count: int = 0
 
     @property
     def total_tiles(self) -> int:
         return self.num_module_chunks * self.num_class_chunks
+
+    @property
+    def modules_per_chunk(self) -> int:
+        """Number of modules per module chunk (ceiling division)."""
+        return (self.total_modules + self.num_module_chunks - 1) // self.num_module_chunks
+
+    def elements_per_tile(self, kind: ModuleBufferKind) -> int:
+        """Element count per tile for a given buffer kind (ADR-030)."""
+        mpc = self.modules_per_chunk
+        if kind == ModuleBufferKind.WEIGHTS:
+            return mpc * self.padded_hidden_count * self.padded_total_output_class_count
+        elif kind == ModuleBufferKind.BIASES:
+            return mpc * self.padded_total_output_class_count
+        elif kind == ModuleBufferKind.TEMPS:
+            return mpc
+        raise ValueError(f"Unknown ModuleBufferKind: {kind}")
 
     def __iter__(self):
         for m_idx in range(self.num_module_chunks):
@@ -170,3 +207,49 @@ class ContiguousGather(GatherPrimitive):
     def get_offsets(self) -> np.ndarray:
         """The offsets are a simple linear progression from the start of the buffer."""
         return np.arange(self.num_partials, dtype=SCALAR_UINT_TYPE) * self.elements_per_partial
+
+
+@dataclass(frozen=True)
+class ModuleChunkGather(GatherPrimitive):
+    """Gathers only the tiles belonging to a single module chunk (ADR-030).
+
+    The TilingScheme orders tiles as:
+        flat_tile_index = module_chunk_index * num_class_chunks + class_chunk_index
+
+    Each module chunk's tiles are therefore a contiguous subsequence of length
+    num_class_chunks, starting at offset (module_chunk_index * num_class_chunks).
+
+    This primitive encodes the Module-Chunk Isolation Invariant (ADR-030) as a
+    structural property of the gather operation: only tiles contributing gradients
+    for the same physical parameter slice are included in a single reduction tree.
+    """
+    scheme: TilingScheme
+    module_chunk_index: int
+    buffer_kind: ModuleBufferKind
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.module_chunk_index < self.scheme.num_module_chunks):
+            raise ValueError(
+                f"module_chunk_index {self.module_chunk_index} out of range "
+                f"[0, {self.scheme.num_module_chunks})"
+            )
+
+    @property
+    def num_partials(self) -> int:
+        return self.scheme.num_class_chunks
+
+    @property
+    def elements_per_partial(self) -> int:
+        return self.scheme.elements_per_tile(self.buffer_kind)
+
+    def get_offsets(self) -> np.ndarray:
+        """Returns offsets for the tiles belonging to this module chunk.
+
+        Each offset is (base_tile + i) * elements_per_partial, where base_tile
+        is module_chunk_index * num_class_chunks and i ranges over [0, num_class_chunks).
+        """
+        base = self.module_chunk_index * self.scheme.num_class_chunks
+        return (
+            (np.arange(self.num_partials, dtype=SCALAR_UINT_TYPE) + base)
+            * self.elements_per_partial
+        )

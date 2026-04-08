@@ -2186,7 +2186,7 @@ __kernel void normalize_gradients(
  * @brief (Node 24) Applies Adam optimizer update to an entire parameter group. Single dispatch.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction terms (`beta1_pow_t`, `beta2_pow_t`) to ensure long-term numerical stability. State-Precision Accumulation: EMA updates on m1 and m2 use ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Moment vectors loaded via load_state_for_accum(); gradients widened via widen_to_accum(); EMA arithmetic in ACCUM_TYPE; results stored via store_state_from_accum(). Bias-corrected values and the final parameter update delta are transformative operations using COMPUTE_TYPE (narrowed via narrow_from_accum()). Parameter buffer subtraction is accumulative in ACCUM_TYPE. Hyperparameter Precision Note: Hyperparameter scalars (β₁, β₂, ε, lr) are received in COMPUTE_TYPE and widened to ACCUM_TYPE for EMA arithmetic. The widening preserves only COMPUTE_TYPE precision for these constants. For β₁ = 0.999 with COMPUTE_TYPE = float, the contribution factor (1 − β₁) carries ~7 significant digits regardless of ACCUM_TYPE."
+ *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction terms (`beta1_pow_t`, `beta2_pow_t`) to ensure long-term numerical stability. State-Precision Accumulation: EMA updates on m1 and m2 use ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Moment vectors loaded via load_state_for_accum(); gradients widened via widen_to_accum(); EMA arithmetic in ACCUM_TYPE; results stored via store_state_from_accum(). Bias-corrected values and the final parameter update delta are transformative operations using COMPUTE_TYPE (narrowed via narrow_from_accum()). Parameter buffer subtraction is accumulative in ACCUM_TYPE. Hyperparameter Precision Note: Hyperparameter scalars (β₁, β₂, ε, lr) are received in COMPUTE_TYPE and widened to ACCUM_TYPE for EMA arithmetic. The widening preserves only COMPUTE_TYPE precision for these constants. For β₁ = 0.999 with COMPUTE_TYPE = float, the contribution factor (1 − β₁) carries ~7 significant digits regardless of ACCUM_TYPE. ADR-030: State-role buffers are indexed via [parameter_offset + i]. The slice access invariant (parameter_offset + parameter_count) <= total_parameter_count ensures no out-of-bounds access."
  *        - Idempotency: "Fundamentally Non-Idempotent (Stateful). Modifies multiple state buffers in-place."
  *        - Synchronization Model: "Stateful Optimizer Update. Consumes final gradients after the Batch Synchronization Point."
  */
@@ -2203,34 +2203,34 @@ __kernel void adam_update(
 
     /**
      * @param update_buffer_GLOBAL_parameters The parameter buffer to be updated in-place (e.g., weights, biases).
-     *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_total_parameter_count)
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "state"
-     *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]
-     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_parameter_count * sizeof(STATE_TYPE)] bytes. [2] The physical memory layout must be identical to
-     * `final_grad`, `m1`, and `m2` buffers.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_parameter_count]
+     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_parameter_count * sizeof(STATE_TYPE)] bytes. [2] The physical memory layout must be identical to
+     * `m1` and `m2` buffers. [3] (src_scalar_NATURAL_parameter_offset + src_scalar_NATURAL_parameter_count) <= src_scalar_NATURAL_total_parameter_count.
      */
     __global STATE_TYPE *update_buffer_GLOBAL_parameters,
 
     /**
      * @param update_buffer_GLOBAL_m1 The first moment vector buffer to be updated in-place.
-     *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_total_parameter_count)
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "state"
-     *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]
-     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_parameter_count * sizeof(STATE_TYPE)] bytes. [2] The physical memory layout must be identical to other
-     * state buffers.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_parameter_count]
+     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_parameter_count * sizeof(STATE_TYPE)] bytes. [2] The physical memory layout must be identical to other
+     * state buffers. [3] (src_scalar_NATURAL_parameter_offset + src_scalar_NATURAL_parameter_count) <= src_scalar_NATURAL_total_parameter_count.
      */
     __global STATE_TYPE *update_buffer_GLOBAL_m1,
 
     /**
      * @param update_buffer_GLOBAL_m2 The second moment vector buffer to be updated in-place.
-     *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_total_parameter_count)
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "state"
-     *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]
-     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_parameter_count * sizeof(STATE_TYPE)] bytes. [2] The physical memory layout must be identical to other
-     * state buffers.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_parameter_count]
+     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_parameter_count * sizeof(STATE_TYPE)] bytes. [2] The physical memory layout must be identical to other
+     * state buffers. [3] (src_scalar_NATURAL_parameter_offset + src_scalar_NATURAL_parameter_count) <= src_scalar_NATURAL_total_parameter_count.
      */
     __global STATE_TYPE *update_buffer_GLOBAL_m2,
 
@@ -2240,30 +2240,34 @@ __kernel void adam_update(
     COMPUTE_TYPE src_scalar_REAL_beta1,
     COMPUTE_TYPE src_scalar_REAL_beta2,
     COMPUTE_TYPE src_scalar_REAL_epsilon,
-    uint        src_scalar_NATURAL_parameter_count);
+    uint        src_scalar_NATURAL_parameter_offset,
+    uint        src_scalar_NATURAL_parameter_count,
+    uint        src_scalar_NATURAL_total_parameter_count);
 
 /**
  * @brief (Node 25) Clamps temperature parameters within a [min, max] range.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Enforces `temps = clamp(temps, min_value, max_value)` for each element. Precision Boundary Conversion: state-role buffer accessed via load_state()/store_state_update(); clamp arithmetic exclusively in COMPUTE_TYPE."
+ *        - Behavioral Invariants: "Enforces `temps = clamp(temps, min_value, max_value)` for each element. Precision Boundary Conversion: state-role buffer accessed via load_state()/store_state_update(); clamp arithmetic exclusively in COMPUTE_TYPE. ADR-030: Buffer is indexed via [parameter_offset + i]. The slice access invariant (parameter_offset + parameter_count) <= total_parameter_count ensures no out-of-bounds access."
  *        - Idempotency: "Fundamentally Non-Idempotent (Stateful). Modifies the temps buffer in-place."
  *        - Synchronization Model: "Finalizer Utility"
  */
 __kernel void clamp_temperatures(
     /**
      * @param update_buffer_GLOBAL_temps The temperature parameter buffer to be clamped in-place.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count)
+     *        - Tensor Shape: (src_scalar_NATURAL_total_parameter_count)
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "state"
-     *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count]
-     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_total_modules_count * sizeof(STATE_TYPE)] bytes for this buffer.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_parameter_count]
+     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_parameter_count * sizeof(STATE_TYPE)] bytes for this buffer. [2] (src_scalar_NATURAL_parameter_offset + src_scalar_NATURAL_parameter_count) <= src_scalar_NATURAL_total_parameter_count.
      */
     __global STATE_TYPE *update_buffer_GLOBAL_temps,
 
     COMPUTE_TYPE src_scalar_REAL_min_value,
     COMPUTE_TYPE src_scalar_REAL_max_value,
-    uint        src_scalar_NATURAL_total_modules_count);
+    uint        src_scalar_NATURAL_parameter_offset,
+    uint        src_scalar_NATURAL_parameter_count,
+    uint        src_scalar_NATURAL_total_parameter_count);
 
 // --- ADR-019: K-Fan-In Reduction Kernel Primitive ---
 // Sentinel value indicating an absent partial in the tail node of a

@@ -182,7 +182,9 @@ class AdamUpdatePush(ctypes.Structure):
         ("beta1", ctypes.c_float),
         ("beta2", ctypes.c_float),
         ("epsilon", ctypes.c_float),
+        ("parameter_offset", ctypes.c_uint32),
         ("parameter_count", ctypes.c_uint32),
+        ("total_parameter_count", ctypes.c_uint32),
     ]
 
 
@@ -190,7 +192,9 @@ class ClampTempsPush(ctypes.Structure):
     _fields_ = [
         ("min_value", ctypes.c_float),
         ("max_value", ctypes.c_float),
-        ("total_modules_count", ctypes.c_uint32),
+        ("parameter_offset", ctypes.c_uint32),
+        ("parameter_count", ctypes.c_uint32),
+        ("total_parameter_count", ctypes.c_uint32),
     ]
 
 

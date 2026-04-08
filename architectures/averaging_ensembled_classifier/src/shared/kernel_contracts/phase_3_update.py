@@ -55,6 +55,9 @@ adam_update_contract = KernelContract(
             "State-Precision Accumulation: Moment EMA updates (m_new, v_new) and parameter "
             "update (p - δ) in ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Bias-corrected "
             "estimates (m_hat, v_hat) and parameter delta in COMPUTE_TYPE.",
+            "ADR-030: State-role buffers are indexed via [parameter_offset + i]. The slice "
+            "access invariant (parameter_offset + parameter_count) <= total_parameter_count "
+            "ensures no out-of-bounds access.",
         ),
     ),
     buffer_params=(
@@ -68,26 +71,35 @@ adam_update_contract = KernelContract(
         ),
         BufferParamSpec(
             name="update_buffer_GLOBAL_parameters", flow="update", memory_scope="GLOBAL",
-            tensor_shape=("parameter_count",),
+            tensor_shape=("total_parameter_count",),
             padding_contract=PaddingContract("NONE", None),
-            calculability_proof=("parameter_count",),
-            validation_preconditions=("identical layout to final_grad, m1, m2",),
+            calculability_proof=("total_parameter_count",),
+            validation_preconditions=(
+                "identical layout to m1, m2",
+                "(parameter_offset + parameter_count) <= total_parameter_count",
+            ),
             precision_role="state",
         ),
         BufferParamSpec(
             name="update_buffer_GLOBAL_m1", flow="update", memory_scope="GLOBAL",
-            tensor_shape=("parameter_count",),
+            tensor_shape=("total_parameter_count",),
             padding_contract=PaddingContract("NONE", None),
-            calculability_proof=("parameter_count",),
-            validation_preconditions=("identical layout to other state buffers",),
+            calculability_proof=("total_parameter_count",),
+            validation_preconditions=(
+                "identical layout to other state buffers",
+                "(parameter_offset + parameter_count) <= total_parameter_count",
+            ),
             precision_role="state",
         ),
         BufferParamSpec(
             name="update_buffer_GLOBAL_m2", flow="update", memory_scope="GLOBAL",
-            tensor_shape=("parameter_count",),
+            tensor_shape=("total_parameter_count",),
             padding_contract=PaddingContract("NONE", None),
-            calculability_proof=("parameter_count",),
-            validation_preconditions=("identical layout to other state buffers",),
+            calculability_proof=("total_parameter_count",),
+            validation_preconditions=(
+                "identical layout to other state buffers",
+                "(parameter_offset + parameter_count) <= total_parameter_count",
+            ),
             precision_role="state",
         ),
     ),
@@ -98,7 +110,9 @@ adam_update_contract = KernelContract(
         ScalarParamSpec("beta1", "src", "REAL"),
         ScalarParamSpec("beta2", "src", "REAL"),
         ScalarParamSpec("epsilon", "src", "REAL"),
+        ScalarParamSpec("parameter_offset", "src", "NATURAL"),
         ScalarParamSpec("parameter_count", "src", "NATURAL"),
+        ScalarParamSpec("total_parameter_count", "src", "NATURAL"),
     ),
     local_memory=(),
     placement=None,
@@ -114,22 +128,30 @@ clamp_temperatures_contract = KernelContract(
             "Enforces temps = clamp(temps, min_value, max_value) for each element.",
             "Transformative operation — Precision Boundary Conversion applies. "
             "State-Precision Accumulation does not apply (no cross-invocation accumulation).",
+            "ADR-030: Buffer is indexed via [parameter_offset + i]. The slice "
+            "access invariant (parameter_offset + parameter_count) <= total_parameter_count "
+            "ensures no out-of-bounds access.",
         ),
     ),
     buffer_params=(
         BufferParamSpec(
             name="update_buffer_GLOBAL_temps", flow="update", memory_scope="GLOBAL",
-            tensor_shape=("total_modules_count",),
+            tensor_shape=("total_parameter_count",),
             padding_contract=PaddingContract("NONE", None),
-            calculability_proof=("total_modules_count",),
-            validation_preconditions=("exact allocation size",),
+            calculability_proof=("total_parameter_count",),
+            validation_preconditions=(
+                "exact allocation size",
+                "(parameter_offset + parameter_count) <= total_parameter_count",
+            ),
             precision_role="state",
         ),
     ),
     scalar_params=(
         ScalarParamSpec("min_value", "src", "REAL"),
         ScalarParamSpec("max_value", "src", "REAL"),
-        ScalarParamSpec("total_modules_count", "src", "NATURAL"),
+        ScalarParamSpec("parameter_offset", "src", "NATURAL"),
+        ScalarParamSpec("parameter_count", "src", "NATURAL"),
+        ScalarParamSpec("total_parameter_count", "src", "NATURAL"),
     ),
     local_memory=(),
     placement=None,

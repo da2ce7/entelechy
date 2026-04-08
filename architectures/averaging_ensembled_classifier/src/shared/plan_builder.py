@@ -54,7 +54,7 @@ from .streaming_loop_plan import (
     ParameterStride,
     StreamingLoopPlan,
 )
-from .workload_primitives import GatherPrimitive, LinearlyChunkedGather, TiledGather, TilingScheme
+from .workload_primitives import GatherPrimitive, LinearlyChunkedGather, ModuleBufferKind, ModuleChunkGather, TiledGather, TilingScheme
 
 
 # =========================================================================
@@ -141,6 +141,9 @@ def _make_tiling(spec: ModelSpec) -> TilingScheme:
         num_class_chunks=num_cls_chunks,
         total_modules=spec.num_modules,
         total_classes=spec.output_classes,
+        # ADR-030: Module-chunk geometry for ModuleChunkGather
+        padded_hidden_count=spec.padded_hidden_dim,
+        padded_total_output_class_count=spec.padded_class_dim,
     )
 
 
@@ -523,18 +526,23 @@ def build_learn_plan(
     )
 
     # Adam optimizer state (m1, m2 per parameter group)
+    # ADR-030 Step 13.6: Optimizer state at FULL MODEL SIZE, not per-chunk
+    full_mod_w_param_count = model_spec.num_modules * model_spec.padded_hidden_dim * model_spec.padded_class_dim
+    full_mod_b_param_count = model_spec.num_modules * model_spec.padded_class_dim
+    full_temps_param_count = model_spec.num_modules
+
     b_m1_module = alloc.allocate(
-        "m1_module", (epp_mod_w,), elem_state, BufferRole.MODEL_STATE, "state")
+        "m1_module", (full_mod_w_param_count,), elem_state, BufferRole.MODEL_STATE, "state")
     b_m2_module = alloc.allocate(
-        "m2_module", (epp_mod_w,), elem_state, BufferRole.MODEL_STATE, "state")
+        "m2_module", (full_mod_w_param_count,), elem_state, BufferRole.MODEL_STATE, "state")
     b_m1_module_biases = alloc.allocate(
-        "m1_module_biases", (epp_mod_b,), elem_state, BufferRole.MODEL_STATE, "state")
+        "m1_module_biases", (full_mod_b_param_count,), elem_state, BufferRole.MODEL_STATE, "state")
     b_m2_module_biases = alloc.allocate(
-        "m2_module_biases", (epp_mod_b,), elem_state, BufferRole.MODEL_STATE, "state")
+        "m2_module_biases", (full_mod_b_param_count,), elem_state, BufferRole.MODEL_STATE, "state")
     b_m1_temps = alloc.allocate(
-        "m1_temps", (epp_temps,), elem_state, BufferRole.MODEL_STATE, "state")
+        "m1_temps", (full_temps_param_count,), elem_state, BufferRole.MODEL_STATE, "state")
     b_m2_temps = alloc.allocate(
-        "m2_temps", (epp_temps,), elem_state, BufferRole.MODEL_STATE, "state")
+        "m2_temps", (full_temps_param_count,), elem_state, BufferRole.MODEL_STATE, "state")
     b_m1_shared = alloc.allocate(
         "m1_shared", (shared_w_param_count,), elem_state, BufferRole.MODEL_STATE, "state")
     b_m2_shared = alloc.allocate(
@@ -1308,12 +1316,16 @@ def build_learn_plan(
     }
 
     # Adam update: shared weights
+    # ADR-030: parameter_offset=0, total_parameter_count=parameter_count (degeneration)
     n24_shared = _dispatch(
         "adam_update_shared", update_deps, adam_update_contract,
         {"final_grad": b_final_grad_shared,
          "parameters": b_shared_weights,
          "m1": b_m1_shared, "m2": b_m2_shared},
-        {**_adam_scalars, "parameter_count": shared_w_param_count},
+        {**_adam_scalars,
+         "parameter_offset": 0,
+         "parameter_count": shared_w_param_count,
+         "total_parameter_count": shared_w_param_count},
         tile_count=1, placement_strategy="linear_generic",
     )
     nodes[n24_shared.node_id] = n24_shared
@@ -1328,7 +1340,10 @@ def build_learn_plan(
         {"final_grad": b_final_grad_shared_biases,
          "parameters": b_biases_shared,
          "m1": b_m1_shared_biases, "m2": b_m2_shared_biases},
-        {**_adam_scalars, "parameter_count": shared_b_param_count},
+        {**_adam_scalars,
+         "parameter_offset": 0,
+         "parameter_count": shared_b_param_count,
+         "total_parameter_count": shared_b_param_count},
         tile_count=1, placement_strategy="linear_generic",
     )
     nodes[n24_shared_b.node_id] = n24_shared_b
@@ -1338,12 +1353,17 @@ def build_learn_plan(
     alloc.add_consumer(b_m2_shared_biases, n24_shared_b.node_id)
 
     # Adam update: module weights
+    # ADR-030: Full model size for module params (currently single-chunk degenerate case)
+    full_mod_w_size = model_spec.num_modules * model_spec.padded_hidden_dim * model_spec.padded_class_dim
     n24_module = _dispatch(
         "adam_update_module", update_deps, adam_update_contract,
         {"final_grad": b_final_grad_mod,
          "parameters": b_module_weights,
          "m1": b_m1_module, "m2": b_m2_module},
-        {**_adam_scalars, "parameter_count": epp_mod_w},
+        {**_adam_scalars,
+         "parameter_offset": 0,
+         "parameter_count": epp_mod_w,
+         "total_parameter_count": full_mod_w_size},
         tile_count=1, placement_strategy="linear_generic",
     )
     nodes[n24_module.node_id] = n24_module
@@ -1353,12 +1373,16 @@ def build_learn_plan(
     alloc.add_consumer(b_m2_module, n24_module.node_id)
 
     # Adam update: module biases
+    full_mod_b_size = model_spec.num_modules * model_spec.padded_class_dim
     n24_module_b = _dispatch(
         "adam_update_module_biases", update_deps, adam_update_contract,
         {"final_grad": b_final_grad_mod_biases,
          "parameters": b_module_biases,
          "m1": b_m1_module_biases, "m2": b_m2_module_biases},
-        {**_adam_scalars, "parameter_count": epp_mod_b},
+        {**_adam_scalars,
+         "parameter_offset": 0,
+         "parameter_count": epp_mod_b,
+         "total_parameter_count": full_mod_b_size},
         tile_count=1, placement_strategy="linear_generic",
     )
     nodes[n24_module_b.node_id] = n24_module_b
@@ -1373,7 +1397,10 @@ def build_learn_plan(
         {"final_grad": b_final_grad_temps,
          "parameters": b_temperatures,
          "m1": b_m1_temps, "m2": b_m2_temps},
-        {**_adam_scalars, "parameter_count": epp_temps},
+        {**_adam_scalars,
+         "parameter_offset": 0,
+         "parameter_count": epp_temps,
+         "total_parameter_count": model_spec.num_modules},
         tile_count=1, placement_strategy="linear_generic",
     )
     nodes[n24_temps.node_id] = n24_temps
@@ -1383,13 +1410,16 @@ def build_learn_plan(
     alloc.add_consumer(b_m2_temps, n24_temps.node_id)
 
     # Clamp temperatures
+    # ADR-030: parameter_count replaces total_modules_count
     n25 = _dispatch(
         "clamp_temperatures",
         frozenset({"adam_update_temps"}),
         clamp_temperatures_contract,
         {"temperatures": b_temperatures},
         {"min_value": 0.01, "max_value": 100.0,
-         "total_modules_count": model_spec.num_modules},
+         "parameter_offset": 0,
+         "parameter_count": model_spec.num_modules,
+         "total_parameter_count": model_spec.num_modules},
         tile_count=1, placement_strategy="linear_generic",
     )
     nodes[n25.node_id] = n25

@@ -5,7 +5,10 @@
 // Clamps learnable temperature parameters to [min, max] range,
 // preventing numerical instability in Softmax/Sigmoid computations.
 //
-// Dispatch: vkCmdDispatch(ceil(total_modules_count / SIMD_WIDTH), 1, 1)
+// ADR-030: Buffer is indexed via [parameter_offset + i].
+// The slice access invariant ensures no out-of-bounds access.
+//
+// Dispatch: vkCmdDispatch(ceil(parameter_count / SIMD_WIDTH), 1, 1)
 
 #version 450
 #include "common.glsl"
@@ -15,15 +18,20 @@ layout(local_size_x_id = 0) in;
 layout(push_constant) uniform PushConstants {
     float min_value;
     float max_value;
-    uint  total_modules_count;
+    uint  parameter_offset;
+    uint  parameter_count;
+    uint  total_parameter_count;
 } push;
 
 layout(set = 0, binding = 0) buffer TempsBuf { STATE_TYPE data[]; } temps;
 
 void main() {
     uint idx = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
-    if (idx >= push.total_modules_count) return;
+    if (idx >= push.parameter_count) return;
 
-    COMPUTE_TYPE val = read_state(temps.data[idx]);
-    temps.data[idx] = write_state(clamp(val, COMPUTE_TYPE(push.min_value), COMPUTE_TYPE(push.max_value)));
+    // ADR-030: Compute the actual index into the state buffer
+    uint state_idx = push.parameter_offset + idx;
+
+    COMPUTE_TYPE val = read_state(temps.data[state_idx]);
+    temps.data[state_idx] = write_state(clamp(val, COMPUTE_TYPE(push.min_value), COMPUTE_TYPE(push.max_value)));
 }

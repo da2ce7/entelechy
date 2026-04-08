@@ -340,7 +340,7 @@ class VulkanPlanRenderer:
             (int(s["parameter_count"]) + w - 1) // w
         ),
         "clamp_temperatures": lambda s, w: (
-            (int(s["total_modules_count"]) + w - 1) // w
+            (int(s["parameter_count"]) + w - 1) // w
         ),
         # Workgroup-per-row: one workgroup per (batch, hidden) row
         "stabilize_and_reduce_grad_hidden_activations": lambda s, w: (

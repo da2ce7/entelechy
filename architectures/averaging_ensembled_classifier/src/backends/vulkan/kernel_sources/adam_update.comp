@@ -11,6 +11,9 @@
 //   - Bias correction and delta computation in COMPUTE_TYPE
 //   - When ACCUM_FLOAT == COMPUTE_TYPE, all casts are identity operations
 //
+// ADR-030: State-role buffers are indexed via [parameter_offset + i].
+// The slice access invariant ensures no out-of-bounds access.
+//
 // Dispatch: vkCmdDispatch(ceil(parameter_count / SIMD_WIDTH), 1, 1)
 // Dispatched per parameter group (weights, biases, temps, shared_w, shared_b)
 // with different buffer bindings.
@@ -27,7 +30,9 @@ layout(push_constant) uniform PushConstants {
     float beta1;
     float beta2;
     float epsilon;
+    uint  parameter_offset;
     uint  parameter_count;
+    uint  total_parameter_count;
 } push;
 
 layout(set = 0, binding = 0) readonly buffer GradBuf   { COMPUTE_TYPE data[]; } grads;
@@ -39,12 +44,15 @@ void main() {
     uint i = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
     if (i >= push.parameter_count) return;
 
-    // Load gradient in COMPUTE_TYPE (precision role: compute)
+    // ADR-030: Compute the actual index into state-role buffers
+    uint state_idx = push.parameter_offset + i;
+
+    // Load gradient in COMPUTE_TYPE (precision role: compute) — zero-indexed per-dispatch
     COMPUTE_TYPE g = grads.data[i];
 
     // State-Precision Accumulation: load moments at full state precision
-    ACCUM_FLOAT m_prev = LOAD_STATE_FOR_ACCUM(m1.data[i]);
-    ACCUM_FLOAT v_prev = LOAD_STATE_FOR_ACCUM(m2.data[i]);
+    ACCUM_FLOAT m_prev = LOAD_STATE_FOR_ACCUM(m1.data[state_idx]);
+    ACCUM_FLOAT v_prev = LOAD_STATE_FOR_ACCUM(m2.data[state_idx]);
 
     // EMA updates in ACCUM_FLOAT (preserves state precision)
     ACCUM_FLOAT g_accum     = WIDEN_TO_ACCUM(g);
@@ -60,8 +68,8 @@ void main() {
                         (ACCUM_FLOAT(1.0) - beta2_accum) * (g_accum * g_accum);
 
     // Store updated moments at state precision
-    m1.data[i] = STORE_STATE_FROM_ACCUM(m_new);
-    m2.data[i] = STORE_STATE_FROM_ACCUM(v_new);
+    m1.data[state_idx] = STORE_STATE_FROM_ACCUM(m_new);
+    m2.data[state_idx] = STORE_STATE_FROM_ACCUM(v_new);
 
     // Bias correction in COMPUTE_TYPE (transformative)
     COMPUTE_TYPE m_hat = NARROW_FROM_ACCUM(m_new) /
@@ -73,6 +81,6 @@ void main() {
     COMPUTE_TYPE param_delta = COMPUTE_TYPE(push.learning_rate) * m_hat /
                                (sqrt(v_hat) + COMPUTE_TYPE(push.epsilon));
 
-    ACCUM_FLOAT current_param = LOAD_STATE_FOR_ACCUM(params.data[i]);
-    params.data[i] = STORE_STATE_FROM_ACCUM(current_param - WIDEN_TO_ACCUM(param_delta));
+    ACCUM_FLOAT current_param = LOAD_STATE_FOR_ACCUM(params.data[state_idx]);
+    params.data[state_idx] = STORE_STATE_FROM_ACCUM(current_param - WIDEN_TO_ACCUM(param_delta));
 }
