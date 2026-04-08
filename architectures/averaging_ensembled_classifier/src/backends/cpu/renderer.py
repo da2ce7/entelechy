@@ -19,6 +19,7 @@ from ...shared.plan_types import (
     ReductionTreeNode,
     StreamingLoopNode,
 )
+from ...shared.buffer_lifecycle import BufferRole
 from ...shared.retrieval_future import RetrievalFuture
 from ._dispatch_table import build_dispatch_table
 from ._ffi_types import ALL_PRECISION_SUFFIXES, PRECISION_C_TYPES, PRECISION_STRUCTS
@@ -82,18 +83,77 @@ class CPUPlanRenderer:
         self._pool = self._lib.pool_create(thread_count)
         self._thread_count = thread_count
 
+        # Persistent MODEL_STATE buffer store (ADR-009).
+        # Keyed by (logical_name, padded_shape, dtype_name) so that
+        # MODEL_STATE buffers survive across render() calls, enabling
+        # multi-batch training where parameter updates accumulate.
+        self._persistent_buffers: dict[
+            tuple[str, tuple[int, ...], str], np.ndarray
+        ] = {}
+
     def __del__(self) -> None:
         if hasattr(self, "_pool") and self._pool:
             self._lib.pool_destroy(self._pool)
             self._pool = None
 
+    # ---------------------------------------------------------------
+    # Weight initialization (symmetry breaking for MODEL_STATE buffers)
+    # ---------------------------------------------------------------
+    # Names containing "weight" get Xavier uniform initialization;
+    # names containing "temperature" are set to 1.0 (unit scaling);
+    # biases, optimizer moments (m1_*, m2_*) stay zero.
+    _WEIGHT_SUBSTRINGS = ("weight",)
+    _UNIT_INIT_SUBSTRINGS = ("temperature",)
+
+    @staticmethod
+    def _buffer_rng(logical_name: str, padded_shape: tuple[int, ...]) -> np.random.Generator:
+        """Deterministic per-buffer RNG seeded by buffer identity."""
+        import hashlib
+        h = hashlib.sha256(f"{logical_name}{padded_shape}".encode()).hexdigest()
+        return np.random.default_rng(int(h[:16], 16))
+
+    def _init_model_state(
+        self, logical_name: str, buf: np.ndarray, padded_shape: tuple[int, ...],
+        logical_shape: tuple[int, ...] | None = None,
+    ) -> None:
+        """Apply role-appropriate initialization to MODEL_STATE buffers."""
+        if any(s in logical_name for s in self._WEIGHT_SUBSTRINGS):
+            # Xavier uniform: fan_in + fan_out from last two dims of shape
+            # Prefer logical_shape (unpadded) when available for correct scaling
+            shape_for_fan = logical_shape if logical_shape and len(logical_shape) >= 2 else padded_shape
+            if len(shape_for_fan) >= 2:
+                fan_in_plus_out = shape_for_fan[-2] + shape_for_fan[-1]
+            else:
+                fan_in_plus_out = max(shape_for_fan[0] if shape_for_fan else buf.size, 2)
+            limit = float(np.sqrt(6.0 / fan_in_plus_out))
+            rng = self._buffer_rng(logical_name, padded_shape)
+            values = rng.uniform(-limit, limit, size=buf.shape)
+            buf[:] = values.astype(buf.dtype)
+        elif any(s in logical_name for s in self._UNIT_INIT_SUBSTRINGS):
+            buf[:] = buf.dtype.type(1.0)
+
     def render(
-        self, plan: ExecutionPlan
+        self,
+        plan: ExecutionPlan,
+        data_injections: dict[str, np.ndarray] | None = None,
     ) -> dict[str, RetrievalFuture]:
         """Render an execution plan via CPU dispatch.
 
         Allocates SIMD-aligned numpy buffers, traverses the plan's
         topological order, and dispatches each node type.
+
+        MODEL_STATE buffers (ADR-009) are persisted across render() calls
+        so that parameter updates from the Learn phase carry forward to
+        subsequent Act phases (multi-batch training).  Weight-role
+        MODEL_STATE buffers are Xavier-initialized on first allocation
+        to break symmetry.
+
+        Args:
+            plan: The execution plan to render.
+            data_injections: Optional mapping of buffer logical_name -> host data.
+                Each entry is copied into the allocated plan buffer with the
+                matching logical_name. The host array is padded to match the
+                buffer's padded shape.
         """
         suffix = _get_precision_suffix(
             plan.precision.storage_dtype,
@@ -109,7 +169,72 @@ class CPUPlanRenderer:
             },
         )
         for descriptor in plan.buffers.values():
-            allocator.allocate(descriptor)
+            key = (
+                descriptor.logical_name,
+                descriptor.padded_shape,
+                allocator._role_dtypes[descriptor.precision_role].str,
+            )
+            if descriptor.role == BufferRole.MODEL_STATE and key in self._persistent_buffers:
+                # Reuse the persistent buffer
+                allocator.set_buffer(descriptor.handle, self._persistent_buffers[key])
+            else:
+                allocator.allocate(descriptor)
+                if descriptor.role == BufferRole.MODEL_STATE:
+                    buf = allocator.get_buffer(descriptor.handle)
+                    self._init_model_state(
+                        descriptor.logical_name, buf, descriptor.padded_shape,
+                        logical_shape=descriptor.logical_shape)
+                    self._persistent_buffers[key] = buf
+
+        # --- Host-to-device data injection ---
+        if data_injections:
+            # Build logical_name -> descriptor mapping
+            name_to_desc = {
+                desc.logical_name: desc
+                for desc in plan.buffers.values()
+            }
+            for logical_name, host_data in data_injections.items():
+                desc = name_to_desc.get(logical_name)
+                if desc is None:
+                    continue
+                buf = allocator.get_buffer(desc.handle)
+                padded_shape = desc.padded_shape
+                buf[:] = 0  # Zero-fill including padding regions
+                if (
+                    logical_name == "targets_cce"
+                    and np.issubdtype(host_data.dtype, np.integer)
+                    and not np.issubdtype(buf.dtype, np.integer)
+                ):
+                    # CCE class indices: raw byte copy preserves int32 bit
+                    # pattern so the C kernel can read the buffer as int*.
+                    src_bytes = host_data.astype(np.int32).tobytes()
+                    dst_bytes = buf.view(np.uint8)
+                    n = min(len(src_bytes), len(dst_bytes))
+                    dst_bytes[:n] = np.frombuffer(src_bytes[:n], dtype=np.uint8)
+                elif host_data.ndim <= 1 or len(padded_shape) <= 1:
+                    if len(padded_shape) > 1 and host_data.ndim == 1:
+                        # 1D host into 2D+ padded buffer: place in first
+                        # column so strided kernel access is correct (e.g.
+                        # BCE targets at [b * padded_class_dim + 0]).
+                        reshaped = buf.reshape(padded_shape)
+                        n = min(len(host_data), padded_shape[0])
+                        reshaped[:n, 0] = host_data[:n].astype(buf.dtype)
+                    else:
+                        # 1D host data or 1D buffer: flat copy into leading
+                        # elements (handles sample_mask, etc.)
+                        flat = host_data.astype(buf.dtype).flatten()
+                        n = min(len(flat), len(buf))
+                        buf[:n] = flat[:n]
+                else:
+                    # Multi-dimensional: copy host region into top-left
+                    # corner of padded buffer so padding stays zero.
+                    host = host_data.astype(buf.dtype)
+                    reshaped = buf.reshape(padded_shape)
+                    slices = tuple(
+                        slice(0, min(host.shape[d], padded_shape[d]))
+                        for d in range(min(host.ndim, len(padded_shape)))
+                    )
+                    reshaped[slices] = host[slices]
 
         futures: dict[str, RetrievalFuture] = {}
 
@@ -138,13 +263,52 @@ class CPUPlanRenderer:
     # Node-type dispatch methods
     # -----------------------------------------------------------
 
-    # Per-element kernels (placement_strategy="linear_generic") need
-    # their task count derived from scalar params, not tile_count.
-    # Each maps kernel_name → callable(scalar_params) → int.
+    # Per-element kernels need their task count derived from scalar
+    # params, not tile_count.  Each entry maps kernel_name to a
+    # callable(scalar_params) → int that computes the task count.
     _TASK_COUNT_RESOLVERS: dict[str, Any] = {
+        # Phase 1 — Act
+        "forward_pass": lambda s: int(s["batch_chunk_count"]),
+        "render_logits_chunk": lambda s: (
+            int(s["module_chunk_count"])
+            * int(s["batch_chunk_count"])
+            * int(s["class_chunk_count"])
+        ),
+        # Phase 2A — Production
+        "compute_probs_loss_cce_chunk": lambda s: (
+            int(s["modules_per_chunk"]) * int(s["total_batch_count"])
+        ),
+        "compute_probs_loss_bce_chunk": lambda s: (
+            int(s["modules_per_chunk"]) * int(s["total_batch_count"])
+        ),
+        "calculate_module_param_grads_chunk": lambda s: (
+            int(s["modules_per_chunk"]) * int(s["hidden_count"])
+        ),
+        # Phase 2B — Processing
+        "backprop_error_to_hidden_chunk": lambda s: (
+            int(s["modules_per_chunk"])
+            * int(s["total_batch_count"])
+            * int(s["padded_hidden_count"])
+        ),
+        "calculate_chunk_temp_gradients": lambda s: int(s["modules_per_chunk"]),
+        # clip_partial_gradients: ignores task_index → tile_count=1 is correct
+        # Phase 2C — Reduction
+        "gather_and_permute_grad_hidden_activations": lambda s: (
+            int(s["total_batch_count"])
+            * int(s["padded_hidden_count"])
+            * int(s["total_modules_count"])
+        ),
         "stabilize_and_reduce_grad_hidden_activations": lambda s: (
             int(s["total_batch_count"]) * int(s["padded_hidden_count"])
         ),
+        # clip_intermediate_grad: ignores task_index → tile_count=1 is correct
+        # Phase 2D — Backprop
+        "backprop_shared_weights_chunk": lambda s: (
+            int(s["padded_input_count"]) * int(s["padded_hidden_count"])
+        ),
+        "backprop_shared_biases_chunk": lambda s: int(s["padded_hidden_count"]),
+        # clip_shared_gradients_chunk: ignores task_index → tile_count=1 is correct
+        # Phase 3 — Update
         "normalize_gradients": lambda s: int(s["parameter_count"]),
         "adam_update": lambda s: int(s["parameter_count"]),
         "clamp_temperatures": lambda s: int(s["total_modules_count"]),
@@ -153,9 +317,10 @@ class CPUPlanRenderer:
     def _resolve_task_count(self, node: KernelDispatchNode) -> int:
         """Compute the actual task count for a KernelDispatchNode.
 
-        For 'linear_generic' kernels each CPU task processes one element,
-        so the task count must be derived from the kernel's scalar params.
-        For all other placement strategies, tile_count is used directly.
+        Each kernel has a specific task decomposition: some dispatch one
+        task per sample, others per element, others once for the entire
+        buffer.  The resolvers map scalar params to the correct count.
+        Kernels not listed fall through to tile_count.
         """
         resolver = self._TASK_COUNT_RESOLVERS.get(node.kernel_name)
         if resolver is not None:
@@ -284,10 +449,13 @@ class CPUPlanRenderer:
         c_plan.partial_width = pw
         c_plan.num_stages = num_stages
 
-        # Threshold schedule — convert to compute-type representation
-        t_alg = rtp.threshold_schedule[0] if rtp.threshold_schedule else 0.0
+        # Threshold schedule — convert to compute-type representation.
+        # None entries mean "no clipping" → use fp_max as a passthrough
+        # threshold so the clipping branch is never triggered.
+        fp_max = plan.precision.compute_fp_format_max
+        t_alg = rtp.threshold_schedule[0] if rtp.threshold_schedule else None
         c_plan.t_algorithmic = _to_compute_scalar(
-            t_alg if t_alg is not None else 0.0, suffix
+            t_alg if t_alg is not None else fp_max, suffix
         )
         lambda_val = (
             rtp.threshold_schedule[1]
@@ -295,7 +463,7 @@ class CPUPlanRenderer:
             else 0.0
         )
         c_plan.lambda_ = _to_compute_scalar(lambda_val, suffix)
-        c_plan.fp_max = _to_compute_scalar(plan.precision.compute_fp_format_max, suffix)
+        c_plan.fp_max = _to_compute_scalar(fp_max, suffix)
         c_plan.epsilon = _to_compute_scalar(plan.precision.compute_epsilon, suffix)
 
         getattr(self._lib, fn_name)(

@@ -48,6 +48,10 @@ class CPUBufferAllocator:
         """Retrieve the numpy array for a given buffer handle."""
         return self._buffers[handle]
 
+    def set_buffer(self, handle: BufferHandle, buf: np.ndarray) -> None:
+        """Associate an externally-provided buffer with a handle."""
+        self._buffers[handle] = buf
+
     def get_data_pointer(self, handle: BufferHandle) -> ctypes.c_void_p:
         """Return a ctypes pointer to the buffer data for FFI dispatch."""
         buf = self._buffers[handle]

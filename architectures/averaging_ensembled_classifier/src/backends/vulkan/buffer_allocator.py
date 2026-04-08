@@ -63,7 +63,7 @@ class VulkanBufferAllocator:
         # Buffers that may be copied to host need transfer_src
         if descriptor.role == BufferRole.BATCH_OUTPUT:
             usage |= vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-        # All buffers may need to receive uploaded data
+        # All buffers may need to receive uploaded data or be zero-filled
         usage |= vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT
 
         buf = self._create_buffer(
@@ -79,6 +79,39 @@ class VulkanBufferAllocator:
         )
         self._buffers[descriptor.handle] = vk_buf
         return vk_buf
+
+    def zero_fill(
+        self,
+        handle: BufferHandle,
+        command_buffer: Any,
+        queue: Any,
+        fence: Any,
+    ) -> None:
+        """Zero-fill a device-local buffer via staging upload."""
+        vk_buf = self._buffers[handle]
+        size = vk_buf.size_bytes
+        staging = self.allocate_staging(size)
+        from vulkan._vulkan import ffi as _ffi  # noqa: PLC0415
+        _ffi.memmove(staging.mapped_buf, bytes(size), size)
+
+        begin_info = vk.VkCommandBufferBeginInfo(
+            flags=vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        )
+        vk.vkBeginCommandBuffer(command_buffer, begin_info)
+        region = vk.VkBufferCopy(srcOffset=0, dstOffset=0, size=size)
+        vk.vkCmdCopyBuffer(
+            command_buffer, staging.buffer, vk_buf.buffer, 1, [region],
+        )
+        vk.vkEndCommandBuffer(command_buffer)
+
+        submit = vk.VkSubmitInfo(
+            commandBufferCount=1,
+            pCommandBuffers=[command_buffer],
+        )
+        vk.vkQueueSubmit(queue, 1, [submit], fence)
+        vk.vkWaitForFences(self._device, 1, [fence], True, int(5e9))
+        vk.vkResetFences(self._device, 1, [fence])
+        vk.vkResetCommandBuffer(command_buffer, 0)
 
     def get_buffer(self, handle: BufferHandle) -> VulkanBuffer:
         """Retrieve the VulkanBuffer for a given buffer handle."""

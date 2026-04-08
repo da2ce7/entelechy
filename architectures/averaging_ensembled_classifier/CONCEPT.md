@@ -24,7 +24,7 @@ Optimization pressure that violates these core principles shall be interpreted a
 The singular goal of the host-side orchestration is to ensure the core computation executes in the fastest possible memory tier (Registers > Local > Global). This principle drives all design decisions, prioritizing memory efficiency over computational complexity.
 
 > **Data organization is inherently informed by the target hardware’s memory hierarchy and access patterns.** The system prioritizes layouts that harmonize with fundamental theoretical constraints of the hardware class (e.g., alignment principles, memory bank theory, access granularity axioms) to optimize computational pathways for throughput and scalable efficiency. This principle elevates hardware-class-aware design as a first-class concern, ensuring implementations achieve maximal bandwidth utilization and latency hiding through generalized hardware paradigms, not ad-hoc device-specific optimizations.
-**Storage precision is a first-class bandwidth lever.** The system decomposes numeric precision into three independent roles — storage, compute, and state — reflecting the distinct optimization targets of bandwidth, arithmetic fidelity, and long-term stability. Narrowing the storage format reduces buffer sizes and transfer bandwidth proportionally (FP16 halves FP32's footprint; FP8 halves again) without constraining the arithmetic precision used for computation or the precision of persistent optimizer state. This decoupling is a direct expression of the Primacy of Memory Strategy: data is stored in the narrowest format that preserves sufficient information for the downstream operation, and widened to the arithmetic format only at the point of computation.
+> **Storage precision is a first-class bandwidth lever.** The system decomposes numeric precision into three independent roles — storage, compute, and state — reflecting the distinct optimization targets of bandwidth, arithmetic fidelity, and long-term stability. Narrowing the storage format reduces buffer sizes and transfer bandwidth proportionally (FP16 halves FP32's footprint; FP8 halves again) without constraining the arithmetic precision used for computation or the precision of persistent optimizer state. This decoupling is a direct expression of the Primacy of Memory Strategy: data is stored in the narrowest format that preserves sufficient information for the downstream operation, and widened to the arithmetic format only at the point of computation.
 
 **Storage-role FP64 is permitted but not optimised.** FP64 storage doubles FP32's bandwidth cost with no storage-compression benefit. The architecture permits storage-role FP64 for configurations where uniformity is preferred over bandwidth (e.g., `PrecisionConfig.float64()` for validation reference), but does not optimize for it. The expected production configurations place FP64 only in compute or state roles — e.g., `PrecisionConfig.mixed_f32_f64_state()` (FP32 storage, FP32 compute, FP64 state) for extended-stability training.
 
@@ -54,12 +54,10 @@ All workflows follow Act (forward pass) then Learn (backpropagation) sequencing,
 The system observes a strict tripartite authority structure to prevent circular dependencies and ensure traceable design decisions:
 
 - **1. Conceptual (This Document):** Sovereign authority defining **what** must be achieved and **why**. Contains all principles, component definitions, and validation scenarios. Structural decisions that realize these mandates are recorded in the ADR chain (ADR-001 through ADR-018); once accepted, an ADR's decision is binding on all downstream layers.
-
   - _Example Mandate:_ "Optimizer implementations must avoid precision erosion across unbounded training steps"
   - _Example ADR:_ ADR-002 establishes the five-node plan type taxonomy as the closed vocabulary for the execution plan
 
 - **2. Contractual (Kernel Headers & Contracts):** Binding authority formalizing **interface requirements**. Translates conceptual mandates into human/machine-verifiable API contracts, expressed as `KernelContract` frozen dataclasses and the `CONTRACT.md` articles.
-
   - _Example Enforcement:_ `adam_update` kernel's `KernelContract` requires `src_scalar_REAL_beta1_pow_t` parameter
 
 - **3. Design (Implementations):** Subordinate authority implementing **how** to fulfill superior layers. Never influences higher layers.
@@ -95,12 +93,10 @@ This indirection-based model is a cornerstone of the **Primacy of Memory Strateg
 This architecture acknowledges degrees for Gradient Clipping, defined as Vector-Wise Scaling. The methods differ only in the **scope of their L2 norm calculation**. They are neutral tools; their purpose is determined by the context in which they are applied.
 
 1.  **`Full-Group-Wise Clipping`**
-
     - **Mechanism:** This method operates on the principle of **"gather and regulate."** It treats the full group of gradients as a single, atomic vector. It computes one L2 norm over the entire pre-summed group and applies a single scaling factor, perfectly preserving the relative magnitudes of all vectors _within_ the group.
     - **Key Property:** Requires a full, synchronizing reduction of the group before it can be applied, making it architecturally expensive.
 
 2.  **`Partial-Group-Wise Clipping`**
-
     - **Mechanism:** This method operates on the principle of **"assemble and scale."** It treats a practical sub-group of gradients as a single, partial vector. It computes one L2 norm over the pre-summed group and applies a single localized scaling factor, preserving the local-relative magnitudes of all vectors _within_ a sub-group.
     - **Key Property:** Requires a local barrier, synchronizing reduction of the sub-group before it can be applied, relatively cheap.
 
@@ -187,12 +183,12 @@ The processing of each batch spans two event-delimited phases whose temporal rel
 
 The user-facing expression of this temporal split is the **WorkTicket**—a stateful object whose lifecycle mirrors the Act/Learn separation:
 
-| Ticket State | Transition | Synchronization Point |
-| :--- | :--- | :--- |
-| `PENDING` | `engine.submit(x_data)` | — |
-| `ACT_COMPLETE` | `ticket.get_prediction()` | `inference_event` |
-| `RESOLVED` | `ticket.resolve(y_data)` | — |
-| `CONSUMED` | `learn_handle.wait()` | `final_batch_event` |
+| Ticket State   | Transition                | Synchronization Point |
+| :------------- | :------------------------ | :-------------------- |
+| `PENDING`      | `engine.submit(x_data)`   | —                     |
+| `ACT_COMPLETE` | `ticket.get_prediction()` | `inference_event`     |
+| `RESOLVED`     | `ticket.resolve(y_data)`  | —                     |
+| `CONSUMED`     | `learn_handle.wait()`     | `final_batch_event`   |
 
 This model natively expresses both **Sequential Execution Mode** (resolve immediately after submit) and **Event-Triggered Execution Mode** (inspect prediction, defer resolution until ground truth arrives) through identical syntax, with no mode flag or conditional branching.
 
@@ -214,13 +210,13 @@ The execution plan is a directed acyclic graph of typed, immutable node descript
 
 The plan's node vocabulary is a **closed taxonomy** of five types:
 
-| Node Type | Semantics |
-| :--- | :--- |
-| `KernelDispatchNode` | A single logical kernel invocation with buffer bindings, scalar parameters, tile decomposition, and placement strategy. |
-| `ReductionTreeNode` | A multi-stage `log_K(N)` reduction tree, carrying fan-in, pre-computed threshold schedule, and initial offset lists. Rendered atomically by the backend, which selects kernel tiers and manages intermediate buffers. |
-| `StreamingLoopNode` | A parametric loop over a chunk-indexed body of `KernelDispatchNode`s. Specifies chunk count and per-chunk parameter strides; the backend instantiates per-chunk parameter values from base + index × stride. |
-| `BarrierNode` | A named synchronization point that joins upstream dependency edges. Carries no dispatch payload—it is a pure sequencing construct. |
-| `RetrievalNode` | A host-accessible result extraction point, specifying the source buffer, expected shape, and the named event it signals. |
+| Node Type            | Semantics                                                                                                                                                                                                             |
+| :------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KernelDispatchNode` | A single logical kernel invocation with buffer bindings, scalar parameters, tile decomposition, and placement strategy.                                                                                               |
+| `ReductionTreeNode`  | A multi-stage `log_K(N)` reduction tree, carrying fan-in, pre-computed threshold schedule, and initial offset lists. Rendered atomically by the backend, which selects kernel tiers and manages intermediate buffers. |
+| `StreamingLoopNode`  | A parametric loop over a chunk-indexed body of `KernelDispatchNode`s. Specifies chunk count and per-chunk parameter strides; the backend instantiates per-chunk parameter values from base + index × stride.          |
+| `BarrierNode`        | A named synchronization point that joins upstream dependency edges. Carries no dispatch payload—it is a pure sequencing construct.                                                                                    |
+| `RetrievalNode`      | A host-accessible result extraction point, specifying the source buffer, expected shape, and the named event it signals.                                                                                              |
 
 No additional node types may be introduced without a formal architectural decision. Per Principle §1 (Architectural Elegance Feedback): when an optimization requires a construct beyond this vocabulary, implementation is suspended and the pattern is formalized as a new first-class node type.
 
@@ -524,7 +520,6 @@ The CCE/BCE strategy divergence (CONCEPT.md §3, Principle "Modular, Dumb Kernel
 This architecture defines two distinct and fundamental types of synchronization points, which are properties of the computational graph itself, independent of the host's scheduling logic (e.g., "Epochs" or "Tickets"). In the execution plan (§6), these manifest as `BarrierNode`s (pure sequencing constructs) and `RetrievalNode`s (host-observable completion points).
 
 - **Item Synchronization Point:** A barrier that resolves a data dependency _within the execution of a single learning item_. It ensures that all necessary partial results for that one item are available before a subsequent algorithmic step can proceed. Its purpose is to enforce the correctness of the core algorithm (e.g., backpropagation).
-
   - **Canonical Example:** Node **(13) `gather_and_permute_grad_h`** — represented as a `KernelDispatchNode` whose completion gates the Item Synchronization `BarrierNode`.
 
 - **Batch Synchronization Point:** A barrier that resolves a data dependency _between multiple independent learning items_ that constitute a single logical batch. It ensures that the parallel-processed, fully-reduced, and normalized gradients for all items are ready before the final, collective state-update step is performed. Its purpose is to enforce the correctness of the parallel training paradigm (e.g., mini-batch gradient descent).
@@ -571,7 +566,6 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
 #### **Learn Phase Kernels: Gradient Processing, Reduction & Synchronization**
 
 - **(11) `clip_partial_gradients`**: **[Utility Kernel]** Performs a local, group-wise clip on the full gradient vector for a single parallel tile.
-
   - **Contract:** Invoked after all partial gradients for a single tile (`Nodes 8, 9, 10`) are generated. It performs the following indivisible operation:
     1.  It computes a **single L2 norm** over the logical concatenation of all input gradient buffers (`Grad_ModW`, `Grad_ModB`, `Grad_Temps`, and `Grad_H_AoS`).
     2.  If this single norm exceeds the threshold, the derived scaling factor is then applied **uniformly** to all four constituent buffers.
@@ -582,31 +576,29 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
 - **(13) `gather_and_permute_grad_h`**: **[Specialized Kernel]** Gathers and permutes the clipped `Grad_H` partials.
   - **Contract:** Reads from the `Clipped_PARTIALS_Grad_H_AoS` collection and writes to a single `Permuted_Grad_H_SoA` buffer. This is a mandatory step before Node (16) and serves as the canonical **Item Synchronization Point**.
 - **The Recursive Clip-Aggregation Engine:** **[Architectural Concept, not a single kernel]**
-
   - **Description:** This refers to the intelligent composition of simple, single-purpose kernels by the Host Orchestrator to form a `log_K(N)` reduction tree. This is the physical implementation of the **Primacy of Memory Strategy**, using the **Indirection Contract** (`offset_list`) to sum scattered partials without intermediate copies.
   - **Contextual Composition:** The Host Orchestrator renders the engine differently based on the data being processed and the tree depth:
-    - **For Single-Stage Trees** (`num_stages == 1`): The tree uses `aggregate_stage_j` (storage-entry or compute-entry variant, depending on the source buffer's `precision_role`), optionally followed by `clip_stage_j` for gradient stabilization.
+    - **For Single-Stage Trees** (`num_stages == 1`): The tree uses `aggregate_stage_j` (storage-entry or compute-entry variant, depending on the source buffer's `precision_role`), optionally followed by `clip_intermediate_grad` for gradient stabilization.
     - **For Multi-Stage Trees** (`num_stages > 1`): The tree's leaf stage (stage 0) uses `reduce_k_fan_in_and_clip` when the source collection is storage-role, or `reduce_k_fan_in_and_clip_from_compute` when the source collection is compute-role (e.g., BCE loss partials). All interior stages (stage ≥ 1) use `reduce_k_fan_in_and_clip_from_compute`, reading the prior stage's COMPUTE_TYPE output. This stage-typed variant selection is an Orchestration-tier concern, resolved by inspecting the source buffer's `precision_role` from its `BufferDescriptor` (ADR-026). Each stage produces `ceil(N/K)` independent output nodes, each formed by summing exactly K input partials and applying an independent per-node L2 clip. This fused kernel eliminates intermediate global memory traffic between the sum and clip operations.
     - **For Diagnostic Reduction (Node 14):** Clipping is disabled (the threshold sentinel bypasses the clip path), producing a simple summation of `PARTIAL_Probs` and `PARTIALS_Loss_BCE`.
     - **For Gradient Reduction (Nodes 15 & 20):** Clipping is enabled at each stage, implementing the `Gradient Stabilization` policy's Quadratic Scaling threshold schedule.
 
 - **`aggregate_stage_j`**: **[Utility Kernel]** A stateless, all-to-one summation kernel.
-
   - **Note:** The `aggregate_stage_j` is a conceptual role fulfilled by a tiered set of concrete kernels (e.g., `aggregate_register_reduce`, `aggregate_local_reduce`) selected by the Host Orchestrator based on reduction width. Each concrete kernel exists in two **precision variants** (ADR-026): the storage-entry variant (e.g., `aggregate_register_reduce`) reads `STORAGE_TYPE` partials via `load_storage()`, while the compute-entry variant (e.g., `aggregate_register_reduce_from_compute`) reads `COMPUTE_TYPE` intermediates directly. The Orchestration tier selects the variant based on the source buffer's `precision_role`.
 
   - **Contract:** Accepts a generic memory pool (`partial_collection`) and an indirection table (`offset_list`) and reduces **all** referenced partials into a **single**, contiguous `Intermediate Sum` buffer of `partial_width` elements. It performs no other logic.
   - **Invocation:** Used for single-stage trees in Nodes (14), (15a), and (20a).
 
-- **`clip_stage_j`**: **[Utility Kernel]** A stateless, partial-group-wise clipping kernel.
+- **`clip_intermediate_grad`**: **[Utility Kernel]** A stateless, partial-group-wise clipping kernel.
   - **Contract:** Accepts a single, contiguous `Intermediate Sum` buffer (the output of `aggregate_stage_j`) and a scalar threshold `T_j`. It computes a single L2 norm for the entire buffer and applies a single scaling factor if the norm is exceeded.
   - **Invocation:** Used for single-stage gradient stabilization in Nodes (15b) and (20b), following an `aggregate_stage_j` dispatch.
 
 - **`reduce_k_fan_in_and_clip`**: **[Utility Kernel]** A stateless, fused K-fan-in reduction-and-clip kernel (ADR-019).
-
-  - **Note:** This kernel is the multi-stage counterpart to the `aggregate_stage_j` + `clip_stage_j` pipeline. It processes `ceil(N/K)` independent reduction nodes in a single dispatch, fusing summation and per-node clipping to avoid intermediate global memory traffic. Like the aggregate kernels, it exists in two **precision variants** (ADR-026): the storage-entry variant reads `STORAGE_TYPE` partials via `load_storage()`, while the compute-entry variant (`reduce_k_fan_in_and_clip_from_compute`) reads `COMPUTE_TYPE` intermediates directly.
+  - **Note:** This kernel is the multi-stage counterpart to the `aggregate_stage_j` + `clip_intermediate_grad` pipeline. It processes `ceil(N/K)` independent reduction nodes in a single dispatch, fusing summation and per-node clipping to avoid intermediate global memory traffic. Like the aggregate kernels, it exists in two **precision variants** (ADR-026): the storage-entry variant reads `STORAGE_TYPE` partials via `load_storage()`, while the compute-entry variant (`reduce_k_fan_in_and_clip_from_compute`) reads `COMPUTE_TYPE` intermediates directly.
 
   - **Contract:** Accepts a generic memory pool (`partial_collection`), a flat offset list with K consecutive entries per node, and a scalar clipping threshold `T_j`. For each node: sums K partials via the Indirection Contract, computes a per-node L2 norm, and conditionally scales the node's output independently. A negative threshold bypasses clipping (diagnostic mode); zero clips to zero norm. Absent partials in the tail node use a sentinel offset (`0xFFFFFFFF`).
   - **Invocation:** The storage-entry variant is used for leaf-stage (stage 0) reduction of storage-role collections. The compute-entry variant (`_from_compute`) is used for interior stages (stage ≥ 1) reading prior COMPUTE_TYPE outputs, and for leaf stages whose source is natively compute-role (e.g., BCE loss partials).
+
 - **`(16) stabilize_and_reduce_grad_hidden_activations`**: **[Specialized Kernel]** A self-contained reduction engine that preserves maximum signal fidelity while applying the system's stabilization policy to the `Grad_H` vector.
   - **Contract:** Internally executes a multi-stage `log_K(M)` reduction. At each internal stage, it performs a **`sum-then-clip`** operation on its inputs, applying the host-provided **Quadratic Scaling Policy**.
   - **Justification for Specialization:** This kernel works in synergy with the mandatory leaf-level clipping from Node (11) to provide a complete, two-stage stabilization strategy. A generic engine is unsuitable because:
@@ -641,7 +633,6 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
 ### **Validation Scenarios**
 
 - **Scenario: The Iris Case (Sequential Execution Mode Validation)**
-
   - **Description:** A classic supervised learning task using the Iris dataset, where a small training batch of pre-labeled flower measurements is processed.
   - **API Expression:**
     ```python
@@ -654,7 +645,6 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
   - **Key Insight:** Proves the **graceful degradation** of the parallel machinery. The Act/Learn split and batch-wide processing model are not costly abstractions on small problems but a foundational primitive that scales from `N=1` to `N=Infinity`.
 
 - **Scenario: The Real-Time Trader (Event-Triggered Execution Mode Validation)**
-
   - **Description:** A high-frequency trading system where the system must make instant predictions (`Act` phase) and the `Learn` phase is triggered later when trade outcomes (labels) arrive.
   - **API Expression:**
     ```python
@@ -669,35 +659,28 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
   - **Key Insight:** Demonstrates the architecture's strength in real-time, event-driven scenarios. The temporal split between Act and Learn is a first-class concept, not a special mode. The ticket holds only host-side state; its arbitrary lifetime in `ACT_COMPLETE` carries zero VRAM cost.
 
 - **Scenario: The Marathon (Massive `epochs`)**
-
   - **Insight:** Guarantees **long-term stability** by delegating the sensitive `beta**t` calculation to the host and passing the final values to the **`(24) adam_update`** kernel, avoiding on-device precision loss and ensuring the optimizer remains mathematically correct indefinitely.
 
 - **Scenario: The Hydra (Massive `num_heads`)**
-
   - **Insight:** Validates the intelligence of the **Reduction Planner**. For a massive number of heads, the host renders an efficient `log_K(N)` reduction tree, not just for diagnostics like loss, but for the core accumulation of **clipped** `Grad_ModW` partials from `Node (11)`, proving the engine is the heart of the learning algorithm itself.
 
 - **Scenario: The Behemoth (Massive `hidden_dim`)**
-
   - **Insight:** Proves **scalability through strategic memory trade-offs**. When the `hidden_i` buffer is a bottleneck, the host's policy to **Cache** or **Recompute** it remains a critical, orthogonal optimization that works in synergy with the batch accumulation model.
 
 - **Scenario: The Lexicon (Massive `output_classes`)**
-
   - **Insight:** Achieves **maximum hardware occupancy** by interleaving partial gradient computation with the subsequent reduction stages. For millions of classes, the Host Orchestrator plans a `log_K(N)` reduction tree for the class-dimension gradients, demonstrating that the engine scales efficiently over any problem dimension.
 
 - **Scenario: The Rodeo (Extreme Instability Resilience)**
-
   - **Description:** A training task using a combination of factors designed to induce extreme numerical instability: a noisy dataset, an aggressively high learning rate, and a low-precision format (FP16). This combination is known to produce exploding partial gradients that would immediately overflow standard FP16 arithmetic.
   - **Validation Focus:** Confirms that the training run completes without encountering `NaN` or `Inf` values in the loss or parameters. The training loss, while potentially high or volatile due to the chaotic inputs, must remain within a finite, observable range and demonstrate a general downward trend.
   - **Key Insight:** Proves the critical role of the **bifurcated clipping stage** as a non-optional, foundational stability primitive. By enforcing a maximum norm on every partial gradient—both the complex, tiled module gradients via **`(11) clip_partial_gradients`** and the streamed shared-layer gradients via **`(19) clip_shared_gradients_chunk`**—_before_ any reduction takes place, the architecture guarantees that intermediate values in the reduction tree and the final summed gradients cannot overflow the limited dynamic range of low-precision formats. This ensures the engine remains numerically robust not just by policy, but **by design**, even under the most adverse training conditions.
 
 - **Scenario: The Scientist's Repeater (Numerical Correctness Validation)**
-
   - **Description:** Two training runs are executed with identical hyperparameters and learning items, but with different training batch sizes (e.g., `N=16` then `N=32`).
   - **Validation Focus:** Confirms that the per-parameter weight updates are of a similar magnitude in both runs.
   - **Key Insight:** Proves the correctness of the **`(21) normalize_gradients`** kernel. By demonstrating that the learning dynamics are independent of batch size, it validates that the system is computing the true _average_ gradient, not the sum, which is critical for predictable hyperparameter tuning and algorithmic stability.
 
 - **Scenario: The Data Tsunami (Massive `batch_size`)**
-
   - **API Expression:**
     ```python
     ticket = engine.submit(X_massive)              # returns immediately; Act plan dispatched
@@ -730,19 +713,16 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
   - **Key Insight:** Proves the **behavioral equivalence** of structurally different rendering paths. OpenCL's per-tile imperative dispatch, Vulkan's single-dispatch command buffer recording, and CPU's synchronous pool dispatch converge to the same mathematical outcome. This is the definitive validation that the backend abstraction boundary (§5) and the execution plan model (§6) faithfully preserve the algorithm's semantics across all execution paradigms.
 
 - **Scenario: The Alchemist (Mixed-Precision Fidelity Validation)**
-
   - **Description:** The same training task is executed in two precision configurations: `PrecisionConfig.float32()` and `PrecisionConfig.mixed_f16_f32()`. Both use the same `PrecisionConfig` with three roles — there is no mode switch.
   - **Validation Focus:** Confirms that the mixed configuration produces loss curves and final parameters tracking the FP32 baseline within tolerance, while achieving memory footprint reduction (FP16 storage halves FP32's footprint). Validates that buffer allocation sizes reflect `storage_dtype`, that accumulation uses `compute_dtype`, that the stabilization policy's safety ceiling derives from `compute_fp_format_max`, and that optimizer state maintains `state_dtype` fidelity.
   - **Key Insight:** Proves the three-role decomposition achieves its stated goal: narrow-storage bandwidth without narrow-compute fidelity loss.
 
 - **Scenario: The Bandwidth Extremist (FP8 Storage Fidelity)**
-
   - **Description:** A training task is executed with `PrecisionConfig.fp8_e4m3()` and compared against `PrecisionConfig.mixed_f16_f32()` baseline. Both configurations use identical compute (FP32) and state (FP32) precision.
   - **Validation Focus:** Confirms that FP8 storage produces convergent training within tolerance of the FP16 baseline. Validates that storage-role buffer sizes are halved (8 bits vs. 16 bits), that quantization error does not prevent convergence, and that the host's scaling machinery maintains numerical correctness.
   - **Key Insight:** Proves the architectural claim that storage precision is independent of training fidelity. The 2× bandwidth reduction vs. FP16 (4× vs. FP32) is achieved without degrading the loss curve, because compute and state remain at FP32.
 
 - **Scenario: The Alchemist II (FP64 State Stability Validation)**
-
   - **Description:** A training task is executed for $10^5$ steps using three configurations: `PrecisionConfig.float32()` (FP32 state), `PrecisionConfig.mixed_f32_f64_state()` (FP64 state with FP32 compute), and a numpy reference implementation using FP64 throughout. All use identical hyperparameters ($\beta_1 = 0.999$, $\beta_2 = 0.9999$) and identical pre-generated gradient sequences of known precision.
   - **Validation Focus:** Confirms that the FP64-state configuration's moment vectors remain stable within $10^{-4}$ relative error over extended training, while FP32-state configurations show measurable precision degradation at scale. The EMA accumulation arithmetic operates in `ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE)` (FP64), preserving state precision; the tolerance bound reflects the FP32 precision of gradient contributions rather than the accumulation itself. Validates that state-precision accumulation correctly isolates moment fidelity from compute-path throughput.
   - **Key Insight:** Proves that the state role, combined with state-precision accumulation, achieves its stated goal: unbounded training stability through extended-precision moment vectors, while allowing narrower `COMPUTE_TYPE` for throughput in transformative operations. The configuration `mixed_f32_f64_state()` provides a distinct tradeoff from `mixed_f32_f64()`: the former preserves FP64 only where erosion compounds (moments), the latter uses FP64 throughout (higher fidelity, lower throughput).

@@ -42,8 +42,13 @@ void PREC_FN(task_backprop_shared_weights)(void* raw_args, uint task_index, uint
 
     const size_t chunk_base = (size_t)a->batch_chunk_index
         * a->padded_input_count * a->padded_hidden_count;
+    /* SIMD-major layout: [h_block][input][SIMD_WIDTH] matches
+     * forward_pass weight addressing so Adam updates the correct element. */
+    const uint hb   = j_idx / SIMD_WIDTH;
+    const uint lane  = j_idx % SIMD_WIDTH;
     const size_t out_idx = chunk_base
-        + (size_t)j_idx * a->padded_input_count + i_idx;
+        + (size_t)hb * a->padded_input_count * SIMD_WIDTH
+        + (size_t)i_idx * SIMD_WIDTH + lane;
     scalar_store_storage(a->partial_grad_weights_shared, out_idx, grad_sw);
 }
 

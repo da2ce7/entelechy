@@ -240,6 +240,10 @@ class TrainingOrchestrator:
             # Extract probabilities from Act phase
             if "inference_event" in act_futures:
                 final_probs = act_futures["inference_event"].result()
+                # Ensemble averaging: if the retrieval returns per-module
+                # probabilities (M, N, C), average across modules.
+                if final_probs.ndim == 3:
+                    final_probs = final_probs.mean(axis=0)
 
             # Learn phase: gradient computation + parameter update
             learn_plan = build_learn_plan(

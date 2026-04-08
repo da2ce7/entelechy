@@ -193,6 +193,14 @@ calculate_module_param_grads_contract = KernelContract(
             precision_role="storage",
         ),
         BufferParamSpec(
+            name="src_buffer_GLOBAL_CONST_temps", flow="src", memory_scope="GLOBAL_CONST",
+            tensor_shape=("total_modules_count",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("total_modules_count",),
+            validation_preconditions=("exact allocation size",),
+            precision_role="state",
+        ),
+        BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_grad_weights_module", flow="dest", memory_scope="GLOBAL",
             tensor_shape=("total_tile_count", "modules_per_chunk", "padded_hidden_count", "padded_total_output_class_count"),
             padding_contract=PaddingContract("NONE", None),

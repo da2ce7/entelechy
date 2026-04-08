@@ -17,6 +17,7 @@ __kernel void calculate_module_param_grads_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_probs,
     __global const void         *src_buffer_GLOBAL_targets,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_temps,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_weights_module,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_biases_module,
     uint                         src_scalar_FLAG_problem_type,
@@ -51,6 +52,7 @@ __kernel void calculate_module_param_grads_chunk(
     // --- 2. Decompose Flat Index to find Global Coordinates ---
     const uint module_chunk_idx  = src_scalar_NATURAL_flat_tile_index / src_scalar_NATURAL_num_class_chunks;
     const uint module_global_idx = module_chunk_idx * src_scalar_NATURAL_modules_per_chunk + module_local_idx;
+    const COMPUTE_TYPE inv_temp  = 1.0f / load_state(src_buffer_GLOBAL_CONST_temps, module_global_idx);
     const uint class_chunk_idx   = src_scalar_NATURAL_flat_tile_index % src_scalar_NATURAL_num_class_chunks;
     const uint class_global_idx  = class_chunk_idx * src_scalar_NATURAL_classes_per_chunk + class_local_idx;
 
@@ -80,6 +82,9 @@ __kernel void calculate_module_param_grads_chunk(
             const __global STORAGE_TYPE *targets_bce = (const __global STORAGE_TYPE *)src_buffer_GLOBAL_targets;
             d_loss_d_logit                           = prob - load_storage(targets_bce, (long)b * src_scalar_NATURAL_padded_total_output_class_count + class_global_idx);
         }
+
+        // Apply temperature chain rule: dL/dz = dL/dz_s * (1/tau)
+        d_loss_d_logit *= inv_temp;
 
         // --- Accumulate Weight and Bias Gradients ---
         const COMPUTE_TYPE h_val = load_storage(src_buffer_GLOBAL_hidden_activations, (long)b * src_scalar_NATURAL_padded_hidden_count + h_idx);
@@ -138,6 +143,7 @@ __kernel void backprop_error_to_hidden_chunk(
     __global const void         *src_buffer_GLOBAL_targets,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
     __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_weights_module,
+    __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_temps,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_hidden_activations_aos,
     uint                         src_scalar_FLAG_problem_type,
     uint                         src_scalar_NATURAL_flat_tile_index,
@@ -182,6 +188,7 @@ __kernel void backprop_error_to_hidden_chunk(
     // Each thread accumulates the gradient contributions from its assigned chunk of the class dimension.
     const uint   module_chunk_idx  = src_scalar_NATURAL_flat_tile_index / src_scalar_NATURAL_num_class_chunks;
     const uint   module_global_idx = module_chunk_idx * src_scalar_NATURAL_modules_per_chunk + module_local_idx;
+    const COMPUTE_TYPE inv_temp    = 1.0f / load_state(src_buffer_GLOBAL_CONST_temps, module_global_idx);
     COMPUTE_TYPE grad_h_accum      = COMPUTE_ZERO;
 
     // Decompose the flat index to find the correct chunk of classes and probabilities.
@@ -209,6 +216,9 @@ __kernel void backprop_error_to_hidden_chunk(
                 const __global STORAGE_TYPE *targets_bce = (const __global STORAGE_TYPE *)src_buffer_GLOBAL_targets;
                 d_loss_d_logit                           = prob - load_storage(targets_bce, (long)batch_idx * src_scalar_NATURAL_padded_total_output_class_count + c_global);
             }
+
+            // Apply temperature chain rule: dL/dz = dL/dz_s * (1/tau)
+            d_loss_d_logit *= inv_temp;
 
             // Read the corresponding weight and accumulate the gradient contribution.
             const long weight_idx = (long)module_global_idx * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_total_output_class_count

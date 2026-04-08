@@ -48,6 +48,9 @@ markers = [
     "opencl: Requires OpenCL backend",
     "vulkan: Requires Vulkan backend",
     "slow: Long-running test",
+    "convergence: All convergence tests (multi-epoch training)",
+    "convergence_fast: Fast convergence smoke tests (<30s each)",
+    "convergence_full: Full convergence tests (1-5 min each)",
 ]
 
 [tool.black]

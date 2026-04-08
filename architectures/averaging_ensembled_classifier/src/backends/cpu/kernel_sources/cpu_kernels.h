@@ -133,6 +133,7 @@ typedef struct {                                                               \
     const STORAGE_T* partial_probs;                                            \
     const void*      targets;                                                  \
     const STORAGE_T* sample_mask;                                              \
+    const STATE_T*   temps;                                                    \
     STORAGE_T*       partial_grad_weights_module;                              \
     STORAGE_T*       partial_grad_biases_module;                               \
     uint             problem_type;                                             \
@@ -157,6 +158,7 @@ typedef struct {                                                               \
     const void*      targets;                                                  \
     const STORAGE_T* sample_mask;                                              \
     const STATE_T*   weights_module;                                           \
+    const STATE_T*   temps;                                                    \
     STORAGE_T*       partial_grad_hidden_activations_aos;                      \
     uint             problem_type;                                             \
     uint             flat_tile_index;                                          \
@@ -196,7 +198,7 @@ typedef struct {                                                               \
     const STORAGE_T* partial_grad_biases_module;                               \
     const STORAGE_T* partial_grad_temps;                                       \
     const STORAGE_T* partial_grad_hidden_activations_aos;                      \
-    const STORAGE_T* clipping_threshold_per_item;                              \
+    const COMPUTE_T* clipping_threshold_per_item;                              \
     STORAGE_T*       clipped_partial_grad_weights_module;                      \
     STORAGE_T*       clipped_partial_grad_biases_module;                       \
     STORAGE_T*       clipped_partial_grad_temps;                               \

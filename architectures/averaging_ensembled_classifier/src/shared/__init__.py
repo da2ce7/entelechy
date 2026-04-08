@@ -42,6 +42,7 @@ from .precision_config import PrecisionConfig
 from .model_spec import ModelSpec
 from .parameter_space import ParameterSpace
 from .stabilization_policy import StabilizationPolicy
+from .optimizer_config import OptimizerConfig
 from .problem_type_strategy import PlanProblemTypeStrategy, PlanCceStrategy, PlanBceStrategy
 
 # Plan builder
@@ -86,6 +87,7 @@ __all__ = [
     "ModelSpec",
     "ParameterSpace",
     "StabilizationPolicy",
+    "OptimizerConfig",
     "PlanProblemTypeStrategy",
     "PlanCceStrategy",
     "PlanBceStrategy",

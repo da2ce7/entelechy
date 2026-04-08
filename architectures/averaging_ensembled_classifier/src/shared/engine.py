@@ -18,6 +18,7 @@ from numpy.typing import NDArray
 
 from .hardware_profile import HardwareProfile
 from .model_spec import ModelSpec
+from .optimizer_config import OptimizerConfig
 from .plan_builder import build_act_plan, build_learn_plan
 from .plan_renderer import PlanRenderer
 from .precision_config import PrecisionConfig
@@ -137,6 +138,7 @@ class Engine:
         backend: str = "auto",
         strategy: PlanProblemTypeStrategy | None = None,
         policy: StabilizationPolicy | None = None,
+        optimizer: OptimizerConfig | None = None,
         renderer_factory: Callable[[str, HardwareProfile, PrecisionConfig], PlanRenderer] | None = None,
     ) -> None:
         """Initialize the Engine.
@@ -149,6 +151,8 @@ class Engine:
             backend: Backend selector ("auto", "cpu", "opencl", "vulkan").
             strategy: Problem type strategy (default: PlanCceStrategy).
             policy: Stabilization policy for gradient clipping (default: auto-configured).
+            optimizer: Optimizer hyperparameters (default: Adam with lr=0.001,
+                β₁=0.9, β₂=0.999, precision-aware ε). See OptimizerConfig.
             renderer_factory: Optional callable to construct a PlanRenderer from
                 (backend, hardware, precision). If None, uses default factory.
                 This parameter preserves shared-layer purity by deferring
@@ -169,6 +173,12 @@ class Engine:
             )
         else:
             self._policy = policy
+
+        # Configure optimizer (ADR-029)
+        self._optimizer = optimizer if optimizer is not None else OptimizerConfig()
+
+        # Adam step counter (incremented each learn dispatch)
+        self._adam_step: int = 0
 
         # Create renderer via factory
         factory = renderer_factory if renderer_factory is not None else _default_renderer_factory
@@ -225,8 +235,8 @@ class Engine:
         """Build and render an Act-only plan, returning the inference future.
 
         This method constructs the Act plan (forward pass + inference retrieval)
-        and dispatches it via the renderer. The renderer populates device buffers
-        with the input data and model parameters.
+        and dispatches it via the renderer. Input data is injected into the
+        plan's ``input_data`` buffer via ``data_injections``.
 
         Args:
             x_data: Input data matrix, shape (N, D_in).
@@ -242,8 +252,14 @@ class Engine:
             batch_size,
         )
 
-        # Render the plan; the renderer handles buffer injection
-        futures = self._renderer.render(plan)
+        # Inject input data and sample mask into plan buffers
+        sample_mask = np.ones(batch_size, dtype=np.float32)
+        injections = {
+            "input_data": x_data,
+            "sample_mask": sample_mask,
+        }
+
+        futures = self._renderer.render(plan, data_injections=injections)
 
         # The Act plan's terminal node has event_name="inference_event"
         return futures["inference_event"]
@@ -256,8 +272,8 @@ class Engine:
         """Build and render a Learn-only plan, returning the final batch future.
 
         Under Choice 4A (recompute), the Learn plan recomputes the forward pass.
-        The input data (x_data) and ground truth (y_data) are passed to the
-        renderer for buffer injection.
+        Input data and ground truth labels are injected into the plan's buffers
+        via ``data_injections``.
 
         Args:
             x_data: Input data matrix, shape (N, D_in).
@@ -267,6 +283,7 @@ class Engine:
             RetrievalFuture for the final_batch_retrieval node.
         """
         batch_size = x_data.shape[0]
+        self._adam_step += 1
         plan = build_learn_plan(
             self._model_spec,
             self._hardware_profile,
@@ -274,10 +291,19 @@ class Engine:
             batch_size,
             self._policy,
             activation_lifecycle="recompute",
+            optimizer=self._optimizer,
+            adam_step=self._adam_step,
         )
 
-        # Render the plan; the renderer handles buffer injection
-        futures = self._renderer.render(plan)
+        # Inject input data, targets, and sample mask into plan buffers
+        sample_mask = np.ones(batch_size, dtype=np.float32)
+        injections: dict[str, NDArray] = {
+            "input_data": x_data,
+            "sample_mask": sample_mask,
+            self._strategy.required_targets_buffer_name: y_data,
+        }
+
+        futures = self._renderer.render(plan, data_injections=injections)
 
         # The Learn plan's terminal node has event_name="final_batch_event"
         return futures["final_batch_event"]

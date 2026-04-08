@@ -43,6 +43,7 @@ class CalculateModuleParamGradsChunkBinding(KernelBinding):
             get_buffer(buffer_bindings["partial_probs"]),
             get_buffer(buffer_bindings["targets"]),
             get_buffer(buffer_bindings["sample_mask"]),
+            get_buffer(buffer_bindings["temps"]),
             get_buffer(buffer_bindings["partial_grad_weights_module"]),
             get_buffer(buffer_bindings["partial_grad_biases_module"]),
             np.uint32(scalar_params["problem_type"]),
@@ -91,6 +92,7 @@ class CalculateModuleParamGradsCceBinding(KernelBinding):
             get_buffer(buffer_bindings["partial_probs"]),
             get_buffer(buffer_bindings["targets"]),
             get_buffer(buffer_bindings["sample_mask"]),
+            get_buffer(buffer_bindings["temps"]),
             get_buffer(buffer_bindings["partial_grad_weights_module"]),
             get_buffer(buffer_bindings["partial_grad_biases_module"]),
             np.uint32(0),  # PROBLEM_TYPE_CCE
@@ -139,6 +141,7 @@ class CalculateModuleParamGradsBceBinding(KernelBinding):
             get_buffer(buffer_bindings["partial_probs"]),
             get_buffer(buffer_bindings["targets"]),
             get_buffer(buffer_bindings["sample_mask"]),
+            get_buffer(buffer_bindings["temps"]),
             get_buffer(buffer_bindings["partial_grad_weights_module"]),
             get_buffer(buffer_bindings["partial_grad_biases_module"]),
             np.uint32(1),  # PROBLEM_TYPE_BCE
@@ -178,6 +181,7 @@ class BackpropErrorToHiddenBinding(KernelBinding):
             get_buffer(buffer_bindings["targets"]),
             get_buffer(buffer_bindings["sample_mask"]),
             get_buffer(buffer_bindings["weights_module"]),
+            get_buffer(buffer_bindings["temps"]),
             get_buffer(buffer_bindings["partial_grad_hidden_activations_aos"]),
             np.uint32(scalar_params["problem_type"]),
             np.uint32(tile_index),

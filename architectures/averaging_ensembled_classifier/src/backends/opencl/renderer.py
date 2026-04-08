@@ -6,9 +6,11 @@ import math
 from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
 import pyopencl as cl
 
 from ...shared.hardware_profile import HardwareProfile
+from ...shared.buffer_lifecycle import BufferRole
 from ...shared.plan_types import (
     BarrierNode,
     ExecutionPlan,
@@ -95,7 +97,67 @@ class OpenCLPlanRenderer:
             self._kernel_cache[name] = cl.Kernel(self._program, name)
         return self._kernel_cache[name]
 
-    def render(self, plan: ExecutionPlan) -> dict[str, RetrievalFuture]:
+    # ---------------------------------------------------------------
+    # MODEL_STATE initialization (must match CPU renderer for parity)
+    # ---------------------------------------------------------------
+    _WEIGHT_SUBSTRINGS = ("weight",)
+    _UNIT_INIT_SUBSTRINGS = ("temperature",)
+
+    @staticmethod
+    def _buffer_rng(logical_name: str, padded_shape: tuple[int, ...]) -> np.random.Generator:
+        """Deterministic per-buffer RNG seeded by buffer identity."""
+        import hashlib
+        h = hashlib.sha256(f"{logical_name}{padded_shape}".encode()).hexdigest()
+        return np.random.default_rng(int(h[:16], 16))
+
+    def _init_model_state_buffers(self, plan: ExecutionPlan) -> None:
+        """Upload Xavier/unit-initialized values for MODEL_STATE buffers."""
+        role_dtypes = {
+            "storage": plan.precision.storage_dtype,
+            "compute": plan.precision.compute_dtype,
+            "state": plan.precision.state_dtype,
+        }
+        for descriptor in plan.buffers.values():
+            if descriptor.role != BufferRole.MODEL_STATE:
+                continue
+            name = descriptor.logical_name
+            total = int(np.prod(descriptor.padded_shape))
+            dtype = role_dtypes[descriptor.precision_role]
+            if any(s in name for s in self._WEIGHT_SUBSTRINGS):
+                shape_for_fan = (
+                    descriptor.logical_shape
+                    if descriptor.logical_shape and len(descriptor.logical_shape) >= 2
+                    else descriptor.padded_shape
+                )
+                if len(shape_for_fan) >= 2:
+                    fan_in_plus_out = shape_for_fan[-2] + shape_for_fan[-1]
+                else:
+                    fan_in_plus_out = max(
+                        shape_for_fan[0] if shape_for_fan else total, 2,
+                    )
+                limit = float(np.sqrt(6.0 / fan_in_plus_out))
+                rng = self._buffer_rng(name, descriptor.padded_shape)
+                host = rng.uniform(
+                    -limit, limit, size=total,
+                ).astype(dtype)
+                cl.enqueue_copy(
+                    self._queue,
+                    self._allocator.get_buffer(descriptor.handle),
+                    host,
+                )
+            elif any(s in name for s in self._UNIT_INIT_SUBSTRINGS):
+                host = np.ones(total, dtype=dtype)
+                cl.enqueue_copy(
+                    self._queue,
+                    self._allocator.get_buffer(descriptor.handle),
+                    host,
+                )
+
+    def render(
+        self,
+        plan: ExecutionPlan,
+        data_injections: dict[str, NDArray] | None = None,
+    ) -> dict[str, RetrievalFuture]:
         """Render an execution plan using PyOpenCL's imperative dispatch model."""
         # Store plan reference for streaming loop body lookup
         self._plan = plan
@@ -104,6 +166,28 @@ class OpenCLPlanRenderer:
         self._queue.finish()
         self._allocator.release_all()
         self._allocator.allocate_plan_buffers(plan.buffers)
+
+        # 1b. Initialize MODEL_STATE buffers (Xavier for weights, unit for temps)
+        self._init_model_state_buffers(plan)
+
+        # 1c. Host-to-device data injection
+        if data_injections:
+            name_to_desc = {
+                desc.logical_name: desc
+                for desc in plan.buffers.values()
+            }
+            for logical_name, host_data in data_injections.items():
+                desc = name_to_desc.get(logical_name)
+                if desc is None:
+                    continue
+                buf = self._allocator.get_buffer(desc.handle)
+                padded = np.zeros(
+                    int(np.prod(desc.padded_shape)),
+                    dtype=host_data.dtype,
+                )
+                flat = host_data.ravel()
+                padded[: len(flat)] = flat
+                cl.enqueue_copy(self._queue, buf, padded)
 
         # 2. Traverse topological order, dispatching each node
         event_map: dict[str, cl.Event] = {}

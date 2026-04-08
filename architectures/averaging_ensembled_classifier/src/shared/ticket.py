@@ -157,11 +157,18 @@ class WorkTicket:
         prediction = self._act_future.result()
         self._act_future.release()
 
+        # Ensemble averaging: if the retrieval returns per-module
+        # probabilities (M, N, C), average across the module axis
+        # to produce the ensemble prediction (N, C).
+        if prediction.ndim == 3:
+            prediction = prediction.mean(axis=0)
+
         # Cache the prediction and transition state
         self._cached_prediction = prediction
         if self._state == TicketState.PENDING:
             self._state = TicketState.ACT_COMPLETE
 
+        assert self._cached_prediction is not None
         return self._cached_prediction
 
     def resolve(self, y_data: NDArray[np.integer]) -> LearnHandle:

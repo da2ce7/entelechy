@@ -80,10 +80,10 @@ def ref_temp_gradients_cce(
     Returns: scalar gradient w.r.t. temperature
     """
     delta = probs - targets  # (batch, classes)
-    # dL/dT = -1/T * sum(delta * z_unscaled) for CCE
+    # dL/dT = -1/T^2 * sum(delta * z_unscaled) for CCE
     per_sample = np.sum(delta * logits_unscaled, axis=-1)
     masked = per_sample * sample_mask
-    return float(-np.sum(masked) / temperature)
+    return float(-np.sum(masked) / (temperature * temperature))
 
 
 def ref_temp_gradients_bce(
@@ -100,7 +100,7 @@ def ref_temp_gradients_bce(
     delta = probs - targets
     per_sample = np.sum(delta * logits_unscaled, axis=-1)
     masked = per_sample * sample_mask
-    return float(-np.sum(masked) / temperature)
+    return float(-np.sum(masked) / (temperature * temperature))
 
 
 def ref_gather_and_permute_grad_h(

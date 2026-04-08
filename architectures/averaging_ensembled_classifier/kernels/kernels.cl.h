@@ -53,14 +53,26 @@
 #ifndef STORAGE_TYPE_IS_HALF
 #error "System Contract Violation: STORAGE_TYPE_IS_HALF must be defined by the host build system."
 #endif
+#ifndef STORAGE_TYPE_IS_FLOAT
+#error "System Contract Violation: STORAGE_TYPE_IS_FLOAT must be defined by the host build system."
+#endif
+#ifndef STORAGE_TYPE_IS_DOUBLE
+#error "System Contract Violation: STORAGE_TYPE_IS_DOUBLE must be defined by the host build system."
+#endif
 #ifndef COMPUTE_TYPE_IS_HALF
 #error "System Contract Violation: COMPUTE_TYPE_IS_HALF must be defined by the host build system."
+#endif
+#ifndef COMPUTE_TYPE_IS_FLOAT
+#error "System Contract Violation: COMPUTE_TYPE_IS_FLOAT must be defined by the host build system."
 #endif
 #ifndef COMPUTE_TYPE_IS_DOUBLE
 #error "System Contract Violation: COMPUTE_TYPE_IS_DOUBLE must be defined by the host build system."
 #endif
 #ifndef STATE_TYPE_IS_HALF
 #error "System Contract Violation: STATE_TYPE_IS_HALF must be defined by the host build system."
+#endif
+#ifndef STATE_TYPE_IS_FLOAT
+#error "System Contract Violation: STATE_TYPE_IS_FLOAT must be defined by the host build system."
 #endif
 #ifndef STATE_TYPE_IS_DOUBLE
 #error "System Contract Violation: STATE_TYPE_IS_DOUBLE must be defined by the host build system."
@@ -115,7 +127,10 @@
 #define COMPUTE_ONE  ((COMPUTE_TYPE)1.0f)
 #endif
 
-// Define standard kernel attributes for OpenCL environment
+// KERNEL_ATTR provides a work-group size hint for backends that choose to
+// apply it. This header specifies interfaces only; actual application of
+// the attribute is a backend rendering-tier concern (OpenCL may apply it,
+// Vulkan uses specialization constants, CPU backend has no work-groups).
 #define KERNEL_ATTR __attribute__((work_group_size_hint(SIMD_WIDTH, 1, 1)))
 
 // --- Mandatory Architectural Constants (Article 5) ---
@@ -157,15 +172,32 @@
 #error "System Contract Violation: E4M3/E5M2 flags require STORAGE_TYPE_IS_FP8=1."
 #endif
 
-// --- Precision Role Mutual Exclusivity (CONTRACT.md Article 6) ---
-#if STORAGE_TYPE_IS_HALF && STORAGE_TYPE_IS_DOUBLE
-#error "System Contract Violation: STORAGE_TYPE _IS_HALF and _IS_DOUBLE are mutually exclusive."
+// --- Precision Role Exactly-One Selection (CONTRACT.md Article 6) ---
+// Each precision role must have exactly one type flag set.
+#if (STORAGE_TYPE_IS_FP8 + STORAGE_TYPE_IS_HALF + STORAGE_TYPE_IS_FLOAT + STORAGE_TYPE_IS_DOUBLE) != 1
+#error "System Contract Violation: Exactly one STORAGE_TYPE_IS_* flag must be set."
 #endif
-#if COMPUTE_TYPE_IS_HALF && COMPUTE_TYPE_IS_DOUBLE
-#error "System Contract Violation: COMPUTE_TYPE _IS_HALF and _IS_DOUBLE are mutually exclusive."
+#if (COMPUTE_TYPE_IS_HALF + COMPUTE_TYPE_IS_FLOAT + COMPUTE_TYPE_IS_DOUBLE) != 1
+#error "System Contract Violation: Exactly one COMPUTE_TYPE_IS_* flag must be set."
 #endif
-#if STATE_TYPE_IS_HALF && STATE_TYPE_IS_DOUBLE
-#error "System Contract Violation: STATE_TYPE _IS_HALF and _IS_DOUBLE are mutually exclusive."
+#if (STATE_TYPE_IS_HALF + STATE_TYPE_IS_FLOAT + STATE_TYPE_IS_DOUBLE) != 1
+#error "System Contract Violation: Exactly one STATE_TYPE_IS_* flag must be set."
+#endif
+
+// --- PrecisionConfig Invariant: storage.itemsize <= compute.itemsize ---
+#if STORAGE_TYPE_IS_DOUBLE && !COMPUTE_TYPE_IS_DOUBLE
+#error "System Contract Violation: storage=double requires compute=double (storage <= compute)"
+#endif
+#if STORAGE_TYPE_IS_FLOAT && COMPUTE_TYPE_IS_HALF
+#error "System Contract Violation: storage=float requires compute >= float (storage <= compute)"
+#endif
+
+// --- PrecisionConfig Invariant: storage.itemsize <= state.itemsize ---
+#if STORAGE_TYPE_IS_DOUBLE && !STATE_TYPE_IS_DOUBLE
+#error "System Contract Violation: storage=double requires state=double (storage <= state)"
+#endif
+#if STORAGE_TYPE_IS_FLOAT && STATE_TYPE_IS_HALF
+#error "System Contract Violation: storage=float requires state >= float (storage <= state)"
 #endif
 
 // --- FP8 Conversion Tables (ADR-025 §6.1) ---
@@ -527,14 +559,26 @@ static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
 #ifndef STORAGE_TYPE_IS_HALF
 #define STORAGE_TYPE_IS_HALF 0
 #endif
+#ifndef STORAGE_TYPE_IS_FLOAT
+#define STORAGE_TYPE_IS_FLOAT 1
+#endif
+#ifndef STORAGE_TYPE_IS_DOUBLE
+#define STORAGE_TYPE_IS_DOUBLE 0
+#endif
 #ifndef COMPUTE_TYPE_IS_HALF
 #define COMPUTE_TYPE_IS_HALF 0
+#endif
+#ifndef COMPUTE_TYPE_IS_FLOAT
+#define COMPUTE_TYPE_IS_FLOAT 1
 #endif
 #ifndef COMPUTE_TYPE_IS_DOUBLE
 #define COMPUTE_TYPE_IS_DOUBLE 0
 #endif
 #ifndef STATE_TYPE_IS_HALF
 #define STATE_TYPE_IS_HALF 0
+#endif
+#ifndef STATE_TYPE_IS_FLOAT
+#define STATE_TYPE_IS_FLOAT 1
 #endif
 #ifndef STATE_TYPE_IS_DOUBLE
 #define STATE_TYPE_IS_DOUBLE 0
@@ -1050,6 +1094,17 @@ __kernel void calculate_module_param_grads_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
 
     /**
+     * @param src_buffer_GLOBAL_CONST_temps The learnable temperature parameters for logit scaling.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "state"
+     *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count]
+     *        - Validation Preconditions: [1] The tile access must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] Host shall allocate exactly
+     * [src_scalar_NATURAL_total_modules_count * sizeof(STATE_TYPE)] bytes.
+     */
+    __global const STATE_TYPE *src_buffer_GLOBAL_CONST_temps,
+
+    /**
      * @param dest_buffer_GLOBAL_partial_grad_weights_module The collection buffer for this tile's computed weight gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {Type: NONE}
@@ -1144,6 +1199,17 @@ __kernel void backprop_error_to_hidden_chunk(
      * exactly [src_scalar_NATURAL_total_modules_count * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_total_output_class_count * sizeof(STATE_TYPE)] bytes.
      */
     __global const STATE_TYPE *src_buffer_GLOBAL_CONST_weights_module,
+
+    /**
+     * @param src_buffer_GLOBAL_CONST_temps The learnable temperature parameters for logit scaling.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "state"
+     *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count]
+     *        - Validation Preconditions: [1] The tile access must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] Host shall allocate exactly
+     * [src_scalar_NATURAL_total_modules_count * sizeof(STATE_TYPE)] bytes.
+     */
+    __global const STATE_TYPE *src_buffer_GLOBAL_CONST_temps,
 
     /**
      * @param dest_buffer_GLOBAL_partial_grad_hidden_activations_aos The collection buffer for this tile's computed upstream gradients.
@@ -1337,12 +1403,12 @@ __kernel void clip_partial_gradients(
      * @param src_buffer_GLOBAL_CONST_clipping_threshold_per_item [CONDITIONAL] A buffer containing a distinct clipping threshold for each item.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "storage"
+     *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count]
      *        - Validation Preconditions: [1] This buffer is read from ONLY IF `src_scalar_FLAG_use_per_item_norm` == 1. [2] If the flag is set, the Host MUST provide a valid buffer of size
-     * [src_scalar_NATURAL_total_tile_count * sizeof(STORAGE_TYPE)]. [3] If the flag is not set, the Host MAY pass a NULL pointer for this argument.
+     * [src_scalar_NATURAL_total_tile_count * sizeof(COMPUTE_TYPE)]. [3] If the flag is not set, the Host MAY pass a NULL pointer for this argument.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_CONST_clipping_threshold_per_item,
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_CONST_clipping_threshold_per_item,
 
     /**
      * @param dest_buffer_GLOBAL_clipped_partial_grad_weights_module Output for clipped weight gradients.
@@ -1468,7 +1534,8 @@ __kernel void gather_and_permute_grad_hidden_activations(
  * @brief (Node 14, 15a & 20a) Tier 1 (N is small): Reduces scattered partial results using registers and an indirection list.
  * @kernel_contract
  *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a collection buffer, located via an explicit offset list. This avoids host-side staging
- * copies."
+ * copies. When used as a stage in a multi-stage reduction tree, operation_type MUST be AGG_MODE_SUM; AGG_MODE_AVERAGE is valid only as a single-stage terminal reduction, as partial-count
+ * division at interior stages produces silently incorrect results."
  *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag. Precision Boundary Conversion: storage-role inputs widened via load_storage(); reduction accumulation in COMPUTE_TYPE; compute-role output written directly in COMPUTE_TYPE."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Reduction Engine Stage"
@@ -1512,7 +1579,8 @@ __kernel void aggregate_register_reduce(
  * @brief (Node 14, 15a & 20a) Tier 2 (N is large): Reduces scattered partial results using local memory and an indirection list.
  * @kernel_contract
  *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a collection buffer, located via an explicit offset list. This avoids host-side staging
- * copies."
+ * copies. When used as a stage in a multi-stage reduction tree, operation_type MUST be AGG_MODE_SUM; AGG_MODE_AVERAGE is valid only as a single-stage terminal reduction, as partial-count
+ * division at interior stages produces silently incorrect results."
  *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag. Precision Boundary Conversion: storage-role inputs widened via load_storage(); reduction accumulation in COMPUTE_TYPE; compute-role output written directly in COMPUTE_TYPE."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Reduction Engine Stage / Work-group Parallel"
@@ -1568,7 +1636,9 @@ __kernel void aggregate_local_reduce(
  * @brief (Node 14, 15a & 20a) Compute-entry variant of aggregate_register_reduce.
  *        Identical algorithm reading COMPUTE_TYPE intermediates directly.
  * @kernel_contract
- *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a COMPUTE_TYPE collection buffer, located via an explicit offset list."
+ *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a COMPUTE_TYPE collection buffer, located via an explicit offset list.
+ * When used as a stage in a multi-stage reduction tree, operation_type MUST be AGG_MODE_SUM; AGG_MODE_AVERAGE is valid only as a single-stage terminal reduction, as partial-count division
+ * at interior stages produces silently incorrect results."
  *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag. All buffers are compute-role; no precision boundary conversion is required. All arithmetic exclusively in COMPUTE_TYPE."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Reduction Engine Stage"
@@ -1612,7 +1682,9 @@ __kernel void aggregate_register_reduce_from_compute(
  * @brief (Node 14, 15a & 20a) Compute-entry variant of aggregate_local_reduce.
  *        Identical algorithm reading COMPUTE_TYPE intermediates directly.
  * @kernel_contract
- *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a COMPUTE_TYPE collection buffer, located via an explicit offset list."
+ *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a COMPUTE_TYPE collection buffer, located via an explicit offset list.
+ * When used as a stage in a multi-stage reduction tree, operation_type MUST be AGG_MODE_SUM; AGG_MODE_AVERAGE is valid only as a single-stage terminal reduction, as partial-count division
+ * at interior stages produces silently incorrect results."
  *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag. All buffers are compute-role; no precision boundary conversion is required. All arithmetic exclusively in COMPUTE_TYPE."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Reduction Engine Stage / Work-group Parallel"

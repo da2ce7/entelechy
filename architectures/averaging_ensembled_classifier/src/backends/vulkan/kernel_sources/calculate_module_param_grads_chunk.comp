@@ -31,6 +31,7 @@ layout(set = 0, binding = 3) readonly buffer TargetsBCE  { STORAGE_TYPE data[]; 
 layout(set = 0, binding = 4) readonly buffer MaskBuf     { STORAGE_TYPE data[]; } src_sample_mask;
 layout(set = 0, binding = 5) writeonly buffer GradWBuf   { STORAGE_TYPE data[]; } dest_grad_w;
 layout(set = 0, binding = 6) writeonly buffer GradBBuf   { STORAGE_TYPE data[]; } dest_grad_b;
+layout(set = 0, binding = 7) readonly buffer TempsBuf    { STATE_TYPE   data[]; } src_temps;
 
 void main() {
     uint tile_idx = gl_WorkGroupID.x;
@@ -70,6 +71,7 @@ void main() {
     if (class_local_idx >= push.classes_per_chunk) return;
 
     uint module_global_idx = module_chunk_idx * push.modules_per_chunk + module_local_idx;
+    COMPUTE_TYPE inv_temp  = COMPUTE_TYPE(1.0) / read_state(src_temps.data[module_global_idx]);
     uint class_global_idx  = class_chunk_idx * push.classes_per_chunk + class_local_idx;
 
     // Partial probability base for this tile
@@ -95,6 +97,9 @@ void main() {
             COMPUTE_TYPE target = read_storage(src_targets_bce.data[b * push.padded_total_output_class_count + class_global_idx]);
             d_loss_d_logit = prob - target;
         }
+
+        // Apply temperature chain rule: dL/dz = dL/dz_s * (1/tau)
+        d_loss_d_logit *= inv_temp;
 
         COMPUTE_TYPE h_val = read_storage(src_hidden.data[b * push.padded_hidden_count + h_idx]);
         p_grad_w += d_loss_d_logit * h_val;

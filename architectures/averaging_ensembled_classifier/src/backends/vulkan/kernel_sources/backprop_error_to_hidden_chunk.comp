@@ -31,6 +31,7 @@ layout(set = 0, binding = 2) readonly buffer TargetsBCE { STORAGE_TYPE data[]; }
 layout(set = 0, binding = 3) readonly buffer MaskBuf    { STORAGE_TYPE data[]; } src_sample_mask;
 layout(set = 0, binding = 4) readonly buffer WeightsBuf { STATE_TYPE   data[]; } src_weights;
 layout(set = 0, binding = 5) writeonly buffer GradHBuf  { STORAGE_TYPE data[]; } dest_grad_h;
+layout(set = 0, binding = 6) readonly buffer TempsBuf   { STATE_TYPE   data[]; } src_temps;
 
 void main() {
     // Flat invocation index decomposed into (module_local, batch, hidden)
@@ -64,6 +65,7 @@ void main() {
     // Decompose tile
     uint module_chunk_idx  = tile_idx / push.num_class_chunks;
     uint module_global_idx = module_chunk_idx * push.modules_per_chunk + module_local_idx;
+    COMPUTE_TYPE inv_temp  = COMPUTE_TYPE(1.0) / read_state(src_temps.data[module_global_idx]);
     uint class_chunk_idx   = tile_idx % push.num_class_chunks;
     uint class_offset      = class_chunk_idx * push.classes_per_chunk;
 
@@ -87,6 +89,9 @@ void main() {
                 COMPUTE_TYPE target = read_storage(src_targets_bce.data[batch_idx * push.padded_total_output_class_count + c_global]);
                 d_loss_d_logit = prob - target;
             }
+
+            // Apply temperature chain rule: dL/dz = dL/dz_s * (1/tau)
+            d_loss_d_logit *= inv_temp;
 
             uint w_idx = module_global_idx * push.padded_hidden_count * push.padded_total_output_class_count
                        + h_idx * push.padded_total_output_class_count + c_global;

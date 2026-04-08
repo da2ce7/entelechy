@@ -42,6 +42,7 @@ void PREC_FN(task_backprop_to_hidden)(void* raw_args, uint task_index, uint thre
 
     const uint module_chunk_idx  = a->flat_tile_index / a->num_class_chunks;
     const uint module_global_idx = module_chunk_idx * a->modules_per_chunk + module_local_idx;
+    const COMPUTE_T inv_temp     = (COMPUTE_T)1.0 / (COMPUTE_T)scalar_load_state(a->temps, module_global_idx);
     const uint class_chunk_idx   = a->flat_tile_index % a->num_class_chunks;
     const uint class_offset      = class_chunk_idx * a->classes_per_chunk;
 
@@ -68,6 +69,9 @@ void PREC_FN(task_backprop_to_hidden)(void* raw_args, uint task_index, uint thre
             d_loss_d_logit = prob - (COMPUTE_T)scalar_load_storage(targets_bce,
                 (size_t)batch_idx * a->padded_total_output_class_count + c_global);
         }
+
+        /* Apply temperature chain rule: dL/dz = dL/dz_s * (1/tau) */
+        d_loss_d_logit *= inv_temp;
 
         const size_t w_idx = (size_t)module_global_idx * a->padded_hidden_count
             * a->padded_total_output_class_count
@@ -182,7 +186,7 @@ void PREC_FN(task_clip_partial_grads)(void* raw_args, uint task_index, uint thre
 
     COMPUTE_T threshold;
     if (a->use_per_item_norm == 1) {
-        threshold = scalar_load_storage(a->clipping_threshold_per_item, a->flat_tile_index);
+        threshold = (COMPUTE_T)a->clipping_threshold_per_item[a->flat_tile_index];
     } else {
         threshold = (COMPUTE_T)a->clipping_threshold_t_pre;
     }

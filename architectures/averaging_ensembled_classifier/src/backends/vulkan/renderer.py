@@ -12,6 +12,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from numpy.typing import NDArray
 
 from ...shared.buffer_lifecycle import BufferHandle, BufferRole
 from ...shared.plan_types import (
@@ -89,27 +90,32 @@ class VulkanPlanRenderer:
         self._pipeline_cache = VulkanPipelineCache(context)
         self._descriptor_mgr = VulkanDescriptorManager(context)
 
+
         # Per-render state (set during render())
         self._pipelines: dict[str, ComputePipeline] = {}
         self._descriptor_sets: dict[str, Any] = {}
         self._descriptor_layouts: dict[str, Any] = {}
 
     def render(
-        self, plan: ExecutionPlan
+        self,
+        plan: ExecutionPlan,
+        data_injections: dict[str, NDArray] | None = None,
     ) -> dict[str, RetrievalFuture]:
         """Record and submit the plan, returning futures for retrieval nodes."""
-        # 1. Allocate device-local buffers
-        for descriptor in plan.buffers.values():
-            self._allocator.allocate(descriptor)
-
-        # 2. Upload input data (BATCH_INPUT buffers with initial data)
+        # 1. Allocate device-local buffers and zero-fill them
         upload_cmd = self._ctx.allocate_command_buffer()
         upload_fence = self._ctx.create_fence()
         for descriptor in plan.buffers.values():
-            if descriptor.role == BufferRole.BATCH_INPUT:
-                # Input data is uploaded by the caller before render;
-                # the plan model does not carry raw data arrays.
-                pass
+            self._allocator.allocate(descriptor)
+            self._allocator.zero_fill(
+                descriptor.handle, upload_cmd,
+                self._ctx.compute_queue, upload_fence,
+            )
+
+        # 2. Initialize MODEL_STATE buffers (Xavier/unit) and upload
+        self._init_model_state_buffers(
+            plan, upload_cmd, self._ctx.compute_queue, upload_fence,
+        )
 
         # 3. Build specialization constants
         spec = SpecConstants(
@@ -187,6 +193,62 @@ class VulkanPlanRenderer:
         self._descriptor_layouts.clear()
         if self._owns_context:
             self._ctx.destroy()
+
+    # ── MODEL_STATE initialization (must match CPU renderer for parity) ──
+
+    _WEIGHT_SUBSTRINGS = ("weight",)
+    _UNIT_INIT_SUBSTRINGS = ("temperature",)
+
+    @staticmethod
+    def _buffer_rng(logical_name: str, padded_shape: tuple[int, ...]) -> np.random.Generator:
+        """Deterministic per-buffer RNG seeded by buffer identity."""
+        import hashlib
+        h = hashlib.sha256(f"{logical_name}{padded_shape}".encode()).hexdigest()
+        return np.random.default_rng(int(h[:16], 16))
+
+    def _init_model_state_buffers(
+        self,
+        plan: ExecutionPlan,
+        cmd: Any,
+        queue: Any,
+        fence: Any,
+    ) -> None:
+        """Upload Xavier/unit-initialized values for MODEL_STATE buffers."""
+        role_dtypes = {
+            "storage": plan.precision.storage_dtype,
+            "compute": plan.precision.compute_dtype,
+            "state": plan.precision.state_dtype,
+        }
+        for descriptor in plan.buffers.values():
+            if descriptor.role != BufferRole.MODEL_STATE:
+                continue
+            name = descriptor.logical_name
+            total = int(np.prod(descriptor.padded_shape))
+            dtype = role_dtypes[descriptor.precision_role]
+            host: np.ndarray | None = None
+            if any(s in name for s in self._WEIGHT_SUBSTRINGS):
+                shape_for_fan = (
+                    descriptor.logical_shape
+                    if descriptor.logical_shape and len(descriptor.logical_shape) >= 2
+                    else descriptor.padded_shape
+                )
+                if len(shape_for_fan) >= 2:
+                    fan_in_plus_out = shape_for_fan[-2] + shape_for_fan[-1]
+                else:
+                    fan_in_plus_out = max(
+                        shape_for_fan[0] if shape_for_fan else total, 2,
+                    )
+                limit = float(np.sqrt(6.0 / fan_in_plus_out))
+                rng = self._buffer_rng(name, descriptor.padded_shape)
+                host = rng.uniform(
+                    -limit, limit, size=total,
+                ).astype(dtype)
+            elif any(s in name for s in self._UNIT_INIT_SUBSTRINGS):
+                host = np.ones(total, dtype=dtype)
+            if host is not None:
+                self._allocator.upload_to_device(
+                    descriptor.handle, host, cmd, queue, fence,
+                )
 
     # ── Pipeline & descriptor preparation ──
 
