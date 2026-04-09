@@ -15,7 +15,7 @@ class ReductionTreePlan:
     per stage and manages intermediate buffers.
     """
     num_partials: int
-    fan_in_K: int
+    fan_in: int
     num_stages: int
     elements_per_partial: int
     initial_offset_list: tuple[int, ...]

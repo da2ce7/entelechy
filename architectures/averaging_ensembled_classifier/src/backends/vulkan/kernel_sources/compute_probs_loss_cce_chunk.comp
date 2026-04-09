@@ -27,7 +27,7 @@ layout(push_constant) uniform PushConstants {
 layout(set = 0, binding = 0) readonly buffer LogitsBuf  { STORAGE_TYPE data[]; } src_logits;
 layout(set = 0, binding = 1) readonly buffer TempsBuf   { STATE_TYPE   data[]; } src_temps;
 layout(set = 0, binding = 2) readonly buffer TargetsBuf { int           data[]; } src_targets;
-layout(set = 0, binding = 3) readonly buffer MaskBuf    { STORAGE_TYPE data[]; } src_sample_mask;
+layout(set = 0, binding = 3) readonly buffer MaskBuf    { uint data[]; } src_sample_mask;
 layout(set = 0, binding = 4) writeonly buffer ProbsBuf  { STORAGE_TYPE data[]; } dest_probs;
 layout(set = 0, binding = 5) writeonly buffer LossBuf   { COMPUTE_TYPE data[]; } dest_loss;
 
@@ -58,7 +58,7 @@ void main() {
     uint loss_out_idx = module_global_idx * push.total_batch_count + batch_idx;
 
     // Handle padded samples
-    if (read_storage(src_sample_mask.data[batch_idx]) < COMPUTE_TYPE(0.5)) {
+    if (load_sample_mask(src_sample_mask.data[batch_idx >> 5u], batch_idx) == 0u) {
         dest_loss.data[loss_out_idx] = COMPUTE_TYPE(0.0);
         uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
         for (uint c_local = 0; c_local < push.classes_per_chunk; ++c_local) {

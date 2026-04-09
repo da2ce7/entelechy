@@ -37,7 +37,7 @@ class BufferDescriptor:
     element_size_bytes: int
     size_bytes: int
     role: BufferRole
-    precision_role: Literal["storage", "compute", "state"]
+    precision_role: Literal["storage", "compute", "state"] | None
     logical_shape: tuple[int, ...] | None = None
     producing_node: str | None = None
     consumers: frozenset[str] = frozenset()

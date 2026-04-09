@@ -35,7 +35,7 @@ void PREC_FN(task_backprop_to_hidden)(void* raw_args, uint task_index, uint thre
         + (size_t)batch_idx * a->padded_hidden_count + h_idx;
     const size_t out_idx = tile_base + local_off;
 
-    if ((COMPUTE_T)scalar_load_storage(a->sample_mask, batch_idx) < (COMPUTE_T)0.5) {
+    if (!load_sample_mask(a->sample_mask, batch_idx)) {
         scalar_store_storage(a->partial_grad_hidden_activations_aos, out_idx, 0.0f);
         return;
     }
@@ -105,7 +105,7 @@ void PREC_FN(task_temp_gradients)(void* raw_args, uint task_index, uint thread_i
     COMPUTE_T p_grad_sum = (COMPUTE_T)0.0;
 
     for (uint b = 0; b < a->total_batch_count; b++) {
-        if ((COMPUTE_T)scalar_load_storage(a->sample_mask, b) < (COMPUTE_T)0.5) continue;
+        if (!load_sample_mask(a->sample_mask, b)) continue;
 
         COMPUTE_T grad_for_sample = (COMPUTE_T)0.0;
         for (uint c_local = 0; c_local < a->classes_per_chunk; c_local++) {

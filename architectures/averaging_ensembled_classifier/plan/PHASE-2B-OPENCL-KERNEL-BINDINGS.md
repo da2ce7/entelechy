@@ -239,7 +239,7 @@ The reduction-related bindings are special because they are consumed by the redu
 - `AggregateLocalReduceBinding` — for large fan-in stages ($K >$ register threshold).
 - `ClipIntermediateGradBinding` — for inter-stage clipping in `"sum_and_clip"` trees.
 
-The renderer selects between register and local bindings per stage based on `fan_in_K` and a heuristic crossover threshold.
+The renderer selects between register and local bindings per stage based on `fan_in` and a heuristic crossover threshold.
 
 **Validation:** Each binding's `marshal_args()` produces an argument list of the correct length and type. Unit tests compare binding output against legacy `KernelSignature.get_args()` output for identical inputs.
 
@@ -362,7 +362,7 @@ def _render_reduction_tree(
 ) -> cl.Event:
     plan = node.reduction_plan
     N = plan.num_partials
-    K = plan.fan_in_K
+    K = plan.fan_in
 
     # 1. Upload initial offset list to device
     offset_buf = upload_offset_list(plan.initial_offset_list)
@@ -694,7 +694,7 @@ The reduction tree renderer implements the rendering contract documented in Phas
 ```
 Input:  ReductionTreePlan (from ReductionTreeNode)
         ├── num_partials (N)
-        ├── fan_in_K (K)
+        ├── fan_in (K)
         ├── num_stages
         ├── initial_offset_list
         ├── tree_variant ("sum" or "sum_and_clip")

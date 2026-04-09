@@ -16,7 +16,7 @@ __kernel void calculate_module_param_grads_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_activations,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_probs,
     __global const void         *src_buffer_GLOBAL_targets,
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint          *src_buffer_GLOBAL_sample_mask,
     __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_temps,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_weights_module,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_biases_module,
@@ -65,7 +65,7 @@ __kernel void calculate_module_param_grads_chunk(
 
     // Each thread sums a strided slice of the batch dimension.
     for (uint b = lid; b < src_scalar_NATURAL_total_batch_count; b += lsize) {
-        if (load_storage(src_buffer_GLOBAL_sample_mask, b) < (COMPUTE_TYPE)0.5f) {
+        if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, b)) {
             continue;
         }
 
@@ -141,7 +141,7 @@ __kernel void calculate_module_param_grads_chunk(
 __kernel void backprop_error_to_hidden_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_probs,
     __global const void         *src_buffer_GLOBAL_targets,
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint          *src_buffer_GLOBAL_sample_mask,
     __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_weights_module,
     __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_temps,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_hidden_activations_aos,
@@ -179,7 +179,7 @@ __kernel void backprop_error_to_hidden_chunk(
     const long out_idx      = tile_base_offset + local_offset;
 
     // Early exit for padded samples, writing zero to the output to maintain correctness.
-    if (load_storage(src_buffer_GLOBAL_sample_mask, batch_idx) < (COMPUTE_TYPE)0.5f) {
+    if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, batch_idx)) {
         store_storage(dest_buffer_GLOBAL_partial_grad_hidden_activations_aos, out_idx, COMPUTE_ZERO);
         return;
     }
@@ -243,7 +243,7 @@ __kernel void calculate_chunk_temp_gradients(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_logits,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_probs,
     __global const void         *src_buffer_GLOBAL_targets,
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint          *src_buffer_GLOBAL_sample_mask,
     __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_temps,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_temps,
     uint                         src_scalar_FLAG_problem_type,
@@ -284,7 +284,7 @@ __kernel void calculate_chunk_temp_gradients(
 
     // Level 1 Reduction (over batch): Each thread sums contributions from a strided slice of the batch.
     for (uint b = lid; b < src_scalar_NATURAL_total_batch_count; b += lsize) {
-        if (load_storage(src_buffer_GLOBAL_sample_mask, b) < (COMPUTE_TYPE)0.5f) {
+        if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, b)) {
             continue;
         }
 

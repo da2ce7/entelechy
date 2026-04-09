@@ -39,6 +39,8 @@ class BackpropSharedWeightsBinding(KernelBinding):
             cl.LocalMemory(local_mem_size),
             get_buffer(buffer_bindings["input"]),
             get_buffer(buffer_bindings["hidden_activations"]),
+            get_buffer(buffer_bindings["hidden_mask"]),
+            np.uint32(scalar_params["FLAG_use_explicit_hidden_mask"]),
             get_buffer(buffer_bindings["summed_grad_hidden_activations"]),
             get_buffer(buffer_bindings["sample_mask"]),
             get_buffer(buffer_bindings["partial_grad_weights_shared"]),
@@ -75,6 +77,8 @@ class BackpropSharedBiasesBinding(KernelBinding):
         return [
             cl.LocalMemory(local_mem_size),
             get_buffer(buffer_bindings["hidden_activations"]),
+            get_buffer(buffer_bindings["hidden_mask"]),
+            np.uint32(scalar_params["FLAG_use_explicit_hidden_mask"]),
             get_buffer(buffer_bindings["summed_grad_hidden_activations"]),
             get_buffer(buffer_bindings["sample_mask"]),
             get_buffer(buffer_bindings["partial_grad_biases_shared"]),

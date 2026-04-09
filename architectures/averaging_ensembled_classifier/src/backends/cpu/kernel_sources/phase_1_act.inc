@@ -21,15 +21,17 @@ void PREC_FN(task_forward_pass)(void* raw_args, uint task_index, uint thread_id)
     if (task_index >= a->batch_chunk_count) return;
 
     const uint sample = a->batch_chunk_offset + task_index;
-    const float mask_val = scalar_load_storage(a->sample_mask, sample);
+    const uint mask_val = (uint)load_sample_mask(a->sample_mask, sample);
 
     STORAGE_T* hidden_row     = a->hidden_activations + (size_t)sample * a->padded_hidden_count;
     STORAGE_T* hidden_msk_row = a->hidden_mask + (size_t)sample * a->padded_hidden_count;
 
     /* Padded samples: zero out and return */
-    if (mask_val < 0.5f) {
+    if (!mask_val) {
         memset(hidden_row, 0, a->padded_hidden_count * PREC_SIZEOF_STORAGE);
-        memset(hidden_msk_row, 0, a->padded_hidden_count * PREC_SIZEOF_STORAGE);
+        if (a->FLAG_produce_hidden_mask) {
+            memset(hidden_msk_row, 0, a->padded_hidden_count * PREC_SIZEOF_STORAGE);
+        }
         return;
     }
 
@@ -39,7 +41,7 @@ void PREC_FN(task_forward_pass)(void* raw_args, uint task_index, uint thread_id)
     const uint num_h_blocks  = padded_hidden / SIMD_WIDTH;
 
     const simd_float v_zero = simd_zero();
-    const simd_float v_mask = simd_set1(mask_val);
+    const simd_float v_mask = simd_set1((float)mask_val);
 
     for (uint hb = 0; hb < num_h_blocks; hb++) {
         const uint h_offset = hb * SIMD_WIDTH;
@@ -69,8 +71,10 @@ void PREC_FN(task_forward_pass)(void* raw_args, uint task_index, uint thread_id)
         simd_store_storage(&hidden_row[h_offset], activated);
 
         /* Hidden mask: 1.0 where pre-ReLU > 0 AND sample is valid */
-        simd_float relu_mask = simd_select(v_zero, v_mask, accum);
-        simd_store_storage(&hidden_msk_row[h_offset], relu_mask);
+        if (a->FLAG_produce_hidden_mask) {
+            simd_float relu_mask = simd_select(v_zero, v_mask, accum);
+            simd_store_storage(&hidden_msk_row[h_offset], relu_mask);
+        }
     }
 }
 
@@ -109,6 +113,12 @@ void PREC_FN(task_render_logits)(void* raw_args, uint task_index, uint thread_id
                          + (size_t)batch_global * a->padded_total_output_class_count
                          + class_global;
 
+    /* Sample mask check (ADR-031) — skip invalid/padded samples */
+    if (!load_sample_mask(a->sample_mask, batch_global)) {
+        scalar_store_storage(a->logits, out_idx, (COMPUTE_T)0);
+        return;
+    }
+
     /* Initialize with bias (state-role buffer) */
     COMPUTE_T logit = scalar_load_state(a->biases_module,
                       (size_t)module_global * a->padded_total_output_class_count + class_global);
@@ -116,9 +126,14 @@ void PREC_FN(task_render_logits)(void* raw_args, uint task_index, uint thread_id
     /* Sparse dot product over hidden dimension */
     const size_t h_base = (size_t)batch_global * a->padded_hidden_count;
     for (uint h = 0; h < a->hidden_count; h++) {
-        const COMPUTE_T h_mask = (COMPUTE_T)scalar_load_storage(a->hidden_mask, h_base + h);
+        const COMPUTE_T h_val = (COMPUTE_T)scalar_load_storage(a->hidden_activations, h_base + h);
+        COMPUTE_T h_mask;
+        if (a->FLAG_use_explicit_hidden_mask) {
+            h_mask = (COMPUTE_T)scalar_load_storage(a->hidden_mask, h_base + h);
+        } else {
+            h_mask = h_val > (COMPUTE_T)0 ? (COMPUTE_T)1 : (COMPUTE_T)0;
+        }
         if (h_mask > (COMPUTE_T)0.5) {
-            const COMPUTE_T h_val = (COMPUTE_T)scalar_load_storage(a->hidden_activations, h_base + h);
             const size_t w_idx = (size_t)module_global * a->padded_hidden_count
                                    * a->padded_total_output_class_count
                                + (size_t)h * a->padded_total_output_class_count

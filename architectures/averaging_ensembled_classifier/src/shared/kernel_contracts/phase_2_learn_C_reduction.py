@@ -247,16 +247,16 @@ reduce_k_fan_in_and_clip_contract = KernelContract(
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_offset_list_flat",
             flow="src", memory_scope="GLOBAL_CONST",
-            tensor_shape=("node_count * fan_in_K",),
+            tensor_shape=("node_count * fan_in",),
             padding_contract=PaddingContract("NONE", None),
-            calculability_proof=("node_count", "fan_in_K"),
+            calculability_proof=("node_count", "fan_in"),
             validation_preconditions=(
-                "exactly node_count * fan_in_K uint entries",
+                "exactly node_count * fan_in uint entries",
             ),
             precision_role=None,
         ),
         BufferParamSpec(
-            name="dest_buffer_GLOBAL_stage_output",
+            name="dest_buffer_GLOBAL_stage_partial",
             flow="dest", memory_scope="GLOBAL",
             tensor_shape=("node_count * partial_width",),
             padding_contract=PaddingContract("NONE", None),
@@ -266,7 +266,7 @@ reduce_k_fan_in_and_clip_contract = KernelContract(
         ),
     ),
     scalar_params=(
-        ScalarParamSpec("fan_in_K", "src", "NATURAL"),
+        ScalarParamSpec("fan_in", "src", "NATURAL"),
         ScalarParamSpec("node_count", "src", "NATURAL"),
         ScalarParamSpec("partial_width", "src", "NATURAL"),
         ScalarParamSpec("clipping_threshold", "src", "REAL"),

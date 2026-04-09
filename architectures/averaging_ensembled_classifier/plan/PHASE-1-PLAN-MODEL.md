@@ -477,7 +477,7 @@ class ReductionTreePlan:
     per stage and manages intermediate buffers.
     """
     num_partials: int                                  # N (total input partials)
-    fan_in_K: int                                      # K (uniform reduction batch size)
+    fan_in: int                                      # K (uniform reduction batch size)
     num_stages: int                                    # ceil(log_K(N))
     elements_per_partial: int                          # Scalar count per partial result
     initial_offset_list: tuple[int, ...]               # Placement-dependent, non-trivial
@@ -505,7 +505,7 @@ For `tree_variant == "sum"`:
 
 **Plan-time validation invariants:**
 
-1. `fan_in_K >= 2`.
+1. `fan_in >= 2`.
 2. $K^{\text{num\_stages}} \geq N$ (sufficient stages to reduce all partials).
 3. `len(threshold_schedule) == num_stages`.
 4. `len(initial_offset_list) == num_partials`.
@@ -518,7 +518,7 @@ For `tree_variant == "sum"`:
 The renderer receives the `ReductionTreePlan` and:
 1. Creates intermediate ping-pong buffers (renderer-internal, not plan-level).
 2. Uploads `initial_offset_list` to device memory (for stage 0).
-3. For each stage, selects kernel tier (register-reduce vs. local-reduce) based on `fan_in_K` and hardware-specific crossover heuristic.
+3. For each stage, selects kernel tier (register-reduce vs. local-reduce) based on `fan_in` and hardware-specific crossover heuristic.
 4. Computes contiguous intermediate offset lists for stages > 0.
 5. Executes stages leaf→root, synchronizing between stages.
 
@@ -1126,7 +1126,7 @@ The `finalize()` method computes `last_consumer` for each buffer from the topolo
 
 The plan builder delegates to `StabilizationPolicy` for reduction tree planning:
 
-1. Call `stabilization_policy.plan_uniform_reduction_tree(num_partials, hardware.max_reduce_fan_in)` to get `fan_in_K` and `num_stages`.
+1. Call `stabilization_policy.plan_uniform_reduction_tree(num_partials, hardware.max_reduce_fan_in)` to get `fan_in` and `num_stages`.
 2. Compute the initial offset list from the upstream `GatherPrimitive` (placement-dependent scatter pattern).
 3. Compute the threshold schedule using the policy's threshold methods for each stage.
 4. Construct `ReductionTreePlan` and wrap in `ReductionTreeNode`.

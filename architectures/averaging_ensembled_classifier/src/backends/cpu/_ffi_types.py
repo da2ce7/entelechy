@@ -140,11 +140,12 @@ def make_precision_types(
 
     structs["ForwardPassArgs"] = _s("ForwardPassArgs", [
         ("input", c_storage_p),
-        ("sample_mask", c_storage_p),
+        ("sample_mask", c_uint_p),
         ("weights_shared_simd_major", c_state_p),
         ("biases_shared", c_state_p),
         ("hidden_activations", c_storage_p),
         ("hidden_mask", c_storage_p),
+        ("FLAG_produce_hidden_mask", c_uint32),
         ("batch_chunk_offset", c_uint32),
         ("batch_chunk_count", c_uint32),
         ("total_batch_count", c_uint32),
@@ -155,6 +156,8 @@ def make_precision_types(
     structs["RenderLogitsArgs"] = _s("RenderLogitsArgs", [
         ("hidden_activations", c_storage_p),
         ("hidden_mask", c_storage_p),
+        ("FLAG_use_explicit_hidden_mask", c_uint32),
+        ("sample_mask", c_uint_p),
         ("weights_module", c_state_p),
         ("biases_module", c_state_p),
         ("logits", c_storage_p),
@@ -178,7 +181,7 @@ def make_precision_types(
         ("logits", c_storage_p),
         ("temps", c_state_p),
         ("targets", c_int_p),
-        ("sample_mask", c_storage_p),
+        ("sample_mask", c_uint_p),
         ("partial_probs", c_storage_p),
         ("final_loss", c_compute_p),  # compute output
         ("flat_tile_index", c_uint32),
@@ -196,7 +199,7 @@ def make_precision_types(
         ("logits", c_storage_p),
         ("temps", c_state_p),
         ("targets", c_storage_p),  # BCE targets in storage dtype
-        ("sample_mask", c_storage_p),
+        ("sample_mask", c_uint_p),
         ("partial_probs", c_storage_p),
         ("partial_loss", c_storage_p),  # BCE partial loss in storage dtype
         ("flat_tile_index", c_uint32),
@@ -214,7 +217,7 @@ def make_precision_types(
         ("hidden_activations", c_storage_p),
         ("partial_probs", c_storage_p),
         ("targets", c_void_p),
-        ("sample_mask", c_storage_p),
+        ("sample_mask", c_uint_p),
         ("temps", c_state_p),
         ("partial_grad_weights_module", c_storage_p),
         ("partial_grad_biases_module", c_storage_p),
@@ -239,7 +242,7 @@ def make_precision_types(
     structs["BackpropToHiddenArgs"] = _s("BackpropToHiddenArgs", [
         ("partial_probs", c_storage_p),
         ("targets", c_void_p),
-        ("sample_mask", c_storage_p),
+        ("sample_mask", c_uint_p),
         ("weights_module", c_state_p),
         ("temps", c_state_p),
         ("partial_grad_hidden_activations_aos", c_storage_p),
@@ -261,7 +264,7 @@ def make_precision_types(
         ("logits", c_storage_p),
         ("partial_probs", c_storage_p),
         ("targets", c_void_p),
-        ("sample_mask", c_storage_p),
+        ("sample_mask", c_uint_p),
         ("temps", c_state_p),
         ("partial_grad_temps", c_storage_p),
         ("problem_type", c_uint32),
@@ -376,8 +379,10 @@ def make_precision_types(
     structs["BackpropSharedWeightsArgs"] = _s("BackpropSharedWeightsArgs", [
         ("input", c_storage_p),
         ("hidden_activations", c_storage_p),
+        ("hidden_mask", c_storage_p),
+        ("FLAG_use_explicit_hidden_mask", c_uint32),
         ("summed_grad_hidden_activations", c_compute_p),  # compute output
-        ("sample_mask", c_storage_p),
+        ("sample_mask", c_uint_p),
         ("partial_grad_weights_shared", c_storage_p),
         ("batch_chunk_offset", c_uint32),
         ("batch_chunk_count", c_uint32),
@@ -391,8 +396,10 @@ def make_precision_types(
 
     structs["BackpropSharedBiasesArgs"] = _s("BackpropSharedBiasesArgs", [
         ("hidden_activations", c_storage_p),
+        ("hidden_mask", c_storage_p),
+        ("FLAG_use_explicit_hidden_mask", c_uint32),
         ("summed_grad_hidden_activations", c_compute_p),  # compute output
-        ("sample_mask", c_storage_p),
+        ("sample_mask", c_uint_p),
         ("partial_grad_biases_shared", c_storage_p),
         ("batch_chunk_offset", c_uint32),
         ("batch_chunk_count", c_uint32),

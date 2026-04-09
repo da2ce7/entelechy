@@ -28,7 +28,7 @@ class CPUBufferAllocator:
     def __init__(
         self,
         simd_alignment: int,
-        role_dtypes: dict[Literal["storage", "compute", "state"], np.dtype],
+        role_dtypes: dict[Literal["storage", "compute", "state"] | None, np.dtype],
     ) -> None:
         self._alignment = simd_alignment
         self._role_dtypes = role_dtypes

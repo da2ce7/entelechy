@@ -157,7 +157,7 @@ class ParameterSpace:
         layouts["hidden_activations"] = MemoryLayout((batch_size, spec.padded_hidden_dim))
         layouts["hidden_mask"] = layouts["hidden_activations"]
         layouts["logits"] = MemoryLayout((spec.num_modules, batch_size, spec.padded_class_dim))
-        layouts["sample_mask"] = MemoryLayout((batch_size,))
+        layouts["sample_mask"] = MemoryLayout(((batch_size + 31) // 32,))
         layouts["targets_cce"] = MemoryLayout((batch_size,))
         layouts["targets_bce"] = MemoryLayout((batch_size, spec.padded_class_dim))
 

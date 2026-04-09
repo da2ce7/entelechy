@@ -42,6 +42,7 @@ class ForwardPassBinding(KernelBinding):
             get_buffer(buffer_bindings["biases_shared"]),
             get_buffer(buffer_bindings["hidden_activations"]),
             get_buffer(buffer_bindings["hidden_mask"]),
+            np.uint32(scalar_params["FLAG_produce_hidden_mask"]),
             np.uint32(scalar_params["batch_chunk_offset"]),
             np.uint32(scalar_params["batch_chunk_count"]),
             np.uint32(scalar_params["total_batch_count"]),
@@ -68,6 +69,8 @@ class RenderLogitsChunkBinding(KernelBinding):
         return [
             get_buffer(buffer_bindings["hidden_activations"]),
             get_buffer(buffer_bindings["hidden_mask"]),
+            np.uint32(scalar_params["FLAG_use_explicit_hidden_mask"]),
+            get_buffer(buffer_bindings["sample_mask"]),
             get_buffer(buffer_bindings["weights_module"]),
             get_buffer(buffer_bindings["biases_module"]),
             get_buffer(buffer_bindings["logits"]),

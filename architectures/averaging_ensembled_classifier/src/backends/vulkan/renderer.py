@@ -29,6 +29,7 @@ from ...shared.streaming_loop_plan import StreamingLoopPlan
 from ._descriptor_manager import VulkanDescriptorManager
 from ._pipeline_cache import ComputePipeline, SpecConstants, VulkanPipelineCache
 from ._push_constants import (
+    BUFFER_BINDING_ORDER,
     DESCRIPTOR_BINDING_COUNTS,
     PUSH_CONSTANT_STRUCTS,
     marshal_push_constants,
@@ -318,11 +319,16 @@ class VulkanPlanRenderer:
                 continue
 
             binding_list: list[tuple[int, VulkanBuffer]] = []
-            for binding_idx, (_, handle) in enumerate(
-                sorted(bindings.items())
-            ):
-                vk_buf = self._allocator.get_buffer(handle)
-                binding_list.append((binding_idx, vk_buf))
+            order = BUFFER_BINDING_ORDER.get(kernel_name)
+            if order is not None:
+                for binding_idx, key in enumerate(order):
+                    if key is not None and key in bindings:
+                        vk_buf = self._allocator.get_buffer(bindings[key])
+                        binding_list.append((binding_idx, vk_buf))
+            else:
+                for binding_idx, (_, handle) in enumerate(bindings.items()):
+                    vk_buf = self._allocator.get_buffer(handle)
+                    binding_list.append((binding_idx, vk_buf))
 
             self._descriptor_mgr.update_set(desc_set, binding_list)
 
@@ -514,7 +520,7 @@ class VulkanPlanRenderer:
 
         # Determine tier per stage
         simd_w = plan.hardware.simd_width
-        fan_in = rtp.fan_in_K
+        fan_in = rtp.fan_in
 
         current_src = src_device_buf
         ping_buf = self._allocator.get_buffer(ping_handle)

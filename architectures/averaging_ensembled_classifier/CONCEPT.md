@@ -30,7 +30,7 @@ The singular goal of the host-side orchestration is to ensure the core computati
 
 **FP8 is the ultimate expression of the Primacy of Memory Strategy.** FP8 (E4M3 or E5M2) storage achieves 4× bandwidth compression vs. FP32 and 2× vs. FP16. However, FP8's 3-bit mantissa (E4M3) or 2-bit mantissa (E5M2) is insufficient for compute or state roles: reductions saturate in one stage, and EMA updates round to zero for high β values. The architecture therefore permits FP8 **only in the storage role**, enforcing this constraint at `PrecisionConfig` construction time. Attempting to create a configuration with FP8 compute or FP8 state raises `ValueError` — there is no user-discipline escape hatch for non-functional training.
 
-**FP8 quantization floor and streaming backpropagation.** FP8 storage introduces a quantization floor at the format's minimum positive subnormal (2⁻⁹ ≈ 0.00195 for E4M3, 2⁻¹⁶ ≈ 1.53×10⁻⁵ for E5M2). Gradient contributions from activations below this floor are silently zeroed during streaming backpropagation (Nodes 17/18), where the ReLU derivative mask is recomputed from stored activations rather than an explicit `hidden_mask` input. This produces an effect equivalent to stochastic sparsification and is acceptable for the storage role — it does not affect convergence for typical activation distributions.
+**FP8 quantization floor and mask strategy.** FP8 storage introduces a quantization floor at the format's minimum positive subnormal (2⁻⁹ ≈ 0.00195 for E4M3, 2⁻¹⁶ ≈ 1.53×10⁻⁵ for E5M2). When `storage_dtype != compute_dtype` (as with all FP8 configurations), the Policy tier automatically selects the `explicit` mask strategy: Node 4 writes the `hidden_mask` buffer capturing the compute-precision derivative truth (1.0 for active units, 0.0 for ReLU-zeroed) before the activation undergoes storage narrowing. Consuming kernels (Nodes 5, 17, 18) read this mask directly via the `src_scalar_FLAG_use_explicit_hidden_mask` flag. This preserves correct gradient gating for activations that were positive at compute precision but zeroed by storage quantization. When `storage_dtype == compute_dtype` (e.g., `PrecisionConfig.float32()`), the Policy tier selects the `recompute` strategy: the mask is bit-identical to `activation > 0` anyway, so no mask buffer is allocated and consumers derive the mask internally.
 
 #### 3. **Modular, "Dumb" Kernels**
 
@@ -296,8 +296,12 @@ The Policy tier's plan construction logic serves as a sophisticated orchestrator
 
 1.  **Memory Assessment & Chunk Definition:** The orchestrator determines an optimal chunking strategy, defining `num_module_chunks`, `num_batch_chunks`, and `num_class_chunks` to balance compute and memory demands. These decisions manifest as tile counts on `KernelDispatchNode`s and chunk counts on `StreamingLoopNode`s. The device's capabilities are described by a `HardwareProfile` carrying `max_reduce_fan_in`, `simd_width`, `cache_line_bytes`, and `global_mem_bytes`—named for its plan-construction role, not its hardware origin. **Class-chunk amplification in collection buffers:** Node 8's `dest_buffer_GLOBAL_partial_grad_weights_module` is allocated with the full `padded_total_output_class_count` in its innermost dimension, but each tile writes only `classes_per_chunk` positions (the remainder is `ZERO_REQUIRED`-initialized). When `num_class_chunks` is large, the per-tile allocation is `num_class_chunks×` the actual write footprint — a deliberate trade-off enabling Node 11 to compute a contiguous-memory L2 norm without cross-tile gather. The chunking strategy must account for this amplification when budgeting device memory.
 
+    **Sample mask packing.** The host packs the per-sample boolean mask into a `uint` bitmask buffer (32 samples per word, LSB-first) before device upload. The `effective_batch_size` scalar for Node 21 is derived via integer popcount over the packed words, yielding an exact count for any batch size up to 2³².
+
     **Padded dimension synthesis.** When a padded dimension scalar (e.g., `padded_hidden_count`, `padded_total_output_class_count`) appears in the Tensor Shape of buffers with different precision roles, the Host Orchestrator computes its value as the least common multiple of all role-specific alignment requirements across every buffer that uses the scalar. For example, `padded_hidden_count` must simultaneously satisfy `padded_hidden_count × sizeof(STORAGE_TYPE) ≡ 0 (mod 128)` for CACHE-padded storage-role buffers, `padded_hidden_count ≡ 0 (mod SIMD_WIDTH)` for SIMD-padded state-role buffers, and any analogous constraint for compute-role buffers. The resulting LCM is configuration-dependent: under `PrecisionConfig.fp8_e4m3()`, the CACHE constraint (128 elements) typically dominates; under `PrecisionConfig.float32()`, the SIMD constraint may dominate. This synthesis is a Policy-tier concern; kernel contracts declare their individual requirements and are not aware of the cross-buffer union.
 2.  **Activation Lifecycle & Streaming:** It selects between a Cache or Recompute strategy and manages **two distinct backpropagation streaming models**, expressed as plan-level structural choices:
+
+    **Mask strategy selection.** The Policy tier evaluates `PrecisionConfig.mask_strategy` at plan-construction time and propagates the result as FLAG scalars on Nodes 4, 5, 17, and 18. Under `recompute` mode, the `hidden_mask` BufferDescriptor is omitted from the plan entirely — no allocation, no lifecycle tracking. Under `explicit` mode, the buffer is allocated and tracked as a `BATCH_INTERMEDIATE` with its `last_consumer` set to the final streaming loop iteration's Node 17 or 18 dispatch. The mask strategy is orthogonal to the activation Cache/Recompute strategy; all four combinations produce correct results (see ADR-031 §1.4).
 
 - **Model A: Accumulate via Recompute (For `Grad_H` and `Grad_Mod*`):** Expressed as a `StreamingLoopNode` whose body recomputes `hidden_i` chunks and writes tile-indexed partials into a collection buffer for subsequent reduction. It maintains a minimal memory footprint at the cost of a parametric loop.
 - **Model B: True Streaming (For `Grad_SW` & `Grad_SB`):** Expressed as a `StreamingLoopNode` (Nodes 17→18→19) that recomputes inputs, computes partial gradients, clips them immediately, and feeds the clipped partials into the reduction engine—all within a single parametric loop.
@@ -378,7 +382,7 @@ graph TD
             K4 --> hidden_mask["Hidden Mask 'i'"]:::data
             P_Shared & P_Module & SampleMask --> K4
             hidden_i & hidden_mask --> K5["(5) render_logits_chunk"]:::kernel
-            P_Module & P_Temps --> K5
+            P_Module & P_Temps & SampleMask --> K5
             K5 --> Full_Logits["Full Logits Buffer"]:::full_intermediate
             subgraph LossPath["Loss Path (CCE/BCE)"]
                 K6["(6) compute_probs_loss_cce"]:::kernel
@@ -456,7 +460,11 @@ graph TD
                     style StreamingLoop streaming_loop
                     Input_i["Recomputed Input 'i'"]:::data --> K17["(17) backprop_shared_weights"]:::kernel
                     hidden_i --> K17
+                    hidden_mask -. "FLAG" .-> K17
+                    SampleMask --> K17
                     hidden_i --> K18["(18) backprop_shared_biases"]:::kernel
+                    hidden_mask -. "FLAG" .-> K18
+                    SampleMask --> K18
                     Summed_Grad_H -. "slice" .-> K17 & K18
                     K17 --> PARTIALS_Grad_SW["PARTIAL Grad_SW 'i'"]:::partial_data
                     K18 --> PARTIALS_Grad_SB["PARTIAL Grad_SB 'i'"]:::partial_data

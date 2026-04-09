@@ -25,14 +25,19 @@ void PREC_FN(task_backprop_shared_weights)(void* raw_args, uint task_index, uint
     for (uint b_local = 0; b_local < a->batch_chunk_count; b_local++) {
         const uint b_global = a->batch_chunk_offset + b_local;
 
-        if ((COMPUTE_T)scalar_load_storage(a->sample_mask, b_global) < (COMPUTE_T)0.5)
+        if (!load_sample_mask(a->sample_mask, b_global))
             continue;
 
         const size_t h_off = (size_t)b_global * a->padded_hidden_count + j_idx;
         const COMPUTE_T grad_h    = a->summed_grad_hidden_activations[h_off];  /* COMPUTE_T* compute */
         const COMPUTE_T hidden_val = (COMPUTE_T)scalar_load_storage(a->hidden_activations, h_off);
 
-        const COMPUTE_T d_act = (hidden_val > (COMPUTE_T)0.0) ? (COMPUTE_T)1.0 : (COMPUTE_T)0.0;
+        COMPUTE_T d_act;
+        if (a->FLAG_use_explicit_hidden_mask) {
+            d_act = (COMPUTE_T)scalar_load_storage(a->hidden_mask, h_off);
+        } else {
+            d_act = (hidden_val > (COMPUTE_T)0.0) ? (COMPUTE_T)1.0 : (COMPUTE_T)0.0;
+        }
         const COMPUTE_T dL_dZ = grad_h * d_act;
 
         const COMPUTE_T input_val = (COMPUTE_T)scalar_load_storage(a->input,
@@ -67,14 +72,19 @@ void PREC_FN(task_backprop_shared_biases)(void* raw_args, uint task_index, uint 
     for (uint b_local = 0; b_local < a->batch_chunk_count; b_local++) {
         const uint b_global = a->batch_chunk_offset + b_local;
 
-        if ((COMPUTE_T)scalar_load_storage(a->sample_mask, b_global) < (COMPUTE_T)0.5)
+        if (!load_sample_mask(a->sample_mask, b_global))
             continue;
 
         const size_t h_off = (size_t)b_global * a->padded_hidden_count + j_idx;
         const COMPUTE_T grad_h    = a->summed_grad_hidden_activations[h_off];  /* COMPUTE_T* compute */
         const COMPUTE_T hidden_val = (COMPUTE_T)scalar_load_storage(a->hidden_activations, h_off);
 
-        const COMPUTE_T d_act = (hidden_val > (COMPUTE_T)0.0) ? (COMPUTE_T)1.0 : (COMPUTE_T)0.0;
+        COMPUTE_T d_act;
+        if (a->FLAG_use_explicit_hidden_mask) {
+            d_act = (COMPUTE_T)scalar_load_storage(a->hidden_mask, h_off);
+        } else {
+            d_act = (hidden_val > (COMPUTE_T)0.0) ? (COMPUTE_T)1.0 : (COMPUTE_T)0.0;
+        }
         grad_sb += grad_h * d_act;
     }
 

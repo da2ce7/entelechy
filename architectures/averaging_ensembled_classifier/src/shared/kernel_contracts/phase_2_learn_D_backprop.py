@@ -31,6 +31,14 @@ backprop_shared_weights_contract = KernelContract(
             precision_role="storage",
         ),
         BufferParamSpec(
+            name="src_buffer_GLOBAL_hidden_mask", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count", "padded_hidden_count"),
+            padding_contract=PaddingContract("CACHE", "Padded to alignment"),
+            calculability_proof=("total_batch_count", "padded_hidden_count"),
+            validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
+        ),
+        BufferParamSpec(
             name="src_buffer_GLOBAL_summed_grad_hidden_activations", flow="src", memory_scope="GLOBAL",
             tensor_shape=("final_grad_hidden_activations_total_count",),
             padding_contract=PaddingContract("NONE", None),
@@ -40,11 +48,11 @@ backprop_shared_weights_contract = KernelContract(
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_sample_mask", flow="src", memory_scope="GLOBAL",
-            tensor_shape=("total_batch_count",),
-            padding_contract=PaddingContract("NONE", None),
+            tensor_shape=("(total_batch_count + 31) / 32",),
+            padding_contract=PaddingContract("NONE", "Bits beyond total_batch_count zero-padded by host"),
             calculability_proof=("total_batch_count",),
             validation_preconditions=("batch slice within bounds",),
-            precision_role="storage",
+            precision_role=None,  # integer-typed bitmask (ADR-031)
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_grad_weights_shared", flow="dest", memory_scope="GLOBAL",
@@ -56,6 +64,7 @@ backprop_shared_weights_contract = KernelContract(
         ),
     ),
     scalar_params=(
+        ScalarParamSpec("FLAG_use_explicit_hidden_mask", "src", "FLAG"),
         ScalarParamSpec("batch_chunk_offset", "src", "NATURAL"),
         ScalarParamSpec("batch_chunk_count", "src", "NATURAL"),
         ScalarParamSpec("batch_chunk_index", "src", "NATURAL"),
@@ -89,6 +98,14 @@ backprop_shared_biases_contract = KernelContract(
             precision_role="storage",
         ),
         BufferParamSpec(
+            name="src_buffer_GLOBAL_hidden_mask", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("total_batch_count", "padded_hidden_count"),
+            padding_contract=PaddingContract("CACHE", "Padded to alignment"),
+            calculability_proof=("total_batch_count", "padded_hidden_count"),
+            validation_preconditions=("batch slice within bounds",),
+            precision_role="storage",
+        ),
+        BufferParamSpec(
             name="src_buffer_GLOBAL_summed_grad_hidden_activations", flow="src", memory_scope="GLOBAL",
             tensor_shape=("final_grad_hidden_activations_total_count",),
             padding_contract=PaddingContract("NONE", None),
@@ -98,11 +115,11 @@ backprop_shared_biases_contract = KernelContract(
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_sample_mask", flow="src", memory_scope="GLOBAL",
-            tensor_shape=("total_batch_count",),
-            padding_contract=PaddingContract("NONE", None),
+            tensor_shape=("(total_batch_count + 31) / 32",),
+            padding_contract=PaddingContract("NONE", "Bits beyond total_batch_count zero-padded by host"),
             calculability_proof=("total_batch_count",),
             validation_preconditions=("batch slice within bounds",),
-            precision_role="storage",
+            precision_role=None,  # integer-typed bitmask (ADR-031)
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_grad_biases_shared", flow="dest", memory_scope="GLOBAL",
@@ -114,6 +131,7 @@ backprop_shared_biases_contract = KernelContract(
         ),
     ),
     scalar_params=(
+        ScalarParamSpec("FLAG_use_explicit_hidden_mask", "src", "FLAG"),
         ScalarParamSpec("batch_chunk_offset", "src", "NATURAL"),
         ScalarParamSpec("batch_chunk_count", "src", "NATURAL"),
         ScalarParamSpec("batch_chunk_index", "src", "NATURAL"),

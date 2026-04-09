@@ -221,3 +221,82 @@ class TestAlchemistMixedPrecisionFidelity:
         """Mixed config is identified as 'mixed' by the tolerance helper."""
         assert precision_label_from_config(PrecisionConfig.mixed_f16_f32()) == "mixed"
         assert precision_label_from_config(PrecisionConfig.float32()) == "fp32"
+
+
+# =========================================================================
+# MaskStrategy selection (ADR-031 §1.2)
+# =========================================================================
+
+
+class TestMaskStrategy:
+    """MaskStrategy selection from PrecisionConfig.mask_strategy."""
+
+    def test_uniform_dtype_selects_recompute(self):
+        """When storage == compute, mask is fully derivable — recompute mode."""
+        assert PrecisionConfig.float32().mask_strategy.mode == "recompute"
+        assert PrecisionConfig.float64().mask_strategy.mode == "recompute"
+
+    def test_precision_boundary_selects_explicit(self):
+        """When storage != compute, precision boundary destroys derivative info."""
+        assert PrecisionConfig.mixed_f16_f32().mask_strategy.mode == "explicit"
+        assert PrecisionConfig.mixed_f32_f64().mask_strategy.mode == "explicit"
+        assert PrecisionConfig.fp8_e4m3().mask_strategy.mode == "explicit"
+        assert PrecisionConfig.fp8_e5m2().mask_strategy.mode == "explicit"
+
+    def test_is_explicit_property(self):
+        """Convenience property .is_explicit matches mode string."""
+        assert PrecisionConfig.mixed_f16_f32().mask_strategy.is_explicit is True
+        assert PrecisionConfig.float32().mask_strategy.is_explicit is False
+
+    def test_is_recompute_property(self):
+        """Convenience property .is_recompute matches mode string."""
+        assert PrecisionConfig.float32().mask_strategy.is_recompute is True
+        assert PrecisionConfig.mixed_f16_f32().mask_strategy.is_recompute is False
+
+    def test_recompute_mode_allocates_stub_hidden_mask(self):
+        """Under recompute mode, hidden_mask buffer should be a minimal stub."""
+        spec = _make_spec(PrecisionConfig.float32())
+        plan = build_act_plan(spec, _HW, PlanCceStrategy(), batch_size=16)
+        bufs = {b.logical_name: b for b in plan.buffers.values()}
+        hidden_mask = bufs["hidden_mask"]
+        # Stub: 1 element × sizeof(storage) — not full batch×hidden
+        assert hidden_mask.padded_shape == (1,)
+
+    def test_explicit_mode_allocates_full_hidden_mask(self):
+        """Under explicit mode, hidden_mask buffer matches activation shape."""
+        spec = _make_spec(PrecisionConfig.mixed_f16_f32())
+        plan = build_act_plan(spec, _HW, PlanCceStrategy(), batch_size=16)
+        bufs = {b.logical_name: b for b in plan.buffers.values()}
+        hidden_mask = bufs["hidden_mask"]
+        assert hidden_mask.padded_shape == (16, spec.padded_hidden_dim)
+
+    def test_explicit_mask_carries_non_derivable_information(self):
+        """Prove that storage narrowing destroys derivative truth for sub-floor activations.
+
+        Concrete scenario (ADR-031 §1.1): a positive activation at compute precision
+        (FP32) that falls below the storage format's quantization floor is stored as
+        zero. The mask computed at compute precision (1.0) differs from the mask
+        derived from stored activations (0.0) — proving the explicit mask carries
+        non-derivable information.
+        """
+        # FP16 min positive subnormal: ~5.96e-8
+        fp16_floor = float(np.finfo(np.float16).smallest_subnormal)
+
+        # A value that is positive in FP32 but below FP16 floor → stored as 0
+        sub_floor_value = fp16_floor * 0.5  # clearly below floor
+        stored = np.float16(sub_floor_value)  # quantized to FP16
+
+        # Compute-precision mask: value > 0 → True
+        compute_mask = float(sub_floor_value > 0)
+        assert compute_mask == 1.0, "Sub-floor value is positive at compute precision"
+
+        # Recomputed mask from stored representation: stored > 0 → False
+        recomputed_mask = float(float(stored) > 0)
+        assert recomputed_mask == 0.0, "Stored sub-floor value is zero"
+
+        # The masks DISAGREE — the explicit mask carries non-derivable information
+        assert compute_mask != recomputed_mask
+
+        # Verify the mask value domain survives storage narrowing (§1.5)
+        assert float(np.float16(0.0)) == 0.0
+        assert float(np.float16(1.0)) == 1.0

@@ -31,6 +31,24 @@ if TYPE_CHECKING:
     from .parameter_space import ParameterSpace
 
 
+def _pack_sample_mask(batch_size: int) -> NDArray[np.uint32]:
+    """Pack batch validity into a uint32 bitmask (ADR-031).
+
+    All samples are marked valid (bit = 1). Returns ceil(batch_size / 32)
+    uint32 words with LSB-first packing. Trailing bits beyond batch_size
+    in the final word are zero.
+    """
+    num_words = (batch_size + 31) // 32
+    mask = np.zeros(num_words, dtype=np.uint32)
+    full_words = batch_size // 32
+    if full_words > 0:
+        mask[:full_words] = np.uint32(0xFFFFFFFF)
+    remainder = batch_size % 32
+    if remainder > 0:
+        mask[full_words] = np.uint32((1 << remainder) - 1)
+    return mask
+
+
 def _default_renderer_factory(
     backend: str,
     hardware: HardwareProfile,
@@ -253,7 +271,7 @@ class Engine:
         )
 
         # Inject input data and sample mask into plan buffers
-        sample_mask = np.ones(batch_size, dtype=np.float32)
+        sample_mask = _pack_sample_mask(batch_size)
         injections = {
             "input_data": x_data,
             "sample_mask": sample_mask,
@@ -296,7 +314,7 @@ class Engine:
         )
 
         # Inject input data, targets, and sample mask into plan buffers
-        sample_mask = np.ones(batch_size, dtype=np.float32)
+        sample_mask = _pack_sample_mask(batch_size)
         injections: dict[str, NDArray] = {
             "input_data": x_data,
             "sample_mask": sample_mask,

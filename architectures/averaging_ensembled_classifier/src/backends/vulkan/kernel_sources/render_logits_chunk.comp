@@ -24,14 +24,16 @@ layout(push_constant) uniform PushConstants {
     uint total_output_class_count;
     uint padded_total_output_class_count;
     uint total_modules_count;
+    uint FLAG_use_explicit_hidden_mask;
 } push;
 
 // ── Descriptor Bindings ────────────────────────────────────────────────
 layout(set = 0, binding = 0) readonly buffer HiddenBuf  { STORAGE_TYPE data[]; } src_hidden;
 layout(set = 0, binding = 1) readonly buffer HMaskBuf   { STORAGE_TYPE data[]; } src_hidden_mask;
-layout(set = 0, binding = 2) readonly buffer WeightsBuf { STATE_TYPE   data[]; } src_weights;
-layout(set = 0, binding = 3) readonly buffer BiasesBuf  { STATE_TYPE   data[]; } src_biases;
-layout(set = 0, binding = 4) writeonly buffer LogitsBuf { STORAGE_TYPE data[]; } dest_logits;
+layout(set = 0, binding = 2) readonly buffer SMaskBuf   { uint data[]; } src_sample_mask;
+layout(set = 0, binding = 3) readonly buffer WeightsBuf { STATE_TYPE   data[]; } src_weights;
+layout(set = 0, binding = 4) readonly buffer BiasesBuf  { STATE_TYPE   data[]; } src_biases;
+layout(set = 0, binding = 5) writeonly buffer LogitsBuf { STORAGE_TYPE data[]; } dest_logits;
 
 void main() {
     // 3D logical mapping from invocation index
@@ -55,13 +57,25 @@ void main() {
                  + batch_global_idx * push.padded_total_output_class_count
                  + class_global_idx;
 
+    // ADR-031: Sample mask early-exit
+    if (load_sample_mask(src_sample_mask.data[batch_global_idx >> 5u], batch_global_idx) == 0u) {
+        dest_logits.data[out_idx] = write_storage(COMPUTE_TYPE(0.0));
+        return;
+    }
+
     // Initialize with bias
     COMPUTE_TYPE logit = read_state(src_biases.data[module_global_idx * push.padded_total_output_class_count + class_global_idx]);
 
     // Sparse dot product over hidden dimension
     for (uint h = 0; h < push.hidden_count; ++h) {
         uint  hidden_base = batch_global_idx * push.padded_hidden_count;
-        COMPUTE_TYPE h_mask = read_storage(src_hidden_mask.data[hidden_base + h]);
+        COMPUTE_TYPE h_mask;
+        if (push.FLAG_use_explicit_hidden_mask != 0u) {
+            h_mask = read_storage(src_hidden_mask.data[hidden_base + h]);
+        } else {
+            h_mask = (read_storage(src_hidden.data[hidden_base + h]) > COMPUTE_TYPE(0.0))
+                     ? COMPUTE_TYPE(1.0) : COMPUTE_TYPE(0.0);
+        }
 
         if (h_mask > COMPUTE_TYPE(0.5)) {
             COMPUTE_TYPE h_val = read_storage(src_hidden.data[hidden_base + h]);

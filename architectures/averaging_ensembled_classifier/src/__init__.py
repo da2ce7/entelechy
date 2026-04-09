@@ -15,7 +15,7 @@ from .main_orchestrator import TrainingOrchestrator, TrainingHyperparams, Stabil
 # --- Model Configuration ---
 from .shared.model_spec import ModelSpec
 from .shared.parameter_space import ParameterSpace
-from .shared.precision_config import PrecisionConfig
+from .shared.precision_config import PrecisionConfig, MaskStrategy
 from .shared.hardware_profile import HardwareProfile
 from .shared.stabilization_policy import StabilizationPolicy
 
@@ -34,6 +34,7 @@ __all__ = [
     "ModelSpec",
     "ParameterSpace",
     "PrecisionConfig",
+    "MaskStrategy",
     "HardwareProfile",
     "StabilizationPolicy",
     # Plan Model

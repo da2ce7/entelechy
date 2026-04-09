@@ -1,4 +1,4 @@
-### **System Contract: Host-Device Kernel Interface (Revision 7)**
+### **System Contract: Host-Device Kernel Interface (Revision 8)**
 
 #### **Preamble**
 
@@ -81,7 +81,7 @@ The `@param` block constitutes the complete logical specification for a paramete
 
 - **`Tensor Shape`**: The logical dimensions of the tensor.
 - **`Padding Contract`**: A key-value object literal specifying padding strategy. > Under the three-role precision model, padding byte counts use the element size of the buffer's actual `precision_role` type: `sizeof(STORAGE_TYPE)`, `sizeof(COMPUTE_TYPE)`, or `sizeof(STATE_TYPE)` as appropriate. Using a different role's `sizeof` in a `Padding Contract` expression is a contract violation.
-- **`Precision Role`**: One of `"storage"`, `"compute"`, or `"state"`. Declares which precision-role dtype from the active `PrecisionConfig` governs this buffer's element type and allocation size. **Mandatory** for all floating-point buffer parameters. Integer-typed buffers (`int`, `uint`, `atomic_uint`) whose element size is format-independent are exempt.
+- **`Precision Role`**: One of `"storage"`, `"compute"`, `"state"`, or `"flag-conditional"`. Declares which precision-role dtype from the active `PrecisionConfig` governs this buffer's element type and allocation size. **Mandatory** for all floating-point buffer parameters. Integer-typed buffers (`int`, `uint`, `atomic_uint`) whose element size is format-independent are exempt. When the role is `"flag-conditional"`, the buffer's element type depends on a FLAG scalar parameter's value; the commentary block MUST enumerate each flag value and its corresponding interpretation (role+type). Host-side validation operates on the runtime flag value.
 - **`Calculability Proof`**: Defines the derivation of buffer dimensions or scalar values through a constructive arithmetic expression composed solely of parameters present within the kernel's interface. All terms in this expression shall correspond to kernel arguments, satisfying the Axiom of Interface Verifiability (1.4).
 - **`Initialization Contract`**: For `dest_` flow buffers, declares whether the Host must pre-initialize the buffer contents before the producing kernel(s) are dispatched. Omission is equivalent to `{Type: NONE}`.
 - **`Validation Preconditions`**: Mandatory conditions the host must meet.
@@ -97,16 +97,29 @@ The `Padding Contract` field `Type` key accepts the following string literals:
 | `SIMD`                    | Padding to align a dimension to the natural SIMD vector width.           |
 | `NONE`                    | No independent padding strategy is applied to this buffer. The buffer's allocation dimensions may incorporate padding from `padded_*` dimension parameters, which are host-computed scalars satisfying the union of alignment constraints across all buffers sharing those dimensions. When `padded_*` parameters appear in the Tensor Shape, the padding is fully determined by those parameter values; no additional buffer-specific padding calculation is required. |
 
-*When a buffer has multiple independently padded dimensions, the `Type` field declares the primary padding motivation for the buffer's characteristic access pattern. Secondary padding on other dimensions is expressed through `padded_*` parameters in the Tensor Shape and may be documented in the `Formula` field. A future revision may extend the Padding Contract to per-dimension specifications.*
+When a buffer has multiple independently padded dimensions, the `Padding Contract` field SHALL use a per-dimension dictionary format that specifies the padding `Type` for each dimension individually:
+
+```
+- Padding Contract: {
+    dim[0] ("total_modules_count"): {Type: NONE},
+    dim[1] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
+    dim[2] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
+  }
+```
+
+Each dimension entry uses the notation `dim[N] ("natural_name" → "padded_name")` for padded dimensions, or `dim[N] ("name")` for unpadded dimensions. The `Type` and `Formula` keys within each dimension entry follow the same vocabulary defined in the table above. This eliminates the "primary padding motivation" ambiguity while staying within the existing vocabulary. It is a natural evolution of the `padded_*` scalar convention that already carries the padding values — this extension carries the padding rationale per dimension.
+
+Buffers with a single padded dimension (or no padding) continue to use the flat `{Type: X}` format.
 
 **3.1.1. Initialization Contract Specification**
 
 The `Initialization Contract` field declares whether the Host must pre-initialize a destination buffer before the producing kernel(s) are dispatched.
 
-| Type Token      | Definition                                                                                                                                                                                                                         |
-| :-------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ZERO_REQUIRED` | Host must zero-fill the entire buffer before any kernel dispatch writes to it. The producing kernel uses partial-write or scatter-write patterns that leave positions unwritten; downstream consumers read the full buffer extent. |
-| `NONE`          | No initialization required. The producing kernel(s) guarantee that all positions read by downstream consumers are written before consumption.                                                                                      |
+| Type Token               | Definition                                                                                                                                                                                                                         |
+| :----------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ZERO_REQUIRED`          | Host must zero-fill the entire buffer before any kernel dispatch writes to it. The producing kernel uses partial-write or scatter-write patterns that leave positions unwritten; downstream consumers read the full buffer extent. |
+| `ZERO_REQUIRED_ADDITIVE` | Host must zero-fill the buffer before the *first* dispatch of a streaming series. The producing kernel adds to existing values on each dispatch; downstream consumers read only after the complete series. |
+| `NONE`                   | No initialization required. The producing kernel(s) guarantee that all positions read by downstream consumers are written before consumption.                                                                                      |
 
 **Default:** When a `dest_` buffer's commentary block omits the `Initialization Contract` field, the contract is implicitly `{Type: NONE}`. This field is not applicable to `src_` flow parameters (produced by prior pipeline stages), `update_buffer_GLOBAL_` parameters (persisted state), or `update_buffer_LOCAL_` parameters (transient work-group scratch).
 
@@ -135,6 +148,15 @@ The following strategy names are exhaustive. Their use contractually binds the i
 | `linear_batch`   | Decomposes by linear chunking of the batch dimension.                             | `src_scalar_NATURAL_batch_chunk_index`   | None, beyond buffer/stride dimensions. |
 | `linear_generic` | Decomposes by linear chunking of an arbitrary dimension.                          | An appropriate `..._chunk_index` scalar. | None, beyond buffer/stride dimensions. |
 
+**3.3. Conditional Buffer Contract**
+
+When a buffer parameter's access is gated by a FLAG scalar (the *controlling flag*), the parameter's commentary block SHALL include:
+
+1. A `[CONDITIONAL]` annotation in the `@param` description line, identifying the controlling flag.
+2. Validation Preconditions specifying: (a) the flag value under which the buffer is accessed, (b) the full allocation and bounds requirements when active, and (c) the permissible stub-buffer behavior when inactive (*"the Host MAY pass a minimal stub buffer"*).
+
+The `[CONDITIONAL]` annotation is a documentation convention; it does not introduce a new flow prefix or memory scope. The buffer's `[Flow]` prefix (`src_` or `dest_`) reflects its role when active.
+
 ### **Article 4: The Kernel Contract Block**
 
 **4.1. Mandate of Inclusion.** Every kernel interface specification **shall** begin with a `@kernel_contract` block. This block is mandatory and must precede the parameter list. Its purpose is to declare holistic constraints that apply to the kernel as a single unit.
@@ -148,6 +170,7 @@ The following strategy names are exhaustive. Their use contractually binds the i
 | **`Synchronization Model`** | Describes the kernel's role within the global DAG, using terms defined in **Article 4.3**.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Optional      |
 | **`Behavioral Invariants`** | Defines strict rules governing the kernel's internal implementation (e.g., "Forbidden from using `pown`"). The recognized values include: `Precision Boundary Conversion` — required for any kernel that accesses buffers whose `precision_role` is `"storage"` or `"state"`. The kernel shall: (1) widen all non-compute-role inputs to `COMPUTE_TYPE` upon load, (2) perform all **transformative** arithmetic exclusively in `COMPUTE_TYPE`, and (3) narrow results from `COMPUTE_TYPE` to the destination buffer's role type upon store. **Accumulative operations** on state-role buffers may instead use the State-Precision Accumulation invariant, which performs accumulation in `max(COMPUTE_TYPE, STATE_TYPE)`. When all role types are equal, both invariants reduce to identity operations. Kernels that access only `"compute"`-role and integer buffers do not require this invariant. `State-Precision Accumulation` — a mandatory invariant for stateful-update kernels performing accumulative operations on state-role buffers (EMA updates, running statistics). The kernel shall perform accumulative arithmetic in `ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE)`. When `STATE_TYPE > COMPUTE_TYPE`, the kernel: (1) loads state values at full `STATE_TYPE` precision, (2) widens compute-role inputs (e.g., gradients) to `STATE_TYPE`, (3) performs accumulative arithmetic in `STATE_TYPE`, and (4) stores results at `STATE_TYPE`. When `STATE_TYPE ≤ COMPUTE_TYPE`, this invariant is equivalent to Precision Boundary Conversion — `ACCUM_TYPE = COMPUTE_TYPE` and all widening casts are identities. The invariant applies only to operations whose mathematical nature is accumulative — incremental updates that refine prior state. Transformative operations within the same kernel (e.g., bias correction division, final parameter update) may use `COMPUTE_TYPE`. | Optional      |
 | **`Precision Variant`**     | Declares this kernel as a precision-typed variant of a named base kernel (ADR-026). Documents the specific buffer role divergence (storage-entry vs. compute-entry) and the selection criterion. The Orchestration tier selects the variant based on the source buffer's `precision_role`. When `STORAGE_TYPE == COMPUTE_TYPE`, both variants compile to identical machine code.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Optional      |
+| **`Kernel Bifurcation`** | Documents that this kernel is one half of a CONCEPT.md Principle 3(B) bifurcated pair. The value SHALL include: (1) an explicit reference to Principle 3(B), (2) identification of the peer kernel, and (3) a summary of the structural incompatibility (differing buffer types, shapes, or DAG edges) that prevents unification under a single interface with a FLAG parameter. This key is applicable only when the §7.0 Exception criteria are met. | Optional |
 
 **4.3. Canonical Behavioral Vocabulary.**
 This section defines the canonical terms used to describe a kernel's behavior or its role in the system DAG, typically within the `Synchronization Model` key.
@@ -305,6 +328,10 @@ The following abbreviations are formally blessed as equivalent short-form repres
 | `probabilities` | `probs`      |
 | `gradient`      | `grad`       |
 
+#### **1.2 Pluralization Rule**
+
+The Canonical Lexicon defines terms in their singular form. Plural forms of defined terms are implicitly valid when they appear as dimensional components — specifically when combined with `num_`, `total_`, `_count`, `_per_*`, or analogous cardinality modifiers. The plural is the natural morphological form for expressing "how many of this entity." Singular and plural forms carry no semantic distinction beyond grammatical number; they refer to the same Lexicon entry.
+
 #### **2.0 Core Data Role Primitives**
 
 #### **Group 1: Foundational Inputs & Ground Truth**
@@ -313,7 +340,7 @@ _These are the primary external data sources for a complete Act/Learn cycle._
 
 | Term      | Definition                                                      |
 | :-------- | :-------------------------------------------------------------- |
-| `input`   | The initial, untransformed data set for a complete computation. |
+| `input`   | The initial, untransformed data set for a complete computation. When used as a dimensional qualifier (e.g., `padded_input_count`, `input_count`), denotes the feature dimensionality of the primary input data. This dimensional usage is distinct from the data-role usage, which denotes the data buffer itself. |
 | `targets` | The ground truth labels for a supervised learning task.         |
 
 #### **Group 2: Learnable Model Parameters**
@@ -366,9 +393,12 @@ _These terms define the scope, validity, or dimension of other data structures._
 | `module`               | A parameter specific to a single classifier module (head).                                                                                 |
 | `shared`               | A parameter that is shared across multiple modules or layers.                                                                              |
 | `output_class`         | A dimension or count related to the output classes of a classifier.                                                                        |
-| `sample_mask`          | A tensor defining the validity (`1.0`) or invalidity/padding (`0.0`) of each sample in a batch.                                            |
-| `hidden_mask`          | A derivative mask, typically from a ReLU operation, combined with an upstream `sample_mask`.                                               |
+| `sample_mask`          | A packed bitmask buffer (`uint*`) encoding sample validity, 32 samples per word, LSB-first. Bit `1` = valid, `0` = invalid/padding. Accessed via `load_sample_mask(mask_words, sample_index)`. Host allocation shape: `((batch_size + 31) // 32,)` of `uint32` elements. |
+| `hidden_mask`          | A derivative mask for the hidden layer activation function. When the mask strategy is `explicit`, this buffer is produced by the forward pass kernel (Node 4) at compute precision and stored at storage precision, preserving derivative information that may be lost during activation storage narrowing. When the mask strategy is `recompute`, consuming kernels derive the mask from stored activations internally. The mask strategy is a Policy-tier decision based on the active `PrecisionConfig`. |
 | `effective_batch_size` | A scalar value representing the effective number of samples in a batch, computed by the host.                                              |
+| `batch`                | The primary sample dimension of a training batch. Used as a dimensional qualifier in counts, offsets, and chunk decompositions. |
+| `hidden`               | The dimensionality of the intermediate (hidden) representation layer. Used as a dimensional qualifier in counts and padding parameters. |
+| `tile`                 | A discrete, indivisible unit of parallel work produced by the flattening of a logical problem grid. Distinguished from `flat_tile` (§3.0) which denotes the specific decomposition strategy; `tile` is the resulting work unit itself. |
 | `height`               | The extent of a logical dimension, typically the slower-moving one (e.g., the number of rows).                                             |
 | `width`                | The number of scalar elements that constitute a single logical row or a 1D vector. For a 2D entity, this represents the number of columns. |
 
@@ -412,6 +442,8 @@ _Generic terms for special cases._
 | Suffix | `_t_j`       | A value that is dependent on the stage j of a multi-stage process (e.g., reduction tree layer).                                                                          |
 | Suffix | `_per_item`  | Denotes a per-item parameterization of a scalar quantity, providing one value per logical work-item (tile) rather than a single global scalar.                           |
 | Suffix | `_per_chunk` | Denotes a per-chunk parameterization, providing one value per decomposition chunk rather than a single global scalar.                                                    |
+| Prefix | `intermediate_` | Denotes a buffer at a transitional reduction stage — past `partial_` (raw/clipped) but before `summed_` (fully reduced). Applicable to buffers that are the output of one aggregation stage and the input to a subsequent clip or aggregation stage. |
+| Prefix | `write_` | Pertaining to the computed write position within a destination buffer. Distinct from `out_` (which marks buffer affinity) in that `write_` qualifies an address offset calculated by the host for placement within a collection buffer. |
 
 #### **5.0 Domain and Utility Primitives**
 
@@ -421,6 +453,7 @@ _Generic terms for special cases._
 | Specialized Layout   | `_aos`                                       | Suffix         | An Array-of-Structs layout.                                                                                                  |
 | Specialized Layout   | `_soa`                                       | Suffix         | A Struct-of-Arrays layout.                                                                                                   |
 | Specialized Layout   | `_permuted`                                  | Suffix         | A buffer whose elements have undergone a non-trivial permutation.                                                            |
+| Specialized Layout   | `_flat`                                      | Suffix         | A logically multi-dimensional structure (e.g., node × K offset pairs) serialized into a contiguous 1D representation. The flattening convention (e.g., row-major) follows Article 1.3. |
 | Local Memory Pattern | `simd_tile`                                  | Data Role      | A local memory tile used for SIMD optimization.                                                                              |
 | Local Memory Pattern | `reduction_tile`                             | Data Role      | A local memory tile used for parallel reduction.                                                                             |
 | Local Memory Pattern | `transpose_tile`                             | Data Role      | A local memory tile used for matrix transpose.                                                                               |
@@ -445,6 +478,8 @@ _Generic terms for special cases._
 | `problem_type`      | Selects the primary loss calculation path (e.g., CCE vs. BCE).                                              |
 | `operation_type`    | Selects the specific mathematical operation for a generic kernel (e.g., SUM vs. AVERAGE for an aggregator). |
 | `use_per_item_norm` | Selects the source for the gradient clipping threshold between a `_global` scalar and a `_per_item` buffer. |
+| `produce_hidden_mask` | Controls whether the forward pass kernel writes the ReLU derivative mask to the `hidden_mask` buffer. When 0, mask writes are skipped and the Host MAY pass a minimal stub buffer. |
+| `use_explicit_hidden_mask` | Selects the source for the ReLU derivative in consuming kernels. When 0, the mask is derived internally from stored activations (`activation > 0`). When 1, the mask is read from an explicit `hidden_mask` buffer. |
 
 #### **7.0 Forbidden & Deprecated Terms**
 

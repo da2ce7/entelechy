@@ -276,8 +276,8 @@ These are definitive — the kernel must match them exactly (within floating-poi
 
 | Reference Function | Kernel(s) | Mathematical Operation |
 | :--- | :--- | :--- |
-| `ref_reduction_tree_sum(partials, fan_in_K)` | Nodes 14/15/20 (`"sum"` variant) | Multi-stage $\log_K(N)$ summation |
-| `ref_reduction_tree_sum_and_clip(partials, fan_in_K, threshold_schedule)` | Nodes 15/20 (`"sum_and_clip"` variant) | Staged sum + per-stage component-wise clip |
+| `ref_reduction_tree_sum(partials, fan_in)` | Nodes 14/15/20 (`"sum"` variant) | Multi-stage $\log_K(N)$ summation |
+| `ref_reduction_tree_sum_and_clip(partials, fan_in, threshold_schedule)` | Nodes 15/20 (`"sum_and_clip"` variant) | Staged sum + per-stage component-wise clip |
 | `ref_stabilize_reduce_grad_h(grad_h_soa, policy_params)` | Node 16 | Specialized single-kernel Grad_H reduction with internal clipping |
 
 **`fixtures/numpy_backprop.py`:**

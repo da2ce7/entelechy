@@ -88,7 +88,7 @@ A parametric header consumed atomically by the backend's renderer. The Policy ti
 @dataclass(frozen=True)
 class ReductionTreePlan:
     num_partials: int
-    fan_in_K: int
+    fan_in: int
     num_stages: int
     elements_per_partial: int
     initial_offset_list: tuple[int, ...]
@@ -153,6 +153,8 @@ class PrecisionConfig:
 Constructed via factory classmethods: `PrecisionConfig.float32()`, `PrecisionConfig.mixed_f16_f32()`, `PrecisionConfig.fp8_e4m3()`, `PrecisionConfig.fp8_e5m2()`, and others. The invariant `storage_dtype.itemsize ≤ compute_dtype.itemsize` and `storage_dtype.itemsize ≤ state_dtype.itemsize` is enforced at construction. FP8 is permitted only in the storage role. `ModelSpec` consumes `PrecisionConfig` via composition; factory classmethods `ModelSpec.float32()` / `ModelSpec.mixed_f16_f32()` are the primary construction API.
 
 The three-role decomposition enables FP16-storage/FP32-compute pipelines without mode flags or conditional compilation — a configuration where all roles share a type is a parameterization, not a distinct mode.
+
+The `mask_strategy` property returns a `MaskStrategy` indicating whether the `hidden_mask` buffer should be explicitly materialized (`"explicit"`) or derived from stored activations at consumption time (`"recompute"`). When `storage_dtype != compute_dtype`, the explicit strategy is selected because the precision boundary destroys derivative information for activations below the storage format's quantization floor.
 
 ### 3.6 Buffer Lifecycle (ADR-009)
 

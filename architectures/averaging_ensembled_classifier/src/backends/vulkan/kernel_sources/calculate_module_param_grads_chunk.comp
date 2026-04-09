@@ -28,7 +28,7 @@ layout(set = 0, binding = 0) readonly buffer HiddenBuf   { STORAGE_TYPE data[]; 
 layout(set = 0, binding = 1) readonly buffer ProbsBuf    { STORAGE_TYPE data[]; } src_probs;
 layout(set = 0, binding = 2) readonly buffer TargetsBuf  { int           data[]; } src_targets_cce;
 layout(set = 0, binding = 3) readonly buffer TargetsBCE  { STORAGE_TYPE data[]; } src_targets_bce;
-layout(set = 0, binding = 4) readonly buffer MaskBuf     { STORAGE_TYPE data[]; } src_sample_mask;
+layout(set = 0, binding = 4) readonly buffer MaskBuf     { uint data[]; } src_sample_mask;
 layout(set = 0, binding = 5) writeonly buffer GradWBuf   { STORAGE_TYPE data[]; } dest_grad_w;
 layout(set = 0, binding = 6) writeonly buffer GradBBuf   { STORAGE_TYPE data[]; } dest_grad_b;
 layout(set = 0, binding = 7) readonly buffer TempsBuf    { STATE_TYPE   data[]; } src_temps;
@@ -82,7 +82,7 @@ void main() {
     COMPUTE_TYPE p_grad_b = COMPUTE_TYPE(0.0);
 
     for (uint b = lid; b < push.total_batch_count; b += lsize) {
-        if (read_storage(src_sample_mask.data[b]) < COMPUTE_TYPE(0.5)) continue;
+        if (load_sample_mask(src_sample_mask.data[b >> 5u], b) == 0u) continue;
 
         uint prob_idx = prob_tile_base
                       + module_local_idx * push.total_batch_count * push.classes_per_chunk

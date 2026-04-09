@@ -17,11 +17,12 @@ layout(push_constant) uniform PushConstants {
     uint total_batch_count;
     uint padded_input_count;
     uint padded_hidden_count;
+    uint FLAG_produce_hidden_mask;
 } push;
 
 // ── Descriptor Bindings ────────────────────────────────────────────────
 layout(set = 0, binding = 0) readonly buffer InputBuf       { STORAGE_TYPE data[]; } src_input;
-layout(set = 0, binding = 1) readonly buffer MaskBuf        { STORAGE_TYPE data[]; } src_sample_mask;
+layout(set = 0, binding = 1) readonly buffer MaskBuf        { uint data[]; } src_sample_mask;
 layout(set = 0, binding = 2) readonly buffer WeightsBuf     { STATE_TYPE   data[]; } src_weights;
 layout(set = 0, binding = 3) readonly buffer BiasesBuf      { STATE_TYPE   data[]; } src_biases;
 layout(set = 0, binding = 4) writeonly buffer HiddenBuf     { STORAGE_TYPE data[]; } dest_hidden;
@@ -38,15 +39,17 @@ void main() {
     if (b_idx >= push.total_batch_count) return;
 
     uint  h_idx      = hb * SPEC_SIMD_WIDTH + lid;
-    COMPUTE_TYPE mask_val   = read_storage(src_sample_mask.data[b_idx]);
+    uint  mask_val   = load_sample_mask(src_sample_mask.data[b_idx >> 5u], b_idx);
     uint  input_base = b_idx * push.padded_input_count;
     uint  w_base     = hb * push.padded_input_count * SPEC_SIMD_WIDTH;
 
     // Handle padded (masked-out) samples
-    if (mask_val < COMPUTE_TYPE(0.5)) {
+    if (mask_val == 0u) {
         uint out_idx = b_idx * push.padded_hidden_count + h_idx;
         dest_hidden.data[out_idx]      = write_storage(COMPUTE_TYPE(0.0));
-        dest_hidden_mask.data[out_idx] = write_storage(COMPUTE_TYPE(0.0));
+        if (push.FLAG_produce_hidden_mask != 0u) {
+            dest_hidden_mask.data[out_idx] = write_storage(COMPUTE_TYPE(0.0));
+        }
         return;
     }
 
@@ -69,11 +72,13 @@ void main() {
         barrier();
     }
 
-    // ReLU activation + sample mask
-    COMPUTE_TYPE activated = max(COMPUTE_TYPE(0.0), accum) * mask_val;
-    COMPUTE_TYPE rmask     = (accum > COMPUTE_TYPE(0.0)) ? mask_val : COMPUTE_TYPE(0.0);
+    // ReLU activation (sample already validated as active)
+    COMPUTE_TYPE activated = max(COMPUTE_TYPE(0.0), accum);
+    COMPUTE_TYPE rmask     = (accum > COMPUTE_TYPE(0.0)) ? COMPUTE_TYPE(1.0) : COMPUTE_TYPE(0.0);
 
     uint out_idx = b_idx * push.padded_hidden_count + h_idx;
-    dest_hidden.data[out_idx]      = write_storage(activated);
-    dest_hidden_mask.data[out_idx] = write_storage(rmask);
+    dest_hidden.data[out_idx] = write_storage(activated);
+    if (push.FLAG_produce_hidden_mask != 0u) {
+        dest_hidden_mask.data[out_idx] = write_storage(rmask);
+    }
 }

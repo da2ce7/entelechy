@@ -166,13 +166,15 @@ class CPUPlanRenderer:
                 "storage": plan.precision.storage_dtype,
                 "compute": plan.precision.compute_dtype,
                 "state": plan.precision.state_dtype,
+                None: np.dtype(np.uint32),
             },
         )
         for descriptor in plan.buffers.values():
+            role_dtype = allocator._role_dtypes[descriptor.precision_role]
             key = (
                 descriptor.logical_name,
                 descriptor.padded_shape,
-                allocator._role_dtypes[descriptor.precision_role].str,
+                role_dtype.str,
             )
             if descriptor.role == BufferRole.MODEL_STATE and key in self._persistent_buffers:
                 # Reuse the persistent buffer
@@ -377,7 +379,7 @@ class CPUPlanRenderer:
             fn_name = f"execute_reduction_tree_{suffix}"
 
         offsets = rtp.initial_offset_list
-        fan_in = rtp.fan_in_K
+        fan_in = rtp.fan_in
         num_stages = rtp.num_stages
         pw = rtp.partial_width
         SENTINEL = 0xFFFFFFFF

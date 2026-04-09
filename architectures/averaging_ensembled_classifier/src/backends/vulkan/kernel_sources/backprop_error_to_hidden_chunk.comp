@@ -28,7 +28,7 @@ layout(push_constant) uniform PushConstants {
 layout(set = 0, binding = 0) readonly buffer ProbsBuf   { STORAGE_TYPE data[]; } src_probs;
 layout(set = 0, binding = 1) readonly buffer TargetsCCE { int           data[]; } src_targets_cce;
 layout(set = 0, binding = 2) readonly buffer TargetsBCE { STORAGE_TYPE data[]; } src_targets_bce;
-layout(set = 0, binding = 3) readonly buffer MaskBuf    { STORAGE_TYPE data[]; } src_sample_mask;
+layout(set = 0, binding = 3) readonly buffer MaskBuf    { uint data[]; } src_sample_mask;
 layout(set = 0, binding = 4) readonly buffer WeightsBuf { STATE_TYPE   data[]; } src_weights;
 layout(set = 0, binding = 5) writeonly buffer GradHBuf  { STORAGE_TYPE data[]; } dest_grad_h;
 layout(set = 0, binding = 6) readonly buffer TempsBuf   { STATE_TYPE   data[]; } src_temps;
@@ -57,7 +57,7 @@ void main() {
     uint out_idx = tile_base + local_offset;
 
     // Padded sample early exit
-    if (read_storage(src_sample_mask.data[batch_idx]) < COMPUTE_TYPE(0.5)) {
+    if (load_sample_mask(src_sample_mask.data[batch_idx >> 5u], batch_idx) == 0u) {
         dest_grad_h.data[out_idx] = write_storage(COMPUTE_TYPE(0.0));
         return;
     }

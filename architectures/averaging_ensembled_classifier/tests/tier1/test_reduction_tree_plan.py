@@ -24,7 +24,7 @@ def _make_tree(
     else:
         schedule = tuple(None for _ in range(num_stages))
     return ReductionTreePlan(
-        num_partials=num_partials, fan_in_K=fan_in, num_stages=num_stages,
+        num_partials=num_partials, fan_in=fan_in, num_stages=num_stages,
         elements_per_partial=1, initial_offset_list=tuple(range(num_partials)),
         tree_variant=variant, threshold_schedule=schedule,
         partial_width=1, source_buffer=BufferHandle(0),
@@ -69,7 +69,7 @@ class TestThresholdSchedule:
         """No threshold exceeds FP16 max / K."""
         fp16_max = 65504.0
         tree = _make_tree(16, 4, fp_max=fp16_max)
-        safety = fp16_max / tree.fan_in_K
+        safety = fp16_max / tree.fan_in
         for t in tree.threshold_schedule:
             if t is not None:
                 assert t <= safety + 1e-6
@@ -79,4 +79,4 @@ class TestFrozenImmutability:
     def test_frozen(self):
         tree = _make_tree(4, 2)
         with pytest.raises(AttributeError):
-            tree.fan_in_K = 99  # type: ignore[misc]
+            tree.fan_in = 99  # type: ignore[misc]

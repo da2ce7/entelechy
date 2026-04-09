@@ -127,7 +127,7 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_partial_collection,
     __global const uint *src_buffer_GLOBAL_CONST_offset_list_flat,
-    __global COMPUTE_TYPE *dest_buffer_GLOBAL_stage_output,
+    __global COMPUTE_TYPE *dest_buffer_GLOBAL_stage_partial,
     uint src_scalar_NATURAL_fan_in_K,
     uint src_scalar_NATURAL_node_count,
     uint src_scalar_NATURAL_partial_width,

@@ -426,4 +426,11 @@ COMPUTE_TYPE workgroup_reduce_max(COMPUTE_TYPE value) {
     return _compute_scratch[0];
 }
 
+// ── ADR-031: Sample Mask Bitmask Access ────────────────────────────────
+// 32 samples per uint word, LSB-first. Returns 0 or 1.
+// Usage: load_sample_mask(mask_buf.data[sample_index >> 5u], sample_index)
+uint load_sample_mask(uint word, uint sample_index) {
+    return (word >> (sample_index & 31u)) & 1u;
+}
+
 #endif // COMMON_GLSL

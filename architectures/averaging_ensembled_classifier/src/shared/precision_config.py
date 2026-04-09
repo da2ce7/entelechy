@@ -1,6 +1,7 @@
 # src/shared/precision_config.py
 """Backend-neutral precision configuration (ADR-008, ADR-020, ADR-022 §1, ADR-025)."""
 from dataclasses import dataclass
+from typing import Literal
 
 import ml_dtypes
 import numpy as np
@@ -11,6 +12,43 @@ import numpy as np
 FP8_E4M3 = np.dtype(ml_dtypes.float8_e4m3fn)
 FP8_E5M2 = np.dtype(ml_dtypes.float8_e5m2)
 FP8_DTYPES = frozenset({FP8_E4M3, FP8_E5M2})
+
+
+@dataclass(frozen=True)
+class MaskStrategy:
+    """Controls hidden_mask buffer lifecycle in the execution plan.
+
+    Policy-tier decision (§5) determining whether the hidden_mask buffer is
+    explicitly materialized or derived at consumption time.
+
+    Modes:
+        "recompute": Consuming kernels derive mask from stored activations.
+                     No mask buffer allocated. Valid only when storage_dtype
+                     == compute_dtype (no precision boundary).
+        "explicit":  Node 4 produces mask buffer capturing compute-precision
+                     derivative truth before storage narrowing. Consuming
+                     kernels read mask directly.
+
+    The mask carries non-zero information whenever the derivative cannot be
+    reconstructed from the stored representation — this occurs when:
+      - storage_dtype != compute_dtype (precision boundary)
+      - External gating (dropout, pruning) is applied (future)
+      - Non-ReLU activations are used (future)
+
+    Selection is automatic based on PrecisionConfig via the
+    select_mask_strategy() factory or PrecisionConfig.mask_strategy property.
+    """
+    mode: Literal["recompute", "explicit"]
+
+    @property
+    def is_explicit(self) -> bool:
+        """True if mask buffer must be materialized."""
+        return self.mode == "explicit"
+
+    @property
+    def is_recompute(self) -> bool:
+        """True if mask can be derived from stored activations."""
+        return self.mode == "recompute"
 
 
 @dataclass(frozen=True)
@@ -270,3 +308,26 @@ class PrecisionConfig:
             compute_fp_format_max=float(f64_info.max),
             compute_epsilon=float(f64_info.eps),
         )
+
+    # --- Mask Strategy Selection (Policy Tier §5) ---
+
+    @property
+    def mask_strategy(self) -> MaskStrategy:
+        """Select mask strategy based on precision configuration.
+
+        When storage_dtype != compute_dtype, the precision boundary destroys
+        derivative information for activations below the storage format's
+        quantization floor. The mask must be explicitly materialized to
+        preserve the compute-precision derivative truth.
+
+        When storage_dtype == compute_dtype, the mask is fully derivable
+        from stored activations (mask = activation > 0).
+
+        Returns:
+            MaskStrategy with mode "explicit" or "recompute".
+        """
+        if self.storage_dtype != self.compute_dtype:
+            # Precision boundary destroys derivative information — mask required
+            return MaskStrategy(mode="explicit")
+        # Mask is fully derivable from stored activations
+        return MaskStrategy(mode="recompute")

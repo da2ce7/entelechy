@@ -253,7 +253,7 @@ __kernel void reduce_k_fan_in_and_clip(
     __local  COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_collection,
     __global const uint        *src_buffer_GLOBAL_CONST_offset_list_flat,
-    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_stage_output,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_stage_partial,
     uint src_scalar_NATURAL_fan_in_K,
     uint src_scalar_NATURAL_node_count,
     uint src_scalar_NATURAL_partial_width,
@@ -267,7 +267,7 @@ __kernel void reduce_k_fan_in_and_clip(
 |:---|:---|:---|:---|
 | `src_buffer_GLOBAL_partial_collection` | src | (undefined) | The memory pool. Valid buffer encompassing all offset references. |
 | `src_buffer_GLOBAL_CONST_offset_list_flat` | src | (`node_count * fan_in_K`) | Flat offset list. K consecutive entries per node. Sentinel `0xFFFFFFFF` for absent partials. |
-| `dest_buffer_GLOBAL_stage_output` | dest | (`node_count * partial_width`) | Contiguous output. Node `n` writes at `[n * partial_width, (n+1) * partial_width)`. |
+| `dest_buffer_GLOBAL_stage_partial` | dest | (`node_count * partial_width`) | Contiguous output. Node `n` writes at `[n * partial_width, (n+1) * partial_width)`. |
 
 **Scalar contracts:**
 
@@ -369,7 +369,7 @@ reduce_k_fan_in_and_clip_contract = KernelContract(
             ),
         ),
         BufferParamSpec(
-            name="dest_buffer_GLOBAL_stage_output",
+            name="dest_buffer_GLOBAL_stage_partial",
             flow="dest", memory_scope="GLOBAL",
             tensor_shape=("node_count * partial_width",),
             padding_contract=PaddingContract("NONE", None),

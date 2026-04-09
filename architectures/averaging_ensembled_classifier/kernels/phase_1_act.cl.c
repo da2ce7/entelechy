@@ -13,11 +13,12 @@
 __kernel void forward_pass(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_simd_tile,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_input,
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint          *src_buffer_GLOBAL_sample_mask,
     __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_weights_shared_simd_major,
     __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_biases_shared,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_hidden_activations,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_hidden_mask,
+    uint                         dest_scalar_FLAG_produce_hidden_mask,
     uint                         src_scalar_NATURAL_batch_chunk_offset,
     uint                         src_scalar_NATURAL_batch_chunk_count,
     uint                         src_scalar_NATURAL_total_batch_count,
@@ -43,9 +44,11 @@ __kernel void forward_pass(
 
     // Early exit for padded samples to avoid wasted computation and synchronization.
     // Both activation and mask are set to zero to propagate the invalid state.
-    if (load_storage(src_buffer_GLOBAL_sample_mask, effective_bid) < (COMPUTE_TYPE)0.5f) {
+    if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, effective_bid)) {
         store_storage(dest_buffer_GLOBAL_hidden_activations, hidden_idx, COMPUTE_ZERO);
-        store_storage(dest_buffer_GLOBAL_hidden_mask, hidden_idx, COMPUTE_ZERO);
+        if (dest_scalar_FLAG_produce_hidden_mask) {
+            store_storage(dest_buffer_GLOBAL_hidden_mask, hidden_idx, COMPUTE_ZERO);
+        }
         return;
     }
 
@@ -101,10 +104,12 @@ __kernel void forward_pass(
     const COMPUTE_TYPE activation = fmax(accum, COMPUTE_ZERO);
     store_storage(dest_buffer_GLOBAL_hidden_activations, hidden_idx, activation);
 
-    // Concurrently compute the derivative mask for ReLU (0 or 1). This is a fused operation that
+    // Conditionally compute the derivative mask for ReLU (0 or 1). This is a fused operation that
     // avoids a separate kernel launch, saving overhead. The `select` intrinsic is often
-    // more efficient than an if/else block.
-    store_storage(dest_buffer_GLOBAL_hidden_mask, hidden_idx, select((COMPUTE_TYPE)0.0f, (COMPUTE_TYPE)1.0f, activation > COMPUTE_ZERO));
+    // more efficient than an if/else block. Mask production is controlled by the FLAG.
+    if (dest_scalar_FLAG_produce_hidden_mask) {
+        store_storage(dest_buffer_GLOBAL_hidden_mask, hidden_idx, select((COMPUTE_TYPE)0.0f, (COMPUTE_TYPE)1.0f, activation > COMPUTE_ZERO));
+    }
 }
 
 // --- Implementation: render_logits_chunk (Node 5) ---
@@ -115,6 +120,8 @@ __kernel void forward_pass(
 __kernel void render_logits_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_activations,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_mask,
+    uint                         src_scalar_FLAG_use_explicit_hidden_mask,
+    __global const uint          *src_buffer_GLOBAL_sample_mask,
     __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_weights_module,
     __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_biases_module,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_logits,
@@ -157,6 +164,13 @@ __kernel void render_logits_chunk(
     const long out_idx = (long)module_global_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_total_output_class_count
                          + (long)batch_global_idx * src_scalar_NATURAL_padded_total_output_class_count + (long)class_global_idx;
 
+    // --- Sample Mask Check (ADR-031) ---
+    // Early exit for padded/invalid samples. Logit output is zeroed.
+    if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, batch_global_idx)) {
+        store_storage(dest_buffer_GLOBAL_logits, out_idx, COMPUTE_ZERO);
+        return;
+    }
+
     // Initialize the accumulator with the corresponding bias.
     COMPUTE_TYPE logit = load_state(src_buffer_GLOBAL_CONST_biases_module, (long)module_global_idx * src_scalar_NATURAL_padded_total_output_class_count + class_global_idx);
 
@@ -165,15 +179,18 @@ __kernel void render_logits_chunk(
     for (uint h = 0; h < src_scalar_NATURAL_hidden_count; ++h) {
         // Calculate the base index for the hidden layer outputs for this batch item.
         const long         hidden_base_idx = (long)batch_global_idx * src_scalar_NATURAL_padded_hidden_count;
-        const COMPUTE_TYPE h_mask          = load_storage(src_buffer_GLOBAL_hidden_mask, hidden_base_idx + h);
+        const COMPUTE_TYPE h_val           = load_storage(src_buffer_GLOBAL_hidden_activations, hidden_base_idx + h);
+
+        // Determine the mask value: explicit from buffer or derived from activation.
+        // When FLAG=1, the mask buffer contains the compute-precision derivative truth.
+        // When FLAG=0, derive the mask from stored activations (mask = activation > 0).
+        const COMPUTE_TYPE h_mask = src_scalar_FLAG_use_explicit_hidden_mask ? load_storage(src_buffer_GLOBAL_hidden_mask, hidden_base_idx + h) : select((COMPUTE_TYPE)0.0f, (COMPUTE_TYPE)1.0f, h_val > COMPUTE_ZERO);
 
         // This `if` check is a critical, sparsity-aware optimization. The upstream ReLU
         // activation (in Node 4) zeroes out many hidden activations. By checking the
-        // mask first, this kernel avoids two expensive global memory reads (for the
-        // activation and weight) and a multiplication for every zeroed-out neuron.
+        // mask first, this kernel avoids an expensive weight read and a multiplication
+        // for every zeroed-out neuron.
         if (h_mask > (COMPUTE_TYPE)0.5f) {
-            const COMPUTE_TYPE h_val = load_storage(src_buffer_GLOBAL_hidden_activations, hidden_base_idx + h);
-
             // The weight index calculation is complex but correctly follows row-major layout
             // while respecting the physical padding of all dimensions.
             const long weight_idx = (long)module_global_idx * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_total_output_class_count
@@ -198,7 +215,7 @@ __kernel void compute_probs_loss_cce_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_logits,
     __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_temps,
     __global const int          *src_buffer_GLOBAL_targets,
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint          *src_buffer_GLOBAL_sample_mask,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_probs,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_final_loss,
     uint                         src_scalar_NATURAL_flat_tile_index,
@@ -229,7 +246,7 @@ __kernel void compute_probs_loss_cce_chunk(
     // --- 3. Handle Padded Samples ---
     const long loss_out_idx = (long)module_global_idx * src_scalar_NATURAL_total_batch_count + batch_idx;
 
-    if (load_storage(src_buffer_GLOBAL_sample_mask, batch_idx) < (COMPUTE_TYPE)0.5f) {
+    if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, batch_idx)) {
         store_storage(dest_buffer_GLOBAL_final_loss, loss_out_idx, COMPUTE_ZERO);
         // Also zero out the partial probabilities this tile is responsible for. This ensures
         // downstream gradient kernels receive correct zero inputs for padded samples.
@@ -315,7 +332,7 @@ __kernel void compute_probs_loss_bce_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_logits,
     __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_temps,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_targets,
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint          *src_buffer_GLOBAL_sample_mask,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_probs,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_loss,
     uint                         src_scalar_NATURAL_flat_tile_index,
@@ -346,7 +363,7 @@ __kernel void compute_probs_loss_bce_chunk(
     const long loss_write_idx        = loss_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count + batch_idx;
 
     // --- 3. Handle Padded Samples ---
-    if (load_storage(src_buffer_GLOBAL_sample_mask, batch_idx) < (COMPUTE_TYPE)0.5f) {
+    if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, batch_idx)) {
         // For padded samples, we must zero out both outputs this tile is responsible for.
         store_storage(dest_buffer_GLOBAL_partial_loss, loss_write_idx, COMPUTE_ZERO);
 

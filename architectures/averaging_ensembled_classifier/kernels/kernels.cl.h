@@ -454,6 +454,15 @@ static inline void store_state_update(
     buf[idx] = (STATE_TYPE)val;
 }
 
+// --- Sample Mask Bitmask Access (ADR-031) ---
+// Packed uint bitmask with 32 samples per word, LSB-first.
+// Compiles to 3 integer ALU operations.
+static inline uint load_sample_mask(
+    __global const uint *mask_words, uint sample_index)
+{
+    return (mask_words[sample_index >> 5u] >> (sample_index & 31u)) & 1u;
+}
+
 // === Accumulation Precision Type (ADR-027) ===
 //
 // Stateful-update kernels perform EMA accumulation in ACCUM_TYPE, defined as
@@ -640,6 +649,10 @@ inline void store_state(STATE_TYPE *buf, size_t idx, COMPUTE_TYPE val) { buf[idx
 // Semantically distinct from store_state(): marks an in-place optimizer
 // state mutation. Currently identical; exists for future extensibility.
 inline void store_state_update(STATE_TYPE *buf, size_t idx, COMPUTE_TYPE val) { buf[idx] = (STATE_TYPE)val; }
+// ADR-031: Sample mask bitmask access — host-mode stub
+inline unsigned int load_sample_mask(const unsigned int *mask_words, unsigned int sample_index) {
+    return (mask_words[sample_index >> 5u] >> (sample_index & 31u)) & 1u;
+}
 // Host-mode accumulation-precision stubs (ADR-027)
 // In host mode, STATE_TYPE == COMPUTE_TYPE == float, so ACCUM_TYPE = COMPUTE_TYPE
 #ifndef ACCUM_TYPE
@@ -684,7 +697,7 @@ inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val) { return (COMPUTE_TYPE)val
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Streamable"
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs loaded via load_storage(); state-role inputs loaded via load_state(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs loaded via load_storage(); state-role inputs loaded via load_state(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Hidden mask production is controlled by `dest_scalar_FLAG_produce_hidden_mask`. When 1: the ReLU derivative mask capturing compute-precision truth is written to `dest_buffer_GLOBAL_hidden_mask`. When 0: mask writes are skipped; the Host MAY pass a minimal stub buffer. This FLAG enables policy-tier control over mask lifecycle based on the precision configuration."
  */
 __kernel void forward_pass(
     /**
@@ -710,20 +723,25 @@ __kernel void forward_pass(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_input,
 
     /**
-     * @param src_buffer_GLOBAL_sample_mask A tensor defining the validity (1) or padding (0) status of samples.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count)
+     * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
+     *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
+     *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
      *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "storage"
+     *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: [1] The access slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
-     * src_scalar_NATURAL_total_batch_count. [2] Host shall allocate exactly [src_scalar_NATURAL_total_batch_count * sizeof(STORAGE_TYPE)] bytes.
+     * src_scalar_NATURAL_total_batch_count. [2] Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint *src_buffer_GLOBAL_sample_mask,
 
     /**
      * @param src_buffer_GLOBAL_CONST_weights_shared_simd_major The learnable shared weights in a SIMD-friendly layout.
      *        - Tensor Shape: (src_scalar_NATURAL_padded_hidden_count/SIMD_WIDTH, src_scalar_NATURAL_padded_input_count, SIMD_WIDTH)
-     *        - Padding Contract: {Type: SIMD, Formula: "hidden_dim padded to SIMD_WIDTH; input_dim padded for alignment"}
+     *        - Padding Contract: {
+     *            dim[0] ("hidden_count/SIMD_WIDTH" → "padded_hidden_count/SIMD_WIDTH"): {Type: SIMD, Formula: "SIMD_WIDTH-multiple alignment on hidden_count ensures exact division"},
+     *            dim[1] ("input_count" → "padded_input_count"): {Type: CACHE, Formula: "128-byte alignment"},
+     *            dim[2] ("SIMD_WIDTH"): {Type: NONE}
+     *          }
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_input_count]
      *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_input_count * sizeof(STATE_TYPE)] bytes.
@@ -752,15 +770,22 @@ __kernel void forward_pass(
     __global STORAGE_TYPE *dest_buffer_GLOBAL_hidden_activations,
 
     /**
-     * @param dest_buffer_GLOBAL_hidden_mask Derived mask from ReLU operation (1 if activation > 0, else 0).
+     * @param dest_buffer_GLOBAL_hidden_mask [CONDITIONAL] Derivative mask from ReLU operation (1 if activation > 0, else 0).
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
-     *        - Validation Preconditions: [1] The write slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
-     * src_scalar_NATURAL_total_batch_count. [2] Host shall allocate exactly [src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes.
+     *        - Validation Preconditions: [1] This buffer is written to ONLY IF `dest_scalar_FLAG_produce_hidden_mask` == 1. [2] If the flag is set, the write slice must be within bounds, as proven
+     * by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <= src_scalar_NATURAL_total_batch_count. [3] If the flag is set, Host shall allocate exactly
+     * [src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes. [4] If the flag is not set, the Host MAY pass a minimal stub buffer.
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_hidden_mask,
+
+    /**
+     * @param dest_scalar_FLAG_produce_hidden_mask A flag controlling mask production.
+     *        - Validation Preconditions: Must be 0 or 1. If 1, the ReLU derivative mask is written to `dest_buffer_GLOBAL_hidden_mask`. If 0, mask writes are skipped.
+     */
+    uint dest_scalar_FLAG_produce_hidden_mask,
 
     uint src_scalar_NATURAL_batch_chunk_offset,
     uint src_scalar_NATURAL_batch_chunk_count,
@@ -776,7 +801,7 @@ __kernel void forward_pass(
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Slice Renderer. Consumes chunked inputs to render a final slice of a monolithic output buffer."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; logit output narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Sparsity-Aware Dot Product: The `hidden_mask` parameter is used as a branch predicate to elide dot-product terms corresponding to ReLU-zeroed hidden units. For each hidden dimension where `hidden_mask[b][h] < 0.5`, the activation and weight reads are skipped entirely. This is a performance optimization exploiting upstream ReLU sparsity; it does not affect mathematical correctness. This optimization is non-mandatory: an implementation that unconditionally evaluates all hidden dimensions produces identical results. The mask's presence in the interface enables but does not require the sparsity exploitation."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; logit output narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Sample Masking (ADR-031): If load_sample_mask(sample_mask, sample) == 0, the sample is invalid/padding; all logit outputs for that sample are set to 0 and further computation is skipped. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sparsity-Aware Dot Product: The mask value is used as a branch predicate to elide dot-product terms corresponding to ReLU-zeroed hidden units. For each hidden dimension where mask < 0.5, the activation and weight reads are skipped entirely. This is a performance optimization exploiting upstream ReLU sparsity; it does not affect mathematical correctness."
  */
 __kernel void render_logits_chunk(
     /**
@@ -792,21 +817,44 @@ __kernel void render_logits_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_activations,
 
     /**
-     * @param src_buffer_GLOBAL_hidden_mask The ReLU mask corresponding to the hidden activations.
+     * @param src_buffer_GLOBAL_hidden_mask [CONDITIONAL] The ReLU mask corresponding to the hidden activations.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
-     *        - Validation Preconditions: [1] The batch slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
-     * src_scalar_NATURAL_total_batch_count. [2] Host must ensure this buffer was allocated to exactly [src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count *
-     * sizeof(STORAGE_TYPE)] bytes.
+     *        - Validation Preconditions: [1] This buffer is read from ONLY IF `src_scalar_FLAG_use_explicit_hidden_mask` == 1. [2] If the flag is set, the batch slice must be within bounds, as
+     * proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <= src_scalar_NATURAL_total_batch_count. [3] If the flag is set, Host must ensure this buffer was
+     * allocated to exactly [src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes. [4] If the flag is not set, the Host MAY pass a minimal stub
+     * buffer.
      */
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_mask,
 
     /**
+     * @param src_scalar_FLAG_use_explicit_hidden_mask A flag to select the ReLU derivative source.
+     *        - Validation Preconditions: Must be 0 or 1. If 0, mask is derived from stored activations (mask = activation > 0). If 1, mask is read from `src_buffer_GLOBAL_hidden_mask`.
+     */
+    uint src_scalar_FLAG_use_explicit_hidden_mask,
+
+    /**
+     * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
+     *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
+     *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "exempt (integer bitmask)"
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
+     *        - Validation Preconditions: [1] The batch access slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
+     * src_scalar_NATURAL_total_batch_count. [2] Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes.
+     */
+    __global const uint *src_buffer_GLOBAL_sample_mask,
+
+    /**
      * @param src_buffer_GLOBAL_CONST_weights_module The learnable weights for all classifier modules.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
-     *        - Padding Contract: {Type: SIMD, Formula: "output_class_count padded to SIMD_WIDTH; host ensures cache-line alignment is jointly satisfied"}
+     *        - Padding Contract: {
+     *            dim[0] ("total_modules_count"): {Type: NONE},
+     *            dim[1] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
+     *            dim[2] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
+     *          }
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
      *        - Validation Preconditions: [1] The module and class slices must be within bounds, as proven by: [(src_scalar_NATURAL_module_chunk_offset + src_scalar_NATURAL_module_chunk_count) <=
@@ -833,8 +881,9 @@ __kernel void render_logits_chunk(
      *        - Padding Contract: {Type: CACHE, Formula: "output_class_count padded for alignment"}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_total_output_class_count]
-     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_total_modules_count * src_scalar_NATURAL_total_batch_count *
-     * src_scalar_NATURAL_padded_total_output_class_count * sizeof(STORAGE_TYPE)] bytes.
+     *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_modules_count * src_scalar_NATURAL_total_batch_count *
+     * src_scalar_NATURAL_padded_total_output_class_count * sizeof(STORAGE_TYPE)] bytes. [2] Padding positions beyond `total_output_class_count` within each `padded_total_output_class_count` stride
+     * are architecturally unwritten. Downstream consumers (Nodes 6, 7, 10) are contractually bounded by `total_output_class_count` and DO NOT access padding.
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_logits,
 
@@ -895,14 +944,15 @@ __kernel void compute_probs_loss_cce_chunk(
     __global const int *src_buffer_GLOBAL_targets,
 
     /**
-     * @param src_buffer_GLOBAL_sample_mask A tensor defining the validity (1) or padding (0) status of samples.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count)
+     * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
+     *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
+     *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
      *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "storage"
+     *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
-     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_total_batch_count * sizeof(STORAGE_TYPE)] bytes for this buffer.
+     *        - Validation Preconditions: Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes for this buffer.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint *src_buffer_GLOBAL_sample_mask,
 
     /**
      * @param dest_buffer_GLOBAL_partial_probs The collection buffer for this tile's computed probabilities.
@@ -983,14 +1033,15 @@ __kernel void compute_probs_loss_bce_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_targets,
 
     /**
-     * @param src_buffer_GLOBAL_sample_mask A tensor defining the validity (1) or padding (0) status of samples.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count)
+     * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
+     *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
+     *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
      *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "storage"
+     *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
-     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_total_batch_count * sizeof(STORAGE_TYPE)] bytes for this buffer.
+     *        - Validation Preconditions: Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes for this buffer.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint *src_buffer_GLOBAL_sample_mask,
 
     /**
      * @param dest_buffer_GLOBAL_partial_probs The collection buffer for this tile's computed probabilities.
@@ -1075,7 +1126,7 @@ __kernel void calculate_module_param_grads_chunk(
      * @param src_buffer_GLOBAL_targets The ground truth labels (type-punned pointer).
      *        - Tensor Shape: Varies based on problem type flag.
      *        - Padding Contract: Varies.
-     *        - Precision Role: "Conditional — storage-role when src_scalar_FLAG_problem_type == BCE; integer-typed (exempt) when CCE. BCE path widens to COMPUTE_TYPE upon load."
+     *        - Precision Role: "flag-conditional" — When src_scalar_FLAG_problem_type == BCE: storage-role (STORAGE_TYPE multi-hot targets), widened to COMPUTE_TYPE upon load. When src_scalar_FLAG_problem_type == CCE: integer-typed (exempt), interpreted as int class indices.
      *        - Calculability Proof: Dependent on problem type flag.
      *        - Validation Preconditions: [1] This is a type-punned pointer (`void*`). [2] Host is contractually obligated to provide the correct target buffer whose layout, type, and total size
      * correspond to the value of `src_scalar_FLAG_problem_type`. [3] The kernel implementation will cast this pointer internally based on the flag.
@@ -1083,15 +1134,16 @@ __kernel void calculate_module_param_grads_chunk(
     __global const void *src_buffer_GLOBAL_targets,
 
     /**
-     * @param src_buffer_GLOBAL_sample_mask A tensor defining the validity (1) or padding (0) status of samples.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count)
+     * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
+     *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
+     *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
      *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "storage"
+     *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: [1] The batch access slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
-     * src_scalar_NATURAL_total_batch_count. [2] Host shall allocate exactly [src_scalar_NATURAL_total_batch_count * sizeof(STORAGE_TYPE)] bytes.
+     * src_scalar_NATURAL_total_batch_count. [2] Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint *src_buffer_GLOBAL_sample_mask,
 
     /**
      * @param src_buffer_GLOBAL_CONST_temps The learnable temperature parameters for logit scaling.
@@ -1107,8 +1159,13 @@ __kernel void calculate_module_param_grads_chunk(
     /**
      * @param dest_buffer_GLOBAL_partial_grad_weights_module The collection buffer for this tile's computed weight gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
-     *        - Padding Contract: {Type: NONE}
-     *        - Initialization Contract: {Type: ZERO_REQUIRED}
+     *        - Padding Contract: {
+     *            dim[0] ("total_tile_count"): {Type: NONE},
+     *            dim[1] ("modules_per_chunk"): {Type: NONE},
+     *            dim[2] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
+     *            dim[3] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
+     *          }
+     *        - Initialization Contract: {Type: ZERO_REQUIRED_ADDITIVE}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
      *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
@@ -1122,7 +1179,7 @@ __kernel void calculate_module_param_grads_chunk(
      * @param dest_buffer_GLOBAL_partial_grad_biases_module The collection buffer for this tile's computed bias gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {Type: NONE}
-     *        - Initialization Contract: {Type: ZERO_REQUIRED}
+     *        - Initialization Contract: {Type: ZERO_REQUIRED_ADDITIVE}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count]
      *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
@@ -1172,7 +1229,7 @@ __kernel void backprop_error_to_hidden_chunk(
      * @param src_buffer_GLOBAL_targets The ground truth labels (type-punned pointer).
      *        - Tensor Shape: Varies based on problem type flag.
      *        - Padding Contract: Varies.
-     *        - Precision Role: "Conditional — storage-role when src_scalar_FLAG_problem_type == BCE; integer-typed (exempt) when CCE. BCE path widens to COMPUTE_TYPE upon load."
+     *        - Precision Role: "flag-conditional" — When src_scalar_FLAG_problem_type == BCE: storage-role (STORAGE_TYPE multi-hot targets), widened to COMPUTE_TYPE upon load. When src_scalar_FLAG_problem_type == CCE: integer-typed (exempt), interpreted as int class indices.
      *        - Calculability Proof: Dependent on problem type flag.
      *        - Validation Preconditions: [1] This is a type-punned pointer (`void*`). [2] Host is contractually obligated to provide the correct target buffer whose layout, type, and total size
      * correspond to the value of `src_scalar_FLAG_problem_type`.
@@ -1180,19 +1237,24 @@ __kernel void backprop_error_to_hidden_chunk(
     __global const void *src_buffer_GLOBAL_targets,
 
     /**
-     * @param src_buffer_GLOBAL_sample_mask A tensor defining the validity (1) or padding (0) status of samples.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count)
+     * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
+     *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
+     *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
      *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "storage"
+     *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
-     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_total_batch_count * sizeof(STORAGE_TYPE)] bytes for this buffer.
+     *        - Validation Preconditions: Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes for this buffer.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint *src_buffer_GLOBAL_sample_mask,
 
     /**
      * @param src_buffer_GLOBAL_CONST_weights_module The learnable weights for all classifier modules.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
-     *        - Padding Contract: {Type: SIMD, Formula: "output_class_count padded to SIMD_WIDTH; host ensures cache-line alignment is jointly satisfied"}
+     *        - Padding Contract: {
+     *            dim[0] ("total_modules_count"): {Type: NONE},
+     *            dim[1] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
+     *            dim[2] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
+     *          }
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
      *        - Validation Preconditions: [1] The overarching tile index must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] Host shall allocate
@@ -1285,7 +1347,7 @@ __kernel void calculate_chunk_temp_gradients(
      * @param src_buffer_GLOBAL_targets The ground truth labels (type-punned pointer).
      *        - Tensor Shape: Varies based on problem type flag.
      *        - Padding Contract: Varies.
-     *        - Precision Role: "Conditional — storage-role when src_scalar_FLAG_problem_type == BCE; integer-typed (exempt) when CCE. BCE path widens to COMPUTE_TYPE upon load."
+     *        - Precision Role: "flag-conditional" — When src_scalar_FLAG_problem_type == BCE: storage-role (STORAGE_TYPE multi-hot targets), widened to COMPUTE_TYPE upon load. When src_scalar_FLAG_problem_type == CCE: integer-typed (exempt), interpreted as int class indices.
      *        - Calculability Proof: Dependent on problem type flag.
      *        - Validation Preconditions: [1] This is a type-punned pointer (`void*`). [2] Host is contractually obligated to provide the correct target buffer whose layout, type, and total size
      * correspond to the value of `src_scalar_FLAG_problem_type`.
@@ -1293,14 +1355,15 @@ __kernel void calculate_chunk_temp_gradients(
     __global const void *src_buffer_GLOBAL_targets,
 
     /**
-     * @param src_buffer_GLOBAL_sample_mask A tensor defining the validity (1) or padding (0) status of samples.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count)
+     * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
+     *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
+     *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
      *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "storage"
+     *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
-     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_total_batch_count * sizeof(STORAGE_TYPE)] bytes for this buffer.
+     *        - Validation Preconditions: Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes for this buffer.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint *src_buffer_GLOBAL_sample_mask,
 
     /**
      * @param src_buffer_GLOBAL_CONST_temps The learnable temperature parameters for logit scaling.
@@ -1362,7 +1425,12 @@ __kernel void clip_partial_gradients(
     /**
      * @param src_buffer_GLOBAL_partial_grad_weights_module Source buffer from Node 8.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {
+     *            dim[0] ("total_tile_count"): {Type: NONE},
+     *            dim[1] ("modules_per_chunk"): {Type: NONE},
+     *            dim[2] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
+     *            dim[3] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
+     *          }
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
      *        - Validation Preconditions: [1] The `flat_tile_index` must be within bounds. [2] Host must allocate buffer with size consistent with the Calculability Proof.
@@ -1510,7 +1578,10 @@ __kernel void gather_and_permute_grad_hidden_activations(
     /**
      * @param dest_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa The final, contiguous, SoA-layout buffer ready for reduction by Node 16.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count)
-     *        - Padding Contract: {Type: CACHE, Formula: "Trailing dimension (`total_modules_count`) is Host-padded to `padded_total_modules_count` for alignment."}
+     *        - Padding Contract: {
+     *            dim[0] ("total_batch_count * hidden_count" → "total_batch_count * padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment on hidden_count stride"},
+     *            dim[1] ("total_modules_count" → "padded_total_modules_count"): {Type: CACHE, Formula: "128-byte alignment"}
+     *          }
      *        - Precision Role: "storage"
      *        - Initialization Contract: {Type: ZERO_REQUIRED}
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count]
@@ -1794,7 +1865,7 @@ __kernel void clip_intermediate_grad(
  *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); reduction accumulation in COMPUTE_TYPE; compute-role output written directly in COMPUTE_TYPE. The kernel's behavior is contractually bound to the following internal logic:
  *
  *          0. **Data Ingress Safety Invariant:**
- *             If the implementation introduces a pre-reduction accumulation step that sums `F` input elements per accumulator (e.g., each thread in a work-group accumulates `ceil(total_modules_count / F_total)` elements), each accumulator MUST be clipped to `src_scalar_REAL_fp_max / F_total` before entering the staged reduction, where `F_total` is the number of accumulators that the first reduction stage will sum. This prevents overflow at the first stage regardless of the total module count or the implementation's parallelism geometry. Implementations with no pre-reduction accumulation (e.g., sequential processing of all elements) need not apply this clip, as the staged reduction's own per-stage safety ceiling is sufficient.
+ *             If the implementation partitions the `total_modules_count` input elements across `P` independent pre-reduction accumulators, each accumulator MUST be clipped to `src_scalar_REAL_fp_max / P` before entering the first staged reduction. When no pre-reduction accumulation occurs, this invariant is inapplicable.
  *
  *          1. **Pre-computation Phase (Single, Initial Calculation):**
  *             a. Determine tactical fan-in: `K_plan = min(src_scalar_NATURAL_policy_max_k, get_local_size(0))`
@@ -1804,9 +1875,7 @@ __kernel void clip_intermediate_grad(
  *             a. Calculate stage index relative to root: `j = num_stages - 1 - s`
  *             b. Calculate algorithmic policy threshold: `T_policy = src_scalar_REAL_policy_t_algorithmic + (src_scalar_REAL_policy_lambda * j * j)`
  *             c. Calculate hardware safety ceiling for this stage's actual fan-in (`K_actual`): `T_safety = src_scalar_REAL_fp_max / K_actual`
- *             d. Synthesize final, authoritative threshold: `final_threshold_for_stage = min(T_policy, T_safety)`
- *
- *          This sequence is the sole valid method for stabilizing the reduction. Deviation is a contract violation."
+ *             d. Synthesize final, authoritative threshold: `final_threshold_for_stage = min(T_policy, T_safety)`"
  *        - Synchronization Model: "Specialized Reduction Kernel / Global Barrier"
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Architectural Justification: "This kernel's contract directly addresses a potential logical fallacy. A naive analysis might conclude that: (a) the kernel's internal planning violates
@@ -1817,7 +1886,10 @@ __kernel void clip_intermediate_grad(
  *          context (`get_local_size(0)`) to produce a fixed, non-negotiable reduction plan (`K_plan`, `num_stages`). This linearizes the problem.
  *
  *          The subsequent `Per-Stage Execution Phase` then executes this plan, with all dependencies resolved. This model confirms the Host retains sole control of stabilization policy, while the
- * Device retains sole control of its immediate execution geometry. The public formula in `Behavioral Invariants` makes this collaboration transparent and verifiable, not hidden."
+ * Device retains sole control of its immediate execution geometry. The public formula in `Behavioral Invariants` makes this collaboration transparent and verifiable, not hidden.
+ *
+ *          The Data Ingress Safety Invariant (§0) prevents first-stage overflow: the sum of P accumulators each bounded by fp_max/P cannot exceed fp_max. When no pre-reduction accumulation occurs
+ * (P = 1), the staged reduction's own per-stage safety ceiling is sufficient. The three-phase sequence (§0, §1, §2) constitutes the sole valid method for stabilizing the reduction."
  */
 __kernel void stabilize_and_reduce_grad_hidden_activations(
     /**
@@ -1833,7 +1905,10 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
     /**
      * @param src_buffer_GLOBAL_grad_hidden_activations_permuted_soa The pre-gathered, contiguous input data in SoA layout, ensuring optimal memory access for row-wise reduction.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count)
-     *        - Padding Contract: {Type: CACHE, Formula: "Trailing dimension (`total_modules_count`) is Host-padded to `padded_total_modules_count` for alignment."}
+     *        - Padding Contract: {
+     *            dim[0] ("total_batch_count * hidden_count" → "total_batch_count * padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment on hidden_count stride"},
+     *            dim[1] ("total_modules_count" → "padded_total_modules_count"): {Type: CACHE, Formula: "128-byte alignment"}
+     *          }
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count]
      *        - Validation Preconditions: Host shall allocate exactly [(src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count) * src_scalar_NATURAL_padded_total_modules_count *
@@ -1892,7 +1967,7 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
  * @brief (Node 17) Computes partial gradients for shared layer weights from a batch chunk.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative is computed internally from `hidden_activations` (mask = activation > 0); no explicit `hidden_mask` input is required. This avoids introducing an additional buffer dependency in the streaming backpropagation path, where minimizing the parameter set of the StreamingLoopNode body reduces orchestration complexity. The sparsity-predicated approach used by Node 5 is architecturally valid here but is not applied."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Integer-typed sample_mask accessed via load_sample_mask(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sample-Level Early Exit: When load_sample_mask() returns 0 for a sample, the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Both upstream invariants (summed_grad_h = 0 from Node 9's masking, relu_derivative = 0 from Node 4's activation zeroing) independently guarantee zero contribution for masked samples regardless of whether the early exit is applied."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Partial Renderer. Designed for the 'True Streaming' backpropagation model."
  */
@@ -1931,6 +2006,25 @@ __kernel void backprop_shared_weights_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_activations,
 
     /**
+     * @param src_buffer_GLOBAL_hidden_mask [CONDITIONAL] The ReLU derivative mask from Node 4.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
+     *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
+     *        - Precision Role: "storage"
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: [1] This buffer is read from ONLY IF `src_scalar_FLAG_use_explicit_hidden_mask` == 1. [2] If the flag is set, the batch access slice must be within bounds,
+     * as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <= src_scalar_NATURAL_total_batch_count. [3] If the flag is set, Host must ensure this buffer was
+     * allocated to exactly [src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes. [4] If the flag is not set, the Host MAY pass a minimal stub
+     * buffer.
+     */
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_mask,
+
+    /**
+     * @param src_scalar_FLAG_use_explicit_hidden_mask A flag to select the ReLU derivative source.
+     *        - Validation Preconditions: Must be 0 or 1. If 0, mask is derived from stored activations (mask = activation > 0). If 1, mask is read from `src_buffer_GLOBAL_hidden_mask`.
+     */
+    uint src_scalar_FLAG_use_explicit_hidden_mask,
+
+    /**
      * @param src_buffer_GLOBAL_summed_grad_hidden_activations The final, consolidated upstream gradient from Node 16.
      *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_activations_total_count)
      *        - Padding Contract: {Type: NONE}
@@ -1942,20 +2036,25 @@ __kernel void backprop_shared_weights_chunk(
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_summed_grad_hidden_activations,
 
     /**
-     * @param src_buffer_GLOBAL_sample_mask A tensor defining the validity (1) or padding (0) status of samples.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count)
+     * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
+     *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
+     *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
      *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "storage"
+     *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: [1] The batch access slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
-     * src_scalar_NATURAL_total_batch_count. [2] Host shall allocate exactly [src_scalar_NATURAL_total_batch_count * sizeof(STORAGE_TYPE)] bytes.
+     * src_scalar_NATURAL_total_batch_count. [2] Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint *src_buffer_GLOBAL_sample_mask,
 
     /**
      * @param dest_buffer_GLOBAL_partial_grad_weights_shared The collection buffer for this chunk's computed weight gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_input_count, src_scalar_NATURAL_padded_hidden_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {
+     *            dim[0] ("num_batch_chunks"): {Type: NONE},
+     *            dim[1] ("input_count" → "padded_input_count"): {Type: CACHE, Formula: "128-byte alignment"},
+     *            dim[2] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"}
+     *          }
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_input_count, src_scalar_NATURAL_padded_hidden_count]
      *        - Placement Contract: linear_batch(src_scalar_NATURAL_batch_chunk_index)
@@ -1977,7 +2076,7 @@ __kernel void backprop_shared_weights_chunk(
  * @brief (Node 18) Computes partial gradients for shared layer biases from a batch chunk.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative is computed internally from `hidden_activations` (mask = activation > 0); no explicit `hidden_mask` input is required. This avoids introducing an additional buffer dependency in the streaming backpropagation path, where minimizing the parameter set of the StreamingLoopNode body reduces orchestration complexity. The sparsity-predicated approach used by Node 5 is architecturally valid here but is not applied."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Integer-typed sample_mask accessed via load_sample_mask(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sample-Level Early Exit: When load_sample_mask() returns 0 for a sample, the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Both upstream invariants (summed_grad_h = 0 from Node 9's masking, relu_derivative = 0 from Node 4's activation zeroing) independently guarantee zero contribution for masked samples regardless of whether the early exit is applied."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Partial Renderer. Designed for the 'True Streaming' backpropagation model."
  */
@@ -2005,6 +2104,25 @@ __kernel void backprop_shared_biases_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_activations,
 
     /**
+     * @param src_buffer_GLOBAL_hidden_mask [CONDITIONAL] The ReLU derivative mask from Node 4.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
+     *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
+     *        - Precision Role: "storage"
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: [1] This buffer is read from ONLY IF `src_scalar_FLAG_use_explicit_hidden_mask` == 1. [2] If the flag is set, the batch access slice must be within bounds,
+     * as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <= src_scalar_NATURAL_total_batch_count. [3] If the flag is set, Host must ensure this buffer was
+     * allocated to exactly [src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes. [4] If the flag is not set, the Host MAY pass a minimal stub
+     * buffer.
+     */
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_mask,
+
+    /**
+     * @param src_scalar_FLAG_use_explicit_hidden_mask A flag to select the ReLU derivative source.
+     *        - Validation Preconditions: Must be 0 or 1. If 0, mask is derived from stored activations (mask = activation > 0). If 1, mask is read from `src_buffer_GLOBAL_hidden_mask`.
+     */
+    uint src_scalar_FLAG_use_explicit_hidden_mask,
+
+    /**
      * @param src_buffer_GLOBAL_summed_grad_hidden_activations The final, consolidated upstream gradient from Node 16.
      *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_activations_total_count)
      *        - Padding Contract: {Type: NONE}
@@ -2016,15 +2134,16 @@ __kernel void backprop_shared_biases_chunk(
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_summed_grad_hidden_activations,
 
     /**
-     * @param src_buffer_GLOBAL_sample_mask A tensor defining the validity (1) or padding (0) status of samples.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count)
+     * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
+     *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
+     *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
      *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "storage"
+     *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: [1] The batch access slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
-     * src_scalar_NATURAL_total_batch_count. [2] Host shall allocate exactly [src_scalar_NATURAL_total_batch_count * sizeof(STORAGE_TYPE)] bytes.
+     * src_scalar_NATURAL_total_batch_count. [2] Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint *src_buffer_GLOBAL_sample_mask,
 
     /**
      * @param dest_buffer_GLOBAL_partial_grad_biases_shared The collection buffer for this chunk's computed bias gradients.
@@ -2103,9 +2222,11 @@ __kernel void clip_shared_gradients_chunk(
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_weights_parameter_count]
-     *        - Validation Preconditions: The Host is responsible for providing a valid
+     *        - Validation Preconditions: [1] The Host is responsible for providing a valid
      *          `dest_scalar_NATURAL_weights_write_offset` such that the write operation
-     *          remains within the bounds of this collection buffer.
+     *          remains within the bounds of this collection buffer: (dest_scalar_NATURAL_weights_write_offset +
+     *          src_scalar_NATURAL_weights_parameter_count) <=
+     *          (src_scalar_NATURAL_num_batch_chunks * src_scalar_NATURAL_weights_parameter_count).
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_weights_shared,
 
@@ -2116,9 +2237,11 @@ __kernel void clip_shared_gradients_chunk(
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_biases_parameter_count]
-     *        - Validation Preconditions: The Host is responsible for providing a valid
+     *        - Validation Preconditions: [1] The Host is responsible for providing a valid
      *          `dest_scalar_NATURAL_biases_write_offset` such that the write operation
-     *          remains within the bounds of this collection buffer.
+     *          remains within the bounds of this collection buffer: (dest_scalar_NATURAL_biases_write_offset +
+     *          src_scalar_NATURAL_biases_parameter_count) <=
+     *          (src_scalar_NATURAL_num_batch_chunks * src_scalar_NATURAL_biases_parameter_count).
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_biases_shared,
 
@@ -2164,8 +2287,8 @@ __kernel void normalize_gradients(
 
     /**
      * @param src_scalar_REAL_effective_batch_size The normalization factor.
-     *        - Calculability Proof: [Host-side calculation: `sum(src_buffer_GLOBAL_sample_mask)`]
-     *        - Validation Preconditions: [1] The Host is contractually obligated to calculate this value by performing a reduction (sum) over the `sample_mask` buffer for the entire batch. [2] The
+     *        - Calculability Proof: [Host-side calculation: popcount over packed `sample_mask` bitmask words]
+     *        - Validation Preconditions: [1] The Host is contractually obligated to calculate this value by performing a popcount over the packed `sample_mask` bitmask (ADR-031 §2.5). [2] The
      * value must be >= 0.
      */
     COMPUTE_TYPE src_scalar_REAL_effective_batch_size,
@@ -2187,7 +2310,7 @@ __kernel void normalize_gradients(
  * @brief (Node 24) Applies Adam optimizer update to an entire parameter group. Single dispatch.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction terms (`beta1_pow_t`, `beta2_pow_t`) to ensure long-term numerical stability. State-Precision Accumulation: EMA updates on m1 and m2 use ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Moment vectors loaded via load_state_for_accum(); gradients widened via widen_to_accum(); EMA arithmetic in ACCUM_TYPE; results stored via store_state_from_accum(). Bias-corrected values and the final parameter update delta are transformative operations using COMPUTE_TYPE (narrowed via narrow_from_accum()). Parameter buffer subtraction is accumulative in ACCUM_TYPE. Hyperparameter Precision Note: Hyperparameter scalars (β₁, β₂, ε, lr) are received in COMPUTE_TYPE and widened to ACCUM_TYPE for EMA arithmetic. The widening preserves only COMPUTE_TYPE precision for these constants. For β₁ = 0.999 with COMPUTE_TYPE = float, the contribution factor (1 − β₁) carries ~7 significant digits regardless of ACCUM_TYPE. ADR-030: State-role buffers are indexed via [parameter_offset + i]. The slice access invariant (parameter_offset + parameter_count) <= total_parameter_count ensures no out-of-bounds access."
+ *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction terms (`beta1_pow_t`, `beta2_pow_t`) to ensure long-term numerical stability. State-Precision Accumulation: EMA updates on m1 and m2 use ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Moment vectors loaded via load_state_for_accum(); gradients widened via widen_to_accum(); EMA arithmetic in ACCUM_TYPE; results stored via store_state_from_accum(). Bias-corrected values and the final parameter update delta are transformative operations using COMPUTE_TYPE (narrowed via narrow_from_accum()). Parameter buffer subtraction is accumulative in ACCUM_TYPE. Hyperparameter Precision Note: Hyperparameter scalars (β₁, β₂, ε, lr) are received in COMPUTE_TYPE and widened to ACCUM_TYPE for EMA arithmetic. The widening preserves only COMPUTE_TYPE precision for these constants. For β₁ = 0.999 with COMPUTE_TYPE = float, the contribution factor (1 − β₁) carries ~7 significant digits regardless of ACCUM_TYPE. Bias Correction Precision Ceiling: The `beta1_pow_t` and `beta2_pow_t` scalars are computed by the Host in FP64 and narrowed to COMPUTE_TYPE at the interface boundary. Under mixed_f32_f64_state() (FP32 compute, FP64 state), beta1^t values below ~1.4e-45 round to FP32 zero, losing FP64 precision. This is currently sound — at t ≈ 100K, 1/(1-beta1^t) ≈ 1.0, so the loss is negligible. A future revision may accept these scalars in STATE_TYPE for full consistency with the state role's unbounded-training-stability guarantee. ADR-030: State-role buffers are indexed via [parameter_offset + i]. The slice access invariant (parameter_offset + parameter_count) <= total_parameter_count ensures no out-of-bounds access."
  *        - Idempotency: "Fundamentally Non-Idempotent (Stateful). Modifies multiple state buffers in-place."
  *        - Synchronization Model: "Stateful Optimizer Update. Consumes final gradients after the Batch Synchronization Point."
  */
@@ -2324,16 +2447,16 @@ __kernel void reduce_k_fan_in_and_clip(
      * @param src_buffer_GLOBAL_CONST_offset_list_flat Flat offset list with K
      *        consecutive entries per node. Sentinel SENTINEL_ABSENT_PARTIAL
      *        (0xFFFFFFFF) indicates an absent partial in the tail node.
-     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in_K)
+     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_fan_in_K]
+     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_fan_in]
      *        - Validation Preconditions: Host must provide a buffer containing exactly
-     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in_K` uint entries.
+     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in` uint entries.
      */
     __global const uint *src_buffer_GLOBAL_CONST_offset_list_flat,
 
     /**
-     * @param dest_buffer_GLOBAL_stage_output Contiguous output buffer. Node n writes
+     * @param dest_buffer_GLOBAL_stage_partial Contiguous output buffer. Node n writes
      *        at `[n * partial_width, (n+1) * partial_width)`.
      *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width)
      *        - Padding Contract: {Type: NONE}
@@ -2342,13 +2465,13 @@ __kernel void reduce_k_fan_in_and_clip(
      *        - Validation Preconditions: Host must allocate exactly
      *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)` bytes.
      */
-    __global COMPUTE_TYPE *dest_buffer_GLOBAL_stage_output,
+    __global COMPUTE_TYPE *dest_buffer_GLOBAL_stage_partial,
 
     /**
-     * @param src_scalar_NATURAL_fan_in_K Number of partials to reduce per node.
+     * @param src_scalar_NATURAL_fan_in Number of partials to reduce per node.
      *        - Validation Preconditions: Must be >= 2.
      */
-    uint src_scalar_NATURAL_fan_in_K,
+    uint src_scalar_NATURAL_fan_in,
 
     /**
      * @param src_scalar_NATURAL_node_count Number of independent reduction nodes.
@@ -2432,16 +2555,16 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
      * @param src_buffer_GLOBAL_CONST_offset_list_flat Flat offset list with K
      *        consecutive entries per node. Sentinel SENTINEL_ABSENT_PARTIAL
      *        (0xFFFFFFFF) indicates an absent partial in the tail node.
-     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in_K)
+     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in)
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_fan_in_K]
+     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_fan_in]
      *        - Validation Preconditions: Host must provide a buffer containing exactly
-     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in_K` uint entries.
+     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in` uint entries.
      */
     __global const uint *src_buffer_GLOBAL_CONST_offset_list_flat,
 
     /**
-     * @param dest_buffer_GLOBAL_stage_output Contiguous output buffer. Node n writes
+     * @param dest_buffer_GLOBAL_stage_partial Contiguous output buffer. Node n writes
      *        at `[n * partial_width, (n+1) * partial_width)`.
      *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width)
      *        - Padding Contract: {Type: NONE}
@@ -2450,13 +2573,13 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
      *        - Validation Preconditions: Host must allocate exactly
      *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)` bytes.
      */
-    __global COMPUTE_TYPE *dest_buffer_GLOBAL_stage_output,
+    __global COMPUTE_TYPE *dest_buffer_GLOBAL_stage_partial,
 
     /**
-     * @param src_scalar_NATURAL_fan_in_K Number of partials to reduce per node.
+     * @param src_scalar_NATURAL_fan_in Number of partials to reduce per node.
      *        - Validation Preconditions: Must be >= 2.
      */
-    uint src_scalar_NATURAL_fan_in_K,
+    uint src_scalar_NATURAL_fan_in,
 
     /**
      * @param src_scalar_NATURAL_node_count Number of independent reduction nodes.

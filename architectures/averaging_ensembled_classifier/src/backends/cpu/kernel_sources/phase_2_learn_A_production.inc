@@ -30,7 +30,7 @@ void PREC_FN(task_cce_probs_loss)(void* raw_args, uint task_index, uint thread_i
 
     const size_t loss_out_idx = (size_t)module_global_idx * a->total_batch_count + batch_idx;
 
-    if ((COMPUTE_T)scalar_load_storage(a->sample_mask, batch_idx) < (COMPUTE_T)0.5) {
+    if (!load_sample_mask(a->sample_mask, batch_idx)) {
         a->final_loss[loss_out_idx] = (COMPUTE_T)0.0;  /* compute-role: direct write */
         const size_t prob_tile_base = (size_t)a->flat_tile_index
             * a->modules_per_chunk * a->total_batch_count * a->classes_per_chunk;
@@ -116,7 +116,7 @@ void PREC_FN(task_bce_probs_loss)(void* raw_args, uint task_index, uint thread_i
         + (size_t)module_local_idx * a->total_batch_count * a->classes_per_chunk
         + (size_t)batch_idx * a->classes_per_chunk;
 
-    if ((COMPUTE_T)scalar_load_storage(a->sample_mask, batch_idx) < (COMPUTE_T)0.5) {
+    if (!load_sample_mask(a->sample_mask, batch_idx)) {
         for (uint c = 0; c < a->classes_per_chunk; c++)
             scalar_store_storage(a->partial_probs, prob_base + c, 0.0f);
         if (a->partial_loss != NULL) {
@@ -201,7 +201,7 @@ void PREC_FN(task_module_param_grads)(void* raw_args, uint task_index, uint thre
         COMPUTE_T grad_b = (COMPUTE_T)0.0;
 
         for (uint b = 0; b < a->total_batch_count; b++) {
-            if ((COMPUTE_T)scalar_load_storage(a->sample_mask, b) < (COMPUTE_T)0.5) continue;
+            if (!load_sample_mask(a->sample_mask, b)) continue;
 
             const size_t prob_idx = prob_tile_base
                 + (size_t)module_local_idx * a->total_batch_count * a->classes_per_chunk

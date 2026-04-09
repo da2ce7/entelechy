@@ -483,7 +483,7 @@ class OpenCLPlanRenderer:
                 "(ADR-019). Call set_reduction_bindings with k_fan_in=..."
             )
 
-        K = plan.fan_in_K
+        K = plan.fan_in
         current_N = plan.num_partials
         source_buf = self._allocator.get_buffer(plan.source_buffer)
 
@@ -542,7 +542,7 @@ class OpenCLPlanRenderer:
                 source=source_buf,
                 offset_list=offset_buf,
                 dest=ping,
-                fan_in_K=K,
+                fan_in=K,
                 node_count=node_count,
                 partial_width=plan.partial_width,
                 clipping_threshold=threshold,

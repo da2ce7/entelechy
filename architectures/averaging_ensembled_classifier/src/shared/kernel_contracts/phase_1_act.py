@@ -26,11 +26,11 @@ forward_pass_contract = KernelContract(
         BufferParamSpec(
             name="src_buffer_GLOBAL_sample_mask",
             flow="src", memory_scope="GLOBAL",
-            tensor_shape=("total_batch_count",),
-            padding_contract=PaddingContract("NONE", None),
+            tensor_shape=("(total_batch_count + 31) / 32",),
+            padding_contract=PaddingContract("NONE", "Bits beyond total_batch_count zero-padded by host"),
             calculability_proof=("total_batch_count",),
             validation_preconditions=("batch slice within bounds",),
-            precision_role="storage",
+            precision_role=None,  # integer-typed bitmask (ADR-031)
         ),
         BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_weights_shared_simd_major",
@@ -70,6 +70,7 @@ forward_pass_contract = KernelContract(
         ),
     ),
     scalar_params=(
+        ScalarParamSpec("FLAG_produce_hidden_mask", "dest", "FLAG"),
         ScalarParamSpec("batch_chunk_offset", "src", "NATURAL"),
         ScalarParamSpec("batch_chunk_count", "src", "NATURAL"),
         ScalarParamSpec("total_batch_count", "src", "NATURAL"),
@@ -110,6 +111,15 @@ render_logits_chunk_contract = KernelContract(
             precision_role="storage",
         ),
         BufferParamSpec(
+            name="src_buffer_GLOBAL_sample_mask",
+            flow="src", memory_scope="GLOBAL",
+            tensor_shape=("(total_batch_count + 31) / 32",),
+            padding_contract=PaddingContract("NONE", "Bits beyond total_batch_count zero-padded by host"),
+            calculability_proof=("total_batch_count",),
+            validation_preconditions=("batch slice within bounds",),
+            precision_role=None,  # integer-typed bitmask (ADR-031)
+        ),
+        BufferParamSpec(
             name="src_buffer_GLOBAL_CONST_weights_module",
             flow="src", memory_scope="GLOBAL_CONST",
             tensor_shape=("total_modules_count", "padded_hidden_count", "padded_total_output_class_count"),
@@ -138,6 +148,7 @@ render_logits_chunk_contract = KernelContract(
         ),
     ),
     scalar_params=(
+        ScalarParamSpec("FLAG_use_explicit_hidden_mask", "src", "FLAG"),
         ScalarParamSpec("batch_chunk_offset", "src", "NATURAL"),
         ScalarParamSpec("batch_chunk_count", "src", "NATURAL"),
         ScalarParamSpec("module_chunk_offset", "src", "NATURAL"),

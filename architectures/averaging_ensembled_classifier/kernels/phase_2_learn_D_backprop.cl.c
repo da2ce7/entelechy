@@ -15,8 +15,10 @@ __kernel void backprop_shared_weights_chunk(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_input,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_activations,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_mask,
+    uint                         src_scalar_FLAG_use_explicit_hidden_mask,
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_summed_grad_hidden_activations,
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint          *src_buffer_GLOBAL_sample_mask,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_weights_shared,
     uint                         src_scalar_NATURAL_batch_chunk_offset,
     uint                         src_scalar_NATURAL_batch_chunk_count,
@@ -48,7 +50,7 @@ __kernel void backprop_shared_weights_chunk(
         const uint b_global = src_scalar_NATURAL_batch_chunk_offset + b_local;
 
         // Skip computation for any padded samples within the chunk.
-        if (load_storage(src_buffer_GLOBAL_sample_mask, b_global) < (COMPUTE_TYPE)0.5f) {
+        if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, b_global)) {
             continue;
         }
 
@@ -58,7 +60,9 @@ __kernel void backprop_shared_weights_chunk(
         const COMPUTE_TYPE hidden_val    = load_storage(src_buffer_GLOBAL_hidden_activations, hidden_offset);
 
         // Derivative of ReLU activation: (dA_j/dZ_j)
-        const COMPUTE_TYPE d_activation = select((COMPUTE_TYPE)0.0f, (COMPUTE_TYPE)1.0f, hidden_val > COMPUTE_ZERO);
+        // When FLAG=1, the mask buffer contains the compute-precision derivative truth.
+        // When FLAG=0, derive the mask from stored activations (mask = activation > 0).
+        const COMPUTE_TYPE d_activation = src_scalar_FLAG_use_explicit_hidden_mask ? load_storage(src_buffer_GLOBAL_hidden_mask, hidden_offset) : select((COMPUTE_TYPE)0.0f, (COMPUTE_TYPE)1.0f, hidden_val > COMPUTE_ZERO);
         const COMPUTE_TYPE dL_dZ_j      = grad_h * d_activation;
 
         // Final term: (dZ_j/dW_ij), which is simply the corresponding input value.
@@ -99,8 +103,10 @@ __kernel void backprop_shared_weights_chunk(
 __kernel void backprop_shared_biases_chunk(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_activations,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_mask,
+    uint                         src_scalar_FLAG_use_explicit_hidden_mask,
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_summed_grad_hidden_activations,
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_sample_mask,
+    __global const uint          *src_buffer_GLOBAL_sample_mask,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_biases_shared,
     uint                         src_scalar_NATURAL_batch_chunk_offset,
     uint                         src_scalar_NATURAL_batch_chunk_count,
@@ -130,7 +136,7 @@ __kernel void backprop_shared_biases_chunk(
         const uint b_global = src_scalar_NATURAL_batch_chunk_offset + b_local;
 
         // Skip computation for any padded samples within the chunk.
-        if (load_storage(src_buffer_GLOBAL_sample_mask, b_global) < (COMPUTE_TYPE)0.5f) {
+        if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, b_global)) {
             continue;
         }
 
@@ -141,7 +147,9 @@ __kernel void backprop_shared_biases_chunk(
         const COMPUTE_TYPE hidden_val    = load_storage(src_buffer_GLOBAL_hidden_activations, hidden_offset);
 
         // Derivative of ReLU activation: (dA_j/dZ_j)
-        const COMPUTE_TYPE d_activation = select((COMPUTE_TYPE)0.0f, (COMPUTE_TYPE)1.0f, hidden_val > COMPUTE_ZERO);
+        // When FLAG=1, the mask buffer contains the compute-precision derivative truth.
+        // When FLAG=0, derive the mask from stored activations (mask = activation > 0).
+        const COMPUTE_TYPE d_activation = src_scalar_FLAG_use_explicit_hidden_mask ? load_storage(src_buffer_GLOBAL_hidden_mask, hidden_offset) : select((COMPUTE_TYPE)0.0f, (COMPUTE_TYPE)1.0f, hidden_val > COMPUTE_ZERO);
 
         // Sum the contributions to the gradient, dL/dB_j. This calculation is simpler
         // than for weights as it does not require reading from the main input buffer.

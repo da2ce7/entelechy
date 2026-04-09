@@ -90,7 +90,7 @@ class _BufferAllocator:
             element_size_bytes=element_size_bytes,
             size_bytes=size_bytes,
             role=role,
-            precision_role=precision_role or "compute",
+            precision_role=precision_role,
             logical_shape=logical_shape,
             producing_node=None,
             consumers=frozenset(),
@@ -177,7 +177,7 @@ def _build_reduction_tree(
 
     return ReductionTreePlan(
         num_partials=num_partials,
-        fan_in_K=fan_in_k,
+        fan_in=fan_in_k,
         num_stages=num_stages,
         elements_per_partial=gather.elements_per_partial,
         initial_offset_list=offsets,
@@ -275,10 +275,11 @@ def build_act_plan(
         (batch_size, model_spec.padded_input_dim),
         elem_storage, BufferRole.BATCH_INPUT, "storage",
     )
+    mask_words = (batch_size + 31) // 32
     b_sample_mask = alloc.allocate(
         "sample_mask",
-        (batch_size,),
-        elem_storage, BufferRole.BATCH_INPUT, "storage",
+        (mask_words,),
+        4, BufferRole.BATCH_INPUT, None,
     )
     b_targets = alloc.allocate(
         strategy.required_targets_buffer_name,
@@ -286,17 +287,27 @@ def build_act_plan(
         4, BufferRole.BATCH_INPUT, "compute",
     )
 
+    # Mask strategy flags (ADR-031)
+    flag_explicit = 1 if model_spec.precision.mask_strategy.mode == "explicit" else 0
+
     # BATCH_INTERMEDIATE
     b_hidden = alloc.allocate(
         "hidden_activations",
         (batch_size, model_spec.padded_hidden_dim),
         elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
-    b_hidden_mask = alloc.allocate(
-        "hidden_mask",
-        (batch_size, model_spec.padded_hidden_dim),
-        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
-    )
+    # ADR-031 §1.4: stub when recompute, full buffer when explicit
+    if flag_explicit:
+        b_hidden_mask = alloc.allocate(
+            "hidden_mask",
+            (batch_size, model_spec.padded_hidden_dim),
+            elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
+        )
+    else:
+        b_hidden_mask = alloc.allocate(
+            "hidden_mask", (1,),
+            elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
+        )
     b_logits = alloc.allocate(
         "full_logits",
         (model_spec.num_modules, batch_size, model_spec.padded_class_dim),
@@ -331,6 +342,7 @@ def build_act_plan(
          "biases_shared": b_biases_shared,
          "hidden_activations": b_hidden, "hidden_mask": b_hidden_mask},
         {"batch_chunk_offset": 0, "batch_chunk_count": batch_size,
+         "FLAG_produce_hidden_mask": flag_explicit,
          "total_batch_count": batch_size,
          "padded_input_count": model_spec.padded_input_dim,
          "padded_hidden_count": model_spec.padded_hidden_dim},
@@ -348,9 +360,11 @@ def build_act_plan(
     n5 = _dispatch(
         "render_logits", frozenset({"forward_pass"}), render_logits_chunk_contract,
         {"hidden_activations": b_hidden, "hidden_mask": b_hidden_mask,
+         "sample_mask": b_sample_mask,
          "weights_module": b_module_weights, "biases_module": b_module_biases,
          "logits": b_logits},
         {"batch_chunk_offset": 0, "batch_chunk_count": batch_size,
+         "FLAG_use_explicit_hidden_mask": flag_explicit,
          "module_chunk_offset": 0,
          "module_chunk_count": model_spec.num_modules,
          "class_chunk_offset": 0,
@@ -367,6 +381,7 @@ def build_act_plan(
     alloc.set_producer(b_logits, n5.node_id)
     alloc.add_consumer(b_hidden, n5.node_id)
     alloc.add_consumer(b_hidden_mask, n5.node_id)
+    alloc.add_consumer(b_sample_mask, n5.node_id)
     alloc.add_consumer(b_module_weights, n5.node_id)
     alloc.add_consumer(b_module_biases, n5.node_id)
 
@@ -557,8 +572,9 @@ def build_learn_plan(
         "input_data", (batch_size, model_spec.padded_input_dim),
         elem_storage, BufferRole.BATCH_INPUT, "storage",
     )
+    mask_words = (batch_size + 31) // 32
     b_sample_mask = alloc.allocate(
-        "sample_mask", (batch_size,), elem_storage, BufferRole.BATCH_INPUT, "storage",
+        "sample_mask", (mask_words,), 4, BufferRole.BATCH_INPUT, None,
     )
     b_targets = alloc.allocate(
         strategy.required_targets_buffer_name,
@@ -566,15 +582,26 @@ def build_learn_plan(
         4, BufferRole.BATCH_INPUT, "compute",
     )
 
+    # Mask strategy flags (ADR-031)
+    flag_explicit = 1 if model_spec.precision.mask_strategy.mode == "explicit" else 0
+
     # --- Upstream intermediate buffers (recomputed in Learn phase) ---
     b_hidden = alloc.allocate(
         "hidden_activations", (batch_size, model_spec.padded_hidden_dim),
         elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
-    b_hidden_mask = alloc.allocate(
-        "hidden_mask", (batch_size, model_spec.padded_hidden_dim),
-        elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
-    )
+    # ADR-031 §1.4: stub when recompute, full buffer when explicit
+    if flag_explicit:
+        b_hidden_mask = alloc.allocate(
+            "hidden_mask",
+            (batch_size, model_spec.padded_hidden_dim),
+            elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
+        )
+    else:
+        b_hidden_mask = alloc.allocate(
+            "hidden_mask", (1,),
+            elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
+        )
     b_logits = alloc.allocate(
         "full_logits",
         (model_spec.num_modules, batch_size, model_spec.padded_class_dim),
@@ -739,6 +766,7 @@ def build_learn_plan(
          "biases_shared": b_biases_shared,
          "hidden_activations": b_hidden, "hidden_mask": b_hidden_mask},
         {"batch_chunk_offset": 0, "batch_chunk_count": batch_size,
+         "FLAG_produce_hidden_mask": flag_explicit,
          "total_batch_count": batch_size,
          "padded_input_count": model_spec.padded_input_dim,
          "padded_hidden_count": model_spec.padded_hidden_dim},
@@ -756,9 +784,11 @@ def build_learn_plan(
     n5 = _dispatch(
         "render_logits", frozenset({"forward_pass"}), render_logits_chunk_contract,
         {"hidden_activations": b_hidden, "hidden_mask": b_hidden_mask,
+         "sample_mask": b_sample_mask,
          "weights_module": b_module_weights, "biases_module": b_module_biases,
          "logits": b_logits},
         {"batch_chunk_offset": 0, "batch_chunk_count": batch_size,
+         "FLAG_use_explicit_hidden_mask": flag_explicit,
          "module_chunk_offset": 0,
          "module_chunk_count": model_spec.num_modules,
          "class_chunk_offset": 0,
@@ -775,6 +805,7 @@ def build_learn_plan(
     alloc.set_producer(b_logits, n5.node_id)
     alloc.add_consumer(b_hidden, n5.node_id)
     alloc.add_consumer(b_hidden_mask, n5.node_id)
+    alloc.add_consumer(b_sample_mask, n5.node_id)
     alloc.add_consumer(b_module_weights, n5.node_id)
     alloc.add_consumer(b_module_biases, n5.node_id)
 
@@ -1070,10 +1101,12 @@ def build_learn_plan(
         backprop_shared_weights_contract,
         {"input": b_input_data,
          "hidden_activations": b_hidden,
+         "hidden_mask": b_hidden_mask,
          "summed_grad_hidden_activations": b_summed_grad_h,
          "sample_mask": b_sample_mask,
          "partial_grad_weights_shared": b_partial_grad_sw},
         {"batch_chunk_offset": 0, "batch_chunk_count": 1,
+         "FLAG_use_explicit_hidden_mask": flag_explicit,
          "batch_chunk_index": 0,
          "total_batch_count": batch_size,
          "num_batch_chunks": batch_size,
@@ -1086,6 +1119,7 @@ def build_learn_plan(
     alloc.set_producer(b_partial_grad_sw, n17.node_id)
     alloc.add_consumer(b_input_data, n17.node_id)
     alloc.add_consumer(b_hidden, n17.node_id)
+    alloc.add_consumer(b_hidden_mask, n17.node_id)
     alloc.add_consumer(b_summed_grad_h, n17.node_id)
     alloc.add_consumer(b_sample_mask, n17.node_id)
 
@@ -1094,10 +1128,12 @@ def build_learn_plan(
         "backprop_shared_biases", phase_ii_done,
         backprop_shared_biases_contract,
         {"hidden_activations": b_hidden,
+         "hidden_mask": b_hidden_mask,
          "summed_grad_hidden_activations": b_summed_grad_h,
          "sample_mask": b_sample_mask,
          "partial_grad_biases_shared": b_partial_grad_sb},
         {"batch_chunk_offset": 0, "batch_chunk_count": 1,
+         "FLAG_use_explicit_hidden_mask": flag_explicit,
          "batch_chunk_index": 0,
          "total_batch_count": batch_size,
          "num_batch_chunks": batch_size,
@@ -1108,6 +1144,7 @@ def build_learn_plan(
     nodes[n18.node_id] = n18
     alloc.set_producer(b_partial_grad_sb, n18.node_id)
     alloc.add_consumer(b_hidden, n18.node_id)
+    alloc.add_consumer(b_hidden_mask, n18.node_id)
     alloc.add_consumer(b_summed_grad_h, n18.node_id)
     alloc.add_consumer(b_sample_mask, n18.node_id)
 

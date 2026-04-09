@@ -20,7 +20,7 @@ class TestReductionTree:
         rng = make_rng(seed=140)
         K = 4
         partials = [rng.standard_normal(16).astype(np.float32) for _ in range(3)]
-        ref = ref_reduction_tree_sum(partials, fan_in_K=K)
+        ref = ref_reduction_tree_sum(partials, fan_in=K)
         expected = sum(partials[1:], partials[0].copy())
         tol = get_tolerance("aggregate_register_reduce", "fp32")
         np.testing.assert_allclose(ref, expected, atol=tol.atol, rtol=tol.rtol)
@@ -31,7 +31,7 @@ class TestReductionTree:
         K = 4
         N = 16
         partials = [rng.standard_normal(8).astype(np.float32) for _ in range(N)]
-        ref = ref_reduction_tree_sum(partials, fan_in_K=K)
+        ref = ref_reduction_tree_sum(partials, fan_in=K)
         expected = sum(partials[1:], partials[0].copy())
         tol = get_tolerance("aggregate_local_reduce", "fp32")
         np.testing.assert_allclose(ref, expected, atol=tol.atol, rtol=tol.rtol)
@@ -43,7 +43,7 @@ class TestReductionTree:
         partials = [rng.standard_normal(8).astype(np.float32) * 10.0 for _ in range(3)]
         threshold = 1.0
         ref = ref_reduction_tree_sum_and_clip(
-            partials, fan_in_K=K, threshold_schedule=[threshold],
+            partials, fan_in=K, threshold_schedule=[threshold],
         )
         norm = np.sqrt(np.sum(ref * ref))
         # After clipping, norm should be <= threshold (within tolerance)
@@ -57,7 +57,7 @@ class TestReductionTree:
         partials = [rng.standard_normal(8).astype(np.float32) * 5.0 for _ in range(N)]
         schedule: list[float | None] = [2.0, 1.5]
         ref = ref_reduction_tree_sum_and_clip(
-            partials, fan_in_K=K, threshold_schedule=schedule,
+            partials, fan_in=K, threshold_schedule=schedule,
         )
         assert not np.any(np.isnan(ref)), "Sum-and-clip produced NaN"
 
@@ -67,7 +67,7 @@ class TestReductionTree:
         K = 4
         N = 7  # Not a power of 4
         partials = [rng.standard_normal(8).astype(np.float32) for _ in range(N)]
-        ref = ref_reduction_tree_sum(partials, fan_in_K=K)
+        ref = ref_reduction_tree_sum(partials, fan_in=K)
         expected = sum(partials[1:], partials[0].copy())
         tol = get_tolerance("aggregate_register_reduce", "fp32")
         np.testing.assert_allclose(ref, expected, atol=tol.atol, rtol=tol.rtol)
@@ -77,7 +77,7 @@ class TestReductionTree:
         rng = make_rng(seed=146)
         K = 4
         partials = [rng.standard_normal(8).astype(np.float32) for _ in range(8)]
-        ref = ref_reduction_tree_sum(partials, fan_in_K=K)
+        ref = ref_reduction_tree_sum(partials, fan_in=K)
         expected = sum(partials[1:], partials[0].copy())
         np.testing.assert_allclose(ref, expected, atol=1e-4, rtol=1e-4)
 
@@ -92,10 +92,10 @@ class TestReductionTree:
         partials = [rng.standard_normal(8).astype(np.float32) * 10.0 for _ in range(3)]
         # Negative threshold: bypass clipping
         ref_bypass = ref_reduction_tree_sum_and_clip(
-            partials, fan_in_K=K, threshold_schedule=[-1.0],
+            partials, fan_in=K, threshold_schedule=[-1.0],
         )
         # Should match pure sum (no clipping)
-        ref_sum = ref_reduction_tree_sum(partials, fan_in_K=K)
+        ref_sum = ref_reduction_tree_sum(partials, fan_in=K)
         np.testing.assert_array_equal(ref_bypass, ref_sum)
 
     def test_zero_threshold_zeros_all_gradients(self):
@@ -104,7 +104,7 @@ class TestReductionTree:
         K = 4
         partials = [rng.standard_normal(8).astype(np.float32) * 10.0 for _ in range(3)]
         ref = ref_reduction_tree_sum_and_clip(
-            partials, fan_in_K=K, threshold_schedule=[0.0],
+            partials, fan_in=K, threshold_schedule=[0.0],
         )
         np.testing.assert_array_equal(ref, np.zeros_like(partials[0]))
 
@@ -117,7 +117,7 @@ class TestReductionTree:
         # Stage 0: bypass, Stage 1: clip to norm 1.0
         schedule: list[float | None] = [-1.0, 1.0]
         ref = ref_reduction_tree_sum_and_clip(
-            partials, fan_in_K=K, threshold_schedule=schedule,
+            partials, fan_in=K, threshold_schedule=schedule,
         )
         # Final norm should be <= 1.0 (clipped at final stage)
         final_norm = np.sqrt(np.sum(ref * ref))

@@ -322,8 +322,8 @@ __kernel void reduce_k_fan_in_and_clip(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_collection,
     __global const uint         *src_buffer_GLOBAL_CONST_offset_list_flat,
-    __global STORAGE_TYPE       *dest_buffer_GLOBAL_stage_output,
-    uint                         src_scalar_NATURAL_fan_in_K,
+    __global STORAGE_TYPE       *dest_buffer_GLOBAL_stage_partial,
+    uint                         src_scalar_NATURAL_fan_in,
     uint                         src_scalar_NATURAL_node_count,
     uint                         src_scalar_NATURAL_partial_width,
     COMPUTE_TYPE                 src_scalar_REAL_clipping_threshold,
@@ -338,7 +338,7 @@ __kernel void reduce_k_fan_in_and_clip(
         return;
     }
 
-    const uint offset_base = node_id * src_scalar_NATURAL_fan_in_K;
+    const uint offset_base = node_id * src_scalar_NATURAL_fan_in;
     const uint dest_base   = node_id * src_scalar_NATURAL_partial_width;
 
     // --- Phase 1: Gather and Accumulate (element-parallel with striding) ---
@@ -350,7 +350,7 @@ __kernel void reduce_k_fan_in_and_clip(
     for (uint elem = lid; elem < src_scalar_NATURAL_partial_width; elem += lsize) {
         COMPUTE_TYPE accum = COMPUTE_ZERO;
 
-        for (uint k = 0; k < src_scalar_NATURAL_fan_in_K; ++k) {
+        for (uint k = 0; k < src_scalar_NATURAL_fan_in; ++k) {
             const uint offset = src_buffer_GLOBAL_CONST_offset_list_flat[offset_base + k];
             if (offset != SENTINEL_ABSENT_PARTIAL) {
                 accum += load_storage(src_buffer_GLOBAL_partial_collection, offset + elem);
@@ -359,7 +359,7 @@ __kernel void reduce_k_fan_in_and_clip(
 
         // Store the accumulated sum in the destination, to be potentially
         // scaled in-place during Phase 3.
-        store_storage(dest_buffer_GLOBAL_stage_output, dest_base + elem, accum);
+        store_storage(dest_buffer_GLOBAL_stage_partial, dest_base + elem, accum);
 
         // Accumulate the square for this thread's L2 norm contribution.
         local_sq_sum += accum * accum;
@@ -397,8 +397,8 @@ __kernel void reduce_k_fan_in_and_clip(
         // --- Phase 3: Conditional In-Place Scaling ---
         if (scale_factor < (COMPUTE_TYPE)1.0f) {
             for (uint elem = lid; elem < src_scalar_NATURAL_partial_width; elem += lsize) {
-                COMPUTE_TYPE val = load_storage(dest_buffer_GLOBAL_stage_output, dest_base + elem);
-                store_storage(dest_buffer_GLOBAL_stage_output, dest_base + elem, val * scale_factor);
+                COMPUTE_TYPE val = load_storage(dest_buffer_GLOBAL_stage_partial, dest_base + elem);
+                store_storage(dest_buffer_GLOBAL_stage_partial, dest_base + elem, val * scale_factor);
             }
         }
     }
@@ -500,8 +500,8 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_partial_collection,
     __global const uint         *src_buffer_GLOBAL_CONST_offset_list_flat,
-    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_stage_output,
-    uint                         src_scalar_NATURAL_fan_in_K,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_stage_partial,
+    uint                         src_scalar_NATURAL_fan_in,
     uint                         src_scalar_NATURAL_node_count,
     uint                         src_scalar_NATURAL_partial_width,
     COMPUTE_TYPE                 src_scalar_REAL_clipping_threshold,
@@ -515,7 +515,7 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
         return;
     }
 
-    const uint offset_base = node_id * src_scalar_NATURAL_fan_in_K;
+    const uint offset_base = node_id * src_scalar_NATURAL_fan_in;
     const uint dest_base   = node_id * src_scalar_NATURAL_partial_width;
 
     // Phase 1: Gather and accumulate — no precision boundary conversion.
@@ -524,7 +524,7 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
     for (uint elem = lid; elem < src_scalar_NATURAL_partial_width; elem += lsize) {
         COMPUTE_TYPE accum = COMPUTE_ZERO;
 
-        for (uint k = 0; k < src_scalar_NATURAL_fan_in_K; ++k) {
+        for (uint k = 0; k < src_scalar_NATURAL_fan_in; ++k) {
             const uint offset = src_buffer_GLOBAL_CONST_offset_list_flat[offset_base + k];
             if (offset != SENTINEL_ABSENT_PARTIAL) {
                 // Direct COMPUTE_TYPE read (no load_storage).
@@ -533,7 +533,7 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
         }
 
         // Direct COMPUTE_TYPE write.
-        dest_buffer_GLOBAL_stage_output[dest_base + elem] = accum;
+        dest_buffer_GLOBAL_stage_partial[dest_base + elem] = accum;
 
         local_sq_sum += accum * accum;
     }
@@ -569,8 +569,8 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
         if (scale_factor < (COMPUTE_TYPE)1.0f) {
             for (uint elem = lid; elem < src_scalar_NATURAL_partial_width; elem += lsize) {
                 // Direct COMPUTE_TYPE read/write.
-                COMPUTE_TYPE val = dest_buffer_GLOBAL_stage_output[dest_base + elem];
-                dest_buffer_GLOBAL_stage_output[dest_base + elem] = val * scale_factor;
+                COMPUTE_TYPE val = dest_buffer_GLOBAL_stage_partial[dest_base + elem];
+                dest_buffer_GLOBAL_stage_partial[dest_base + elem] = val * scale_factor;
             }
         }
     }

@@ -21,23 +21,25 @@ class ForwardPassPush(ctypes.Structure):
         ("total_batch_count", ctypes.c_uint32),
         ("padded_input_count", ctypes.c_uint32),
         ("padded_hidden_count", ctypes.c_uint32),
+        ("FLAG_produce_hidden_mask", ctypes.c_uint32),
     ]
 
 
 class RenderLogitsPush(ctypes.Structure):
     _fields_ = [
-        ("num_class_chunks", ctypes.c_uint32),
-        ("classes_per_chunk", ctypes.c_uint32),
-        ("modules_per_chunk", ctypes.c_uint32),
+        ("batch_chunk_offset", ctypes.c_uint32),
+        ("batch_chunk_count", ctypes.c_uint32),
+        ("module_chunk_offset", ctypes.c_uint32),
+        ("module_chunk_count", ctypes.c_uint32),
+        ("class_chunk_offset", ctypes.c_uint32),
+        ("class_chunk_count", ctypes.c_uint32),
         ("total_batch_count", ctypes.c_uint32),
+        ("hidden_count", ctypes.c_uint32),
+        ("padded_hidden_count", ctypes.c_uint32),
         ("total_output_class_count", ctypes.c_uint32),
         ("padded_total_output_class_count", ctypes.c_uint32),
-        ("padded_hidden_count", ctypes.c_uint32),
         ("total_modules_count", ctypes.c_uint32),
-        ("padded_total_modules_count", ctypes.c_uint32),
-        ("module_offset", ctypes.c_uint32),
-        ("class_offset", ctypes.c_uint32),
-        ("total_tile_count", ctypes.c_uint32),
+        ("FLAG_use_explicit_hidden_mask", ctypes.c_uint32),
     ]
 
 
@@ -139,6 +141,7 @@ class SharedBackpropWeightsPush(ctypes.Structure):
         ("padded_input_count", ctypes.c_uint32),
         ("padded_hidden_count", ctypes.c_uint32),
         ("final_grad_hidden_activations_total_count", ctypes.c_uint32),
+        ("FLAG_use_explicit_hidden_mask", ctypes.c_uint32),
     ]
 
 
@@ -151,6 +154,7 @@ class SharedBackpropBiasesPush(ctypes.Structure):
         ("num_batch_chunks", ctypes.c_uint32),
         ("padded_hidden_count", ctypes.c_uint32),
         ("final_grad_hidden_activations_total_count", ctypes.c_uint32),
+        ("FLAG_use_explicit_hidden_mask", ctypes.c_uint32),
     ]
 
 
@@ -223,11 +227,104 @@ PUSH_CONSTANT_STRUCTS: dict[str, type[ctypes.Structure]] = {
 }
 
 
+# ── Descriptor buffer binding order ──
+#
+# Maps kernel_name → ordered tuple of plan buffer-key names.
+# The i-th entry corresponds to ``layout(set=0, binding=i)`` in the shader.
+# ``None`` marks a binding slot that has no plan-level key (e.g. the
+# alternate-format targets buffer in Strategy-A shaders); the renderer
+# leaves such slots uninitialised because dead-code elimination in the
+# specialised pipeline guarantees they are never accessed.
+
+BUFFER_BINDING_ORDER: dict[str, tuple[str | None, ...]] = {
+    # Node 4
+    "forward_pass": (
+        "input", "sample_mask", "weights_shared_simd_major",
+        "biases_shared", "hidden_activations", "hidden_mask",
+    ),
+    # Node 5
+    "render_logits_chunk": (
+        "hidden_activations", "hidden_mask", "sample_mask",
+        "weights_module", "biases_module", "logits",
+    ),
+    # Node 6 (CCE)
+    "compute_probs_loss_cce_chunk": (
+        "logits", "temps", "targets", "sample_mask",
+        "partial_probs", "final_loss",
+    ),
+    # Node 7 (BCE)
+    "compute_probs_loss_bce_chunk": (
+        "logits", "temps", "targets", "sample_mask",
+        "partial_probs", "partial_loss",
+    ),
+    # Node 8 — Strategy A (dual targets: binding 3 unused for CCE)
+    "calculate_module_param_grads_chunk": (
+        "hidden_activations", "partial_probs", "targets", None,
+        "sample_mask", "partial_grad_weights_module",
+        "partial_grad_biases_module", "temps",
+    ),
+    # Node 9 — Strategy A (dual targets: binding 2 unused for CCE)
+    "backprop_error_to_hidden_chunk": (
+        "partial_probs", "targets", None, "sample_mask",
+        "weights_module", "partial_grad_hidden_activations_aos", "temps",
+    ),
+    # Node 10 — Strategy A (dual targets: binding 3 unused for CCE)
+    "calculate_chunk_temp_gradients": (
+        "logits", "partial_probs", "targets", None,
+        "sample_mask", "temps", "partial_grad_temps",
+    ),
+    # Node 11 (binding 4 = per-item threshold, unused when use_per_item_norm=0)
+    "clip_partial_gradients": (
+        "partial_grad_weights_module", "partial_grad_biases_module",
+        "partial_grad_temps", "partial_grad_hidden_activations_aos", None,
+        "clipped_partial_grad_weights_module", "clipped_partial_grad_biases_module",
+        "clipped_partial_grad_temps", "clipped_partial_grad_hidden_activations_aos",
+    ),
+    # Node 13
+    "gather_and_permute_grad_hidden_activations": (
+        "clipped_partial_grad_hidden_activations_aos",
+        "clipped_grad_hidden_activations_permuted_soa",
+    ),
+    # Node 16
+    "stabilize_and_reduce_grad_hidden_activations": (
+        "grad_hidden_activations_permuted_soa",
+        "summed_grad_hidden_activations",
+    ),
+    # Node 17
+    "backprop_shared_weights_chunk": (
+        "input", "hidden_activations", "summed_grad_hidden_activations",
+        "sample_mask", "hidden_mask", "partial_grad_weights_shared",
+    ),
+    # Node 18
+    "backprop_shared_biases_chunk": (
+        "hidden_activations", "summed_grad_hidden_activations",
+        "sample_mask", "hidden_mask", "partial_grad_biases_shared",
+    ),
+    # Node 19
+    "clip_shared_gradients_chunk": (
+        "partial_grad_weights_shared", "partial_grad_biases_shared",
+        "clipped_partial_grad_weights_shared", "clipped_partial_grad_biases_shared",
+    ),
+    # Node 21 (all instances share this order)
+    "normalize_gradients": (
+        "summed_grad", "final_grad",
+    ),
+    # Node 24 (all instances share this order)
+    "adam_update": (
+        "final_grad", "parameters", "m1", "m2",
+    ),
+    # Node 25
+    "clamp_temperatures": (
+        "temperatures",
+    ),
+}
+
+
 # ── Descriptor binding counts per shader (Phase 5A §7) ──
 
 DESCRIPTOR_BINDING_COUNTS: dict[str, int] = {
     "forward_pass": 6,
-    "render_logits_chunk": 5,
+    "render_logits_chunk": 6,
     "compute_probs_loss_cce_chunk": 6,
     "compute_probs_loss_bce_chunk": 6,
     "calculate_module_param_grads_chunk": 8,
@@ -239,8 +336,8 @@ DESCRIPTOR_BINDING_COUNTS: dict[str, int] = {
     "aggregate_partials_from_compute": 3,  # ADR-026: same layout as storage-entry
     "clip_intermediate_grad": 1,
     "stabilize_and_reduce_grad_hidden_activations": 2,
-    "backprop_shared_weights_chunk": 5,
-    "backprop_shared_biases_chunk": 4,
+    "backprop_shared_weights_chunk": 6,
+    "backprop_shared_biases_chunk": 5,
     "clip_shared_gradients_chunk": 4,
     "normalize_gradients": 2,
     "adam_update": 4,

@@ -10,7 +10,7 @@ from numpy.typing import NDArray
 
 def ref_reduction_tree_sum(
     partials: list[NDArray[np.floating[Any]]],
-    fan_in_K: int,
+    fan_in: int,
 ) -> NDArray[np.floating[Any]]:
     """Reference: multi-stage sum reduction tree.
 
@@ -25,7 +25,7 @@ def ref_reduction_tree_sum(
 
 def ref_reduction_tree_sum_and_clip(
     partials: list[NDArray[np.floating[Any]]],
-    fan_in_K: int,
+    fan_in: int,
     threshold_schedule: list[float | None],
     epsilon: float = 1e-7,
 ) -> NDArray[np.floating[Any]]:
@@ -44,8 +44,8 @@ def ref_reduction_tree_sum_and_clip(
     stage = 0
     while len(current) > 1:
         next_level: list[NDArray[np.floating[Any]]] = []
-        for i in range(0, len(current), fan_in_K):
-            group = current[i : i + fan_in_K]
+        for i in range(0, len(current), fan_in):
+            group = current[i : i + fan_in]
             summed = sum(group[1:], group[0].copy())
             next_level.append(summed)
 

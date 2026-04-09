@@ -38,6 +38,11 @@
 typedef uint32_t uint;
 #endif
 
+/* ADR-031: Sample mask bitmask access — 32 samples per uint word, LSB-first */
+static inline uint load_sample_mask(const uint *mask_words, uint sample_index) {
+    return (mask_words[sample_index >> 5u] >> (sample_index & 31u)) & 1u;
+}
+
 /* ================================================================
  * Multi-Precision Configuration (ADR-008, ADR-023 §2.3, ADR-024 §4)
  *
@@ -59,11 +64,12 @@ typedef uint32_t uint;
 /* --- Act Phase --- */                                                        \
 typedef struct {                                                               \
     const STORAGE_T* input;                                                    \
-    const STORAGE_T* sample_mask;                                              \
+    const uint*      sample_mask;                                              \
     const STATE_T*   weights_shared_simd_major;                                \
     const STATE_T*   biases_shared;                                            \
     STORAGE_T*       hidden_activations;                                       \
     STORAGE_T*       hidden_mask;                                              \
+    uint             FLAG_produce_hidden_mask;                                 \
     uint             batch_chunk_offset;                                       \
     uint             batch_chunk_count;                                        \
     uint             total_batch_count;                                        \
@@ -74,6 +80,8 @@ typedef struct {                                                               \
 typedef struct {                                                               \
     const STORAGE_T* hidden_activations;                                       \
     const STORAGE_T* hidden_mask;                                              \
+    uint             FLAG_use_explicit_hidden_mask;                            \
+    const uint*      sample_mask;                                              \
     const STATE_T*   weights_module;                                           \
     const STATE_T*   biases_module;                                            \
     STORAGE_T*       logits;                                                   \
@@ -96,7 +104,7 @@ typedef struct {                                                               \
     const STORAGE_T* logits;                                                   \
     const STATE_T*   temps;                                                    \
     const int*       targets;                                                  \
-    const STORAGE_T* sample_mask;                                              \
+    const uint*      sample_mask;                                              \
     STORAGE_T*       partial_probs;                                            \
     COMPUTE_T*       final_loss;                                               \
     uint             flat_tile_index;                                          \
@@ -114,7 +122,7 @@ typedef struct {                                                               \
     const STORAGE_T* logits;                                                   \
     const STATE_T*   temps;                                                    \
     const STORAGE_T* targets;                                                  \
-    const STORAGE_T* sample_mask;                                              \
+    const uint*      sample_mask;                                              \
     STORAGE_T*       partial_probs;                                            \
     STORAGE_T*       partial_loss;                                             \
     uint             flat_tile_index;                                          \
@@ -132,7 +140,7 @@ typedef struct {                                                               \
     const STORAGE_T* hidden_activations;                                       \
     const STORAGE_T* partial_probs;                                            \
     const void*      targets;                                                  \
-    const STORAGE_T* sample_mask;                                              \
+    const uint*      sample_mask;                                              \
     const STATE_T*   temps;                                                    \
     STORAGE_T*       partial_grad_weights_module;                              \
     STORAGE_T*       partial_grad_biases_module;                               \
@@ -156,7 +164,7 @@ typedef struct {                                                               \
 typedef struct {                                                               \
     const STORAGE_T* partial_probs;                                            \
     const void*      targets;                                                  \
-    const STORAGE_T* sample_mask;                                              \
+    const uint*      sample_mask;                                              \
     const STATE_T*   weights_module;                                           \
     const STATE_T*   temps;                                                    \
     STORAGE_T*       partial_grad_hidden_activations_aos;                      \
@@ -178,7 +186,7 @@ typedef struct {                                                               \
     const STORAGE_T* logits;                                                   \
     const STORAGE_T* partial_probs;                                            \
     const void*      targets;                                                  \
-    const STORAGE_T* sample_mask;                                              \
+    const uint*      sample_mask;                                              \
     const STATE_T*   temps;                                                    \
     STORAGE_T*       partial_grad_temps;                                       \
     uint             problem_type;                                             \
@@ -291,8 +299,10 @@ typedef struct {                                                               \
 typedef struct {                                                               \
     const STORAGE_T* input;                                                    \
     const STORAGE_T* hidden_activations;                                       \
+    const STORAGE_T* hidden_mask;                                              \
+    uint             FLAG_use_explicit_hidden_mask;                            \
     const COMPUTE_T* summed_grad_hidden_activations;                           \
-    const STORAGE_T* sample_mask;                                              \
+    const uint*      sample_mask;                                              \
     STORAGE_T*       partial_grad_weights_shared;                              \
     uint             batch_chunk_offset;                                       \
     uint             batch_chunk_count;                                        \
@@ -306,8 +316,10 @@ typedef struct {                                                               \
                                                                                \
 typedef struct {                                                               \
     const STORAGE_T* hidden_activations;                                       \
+    const STORAGE_T* hidden_mask;                                              \
+    uint             FLAG_use_explicit_hidden_mask;                            \
     const COMPUTE_T* summed_grad_hidden_activations;                           \
-    const STORAGE_T* sample_mask;                                              \
+    const uint*      sample_mask;                                              \
     STORAGE_T*       partial_grad_biases_shared;                               \
     uint             batch_chunk_offset;                                       \
     uint             batch_chunk_count;                                        \

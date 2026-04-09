@@ -38,7 +38,7 @@ from .plan_renderer import PlanRenderer
 
 # Configuration types
 from .hardware_profile import HardwareProfile
-from .precision_config import PrecisionConfig
+from .precision_config import PrecisionConfig, MaskStrategy
 from .model_spec import ModelSpec
 from .parameter_space import ParameterSpace
 from .stabilization_policy import StabilizationPolicy
@@ -84,6 +84,7 @@ __all__ = [
     # Configuration types
     "HardwareProfile",
     "PrecisionConfig",
+    "MaskStrategy",
     "ModelSpec",
     "ParameterSpace",
     "StabilizationPolicy",
