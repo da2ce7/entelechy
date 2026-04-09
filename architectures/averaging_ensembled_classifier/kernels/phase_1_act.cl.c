@@ -22,8 +22,11 @@ __kernel void forward_pass(
     uint                         src_scalar_NATURAL_batch_chunk_offset,
     uint                         src_scalar_NATURAL_batch_chunk_count,
     uint                         src_scalar_NATURAL_total_batch_count,
+    uint                         src_scalar_NATURAL_input_count,
     uint                         src_scalar_NATURAL_padded_input_count,
     uint                         src_scalar_NATURAL_padded_hidden_count) {
+
+    (void)src_scalar_NATURAL_input_count; // Interface completeness (R8); available for future iteration-bound optimizations.
 
     // --- 1. Work-Item to Logical Coordinate Mapping ---
     // Each work-item is responsible for computing one element of the hidden activation tensor.

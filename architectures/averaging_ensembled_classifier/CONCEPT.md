@@ -178,6 +178,18 @@ Implementations may choose to make an natural extension to support a **`Per-Item
 
 A Host Orchestrator could be configured to implement a true **`Group-Wise`** clipping policy for workloads that demand perfectly preserved relative gradient magnitudes. This would require extending the kernel set to include the necessary pre-summation and global norm calculations, and it would come at a significant host complexity, performance and synchronization cost. Such an extension is considered a specialized, scientific execution path.
 
+##### **3.6. Zero-Propagation Invariant**
+
+Padding positions in state-role parameter buffers (weights, biases) are host-initialized to zero and maintained at zero by the optimizer (which operates only on logical-extent positions). This invariant propagates through the forward pass (Nodes 4→5) and backward pass (Nodes 16→17→18), ensuring that padding positions in compute-role and storage-role intermediate buffers carry zero values without requiring per-kernel boundary checks at every consumption point.
+
+The zero-propagation chain operates as follows:
+
+1. **State-role origin:** Host initializes weight and bias padding to zero. Optimizer kernels (Nodes 24, 25) update only logical-extent positions, preserving zeros at padding indices.
+2. **Forward propagation:** Node 4 computes `W*x + b` over the padded input dimension. Because input padding is host-zeroed and weight padding is state-zero, hidden-activation padding positions receive only bias contributions — which are themselves zero at padding indices. Node 5 consumes these zero-padded activations.
+3. **Backward propagation:** Node 13's `ZERO_REQUIRED` output initialization ensures padded module positions carry zero. Node 16 reduces across modules, propagating zeros at padded positions into `summed_grad_h`. Nodes 17 and 18 consume this zero-padded gradient, and their own padding zero-fill guarantees (enforced via explicit `input_count`/`hidden_count` boundary parameters) ensure the chain terminates cleanly.
+
+This invariant is a first-class architectural property. Kernels whose Behavioral Invariants claim "Padding Zero-Fill" at positions lacking explicit logical-extent boundary parameters are relying on this chain. Any modification to host initialization, optimizer update bounds, or `ZERO_REQUIRED` initialization contracts must preserve this invariant or introduce explicit boundary parameters at affected consumption points.
+
 #### **4. Asynchronous Host Interaction**
 
 The processing of each batch spans two event-delimited phases whose temporal relationship is controlled by the user:

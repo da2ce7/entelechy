@@ -287,7 +287,7 @@ BUFFER_BINDING_ORDER: dict[str, tuple[str | None, ...]] = {
     ),
     # Node 16
     "stabilize_and_reduce_grad_hidden_activations": (
-        "grad_hidden_activations_permuted_soa",
+        "clipped_grad_hidden_activations_permuted_soa",
         "summed_grad_hidden_activations",
     ),
     # Node 17

@@ -73,6 +73,7 @@ typedef struct {                                                               \
     uint             batch_chunk_offset;                                       \
     uint             batch_chunk_count;                                        \
     uint             total_batch_count;                                        \
+    uint             input_count;                                              \
     uint             padded_input_count;                                       \
     uint             padded_hidden_count;                                      \
 } ForwardPassArgs_##SUFFIX;                                                    \
@@ -275,7 +276,7 @@ typedef struct {                                                               \
 } ReductionTreePlanComputeEntry_##SUFFIX;                                      \
                                                                                \
 typedef struct {                                                               \
-    const STORAGE_T* grad_hidden_activations_permuted_soa;                     \
+    const STORAGE_T* clipped_grad_hidden_activations_permuted_soa;             \
     COMPUTE_T*       summed_grad_hidden_activations;                           \
     COMPUTE_T        fp_max;                                                   \
     COMPUTE_T        policy_t_algorithmic;                                     \
@@ -309,7 +310,9 @@ typedef struct {                                                               \
     uint             batch_chunk_index;                                        \
     uint             total_batch_count;                                        \
     uint             num_batch_chunks;                                   \
+    uint             input_count;                                              \
     uint             padded_input_count;                                       \
+    uint             hidden_count;                                             \
     uint             padded_hidden_count;                                      \
     uint             final_grad_hidden_total_element_count;                    \
 } BackpropSharedWeightsArgs_##SUFFIX;                                          \
@@ -326,6 +329,7 @@ typedef struct {                                                               \
     uint             batch_chunk_index;                                        \
     uint             total_batch_count;                                        \
     uint             num_batch_chunks;                                   \
+    uint             hidden_count;                                             \
     uint             padded_hidden_count;                                      \
     uint             final_grad_hidden_total_element_count;                    \
 } BackpropSharedBiasesArgs_##SUFFIX;                                           \

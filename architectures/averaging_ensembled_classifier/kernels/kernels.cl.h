@@ -348,6 +348,8 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
     int exp8 = exp32 + 15;  // E5M2 bias = 15
     
     // Handle subnormals
+    // NOTE: Subnormal rounding omits shifted-out bits from sticky calculation.
+    // Max error: 1 ULP of FP8 E5M2 subnormal (2^-16). Below quantization floor; no fix required.
     if (exp8 <= 0) {
         int shift = 1 - exp8;
         if (shift >= 24) {
@@ -471,6 +473,17 @@ static inline uint load_sample_mask(
 //
 // When STATE_TYPE <= COMPUTE_TYPE, ACCUM_TYPE == COMPUTE_TYPE and all casts
 // are identity operations eliminated by the compiler.
+//
+// ACCUM_TYPE coverage matrix (S=STATE, C=COMPUTE):
+//   S=double, C=double → else branch:  ACCUM=double (COMPUTE) ✓
+//   S=double, C=float  → branch 1:     ACCUM=double (STATE)   ✓
+//   S=double, C=half   → branch 1:     ACCUM=double (STATE)   ✓
+//   S=float,  C=double → else branch:  ACCUM=double (COMPUTE) ✓
+//   S=float,  C=float  → else branch:  ACCUM=float  (COMPUTE) ✓
+//   S=float,  C=half   → branch 2:     ACCUM=float  (STATE)   ✓
+//   S=half,   C=double → else branch:  ACCUM=double (COMPUTE) ✓
+//   S=half,   C=float  → else branch:  ACCUM=float  (COMPUTE) ✓
+//   S=half,   C=half   → else branch:  ACCUM=half   (COMPUTE) ✓
 
 #if STATE_TYPE_IS_DOUBLE && !COMPUTE_TYPE_IS_DOUBLE
     // STATE_TYPE (double) > COMPUTE_TYPE (float or half)
@@ -770,7 +783,7 @@ __kernel void forward_pass(
     __global STORAGE_TYPE *dest_buffer_GLOBAL_hidden_activations,
 
     /**
-     * @param dest_buffer_GLOBAL_hidden_mask [CONDITIONAL] Derivative mask from ReLU operation (1 if activation > 0, else 0).
+     * @param dest_buffer_GLOBAL_hidden_mask [CONDITIONAL on dest_scalar_FLAG_produce_hidden_mask] Derivative mask from ReLU operation (1 if activation > 0, else 0).
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
      *        - Precision Role: "storage"
@@ -790,6 +803,7 @@ __kernel void forward_pass(
     uint src_scalar_NATURAL_batch_chunk_offset,
     uint src_scalar_NATURAL_batch_chunk_count,
     uint src_scalar_NATURAL_total_batch_count,
+    uint src_scalar_NATURAL_input_count,
     uint src_scalar_NATURAL_padded_input_count,
     uint src_scalar_NATURAL_padded_hidden_count);
 
@@ -817,7 +831,7 @@ __kernel void render_logits_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_activations,
 
     /**
-     * @param src_buffer_GLOBAL_hidden_mask [CONDITIONAL] The ReLU mask corresponding to the hidden activations.
+     * @param src_buffer_GLOBAL_hidden_mask [CONDITIONAL on src_scalar_FLAG_use_explicit_hidden_mask] The ReLU mask corresponding to the hidden activations.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
      *        - Precision Role: "storage"
@@ -906,7 +920,7 @@ __kernel void render_logits_chunk(
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Behavioral Invariants: "The implementation is a fused, indivisible unit for numerically stable Softmax calculation. Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; partial_probs narrowed via store_storage(); final_loss written directly in COMPUTE_TYPE (no narrowing). All arithmetic exclusively in COMPUTE_TYPE. Loss Write Predicate: The kernel writes to dest_buffer_GLOBAL_final_loss[module][sample] only when the target class index for the sample falls within the current tile's class chunk range [class_chunk_offset, class_chunk_offset + classes_per_chunk). All other tiles skip the loss write, relying on the ZERO_REQUIRED initialization."
  *        - Idempotency: "Strictly Idempotent"
- *        - Synchronization Model: "Partial Renderer for probabilities output."
+ *        - Synchronization Model: "Partial Renderer for probabilities output. Conditional Writer for loss (predicate: target class index ∈ [class_chunk_offset, class_chunk_offset + classes_per_chunk))."
  *        - Kernel Bifurcation: "CONCEPT.md Principle 3(B) — separate kernel required due to incompatible type signatures,
  *          memory layouts, and DAG topology vs. Node 7 (BCE path). CONTRACT §7.0 Exception applies."
  */
@@ -986,13 +1000,17 @@ __kernel void compute_probs_loss_cce_chunk(
     uint src_scalar_NATURAL_total_output_class_count,
     uint src_scalar_NATURAL_padded_total_output_class_count,
     uint src_scalar_NATURAL_total_modules_count,
+    /**
+     * @param src_scalar_NATURAL_total_tile_count The total number of tiles in the flattened (module_chunk, class_chunk) grid.
+     *        - Calculability Proof: [ceil(src_scalar_NATURAL_total_modules_count / src_scalar_NATURAL_modules_per_chunk) * src_scalar_NATURAL_num_class_chunks]
+     */
     uint src_scalar_NATURAL_total_tile_count);
 
 /**
  * @brief (Node 7) Computes probabilities and PARTIAL BCE loss for a tile.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; partial_probs narrowed via store_storage(); partial_loss written in COMPUTE_TYPE. All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Behavioral Invariants: "The implementation shall employ a numerically stable Sigmoid computation (two-branch form: for positive logits, σ(x) = 1/(1+exp(-x)); for negative logits, σ(x) = exp(x)/(1+exp(x))) to prevent exp() overflow. BCE loss shall use a numerically stable formulation that avoids log(0) (e.g., max(x,0) - x*y + log(1+exp(-|x|))). Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; partial_probs narrowed via store_storage(); partial_loss written in COMPUTE_TYPE. All arithmetic exclusively in COMPUTE_TYPE."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Dual Partial Renderer. Uses flat_tile_index for both probability and loss outputs."
  *        - Kernel Bifurcation: "CONCEPT.md Principle 3(B) — separate kernel required due to incompatible type signatures,
@@ -1075,6 +1093,10 @@ __kernel void compute_probs_loss_bce_chunk(
     uint src_scalar_NATURAL_total_output_class_count,
     uint src_scalar_NATURAL_padded_total_output_class_count,
     uint src_scalar_NATURAL_total_modules_count,
+    /**
+     * @param src_scalar_NATURAL_total_tile_count The total number of tiles in the flattened (module_chunk, class_chunk) grid.
+     *        - Calculability Proof: [ceil(src_scalar_NATURAL_total_modules_count / src_scalar_NATURAL_modules_per_chunk) * src_scalar_NATURAL_num_class_chunks]
+     */
     uint src_scalar_NATURAL_total_tile_count);
 
 // --- Phase 8-10: Parallel Gradient Computation ---
@@ -1083,7 +1105,7 @@ __kernel void compute_probs_loss_bce_chunk(
  * @brief (Node 8) Computes partial module param gradients (Weights, Biases) for a tile.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. Padding Zero-Fill: For padded dimensions where the logical extent (hidden_count, total_output_class_count) is less than the padded extent (padded_hidden_count, padded_total_output_class_count), the kernel SHALL write zero for all positions at indices >= the logical extent. This guarantees that downstream L2 norm computations (Node 11) over the full padded extent are mathematically equivalent to norms over the logical extent."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Dual Partial Renderer. Uses flat_tile_index for both weight and bias gradient outputs."
  */
@@ -1178,7 +1200,7 @@ __kernel void calculate_module_param_grads_chunk(
     /**
      * @param dest_buffer_GLOBAL_partial_grad_biases_module The collection buffer for this tile's computed bias gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: SIMD, Formula: "SIMD_WIDTH alignment via padded_total_output_class_count"}
      *        - Initialization Contract: {Type: ZERO_REQUIRED_ADDITIVE}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count]
@@ -1202,13 +1224,17 @@ __kernel void calculate_module_param_grads_chunk(
     uint src_scalar_NATURAL_total_output_class_count,
     uint src_scalar_NATURAL_padded_total_output_class_count,
     uint src_scalar_NATURAL_total_modules_count,
+    /**
+     * @param src_scalar_NATURAL_total_tile_count The total number of tiles in the flattened (module_chunk, class_chunk) grid.
+     *        - Calculability Proof: [ceil(src_scalar_NATURAL_total_modules_count / src_scalar_NATURAL_modules_per_chunk) * src_scalar_NATURAL_num_class_chunks]
+     */
     uint src_scalar_NATURAL_total_tile_count);
 
 /**
  * @brief (Node 9) Computes the partial upstream gradient for the hidden layer (Grad_H) for a tile.
  * @kernel_contract
  *        - Holistic Constraints: "This kernel processes the complete batch dimension in a single dispatch. Batch-chunking parameters (batch_chunk_offset, batch_chunk_count) are intentionally absent because the downstream Item Synchronization Point (Node 13) requires a monolithic collection buffer."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened upon load; storage-role output narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened upon load; storage-role output narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Padding Zero-Fill: For the padded_hidden_count dimension, the kernel SHALL write zero for all positions at indices >= hidden_count. This guarantees that downstream L2 norm computations (Node 11) over the full padded extent are mathematically equivalent to norms over the logical extent."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Partial Renderer for a monolithic intermediate buffer."
  */
@@ -1276,7 +1302,7 @@ __kernel void backprop_error_to_hidden_chunk(
     /**
      * @param dest_buffer_GLOBAL_partial_grad_hidden_activations_aos The collection buffer for this tile's computed upstream gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: CACHE, Formula: "128-byte alignment via padded_hidden_count"}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
      *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
@@ -1298,6 +1324,10 @@ __kernel void backprop_error_to_hidden_chunk(
     uint src_scalar_NATURAL_total_output_class_count,
     uint src_scalar_NATURAL_padded_total_output_class_count,
     uint src_scalar_NATURAL_total_modules_count,
+    /**
+     * @param src_scalar_NATURAL_total_tile_count The total number of tiles in the flattened (module_chunk, class_chunk) grid.
+     *        - Calculability Proof: [ceil(src_scalar_NATURAL_total_modules_count / src_scalar_NATURAL_modules_per_chunk) * src_scalar_NATURAL_num_class_chunks]
+     */
     uint src_scalar_NATURAL_total_tile_count);
 
 /**
@@ -1397,6 +1427,10 @@ __kernel void calculate_chunk_temp_gradients(
     uint src_scalar_NATURAL_total_output_class_count,
     uint src_scalar_NATURAL_padded_total_output_class_count,
     uint src_scalar_NATURAL_total_modules_count,
+    /**
+     * @param src_scalar_NATURAL_total_tile_count The total number of tiles in the flattened (module_chunk, class_chunk) grid.
+     *        - Calculability Proof: [ceil(src_scalar_NATURAL_total_modules_count / src_scalar_NATURAL_modules_per_chunk) * src_scalar_NATURAL_num_class_chunks]
+     */
     uint src_scalar_NATURAL_total_tile_count);
 
 // --- Phase 11: Gradient Clipping ---
@@ -1407,7 +1441,7 @@ __kernel void calculate_chunk_temp_gradients(
  *        - Holistic Constraints: "The kernel processes the complete set of partial gradients for a single logical work item (`flat_tile_index`). The clipping threshold is determined by
  * `src_scalar_FLAG_use_per_item_norm`."
  *        - Behavioral Invariants: "[1] Implements a two-pass algorithm: Norm calculation followed by conditional scaling. [2] An epsilon term shall be used to prevent division by zero when
- * calculating the scaling factor. Precision Boundary Conversion: storage-role inputs widened via load_storage(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE."
+ * calculating the scaling factor. [3] The L2 norm is computed over the logical concatenation of all four input gradient buffers (weights, biases, temperatures, hidden activations). A single derived scaling factor is applied uniformly to all four output buffers. Independent per-buffer norms are a contract violation. Precision Boundary Conversion: storage-role inputs widened via load_storage(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. FP8 Quantization Note: When STORAGE_TYPE is FP8, the clip-then-store sequence introduces re-quantization error. Gradient components scaled below the FP8 quantization floor (2^-9 for E4M3, 2^-16 for E5M2) may round to zero, effectively zeroing a subset of the gradient. This is an accepted consequence of the Primacy of Memory Strategy — the architecture trades gradient fidelity for 4x bandwidth compression. The Quadratic Scaling Policy's threshold schedule accounts for this by maintaining gradients well above the quantization floor."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Utility / Stability Primitive. Acts as a barrier for a single item's partial results before reduction."
  */
@@ -1440,7 +1474,7 @@ __kernel void clip_partial_gradients(
     /**
      * @param src_buffer_GLOBAL_partial_grad_biases_module Source buffer from Node 8.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: SIMD, Formula: "SIMD_WIDTH alignment via padded_total_output_class_count"}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count]
      *        - Validation Preconditions: [1] The `flat_tile_index` must be within bounds. [2] Host must allocate buffer with size consistent with the Calculability Proof.
@@ -1460,7 +1494,7 @@ __kernel void clip_partial_gradients(
     /**
      * @param src_buffer_GLOBAL_partial_grad_hidden_activations_aos Source buffer from Node 9.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: CACHE, Formula: "128-byte alignment via padded_hidden_count"}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
      *        - Validation Preconditions: [1] The `flat_tile_index` must be within bounds. [2] Host must allocate buffer with size consistent with the Calculability Proof.
@@ -1468,20 +1502,25 @@ __kernel void clip_partial_gradients(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_grad_hidden_activations_aos,
 
     /**
-     * @param src_buffer_GLOBAL_CONST_clipping_threshold_per_item [CONDITIONAL] A buffer containing a distinct clipping threshold for each item.
+     * @param src_buffer_GLOBAL_CONST_clipping_threshold_per_item [CONDITIONAL on src_scalar_FLAG_use_per_item_norm] A buffer containing a distinct clipping threshold for each item.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count)
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count]
      *        - Validation Preconditions: [1] This buffer is read from ONLY IF `src_scalar_FLAG_use_per_item_norm` == 1. [2] If the flag is set, the Host MUST provide a valid buffer of size
-     * [src_scalar_NATURAL_total_tile_count * sizeof(COMPUTE_TYPE)]. [3] If the flag is not set, the Host MAY pass a NULL pointer for this argument.
+     * [src_scalar_NATURAL_total_tile_count * sizeof(COMPUTE_TYPE)]. [3] If the flag is not set, the Host MAY pass a minimal stub buffer.
      */
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_CONST_clipping_threshold_per_item,
 
     /**
      * @param dest_buffer_GLOBAL_clipped_partial_grad_weights_module Output for clipped weight gradients.
      *        - Tensor Shape: Identical to its `src_` counterpart.
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {
+     *            dim[0] ("total_tile_count"): {Type: NONE},
+     *            dim[1] ("modules_per_chunk"): {Type: NONE},
+     *            dim[2] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
+     *            dim[3] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
+     *          }
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
      *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
@@ -1492,7 +1531,7 @@ __kernel void clip_partial_gradients(
     /**
      * @param dest_buffer_GLOBAL_clipped_partial_grad_biases_module Output for clipped bias gradients.
      *        - Tensor Shape: Identical to its `src_` counterpart.
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: SIMD, Formula: "SIMD_WIDTH alignment via padded_total_output_class_count"}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count]
      *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
@@ -1514,7 +1553,7 @@ __kernel void clip_partial_gradients(
     /**
      * @param dest_buffer_GLOBAL_clipped_partial_grad_hidden_activations_aos Output for clipped upstream gradients.
      *        - Tensor Shape: Identical to its `src_` counterpart.
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: CACHE, Formula: "128-byte alignment via padded_hidden_count"}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
      *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
@@ -1531,7 +1570,10 @@ __kernel void clip_partial_gradients(
 
     /**
      * @param src_scalar_REAL_clipping_threshold_t_pre [CONDITIONAL] The maximum permissible L2 norm, applied to all items if the controlling flag is 0.
-     *        - Validation Preconditions: Must be a positive real number. This value is IGNORED if `src_scalar_FLAG_use_per_item_norm` == 1.
+     *        - Validation Preconditions: [1] Must be a positive real number. This value is IGNORED if `src_scalar_FLAG_use_per_item_norm` == 1.
+     *          [2] The Host MUST ensure this value satisfies the Pre-Summation Amplification constraint:
+     *          (src_scalar_REAL_clipping_threshold_t_pre * src_scalar_NATURAL_num_class_chunks) <= COMPUTE_FP_FORMAT_MAX,
+     *          because the downstream Node 13 sums num_class_chunks clipped tiles per element (see CONCEPT.md §3.4).
      */
     COMPUTE_TYPE src_scalar_REAL_clipping_threshold_t_pre,
 
@@ -1549,6 +1591,10 @@ __kernel void clip_partial_gradients(
     uint src_scalar_NATURAL_total_batch_count,
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_padded_total_output_class_count,
+    /**
+     * @param src_scalar_NATURAL_total_tile_count The total number of tiles in the flattened (module_chunk, class_chunk) grid.
+     *        - Calculability Proof: [ceil(src_scalar_NATURAL_total_modules_count / src_scalar_NATURAL_modules_per_chunk) * src_scalar_NATURAL_num_class_chunks]
+     */
     uint src_scalar_NATURAL_total_tile_count);
 
 // --- Phase 13: Data Layout Transformation & Permutation ---
@@ -1566,7 +1612,7 @@ __kernel void gather_and_permute_grad_hidden_activations(
     /**
      * @param src_buffer_GLOBAL_clipped_partial_grad_hidden_activations_aos The full collection of *clipped* partial upstream gradients, produced by Node 11.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: CACHE, Formula: "128-byte alignment via padded_hidden_count"}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
      *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_tile_count * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count *
@@ -1711,7 +1757,7 @@ __kernel void aggregate_local_reduce(
  *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a COMPUTE_TYPE collection buffer, located via an explicit offset list.
  * When used as a stage in a multi-stage reduction tree, operation_type MUST be AGG_MODE_SUM; AGG_MODE_AVERAGE is valid only as a single-stage terminal reduction, as partial-count division
  * at interior stages produces silently incorrect results."
- *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag. All buffers are compute-role; no precision boundary conversion is required. All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag. All buffers are compute-role; no precision boundary conversion is required. Reduction accumulation in COMPUTE_TYPE; compute-role output written directly. All arithmetic exclusively in COMPUTE_TYPE."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Reduction Engine Stage"
  *        - Precision Variant: "Compute-entry variant of aggregate_register_reduce. Used for interior stages of multi-stage reduction trees (where the source is a prior stage's COMPUTE_TYPE output) and for leaf stages whose source collection is natively COMPUTE_TYPE."
@@ -1757,7 +1803,7 @@ __kernel void aggregate_register_reduce_from_compute(
  *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a COMPUTE_TYPE collection buffer, located via an explicit offset list.
  * When used as a stage in a multi-stage reduction tree, operation_type MUST be AGG_MODE_SUM; AGG_MODE_AVERAGE is valid only as a single-stage terminal reduction, as partial-count division
  * at interior stages produces silently incorrect results."
- *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag. All buffers are compute-role; no precision boundary conversion is required. All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag. All buffers are compute-role; no precision boundary conversion is required. Reduction accumulation in COMPUTE_TYPE; compute-role output written directly. All arithmetic exclusively in COMPUTE_TYPE."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Reduction Engine Stage / Work-group Parallel"
  *        - Precision Variant: "Compute-entry variant of aggregate_local_reduce. Used for interior stages of multi-stage reduction trees (where the source is a prior stage's COMPUTE_TYPE output) and for leaf stages whose source collection is natively COMPUTE_TYPE."
@@ -1903,7 +1949,7 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
     /**
-     * @param src_buffer_GLOBAL_grad_hidden_activations_permuted_soa The pre-gathered, contiguous input data in SoA layout, ensuring optimal memory access for row-wise reduction.
+     * @param src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa The pre-gathered, contiguous input data in SoA layout, ensuring optimal memory access for row-wise reduction.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count)
      *        - Padding Contract: {
      *            dim[0] ("total_batch_count * hidden_count" → "total_batch_count * padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment on hidden_count stride"},
@@ -1914,7 +1960,7 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
      *        - Validation Preconditions: Host shall allocate exactly [(src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count) * src_scalar_NATURAL_padded_total_modules_count *
      * sizeof(STORAGE_TYPE)] bytes. This buffer must be fully populated by Node 13 before dispatch.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_grad_hidden_activations_permuted_soa,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa,
 
     /**
      * @param dest_buffer_GLOBAL_summed_grad_hidden_activations The destination for the single, final, summed hidden layer gradient vector.
@@ -1967,7 +2013,7 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
  * @brief (Node 17) Computes partial gradients for shared layer weights from a batch chunk.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Integer-typed sample_mask accessed via load_sample_mask(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sample-Level Early Exit: When load_sample_mask() returns 0 for a sample, the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Both upstream invariants (summed_grad_h = 0 from Node 9's masking, relu_derivative = 0 from Node 4's activation zeroing) independently guarantee zero contribution for masked samples regardless of whether the early exit is applied."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Integer-typed sample_mask accessed via load_sample_mask(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sample-Level Early Exit: When load_sample_mask() returns 0 for a sample, the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Both upstream invariants (summed_grad_h = 0 from Node 9's masking, relu_derivative = 0 from Node 4's activation zeroing) independently guarantee zero contribution for masked samples regardless of whether the early exit is applied. Padding Zero-Fill: For padded dimensions where the logical extent (input_count, hidden_count) is less than the padded extent (padded_input_count, padded_hidden_count), the kernel SHALL write zero for all positions at indices >= the logical extent. This guarantees that downstream L2 norm computations (Node 19) over the full padded extent are mathematically equivalent to norms over the logical extent."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Partial Renderer. Designed for the 'True Streaming' backpropagation model."
  */
@@ -2006,7 +2052,7 @@ __kernel void backprop_shared_weights_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_activations,
 
     /**
-     * @param src_buffer_GLOBAL_hidden_mask [CONDITIONAL] The ReLU derivative mask from Node 4.
+     * @param src_buffer_GLOBAL_hidden_mask [CONDITIONAL on src_scalar_FLAG_use_explicit_hidden_mask] The ReLU derivative mask from Node 4.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
      *        - Precision Role: "storage"
@@ -2068,7 +2114,9 @@ __kernel void backprop_shared_weights_chunk(
     uint src_scalar_NATURAL_batch_chunk_index,
     uint src_scalar_NATURAL_total_batch_count,
     uint src_scalar_NATURAL_num_batch_chunks,
+    uint src_scalar_NATURAL_input_count,
     uint src_scalar_NATURAL_padded_input_count,
+    uint src_scalar_NATURAL_hidden_count,
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_final_grad_hidden_activations_total_count);
 
@@ -2076,7 +2124,7 @@ __kernel void backprop_shared_weights_chunk(
  * @brief (Node 18) Computes partial gradients for shared layer biases from a batch chunk.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Integer-typed sample_mask accessed via load_sample_mask(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sample-Level Early Exit: When load_sample_mask() returns 0 for a sample, the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Both upstream invariants (summed_grad_h = 0 from Node 9's masking, relu_derivative = 0 from Node 4's activation zeroing) independently guarantee zero contribution for masked samples regardless of whether the early exit is applied."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Integer-typed sample_mask accessed via load_sample_mask(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sample-Level Early Exit: When load_sample_mask() returns 0 for a sample, the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Both upstream invariants (summed_grad_h = 0 from Node 9's masking, relu_derivative = 0 from Node 4's activation zeroing) independently guarantee zero contribution for masked samples regardless of whether the early exit is applied. Padding Zero-Fill: For the padded_hidden_count dimension, the kernel SHALL write zero for all positions at indices >= hidden_count. This guarantees that downstream L2 norm computations (Node 19) over the full padded extent are mathematically equivalent to norms over the logical extent."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Partial Renderer. Designed for the 'True Streaming' backpropagation model."
  */
@@ -2104,7 +2152,7 @@ __kernel void backprop_shared_biases_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_activations,
 
     /**
-     * @param src_buffer_GLOBAL_hidden_mask [CONDITIONAL] The ReLU derivative mask from Node 4.
+     * @param src_buffer_GLOBAL_hidden_mask [CONDITIONAL on src_scalar_FLAG_use_explicit_hidden_mask] The ReLU derivative mask from Node 4.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
      *        - Precision Role: "storage"
@@ -2148,7 +2196,7 @@ __kernel void backprop_shared_biases_chunk(
     /**
      * @param dest_buffer_GLOBAL_partial_grad_biases_shared The collection buffer for this chunk's computed bias gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_hidden_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: CACHE, Formula: "128-byte alignment via padded_hidden_count"}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_hidden_count]
      *        - Placement Contract: linear_batch(src_scalar_NATURAL_batch_chunk_index)
@@ -2162,6 +2210,7 @@ __kernel void backprop_shared_biases_chunk(
     uint src_scalar_NATURAL_batch_chunk_index,
     uint src_scalar_NATURAL_total_batch_count,
     uint src_scalar_NATURAL_num_batch_chunks,
+    uint src_scalar_NATURAL_hidden_count,
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_final_grad_hidden_activations_total_count);
 
@@ -2173,7 +2222,7 @@ __kernel void backprop_shared_biases_chunk(
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Behavioral Invariants: "[1] Implements a two-pass algorithm: Norm calculation followed
  *          by conditional scaling. [2] The L2 norm is computed over the concatenated
- *          vector of both weight and bias gradients for the chunk. Precision Boundary Conversion: storage-role inputs widened via load_storage(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE."
+ *          vector of both weight and bias gradients for the chunk. Precision Boundary Conversion: storage-role inputs widened via load_storage(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. FP8 Quantization Note: When STORAGE_TYPE is FP8, the clip-then-store sequence introduces re-quantization error. Gradient components scaled below the FP8 quantization floor (2^-9 for E4M3, 2^-16 for E5M2) may round to zero, effectively zeroing a subset of the gradient. This is an accepted consequence of the Primacy of Memory Strategy — the architecture trades gradient fidelity for 4x bandwidth compression. The Quadratic Scaling Policy's threshold schedule accounts for this by maintaining gradients well above the quantization floor."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Streamable Utility / Stability Primitive. The responsibility
  *          for calculating the write offset is delegated entirely to the host, making this kernel
@@ -2310,7 +2359,7 @@ __kernel void normalize_gradients(
  * @brief (Node 24) Applies Adam optimizer update to an entire parameter group. Single dispatch.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction terms (`beta1_pow_t`, `beta2_pow_t`) to ensure long-term numerical stability. State-Precision Accumulation: EMA updates on m1 and m2 use ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Moment vectors loaded via load_state_for_accum(); gradients widened via widen_to_accum(); EMA arithmetic in ACCUM_TYPE; results stored via store_state_from_accum(). Bias-corrected values and the final parameter update delta are transformative operations using COMPUTE_TYPE (narrowed via narrow_from_accum()). Parameter buffer subtraction is accumulative in ACCUM_TYPE. Hyperparameter Precision Note: Hyperparameter scalars (β₁, β₂, ε, lr) are received in COMPUTE_TYPE and widened to ACCUM_TYPE for EMA arithmetic. The widening preserves only COMPUTE_TYPE precision for these constants. For β₁ = 0.999 with COMPUTE_TYPE = float, the contribution factor (1 − β₁) carries ~7 significant digits regardless of ACCUM_TYPE. Bias Correction Precision Ceiling: The `beta1_pow_t` and `beta2_pow_t` scalars are computed by the Host in FP64 and narrowed to COMPUTE_TYPE at the interface boundary. Under mixed_f32_f64_state() (FP32 compute, FP64 state), beta1^t values below ~1.4e-45 round to FP32 zero, losing FP64 precision. This is currently sound — at t ≈ 100K, 1/(1-beta1^t) ≈ 1.0, so the loss is negligible. A future revision may accept these scalars in STATE_TYPE for full consistency with the state role's unbounded-training-stability guarantee. ADR-030: State-role buffers are indexed via [parameter_offset + i]. The slice access invariant (parameter_offset + parameter_count) <= total_parameter_count ensures no out-of-bounds access."
+ *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction terms (`beta1_pow_t`, `beta2_pow_t`) to ensure long-term numerical stability. State-Precision Accumulation: EMA updates on m1 and m2 use ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Moment vectors loaded via load_state_for_accum(); gradients widened via widen_to_accum(); EMA arithmetic in ACCUM_TYPE; results stored via store_state_from_accum(). Bias-corrected values and the final parameter update delta are transformative operations using COMPUTE_TYPE (narrowed via narrow_from_accum()). Parameter buffer subtraction is accumulative in ACCUM_TYPE. Hyperparameter Precision Note: Hyperparameter scalars (β₁, β₂, ε, lr) are received in COMPUTE_TYPE and widened to ACCUM_TYPE for EMA arithmetic. The widening preserves only COMPUTE_TYPE precision for these constants. For β₁ = 0.999 with COMPUTE_TYPE = float, the contribution factor (1 − β₁) carries ~7 significant digits regardless of ACCUM_TYPE. Bias Correction Precision Ceiling: The `beta1_pow_t` and `beta2_pow_t` scalars are computed by the Host in FP64 and narrowed to COMPUTE_TYPE at the interface boundary. Under mixed_f32_f64_state() (FP32 compute, FP64 state), beta1^t values below ~1.4e-45 round to FP32 zero, losing FP64 precision. This is currently sound — at t ≈ 100K, 1/(1-beta1^t) ≈ 1.0, so the loss is negligible. A future revision may accept these scalars in STATE_TYPE for full consistency with the state role's unbounded-training-stability guarantee. This interface typing is the last remaining non-state-precision bottleneck in the Adam path; see CONCEPT.md §11 (state-precision accumulation design). ADR-030: State-role buffers are indexed via [parameter_offset + i]. The slice access invariant (parameter_offset + parameter_count) <= total_parameter_count ensures no out-of-bounds access."
  *        - Idempotency: "Fundamentally Non-Idempotent (Stateful). Modifies multiple state buffers in-place."
  *        - Synchronization Model: "Stateful Optimizer Update. Consumes final gradients after the Batch Synchronization Point."
  */
@@ -2513,7 +2562,8 @@ __kernel void reduce_k_fan_in_and_clip(
  *          clipping_threshold < 0, clip is bypassed (diagnostic mode).
  *          Zero threshold clips to zero norm (zeroes all gradients).
  *          Epsilon prevents division by zero. All buffers are compute-role;
- *          no precision boundary conversion is required. All arithmetic
+ *          no precision boundary conversion is required. Reduction accumulation
+ *          in COMPUTE_TYPE; compute-role output written directly. All arithmetic
  *          exclusively in COMPUTE_TYPE."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Reduction Engine Stage"

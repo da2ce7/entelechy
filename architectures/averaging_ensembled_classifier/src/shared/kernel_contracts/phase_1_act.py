@@ -74,6 +74,7 @@ forward_pass_contract = KernelContract(
         ScalarParamSpec("batch_chunk_offset", "src", "NATURAL"),
         ScalarParamSpec("batch_chunk_count", "src", "NATURAL"),
         ScalarParamSpec("total_batch_count", "src", "NATURAL"),
+        ScalarParamSpec("input_count", "src", "NATURAL"),
         ScalarParamSpec("padded_input_count", "src", "NATURAL"),
         ScalarParamSpec("padded_hidden_count", "src", "NATURAL"),
     ),

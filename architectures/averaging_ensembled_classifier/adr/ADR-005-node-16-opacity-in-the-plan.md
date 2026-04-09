@@ -167,7 +167,7 @@ KernelDispatchNode(
     kernel_identity="stabilize_and_reduce_grad_hidden_activations",
     buffer_bindings={
         "update_buffer_LOCAL_reduction_tile": "__local__",
-        "src_buffer_GLOBAL_grad_hidden_activations_permuted_soa": "permuted_grad_h_soa",
+        "src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa": "permuted_grad_h_soa",
         "dest_buffer_GLOBAL_summed_grad_hidden_activations": "summed_grad_hidden",
     },
     scalar_params={

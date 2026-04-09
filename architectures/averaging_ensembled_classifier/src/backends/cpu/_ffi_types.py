@@ -149,6 +149,7 @@ def make_precision_types(
         ("batch_chunk_offset", c_uint32),
         ("batch_chunk_count", c_uint32),
         ("total_batch_count", c_uint32),
+        ("input_count", c_uint32),
         ("padded_input_count", c_uint32),
         ("padded_hidden_count", c_uint32),
     ])
@@ -354,7 +355,7 @@ def make_precision_types(
     ])
 
     structs["StabilizeReduceArgs"] = _s("StabilizeReduceArgs", [
-        ("grad_hidden_activations_permuted_soa", c_storage_p),
+        ("clipped_grad_hidden_activations_permuted_soa", c_storage_p),
         ("summed_grad_hidden_activations", c_compute_p),  # compute output
         ("fp_max", c_compute),
         ("policy_t_algorithmic", c_compute),
@@ -389,7 +390,9 @@ def make_precision_types(
         ("batch_chunk_index", c_uint32),
         ("total_batch_count", c_uint32),
         ("num_batch_chunks", c_uint32),
+        ("input_count", c_uint32),
         ("padded_input_count", c_uint32),
+        ("hidden_count", c_uint32),
         ("padded_hidden_count", c_uint32),
         ("final_grad_hidden_activations_total_count", c_uint32),
     ])
@@ -406,6 +409,7 @@ def make_precision_types(
         ("batch_chunk_index", c_uint32),
         ("total_batch_count", c_uint32),
         ("num_batch_chunks", c_uint32),
+        ("hidden_count", c_uint32),
         ("padded_hidden_count", c_uint32),
         ("final_grad_hidden_activations_total_count", c_uint32),
     ])

@@ -318,9 +318,16 @@ def build_act_plan(
         (tile_count, modules_per_chunk, batch_size, classes_per_chunk),
         elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
+    # BCE: tiled partial collection (tile_count, modules_per_chunk, batch_size)
+    # CCE: scatter-write monolithic (num_modules, batch_size)
+    _bce_loss = "cce" not in strategy.get_loss_contract().kernel_name
+    _loss_shape = (
+        (tile_count, modules_per_chunk, batch_size) if _bce_loss
+        else (model_spec.num_modules, batch_size)
+    )
     b_loss_output = alloc.allocate(
         "loss_output",
-        (model_spec.num_modules, batch_size),
+        _loss_shape,
         elem_compute, BufferRole.BATCH_INTERMEDIATE, "compute",
     )
 
@@ -344,6 +351,7 @@ def build_act_plan(
         {"batch_chunk_offset": 0, "batch_chunk_count": batch_size,
          "FLAG_produce_hidden_mask": flag_explicit,
          "total_batch_count": batch_size,
+         "input_count": model_spec.input_dim,
          "padded_input_count": model_spec.padded_input_dim,
          "padded_hidden_count": model_spec.padded_hidden_dim},
         tile_count=1, placement_strategy="linear_batch",
@@ -612,9 +620,16 @@ def build_learn_plan(
         (tile_count, modules_per_chunk, batch_size, classes_per_chunk),
         elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
+    # BCE: tiled partial collection (tile_count, modules_per_chunk, batch_size)
+    # CCE: scatter-write monolithic (num_modules, batch_size)
+    _bce_loss = "cce" not in strategy.get_loss_contract().kernel_name
+    _loss_shape = (
+        (tile_count, modules_per_chunk, batch_size) if _bce_loss
+        else (model_spec.num_modules, batch_size)
+    )
     b_loss_output = alloc.allocate(
         "loss_output",
-        (model_spec.num_modules, batch_size),
+        _loss_shape,
         elem_compute, BufferRole.BATCH_INTERMEDIATE, "compute",
     )
     b_biases_shared = alloc.allocate(
@@ -768,6 +783,7 @@ def build_learn_plan(
         {"batch_chunk_offset": 0, "batch_chunk_count": batch_size,
          "FLAG_produce_hidden_mask": flag_explicit,
          "total_batch_count": batch_size,
+         "input_count": model_spec.input_dim,
          "padded_input_count": model_spec.padded_input_dim,
          "padded_hidden_count": model_spec.padded_hidden_dim},
         tile_count=1, placement_strategy="linear_batch",
@@ -1015,7 +1031,7 @@ def build_learn_plan(
         "stabilize_reduce_grad_h",
         frozenset({"item_sync_barrier"}),
         stabilize_reduce_grad_h_contract,
-        {"grad_hidden_activations_permuted_soa": b_permuted_grad_h,
+        {"clipped_grad_hidden_activations_permuted_soa": b_permuted_grad_h,
          "summed_grad_hidden_activations": b_summed_grad_h},
         {"fp_max": model_spec.precision.compute_fp_format_max,
          "policy_t_algorithmic": policy.t_algorithmic,
@@ -1110,7 +1126,9 @@ def build_learn_plan(
          "batch_chunk_index": 0,
          "total_batch_count": batch_size,
          "num_batch_chunks": batch_size,
+         "input_count": model_spec.input_dim,
          "padded_input_count": model_spec.padded_input_dim,
+         "hidden_count": model_spec.hidden_dim,
          "padded_hidden_count": model_spec.padded_hidden_dim,
          "final_grad_hidden_activations_total_count": grad_h_total},
         tile_count=1, placement_strategy="linear_batch",
@@ -1137,6 +1155,7 @@ def build_learn_plan(
          "batch_chunk_index": 0,
          "total_batch_count": batch_size,
          "num_batch_chunks": batch_size,
+         "hidden_count": model_spec.hidden_dim,
          "padded_hidden_count": model_spec.padded_hidden_dim,
          "final_grad_hidden_activations_total_count": grad_h_total},
         tile_count=1, placement_strategy="linear_batch",

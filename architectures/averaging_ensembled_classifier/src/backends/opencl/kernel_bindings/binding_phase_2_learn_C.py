@@ -190,7 +190,7 @@ class StabilizeReduceGradHBinding(KernelBinding):
         local_mem_size = self._workgroup_size * element_size
         return [
             cl.LocalMemory(local_mem_size),
-            get_buffer(buffer_bindings["grad_hidden_activations_permuted_soa"]),
+            get_buffer(buffer_bindings["clipped_grad_hidden_activations_permuted_soa"]),
             get_buffer(buffer_bindings["summed_grad_hidden_activations"]),
             np.float32(scalar_params["fp_max"]),
             np.float32(scalar_params["policy_t_algorithmic"]),

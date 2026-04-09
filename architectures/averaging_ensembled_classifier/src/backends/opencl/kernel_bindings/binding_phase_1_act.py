@@ -46,6 +46,7 @@ class ForwardPassBinding(KernelBinding):
             np.uint32(scalar_params["batch_chunk_offset"]),
             np.uint32(scalar_params["batch_chunk_count"]),
             np.uint32(scalar_params["total_batch_count"]),
+            np.uint32(scalar_params["input_count"]),
             np.uint32(scalar_params["padded_input_count"]),
             np.uint32(scalar_params["padded_hidden_count"]),
         ]

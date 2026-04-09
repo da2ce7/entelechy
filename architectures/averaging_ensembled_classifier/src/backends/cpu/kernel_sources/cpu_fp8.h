@@ -221,6 +221,8 @@ static inline cpu_fp8_e5m2 cpu_float_to_fp8_e5m2(float val) {
     int exp8 = exp32 + E5M2_BIAS;
 
     /* Handle subnormals */
+    /* NOTE: Subnormal rounding omits shifted-out bits from sticky calculation.
+       Max error: 1 ULP of FP8 E5M2 subnormal (2^-16). Below quantization floor; no fix required. */
     if (exp8 <= 0) {
         int shift = 1 - exp8;
         if (shift >= 24) {

@@ -66,7 +66,7 @@ void PREC_FN(task_stabilize_reduce_grad_h)(void* raw_args, uint task_index, uint
 
     if (M <= 1) {
         COMPUTE_T val = (M == 1)
-            ? (COMPUTE_T)scalar_load_storage(a->grad_hidden_activations_permuted_soa, row_offset)
+            ? (COMPUTE_T)scalar_load_storage(a->clipped_grad_hidden_activations_permuted_soa, row_offset)
             : (COMPUTE_T)0.0;
         a->summed_grad_hidden_activations[row_idx] = val;
         return;
@@ -107,7 +107,7 @@ void PREC_FN(task_stabilize_reduce_grad_h)(void* raw_args, uint task_index, uint
 
     /* Load initial values (STORAGE_T → COMPUTE_T conversion) */
     for (uint i = 0; i < M; i++) {
-        current[i] = scalar_load_storage(a->grad_hidden_activations_permuted_soa,
+        current[i] = scalar_load_storage(a->clipped_grad_hidden_activations_permuted_soa,
                                          row_offset + i);
     }
 

@@ -17,7 +17,7 @@ gather_and_permute_grad_h_contract = KernelContract(
         BufferParamSpec(
             name="src_buffer_GLOBAL_clipped_partial_grad_hidden_activations_aos", flow="src", memory_scope="GLOBAL",
             tensor_shape=("total_tile_count", "modules_per_chunk", "total_batch_count", "padded_hidden_count"),
-            padding_contract=PaddingContract("NONE", None),
+            padding_contract=PaddingContract("CACHE", "128-byte alignment via padded_hidden_count"),
             calculability_proof=("total_tile_count", "modules_per_chunk", "total_batch_count", "padded_hidden_count"),
             validation_preconditions=("fully populated by Node 11",),
             precision_role="storage",
@@ -179,7 +179,7 @@ stabilize_reduce_grad_h_contract = KernelContract(
     ),
     buffer_params=(
         BufferParamSpec(
-            name="src_buffer_GLOBAL_grad_hidden_activations_permuted_soa", flow="src", memory_scope="GLOBAL",
+            name="src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa", flow="src", memory_scope="GLOBAL",
             tensor_shape=("total_batch_count * padded_hidden_count", "padded_total_modules_count"),
             padding_contract=PaddingContract("CACHE", "Trailing dimension padded for alignment."),
             calculability_proof=("total_batch_count", "padded_hidden_count", "padded_total_modules_count"),

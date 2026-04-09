@@ -190,7 +190,7 @@ __kernel void clip_intermediate_grad(
 // operations where the clipping threshold is dynamically recalculated at every stage.
 __kernel void stabilize_and_reduce_grad_hidden_activations(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_grad_hidden_activations_permuted_soa,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa,
     __global COMPUTE_TYPE       *dest_buffer_GLOBAL_summed_grad_hidden_activations,
     COMPUTE_TYPE                 src_scalar_REAL_fp_max,
     COMPUTE_TYPE                 src_scalar_REAL_policy_t_algorithmic,
@@ -219,7 +219,7 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
     COMPUTE_TYPE thread_accumulator = COMPUTE_ZERO;
     const long   row_offset         = (long)row_idx * src_scalar_NATURAL_padded_total_modules_count;
     for (uint i = lid; i < src_scalar_NATURAL_total_modules_count; i += lsize) {
-        thread_accumulator += load_storage(src_buffer_GLOBAL_grad_hidden_activations_permuted_soa, row_offset + i);
+        thread_accumulator += load_storage(src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa, row_offset + i);
     }
 
     // --- Phase 1 Safety Clip (ADR-005 Opacity Principle) ---

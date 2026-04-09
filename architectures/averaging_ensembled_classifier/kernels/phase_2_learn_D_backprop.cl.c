@@ -25,9 +25,14 @@ __kernel void backprop_shared_weights_chunk(
     uint                         src_scalar_NATURAL_batch_chunk_index,
     uint                         src_scalar_NATURAL_total_batch_count,
     uint                         src_scalar_NATURAL_num_batch_chunks,
+    uint                         src_scalar_NATURAL_input_count,
     uint                         src_scalar_NATURAL_padded_input_count,
+    uint                         src_scalar_NATURAL_hidden_count,
     uint                         src_scalar_NATURAL_padded_hidden_count,
     uint                         src_scalar_NATURAL_final_grad_hidden_activations_total_count) {
+
+    (void)src_scalar_NATURAL_input_count;  // Interface completeness (R1); available for explicit zero-fill.
+    (void)src_scalar_NATURAL_hidden_count; // Interface completeness (R1); available for explicit zero-fill.
 
     // --- 1. Work-Group to Gradient Component Mapping ---
     // The 2D work-group ID maps to a coordinate in the shared weight matrix (input_dim, hidden_dim).
@@ -113,8 +118,11 @@ __kernel void backprop_shared_biases_chunk(
     uint                         src_scalar_NATURAL_batch_chunk_index,
     uint                         src_scalar_NATURAL_total_batch_count,
     uint                         src_scalar_NATURAL_num_batch_chunks,
+    uint                         src_scalar_NATURAL_hidden_count,
     uint                         src_scalar_NATURAL_padded_hidden_count,
     uint                         src_scalar_NATURAL_final_grad_hidden_activations_total_count) {
+
+    (void)src_scalar_NATURAL_hidden_count; // Interface completeness (R1); available for explicit zero-fill.
 
     // --- 1. Work-Group to Gradient Component Mapping ---
     // The 1D work-group ID maps to an index in the shared bias vector.
