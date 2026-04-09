@@ -38,6 +38,9 @@ dev = [
     "black",
     "cppcheck",
 ]
+oracle = [
+    "torch>=2.0.0",
+]
 
 [tool.pytest.ini_options]
 markers = [
@@ -51,6 +54,7 @@ markers = [
     "convergence: All convergence tests (multi-epoch training)",
     "convergence_fast: Fast convergence smoke tests (<30s each)",
     "convergence_full: Full convergence tests (1-5 min each)",
+    "oracle: Oracle tests requiring PyTorch (differential triangulation)",
 ]
 
 [tool.black]

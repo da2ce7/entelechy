@@ -72,16 +72,7 @@ void PREC_FN(task_stabilize_reduce_grad_h)(void* raw_args, uint task_index, uint
         return;
     }
 
-    uint K = a->policy_max_k;
-    if (K < 2) K = 2;
-
-    uint num_stages = 0;
-    uint temp_items = M;
-    while (temp_items > 1) {
-        temp_items = (temp_items + K - 1) / K;
-        num_stages++;
-    }
-
+    /* CPU pre-accumulation: load all M elements (W = M, each "thread" is one task). */
     COMPUTE_T stack_a[1024];
     COMPUTE_T stack_b[1024];
     COMPUTE_T* heap_a = NULL;
@@ -105,30 +96,36 @@ void PREC_FN(task_stabilize_reduce_grad_h)(void* raw_args, uint task_index, uint
         next    = heap_b;
     }
 
-    /* Load initial values (STORAGE_T → COMPUTE_T conversion) */
+    /* Load initial values (STORAGE_T -> COMPUTE_T conversion) */
     for (uint i = 0; i < M; i++) {
         current[i] = scalar_load_storage(a->clipped_grad_hidden_activations_permuted_soa,
                                          row_offset + i);
     }
 
+    /* Pre-accumulation clip (host-prescribed threshold). */
+    /* For CPU (W = M), host sets t_pre = fp_max (no-op when values are safe). */
+    for (uint i = 0; i < M; i++) {
+        COMPUTE_T mag = COMPUTE_FABS(current[i]);
+        if (mag > a->clipping_threshold_t_pre) {
+            current[i] *= a->clipping_threshold_t_pre / (mag + a->epsilon);
+        }
+    }
+
+    /* Staged reduction using the host-prescribed per-stage thresholds.
+     * Binary tree: at stage s, stride = 2^s, each pair separated by stride. */
     uint num_items = M;
-    for (uint s = 0; s < num_stages; s++) {
-        uint j = num_stages - 1 - s;
-        COMPUTE_T T_policy = a->policy_t_algorithmic + a->policy_lambda * (COMPUTE_T)(j * j);
-        uint K_actual = (K < num_items) ? K : num_items;
-        COMPUTE_T T_safety = (K_actual > 0)
-            ? (a->fp_max / (COMPUTE_T)K_actual) : a->fp_max;
-        COMPUTE_T threshold = (T_policy < T_safety) ? T_policy : T_safety;
+    for (uint s = 0; s < a->num_reduction_stages; s++) {
+        COMPUTE_T threshold = a->clipping_threshold_per_stage[s];
 
-        uint new_count = (num_items + K - 1) / K;
+        uint new_count = (num_items + 1) / 2;
         for (uint g = 0; g < new_count; g++) {
-            uint start = g * K;
-            uint end = start + K;
-            if (end > num_items) end = num_items;
-
-            COMPUTE_T sum = (COMPUTE_T)0.0;
-            for (uint i = start; i < end; i++) {
-                sum += current[i];
+            uint left  = g * 2;
+            uint right = left + 1;
+            COMPUTE_T sum;
+            if (right < num_items) {
+                sum = current[left] + current[right];
+            } else {
+                sum = current[left];
             }
 
             COMPUTE_T norm = COMPUTE_FABS(sum);

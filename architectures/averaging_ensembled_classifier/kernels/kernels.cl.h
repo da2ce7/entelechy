@@ -1905,107 +1905,174 @@ __kernel void clip_intermediate_grad(
 
 // --- Phase 16: Specialized Grad_H Reduction ---
 /**
- * @brief (Node 16) Specialized Kernel: Reduces the permuted Grad_H buffer using a self-contained, multi-stage, numerically-stable reduction algorithm.
+ * @brief (Node 16) Specialized Kernel: Reduces the permuted Grad_H buffer
+ *        using a host-prescribed, multi-stage, numerically-stable reduction.
  * @kernel_contract
- *        - Holistic Constraints: "This kernel performs a complete, row-wise reduction on the monolithic, contiguous SoA buffer produced by the upstream Item Synchronization Point (Node 13)."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); reduction accumulation in COMPUTE_TYPE; compute-role output written directly in COMPUTE_TYPE. The kernel's behavior is contractually bound to the following internal logic:
+ *        - Holistic Constraints: "This kernel performs a complete, row-wise
+ *          reduction on the monolithic, contiguous SoA buffer produced by the
+ *          upstream Item Synchronization Point (Node 13). The stabilization
+ *          schedule is prescribed by the Orchestration tier; the kernel applies
+ *          it without independent policy computation."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role
+ *          inputs widened via load_storage(); reduction accumulation in
+ *          COMPUTE_TYPE; compute-role output written directly in COMPUTE_TYPE.
+ *          The kernel's behavior is contractually bound to:
  *
- *          0. **Data Ingress Safety Invariant:**
- *             If the implementation partitions the `total_modules_count` input elements across `P` independent pre-reduction accumulators, each accumulator MUST be clipped to `src_scalar_REAL_fp_max / P` before entering the first staged reduction. When no pre-reduction accumulation occurs, this invariant is inapplicable.
+ *          1. **Pre-accumulation Phase:**
+ *             Each thread accumulates
+ *             ceil(total_modules_count / get_local_size(0)) elements from its
+ *             assigned row. Each thread's accumulator is clipped to
+ *             src_scalar_REAL_clipping_threshold_t_pre after accumulation.
+ *             When total_modules_count <= get_local_size(0), each thread loads
+ *             at most one element and the clip is a no-op (the host sets the
+ *             threshold sufficiently high).
  *
- *          1. **Pre-computation Phase (Single, Initial Calculation):**
- *             a. Determine tactical fan-in: `K_plan = min(src_scalar_NATURAL_policy_max_k, get_local_size(0))`
- *             b. Determine true tree depth: `num_stages = ceil(log(total_modules_count) / log(K_plan))`
+ *          2. **Staged Reduction Phase:**
+ *             num_reduction_stages rounds of work-group-parallel tree reduction.
+ *             After each round's summation, the per-element result is clipped
+ *             to src_buffer_GLOBAL_CONST_clipping_threshold_per_stage[s]
+ *             (where s indexes the round from 0 to num_reduction_stages - 1).
+ *             The kernel determines the internal binary tree structure and
+ *             fan-in distribution among stages.
+ *             Thread 0 writes the final single-element result to the
+ *             destination buffer.
  *
- *          2. **Per-Stage Execution (`s` from 0 to `num_stages-1`):**
- *             a. Calculate stage index relative to root: `j = num_stages - 1 - s`
- *             b. Calculate algorithmic policy threshold: `T_policy = src_scalar_REAL_policy_t_algorithmic + (src_scalar_REAL_policy_lambda * j * j)`
- *             c. Calculate hardware safety ceiling for this stage's actual fan-in (`K_actual`): `T_safety = src_scalar_REAL_fp_max / K_actual`
- *             d. Synthesize final, authoritative threshold: `final_threshold_for_stage = min(T_policy, T_safety)`"
- *        - Synchronization Model: "Specialized Reduction Kernel / Global Barrier"
+ *          When num_reduction_stages is 0, the kernel bypasses the Staged
+ *          Reduction Phase entirely: pre-accumulation produces at most one
+ *          value per row, and thread 0 writes it directly."
+ *        - Synchronization Model: "Specialized Reduction Kernel / Global
+ *          Barrier"
  *        - Idempotency: "Associatively Non-Idempotent"
- *        - Architectural Justification: "This kernel's contract directly addresses a potential logical fallacy. A naive analysis might conclude that: (a) the kernel's internal planning violates
- * host/device jurisdictional separation, or (b) the threshold calculation is logically circular (`K` depends on `T` which depends on `J` which depends on `K`). This contract asserts that the design
- * is sound by mandating a strict two-phase execution model that resolves both issues.
- *
- *          The `Pre-computation Phase` firmly establishes the kernel's role as a 'Computational Agent,' not a 'Silent Monolith.' It synthesizes the Host's policy (`policy_max_k`) with its own runtime
- *          context (`get_local_size(0)`) to produce a fixed, non-negotiable reduction plan (`K_plan`, `num_stages`). This linearizes the problem.
- *
- *          The subsequent `Per-Stage Execution Phase` then executes this plan, with all dependencies resolved. This model confirms the Host retains sole control of stabilization policy, while the
- * Device retains sole control of its immediate execution geometry. The public formula in `Behavioral Invariants` makes this collaboration transparent and verifiable, not hidden.
- *
- *          The Data Ingress Safety Invariant (§0) prevents first-stage overflow: the sum of P accumulators each bounded by fp_max/P cannot exceed fp_max. When no pre-reduction accumulation occurs
- * (P = 1), the staged reduction's own per-stage safety ceiling is sufficient. The three-phase sequence (§0, §1, §2) constitutes the sole valid method for stabilizing the reduction."
+ *        - Architectural Justification: "This kernel is a specialized,
+ *          single-launch reduction engine optimized for the contiguous SoA
+ *          buffer produced by the upstream Node 13 synchronization point.
+ *          The Orchestration tier prescribes the threshold schedule, and the
+ *          kernel applies it — consistent with the threshold injection pattern
+ *          used by the generic reduction engine (Nodes 14/15/20). The kernel
+ *          retains sole control of its internal execution geometry (thread
+ *          assignment, pre-accumulation fan-in, binary tree structure), while
+ *          the Host retains sole control of stabilization policy through the
+ *          prescribed schedule."
  */
 __kernel void stabilize_and_reduce_grad_hidden_activations(
     /**
-     * @param update_buffer_LOCAL_reduction_tile A work-group exclusive memory resource for high-bandwidth parallel reduction.
+     * @param update_buffer_LOCAL_reduction_tile Work-group exclusive memory
+     *        for high-bandwidth parallel reduction.
      *        - Tensor Shape: (get_local_size(0))
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "compute" (LOCAL scratch)
      *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     *        - Validation Preconditions: Host shall allocate local memory equal
+     *          to the work-group size in dimension 0 multiplied by
+     *          sizeof(COMPUTE_TYPE).
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
     /**
-     * @param src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa The pre-gathered, contiguous input data in SoA layout, ensuring optimal memory access for row-wise reduction.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count)
+     * @param src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa
+     *        The pre-gathered, contiguous input data in SoA layout.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count *
+     *          src_scalar_NATURAL_padded_hidden_count,
+     *          src_scalar_NATURAL_padded_total_modules_count)
      *        - Padding Contract: {
-     *            dim[0] ("total_batch_count * hidden_count" → "total_batch_count * padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment on hidden_count stride"},
-     *            dim[1] ("total_modules_count" → "padded_total_modules_count"): {Type: CACHE, Formula: "128-byte alignment"}
+     *            dim[0] ("total_batch_count * hidden_count" →
+     *              "total_batch_count * padded_hidden_count"):
+     *              {Type: CACHE, Formula: "128-byte alignment on
+     *              hidden_count stride"},
+     *            dim[1] ("total_modules_count" →
+     *              "padded_total_modules_count"):
+     *              {Type: CACHE, Formula: "128-byte alignment"}
      *          }
      *        - Precision Role: "storage"
-     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_modules_count]
-     *        - Validation Preconditions: Host shall allocate exactly [(src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count) * src_scalar_NATURAL_padded_total_modules_count *
-     * sizeof(STORAGE_TYPE)] bytes. This buffer must be fully populated by Node 13 before dispatch.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count,
+     *          src_scalar_NATURAL_padded_hidden_count,
+     *          src_scalar_NATURAL_padded_total_modules_count]
+     *        - Validation Preconditions: Host shall allocate exactly
+     *          [(src_scalar_NATURAL_total_batch_count *
+     *          src_scalar_NATURAL_padded_hidden_count) *
+     *          src_scalar_NATURAL_padded_total_modules_count *
+     *          sizeof(STORAGE_TYPE)] bytes. This buffer must be fully
+     *          populated by Node 13 before dispatch.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa,
+    __global const STORAGE_TYPE
+        *src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa,
 
     /**
-     * @param dest_buffer_GLOBAL_summed_grad_hidden_activations The destination for the single, final, summed hidden layer gradient vector.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count)
+     * @param dest_buffer_GLOBAL_summed_grad_hidden_activations The
+     *        destination for the final, summed hidden layer gradient vector.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count *
+     *          src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "compute"
-     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
-     *        - Validation Preconditions: Host shall allocate exactly [(src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count) * sizeof(COMPUTE_TYPE)] bytes.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count,
+     *          src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: Host shall allocate exactly
+     *          [(src_scalar_NATURAL_total_batch_count *
+     *          src_scalar_NATURAL_padded_hidden_count) *
+     *          sizeof(COMPUTE_TYPE)] bytes.
      */
-    __global COMPUTE_TYPE *dest_buffer_GLOBAL_summed_grad_hidden_activations,
+    __global COMPUTE_TYPE
+        *dest_buffer_GLOBAL_summed_grad_hidden_activations,
 
     /**
-     * @param src_scalar_REAL_fp_max The absolute maximum finite value for the current scalar type. Used to calculate hardware safety ceilings.
-     *        - Validation Preconditions: Must be a positive real number (e.g., 65504.0 for FP16).
+     * @param src_buffer_GLOBAL_CONST_clipping_threshold_per_stage
+     *        Host-prescribed threshold schedule for the staged reduction.
+     *        Entry s (0-indexed) is the clip threshold applied after staged
+     *        reduction round s. Index 0 is the first clip after
+     *        pre-accumulation (leaf); index num_reduction_stages - 1 is the
+     *        final clip (root). Each entry is the min of the Quadratic
+     *        Scaling Policy threshold and the safety ceiling for that stage,
+     *        pre-computed by the Orchestration tier.
+     *        - Tensor Shape:
+     *          (src_scalar_NATURAL_num_reduction_stages)
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof:
+     *          [src_scalar_NATURAL_num_reduction_stages]
+     *        - Validation Preconditions: [1] Host shall allocate exactly
+     *          [src_scalar_NATURAL_num_reduction_stages *
+     *          sizeof(COMPUTE_TYPE)] bytes. [2] When
+     *          num_reduction_stages == 0, the Host MAY pass a minimal stub
+     *          buffer. [3] All entries must be positive real numbers.
+     *          [4] The schedule must be monotonically non-increasing
+     *          (schedule[0] >= schedule[1] >= ... >= schedule[num-1]),
+     *          reflecting the Quadratic Scaling Policy's funnel property.
      */
-    COMPUTE_TYPE src_scalar_REAL_fp_max,
+    __global const COMPUTE_TYPE
+        *src_buffer_GLOBAL_CONST_clipping_threshold_per_stage,
 
     /**
-     * @param src_scalar_REAL_policy_t_algorithmic The user's target final gradient norm. Serves as the anchor for the stabilization policy.
-     *        - Validation Preconditions: Must be a non-negative real number. A value of 0 indicates a safety-only policy.
+     * @param src_scalar_NATURAL_num_reduction_stages Number of clip stages
+     *        in the staged reduction. Zero when total_modules_count <= 1.
+     *        - Validation Preconditions: [1] Must be 0 when
+     *          total_modules_count <= 1. [2] Must be >= 1 when
+     *          total_modules_count > 1.
      */
-    COMPUTE_TYPE src_scalar_REAL_policy_t_algorithmic,
+    uint src_scalar_NATURAL_num_reduction_stages,
 
     /**
-     * @param src_scalar_REAL_policy_lambda The quadratic scaling parameter that controls the curvature of the stabilization policy funnel.
-     *        - Validation Preconditions: Must be a non-negative real number.
+     * @param src_scalar_REAL_clipping_threshold_t_pre Clip threshold for
+     *        each thread's pre-accumulation phase. Set to
+     *        compute_fp_format_max / K by the Orchestration tier when
+     *        pre-accumulation occurs (total_modules_count >
+     *        dispatch workgroup size); set to compute_fp_format_max when
+     *        each thread loads at most one element.
+     *        - Validation Preconditions: Must be a positive real number.
      */
-    COMPUTE_TYPE src_scalar_REAL_policy_lambda,
+    COMPUTE_TYPE src_scalar_REAL_clipping_threshold_t_pre,
 
     /**
-     * @param src_scalar_NATURAL_policy_max_k Host-provided, pre-sanitized upper bound for the kernel's internal reduction fan-in (`K`).
-     *        - Validation Preconditions: [1] This parameter is the Host's final, authoritative command on maximum fan-in; it is not a suggestion. [2] The Host is contractually obligated to compute
-     * this value by synthesizing three distinct constraints and taking their minimum: a. The user's desired reduction policy (e.g., `K=2` for max reproducibility). b. The physical hardware limits of
-     * the target device (e.g., `device.max_work_group_size`). c. The absolute mathematical safety limit required to prevent signal annihilation, derived from a system-defined `min_threshold` (e.g.,
-     * `FP_FORMAT_MAX / min_threshold`).
-     *        - Performance Notes: "This Host-side synthesis is mandatory because the kernel, by design, does not receive a `min_threshold` parameter. This architectural choice delegates the
-     * responsibility for preventing signal annihilation to the Host, allowing the kernel to remain a more focused and efficient computational unit."
+     * @param src_scalar_REAL_epsilon Small constant to prevent division by
+     *        zero during norm calculation.
+     *        - Validation Preconditions: Must be a small, positive real
+     *          number (e.g., 1e-6).
      */
-    uint src_scalar_NATURAL_policy_max_k,
-
     COMPUTE_TYPE src_scalar_REAL_epsilon,
-    uint        src_scalar_NATURAL_total_batch_count,
-    uint        src_scalar_NATURAL_padded_hidden_count,
-    uint        src_scalar_NATURAL_total_modules_count,
-    uint        src_scalar_NATURAL_padded_total_modules_count);
+
+    uint src_scalar_NATURAL_total_batch_count,
+    uint src_scalar_NATURAL_padded_hidden_count,
+    uint src_scalar_NATURAL_total_modules_count,
+    uint src_scalar_NATURAL_padded_total_modules_count);
 
 // --- Phase 17-18: Streaming Shared Layer Backpropagation ---
 

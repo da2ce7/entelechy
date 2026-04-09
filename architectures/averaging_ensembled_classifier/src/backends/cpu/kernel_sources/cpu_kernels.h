@@ -278,10 +278,9 @@ typedef struct {                                                               \
 typedef struct {                                                               \
     const STORAGE_T* clipped_grad_hidden_activations_permuted_soa;             \
     COMPUTE_T*       summed_grad_hidden_activations;                           \
-    COMPUTE_T        fp_max;                                                   \
-    COMPUTE_T        policy_t_algorithmic;                                     \
-    COMPUTE_T        policy_lambda;                                            \
-    uint             policy_max_k;                                             \
+    const COMPUTE_T* clipping_threshold_per_stage;                             \
+    uint             num_reduction_stages;                                     \
+    COMPUTE_T        clipping_threshold_t_pre;                                 \
     COMPUTE_T        epsilon;                                                  \
     uint             total_batch_count;                                        \
     uint             padded_hidden_count;                                      \

@@ -25,6 +25,7 @@ from ...shared.plan_types import (
 )
 from ...shared.reduction_tree_plan import ReductionTreePlan
 from ...shared.retrieval_future import RetrievalFuture
+from ...shared.stabilization_policy import render_node16_threshold_schedule
 from ...shared.streaming_loop_plan import StreamingLoopPlan
 from ._descriptor_manager import VulkanDescriptorManager
 from ._pipeline_cache import ComputePipeline, SpecConstants, VulkanPipelineCache
@@ -364,6 +365,13 @@ class VulkanPlanRenderer:
         kernel = node.kernel_name
         pipeline = self._pipelines[kernel]
 
+        # Node 16: compute threshold schedule and upload to device buffer.
+        scalar_params = node.scalar_params
+        if kernel == "stabilize_and_reduce_grad_hidden_activations":
+            scalar_params, schedule_data = self._render_node16_schedule(
+                node, plan,
+            )
+
         vk.vkCmdBindPipeline(
             cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline
         )
@@ -382,9 +390,34 @@ class VulkanPlanRenderer:
                 None,
             )
 
+        # Node 16: upload schedule to the bound buffer inline.
+        if kernel == "stabilize_and_reduce_grad_hidden_activations":
+            schedule_handle = node.buffer_bindings["clipping_threshold_per_stage"]
+            vk_buf = self._allocator.get_buffer(schedule_handle)
+            if len(schedule_data) > 0:
+                host_bytes = np.array(schedule_data, dtype=np.float32).tobytes()
+                vk.vkCmdUpdateBuffer(
+                    cmd, vk_buf.buffer, 0, len(host_bytes),
+                    _ffi.from_buffer(host_bytes),
+                )
+                # Pipeline barrier: transfer → compute read.
+                barrier = vk.VkBufferMemoryBarrier(
+                    srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                    dstAccessMask=vk.VK_ACCESS_SHADER_READ_BIT,
+                    buffer=vk_buf.buffer,
+                    offset=0,
+                    size=len(host_bytes),
+                )
+                vk.vkCmdPipelineBarrier(
+                    cmd,
+                    vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0, 0, None, 1, [barrier], 0, None,
+                )
+
         # Push constants
         pc_bytes = marshal_push_constants(
-            kernel, node.scalar_params
+            kernel, scalar_params
         )
         pc_buf = _ffi.from_buffer(pc_bytes)
         vk.vkCmdPushConstants(
@@ -398,8 +431,6 @@ class VulkanPlanRenderer:
 
         # Dispatch
         if kernel in _2D_DISPATCH_KERNELS:
-            # 2D dispatch: tile_count encodes (x * y), local_work_size
-            # provides the second dimension hint
             x_groups = node.tile_count
             y_groups = 1
             if node.local_work_size is not None and node.local_work_size > 0:
@@ -410,11 +441,46 @@ class VulkanPlanRenderer:
             resolver = self._WORKGROUP_COUNT_RESOLVERS.get(node.kernel_name)
             if resolver is not None:
                 wg_count = resolver(
-                    node.scalar_params, plan.hardware.simd_width,
+                    scalar_params, plan.hardware.simd_width,
                 )
                 vk.vkCmdDispatch(cmd, wg_count, 1, 1)
             else:
                 vk.vkCmdDispatch(cmd, node.tile_count, 1, 1)
+
+    def _render_node16_schedule(
+        self,
+        node: KernelDispatchNode,
+        plan: ExecutionPlan,
+    ) -> tuple[dict[str, int | float], list[float]]:
+        """Compute the Node 16 threshold schedule for the GPU workgroup size.
+
+        Returns modified scalar_params dict with kernel-interface keys and
+        the schedule data to upload.
+        """
+        sp = node.scalar_params
+        W = plan.hardware.simd_width
+        M = int(sp["total_modules_count"])
+        max_k = int(sp["policy_max_k"])
+
+        num_stages, t_pre, schedule = render_node16_threshold_schedule(
+            t_algorithmic=float(sp["policy_t_algorithmic"]),
+            lambda_=float(sp["policy_lambda"]),
+            compute_fp_format_max=float(sp["compute_fp_format_max"]),
+            total_modules=M,
+            workgroup_size=W,
+            max_fan_in=max_k,
+        )
+
+        kernel_params: dict[str, int | float] = {
+            "num_reduction_stages": num_stages,
+            "clipping_threshold_t_pre": t_pre,
+            "epsilon": sp["epsilon"],
+            "total_batch_count": sp["total_batch_count"],
+            "padded_hidden_count": sp["padded_hidden_count"],
+            "total_modules_count": sp["total_modules_count"],
+            "padded_total_modules_count": sp["padded_total_modules_count"],
+        }
+        return kernel_params, schedule
 
     def _record_reduction_tree(
         self,

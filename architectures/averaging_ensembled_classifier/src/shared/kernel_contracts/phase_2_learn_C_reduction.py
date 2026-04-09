@@ -169,12 +169,12 @@ clip_intermediate_grad_contract = KernelContract(
 stabilize_reduce_grad_h_contract = KernelContract(
     kernel_name="stabilize_and_reduce_grad_hidden_activations",
     contract_block=KernelContractBlock(
-        holistic_constraints="Complete row-wise reduction on the monolithic, contiguous SoA buffer from Node 13.",
+        holistic_constraints="Complete row-wise reduction on the monolithic, contiguous SoA buffer from Node 13. The stabilization schedule is prescribed by the Orchestration tier; the kernel applies it without independent policy computation.",
         idempotency="Associatively Non-Idempotent",
         synchronization_model="Specialized Reduction Kernel / Global Barrier",
         behavioral_invariants=(
-            "Pre-computation: K_plan = min(policy_max_k, get_local_size(0)); num_stages = ceil(log(total_modules)/log(K_plan))",
-            "Per-stage: j = num_stages-1-s; T_policy = t_algorithmic + lambda*j*j; T_safety = fp_max/K_actual; final = min(T_policy, T_safety)",
+            "Pre-accumulation: each thread accumulates ceil(total_modules_count / workgroup_size) elements, clipped to clipping_threshold_t_pre.",
+            "Staged reduction: num_reduction_stages rounds of sum-then-clip using clipping_threshold_per_stage[s].",
         ),
     ),
     buffer_params=(
@@ -194,12 +194,18 @@ stabilize_reduce_grad_h_contract = KernelContract(
             validation_preconditions=("exact allocation size",),
             precision_role="compute",
         ),
+        BufferParamSpec(
+            name="src_buffer_GLOBAL_CONST_clipping_threshold_per_stage", flow="src", memory_scope="GLOBAL",
+            tensor_shape=("num_reduction_stages",),
+            padding_contract=PaddingContract("NONE", None),
+            calculability_proof=("num_reduction_stages",),
+            validation_preconditions=("all entries positive", "monotonically non-increasing"),
+            precision_role="compute",
+        ),
     ),
     scalar_params=(
-        ScalarParamSpec("fp_max", "src", "REAL"),
-        ScalarParamSpec("policy_t_algorithmic", "src", "REAL"),
-        ScalarParamSpec("policy_lambda", "src", "REAL"),
-        ScalarParamSpec("policy_max_k", "src", "NATURAL"),
+        ScalarParamSpec("num_reduction_stages", "src", "NATURAL"),
+        ScalarParamSpec("clipping_threshold_t_pre", "src", "REAL"),
         ScalarParamSpec("epsilon", "src", "REAL"),
         ScalarParamSpec("total_batch_count", "src", "NATURAL"),
         ScalarParamSpec("padded_hidden_count", "src", "NATURAL"),

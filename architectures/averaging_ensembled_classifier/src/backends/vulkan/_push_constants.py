@@ -119,10 +119,8 @@ class ClipIntermediatePush(ctypes.Structure):
 
 class StabilizeReducePush(ctypes.Structure):
     _fields_ = [
-        ("fp_max", ctypes.c_float),
-        ("policy_t_algorithmic", ctypes.c_float),
-        ("policy_lambda", ctypes.c_float),
-        ("policy_max_k", ctypes.c_uint32),
+        ("num_reduction_stages", ctypes.c_uint32),
+        ("clipping_threshold_t_pre", ctypes.c_float),
         ("epsilon", ctypes.c_float),
         ("total_batch_count", ctypes.c_uint32),
         ("padded_hidden_count", ctypes.c_uint32),
@@ -289,6 +287,7 @@ BUFFER_BINDING_ORDER: dict[str, tuple[str | None, ...]] = {
     "stabilize_and_reduce_grad_hidden_activations": (
         "clipped_grad_hidden_activations_permuted_soa",
         "summed_grad_hidden_activations",
+        "clipping_threshold_per_stage",
     ),
     # Node 17
     "backprop_shared_weights_chunk": (
@@ -335,7 +334,7 @@ DESCRIPTOR_BINDING_COUNTS: dict[str, int] = {
     "aggregate_partials": 3,
     "aggregate_partials_from_compute": 3,  # ADR-026: same layout as storage-entry
     "clip_intermediate_grad": 1,
-    "stabilize_and_reduce_grad_hidden_activations": 2,
+    "stabilize_and_reduce_grad_hidden_activations": 3,
     "backprop_shared_weights_chunk": 6,
     "backprop_shared_biases_chunk": 5,
     "clip_shared_gradients_chunk": 4,

@@ -9,6 +9,7 @@ import pyopencl as cl
 
 from ....shared.buffer_lifecycle import BufferHandle
 from ....shared.memory_layout import pad_to_multiple
+from ....shared.stabilization_policy import render_node16_threshold_schedule
 from .base import KernelBinding
 
 
@@ -188,14 +189,33 @@ class StabilizeReduceGradHBinding(KernelBinding):
     def marshal_args(self, get_buffer: Callable[[BufferHandle], cl.Buffer], buffer_bindings: dict[str, BufferHandle], scalar_params: dict[str, int | float], tile_index: int) -> list[Any]:
         element_size = int(scalar_params.get("element_size", 4))
         local_mem_size = self._workgroup_size * element_size
+
+        # Render the threshold schedule for this backend's workgroup size.
+        M = int(scalar_params["total_modules_count"])
+        W = self._workgroup_size
+        max_k = int(scalar_params["policy_max_k"])
+        num_stages, t_pre, schedule = render_node16_threshold_schedule(
+            t_algorithmic=float(scalar_params["policy_t_algorithmic"]),
+            lambda_=float(scalar_params["policy_lambda"]),
+            compute_fp_format_max=float(scalar_params["compute_fp_format_max"]),
+            total_modules=M,
+            workgroup_size=W,
+            max_fan_in=max_k,
+        )
+
+        # Fill the schedule buffer.
+        schedule_buf = get_buffer(buffer_bindings["clipping_threshold_per_stage"])
+        if schedule:
+            schedule_np = np.array(schedule, dtype=np.float32)
+            cl.enqueue_copy(schedule_buf.context.queue, schedule_buf, schedule_np)
+
         return [
             cl.LocalMemory(local_mem_size),
             get_buffer(buffer_bindings["clipped_grad_hidden_activations_permuted_soa"]),
             get_buffer(buffer_bindings["summed_grad_hidden_activations"]),
-            np.float32(scalar_params["fp_max"]),
-            np.float32(scalar_params["policy_t_algorithmic"]),
-            np.float32(scalar_params["policy_lambda"]),
-            np.uint32(scalar_params["policy_max_k"]),
+            get_buffer(buffer_bindings["clipping_threshold_per_stage"]),
+            np.uint32(num_stages),
+            np.float32(t_pre),
             np.float32(scalar_params["epsilon"]),
             np.uint32(scalar_params["total_batch_count"]),
             np.uint32(scalar_params["padded_hidden_count"]),

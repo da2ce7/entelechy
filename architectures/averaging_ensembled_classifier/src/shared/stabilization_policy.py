@@ -25,7 +25,7 @@ logic that governs gradient reduction.
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import List, Tuple
 
 
 @dataclass(frozen=True)
@@ -108,6 +108,36 @@ class StabilizationPolicy:
         # WHY: A fan-in of less than 2 is mathematically nonsensical for a reduction.
         # This enforces a sane lower bound on the final return value.
         return max(2, int(final_k))
+
+    def render_node16_schedule(
+        self,
+        total_modules: int,
+        workgroup_size: int,
+        max_fan_in: int,
+    ) -> Tuple[int, float, List[float]]:
+        """Render a host-prescribed threshold schedule for Node 16.
+
+        Implements the §6.2 algorithm from the report: computes the
+        pre-accumulation threshold, number of staged reduction stages,
+        and per-stage threshold schedule adapted to the backend's
+        dispatch topology.
+
+        Args:
+            total_modules: M — number of modules to reduce.
+            workgroup_size: W — dispatch workgroup size. For CPU, pass M.
+            max_fan_in: Host-provided upper bound on fan-in K.
+
+        Returns:
+            (num_reduction_stages, pre_accum_threshold, threshold_schedule)
+        """
+        return render_node16_threshold_schedule(
+            t_algorithmic=self.t_algorithmic,
+            lambda_=self.lambda_,
+            compute_fp_format_max=self.compute_fp_format_max,
+            total_modules=total_modules,
+            workgroup_size=workgroup_size,
+            max_fan_in=max_fan_in,
+        )
 
     # =========================================================================
     # === API for Generic Reduction Trees (Consumed by Nodes 15 & 20)       ===
@@ -240,3 +270,51 @@ class StabilizationPolicy:
         # The final, authoritative value respects the policy, but is bound by safety.
         # This is the canonical clamp that embodies the system's core principle.
         return min(floored_policy, safety_ceiling)
+
+
+# =========================================================================
+# Standalone schedule rendering — callable from any tier
+# =========================================================================
+
+def render_node16_threshold_schedule(
+    t_algorithmic: float,
+    lambda_: float,
+    compute_fp_format_max: float,
+    total_modules: int,
+    workgroup_size: int,
+    max_fan_in: int,
+) -> Tuple[int, float, List[float]]:
+    """Render the host-prescribed threshold schedule for Node 16.
+
+    Implements the §6.2 rendering algorithm. Each backend calls this
+    with its own workgroup_size (CPU: W = M; GPU: W = dispatch workgroup).
+
+    Returns:
+        (num_reduction_stages, pre_accum_threshold, threshold_schedule)
+    """
+    fp_max = compute_fp_format_max
+    M = total_modules
+    W = workgroup_size
+
+    P = min(M, W)
+    K = min(max_fan_in, P)
+    K = max(K, 2)
+
+    if P <= 1:
+        return (0, fp_max, [])
+
+    num_stages = math.ceil(math.log(P) / math.log(K))
+
+    if M > P:
+        pre_accum_threshold = fp_max / K
+    else:
+        pre_accum_threshold = fp_max
+
+    schedule: List[float] = []
+    for s in range(num_stages):
+        j = num_stages - 1 - s  # leaf = highest j, root = j=0
+        T_policy = t_algorithmic + lambda_ * (j * j)
+        T_safety = fp_max / K
+        schedule.append(min(T_policy, T_safety))
+
+    return (num_stages, pre_accum_threshold, schedule)

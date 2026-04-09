@@ -357,10 +357,9 @@ def make_precision_types(
     structs["StabilizeReduceArgs"] = _s("StabilizeReduceArgs", [
         ("clipped_grad_hidden_activations_permuted_soa", c_storage_p),
         ("summed_grad_hidden_activations", c_compute_p),  # compute output
-        ("fp_max", c_compute),
-        ("policy_t_algorithmic", c_compute),
-        ("policy_lambda", c_compute),
-        ("policy_max_k", c_uint32),
+        ("clipping_threshold_per_stage", c_compute_p),  # compute schedule buffer
+        ("num_reduction_stages", c_uint32),
+        ("clipping_threshold_t_pre", c_compute),
         ("epsilon", c_compute),
         ("total_batch_count", c_uint32),
         ("padded_hidden_count", c_uint32),

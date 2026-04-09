@@ -182,20 +182,17 @@ __kernel void clip_intermediate_grad(
 }
 
 // --- Implementation: stabilize_and_reduce_grad_hidden_activations (Node 16) ---
-// Strategy: A specialized, self-contained reduction engine using a "work-group per row"
-// model. The kernel first performs an initial reduction of the global input row into a
-// vector of partial sums in local memory. It then acts as a "Computational Agent,"
-// synthesizing a multi-stage reduction plan based on host policy and its own runtime
-// context. Finally, it executes this plan, performing a series of `sum-then-clip`
-// operations where the clipping threshold is dynamically recalculated at every stage.
+// Strategy: A specialized reduction engine using a "work-group per row" model.
+// The kernel receives a host-prescribed threshold schedule and applies it.
+// Phase 1: Pre-accumulation — each thread reduces its assigned elements and clips.
+// Phase 2: Staged reduction — applies the per-stage threshold schedule.
 __kernel void stabilize_and_reduce_grad_hidden_activations(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa,
     __global COMPUTE_TYPE       *dest_buffer_GLOBAL_summed_grad_hidden_activations,
-    COMPUTE_TYPE                 src_scalar_REAL_fp_max,
-    COMPUTE_TYPE                 src_scalar_REAL_policy_t_algorithmic,
-    COMPUTE_TYPE                 src_scalar_REAL_policy_lambda,
-    uint                         src_scalar_NATURAL_policy_max_k,
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_CONST_clipping_threshold_per_stage,
+    uint                         src_scalar_NATURAL_num_reduction_stages,
+    COMPUTE_TYPE                 src_scalar_REAL_clipping_threshold_t_pre,
     COMPUTE_TYPE                 src_scalar_REAL_epsilon,
     uint                         src_scalar_NATURAL_total_batch_count,
     uint                         src_scalar_NATURAL_padded_hidden_count,
@@ -203,7 +200,6 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
     uint                         src_scalar_NATURAL_padded_total_modules_count) {
 
     // --- Phase 0: Setup ---
-    // Each work-group is responsible for reducing one full row of the SoA buffer.
     const uint row_idx = get_group_id(0);
     const uint lid     = get_local_id(0);
     const uint lsize   = get_local_size(0);
@@ -213,100 +209,49 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
         return;
     }
 
-    // --- Phase 1: Unified Data Ingress & Initial Reduction ---
-    // This single, universal path reduces the global input row into `lsize` partial
-    // sums stored in local memory, creating a consistent starting state for the main reduction.
+    // --- Phase 1: Pre-accumulation ---
+    // Each thread accumulates ceil(total_modules_count / lsize) elements,
+    // then clips to the host-prescribed pre-accumulation threshold.
     COMPUTE_TYPE thread_accumulator = COMPUTE_ZERO;
     const long   row_offset         = (long)row_idx * src_scalar_NATURAL_padded_total_modules_count;
     for (uint i = lid; i < src_scalar_NATURAL_total_modules_count; i += lsize) {
         thread_accumulator += load_storage(src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa, row_offset + i);
     }
 
-    // --- Phase 1 Safety Clip (ADR-005 Opacity Principle) ---
-    // The Phase 2 staged reduction sums up to `lsize` partial values at its first stage.
-    // To prevent overflow, each partial must be bounded by fp_max / lsize. This keeps
-    // the workgroup size as an internal execution-tier concern, not leaking to host policy.
-    // The host only needs to account for Node 13's `num_class_chunks` amplification.
-    const COMPUTE_TYPE phase1_ceiling = src_scalar_REAL_fp_max / (COMPUTE_TYPE)lsize;
-    const COMPUTE_TYPE mag            = fabs(thread_accumulator);
-    if (mag > phase1_ceiling) {
-        thread_accumulator *= phase1_ceiling / (mag + src_scalar_REAL_epsilon);
+    // Pre-accumulation clip (host-prescribed threshold).
+    const COMPUTE_TYPE mag = fabs(thread_accumulator);
+    if (mag > src_scalar_REAL_clipping_threshold_t_pre) {
+        thread_accumulator *= src_scalar_REAL_clipping_threshold_t_pre / (mag + src_scalar_REAL_epsilon);
     }
 
     update_buffer_LOCAL_reduction_tile[lid] = thread_accumulator;
 
-    barrier(CLK_LOCAL_MEM_FENCE); // Ensure all initial partial sums are in local memory.
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-    // --- Phase 2: Pre-computation of Reduction Plan ---
-    // First, calculate the plan based on raw inputs to check for contract violations.
-    uint unsafe_K_plan = min(src_scalar_NATURAL_policy_max_k, lsize);
+    // --- Phase 2: Staged Reduction ---
+    // Binary tree reduction with per-stage host-prescribed thresholds.
+    uint num_items_in_stage = lsize;
+    for (uint s = 0; s < src_scalar_NATURAL_num_reduction_stages; ++s) {
+        const COMPUTE_TYPE threshold = src_buffer_GLOBAL_CONST_clipping_threshold_per_stage[s];
 
-#if defined(DEBUG_MODE) && DEBUG_MODE > 0
-    // --- DEBUG PANIC BLOCK ---
-    // This block is compiled out of release builds. In debug mode, it acts as a
-    // contract validator, explicitly failing if the host provides a mathematically
-    // invalid fan-in, which prevents silent numerical errors.
-    if (unsafe_K_plan <= 1) {
-        if (lid == 0) { // Only one thread prints to avoid console spam.
-            printf("\n\n!!! KERNEL PANIC !!!\n");
-            printf("In kernel 'stabilize_and_reduce_grad_hidden_activations' for row: %u\n", row_idx);
-            printf("Reason: Host violated K_plan contract. A fan-in of <= 1 is mathematically invalid for reduction.\n");
-            printf("   Host provided policy_max_k: %u\n", src_scalar_NATURAL_policy_max_k);
-            printf("   Resulting unsafe_K_plan:    %u\n", unsafe_K_plan);
-            printf("Execution of this work-group is halting.\n\n");
-        }
-        return; // Halt further execution for this work-group.
-    }
-#endif
+        // Binary tree: each active thread sums itself and its partner.
+        const uint stride = 1u << s;
+        const uint pair   = 2u * stride;
+        if (lid % pair == 0 && lid + stride < num_items_in_stage) {
+            COMPUTE_TYPE sum_vec = update_buffer_LOCAL_reduction_tile[lid]
+                                 + update_buffer_LOCAL_reduction_tile[lid + stride];
 
-    // Sanitize K_plan to be >= 2, making the kernel robust against host error in release builds.
-    const uint K_plan              = max(2u, unsafe_K_plan);
-    uint       num_items_in_stage  = lsize;
-    uint       num_stages_total    = 0;
-    uint       temp_items_for_plan = lsize;
-
-    // This efficient, integer-only loop calculates `ceil(log_K(N))`, where N is `lsize`.
-    while (temp_items_for_plan > 1) {
-        temp_items_for_plan = (temp_items_for_plan + K_plan - 1) / K_plan;
-        num_stages_total++;
-    }
-
-    // --- Phase 3: Staged, Stabilized Reduction Loop ---
-    for (uint s = 0; s < num_stages_total; ++s) {
-        // --- 3a. Synthesize Stage-Specific Threshold (Contract Compliant) ---
-        // This is the core of the policy-driven stabilization.
-        const uint         j                         = num_stages_total - 1 - s; // Reverse index, j=0 is the final stage.
-        const COMPUTE_TYPE T_policy                  = src_scalar_REAL_policy_t_algorithmic + src_scalar_REAL_policy_lambda * (COMPUTE_TYPE)(j * j);
-        const uint         K_actual                  = min((uint)K_plan, num_items_in_stage);
-        const COMPUTE_TYPE T_safety                  = (K_actual > 0) ? (src_scalar_REAL_fp_max / (COMPUTE_TYPE)K_actual) : src_scalar_REAL_fp_max;
-        const COMPUTE_TYPE final_threshold_for_stage = min(T_policy, T_safety); // Clamp policy by hardware safety.
-
-        // --- 3b. Perform One Level of `sum-then-clip` Reduction ---
-        // Each thread `lid` becomes a "sub-group leader" for a block of up to `K_plan` items.
-        if (lid < (num_items_in_stage + K_plan - 1) / K_plan) {
-            const uint start_idx = lid * K_plan;
-            const uint end_idx   = min(start_idx + K_plan, num_items_in_stage);
-
-            COMPUTE_TYPE sum_vec = COMPUTE_ZERO;
-            for (uint i = start_idx; i < end_idx; ++i) {
-                sum_vec += update_buffer_LOCAL_reduction_tile[i];
-            }
-
-            // For a scalar sum, the L2 norm is just its absolute value.
             COMPUTE_TYPE norm = fabs(sum_vec);
-            if (norm > final_threshold_for_stage) {
-                sum_vec *= final_threshold_for_stage / (norm + src_scalar_REAL_epsilon);
+            if (norm > threshold) {
+                sum_vec *= threshold / (norm + src_scalar_REAL_epsilon);
             }
-            // Overwrite this sub-group's slot with the new, compacted value.
             update_buffer_LOCAL_reduction_tile[lid] = sum_vec;
         }
 
-        barrier(CLK_LOCAL_MEM_FENCE); // Synchronize before starting the next stage.
-        num_items_in_stage = (num_items_in_stage + K_plan - 1) / K_plan;
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // --- Phase 4: Final Write ---
-    // After all stages, the final, fully reduced value resides in the first slot.
+    // --- Phase 3: Final Write ---
     if (lid == 0) {
         dest_buffer_GLOBAL_summed_grad_hidden_activations[row_idx] = update_buffer_LOCAL_reduction_tile[0];
     }

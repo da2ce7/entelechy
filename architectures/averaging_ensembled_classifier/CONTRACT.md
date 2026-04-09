@@ -443,6 +443,7 @@ _Generic terms for special cases._
 | Suffix | `_t_j`       | A value that is dependent on the stage j of a multi-stage process (e.g., reduction tree layer).                                                                          |
 | Suffix | `_per_item`  | Denotes a per-item parameterization of a scalar quantity, providing one value per logical work-item (tile) rather than a single global scalar.                           |
 | Suffix | `_per_chunk` | Denotes a per-chunk parameterization, providing one value per decomposition chunk rather than a single global scalar.                                                    |
+| Suffix | `_per_stage` | Denotes a per-stage parameterization of a scalar quantity, providing one value per reduction tree stage rather than a single global scalar.                               |
 | Prefix | `intermediate_` | Denotes a buffer at a transitional reduction stage — past `partial_` (raw/clipped) but before `summed_` (fully reduced). Applicable to buffers that are the output of one aggregation stage and the input to a subsequent clip or aggregation stage. |
 | Prefix | `write_` | Pertaining to the computed write position within a destination buffer. Distinct from `out_` (which marks buffer affinity) in that `write_` qualifies an address offset calculated by the host for placement within a collection buffer. |
 

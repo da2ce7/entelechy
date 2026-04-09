@@ -21,6 +21,7 @@ from ...shared.plan_types import (
 )
 from ...shared.buffer_lifecycle import BufferRole
 from ...shared.retrieval_future import RetrievalFuture
+from ...shared.stabilization_policy import render_node16_threshold_schedule
 from ._dispatch_table import build_dispatch_table
 from ._ffi_types import ALL_PRECISION_SUFFIXES, PRECISION_C_TYPES, PRECISION_STRUCTS
 from ._loader import load_cpu_library
@@ -338,14 +339,61 @@ class CPUPlanRenderer:
         """Dispatch a KernelDispatchNode via pool_dispatch_and_wait."""
         fn_addr, struct_cls = self._dispatch_tables[suffix][node.kernel_name]
 
-        args = self._marshal_args(struct_cls, node, allocator, suffix)
+        # Node 16: compute and fill the threshold schedule buffer.
+        effective_node = node
+        if node.kernel_name == "stabilize_and_reduce_grad_hidden_activations":
+            effective_node = self._prepare_node16(node, allocator, suffix)
+
+        args = self._marshal_args(struct_cls, effective_node, allocator, suffix)
 
         self._lib.pool_dispatch_and_wait(
             self._pool,
             fn_addr,
             ctypes.byref(args),
-            self._resolve_task_count(node),
+            self._resolve_task_count(effective_node),
         )
+
+    def _prepare_node16(
+        self,
+        node: KernelDispatchNode,
+        allocator: CPUBufferAllocator,
+        suffix: str,
+    ) -> KernelDispatchNode:
+        """Compute the Node 16 schedule and fill the schedule buffer.
+
+        For CPU, W = M (no workgroup limitation). Returns a modified node
+        with kernel-interface scalar_params.
+        """
+        sp = node.scalar_params
+        M = int(sp["total_modules_count"])
+        max_k = int(sp["policy_max_k"])
+
+        num_stages, t_pre, schedule = render_node16_threshold_schedule(
+            t_algorithmic=float(sp["policy_t_algorithmic"]),
+            lambda_=float(sp["policy_lambda"]),
+            compute_fp_format_max=float(sp["compute_fp_format_max"]),
+            total_modules=M,
+            workgroup_size=M,  # CPU: W = M
+            max_fan_in=max_k,
+        )
+
+        # Fill the schedule buffer with computed threshold values.
+        schedule_handle = node.buffer_bindings["clipping_threshold_per_stage"]
+        buf = allocator.get_buffer(schedule_handle)
+        for i, val in enumerate(schedule):
+            buf[i] = buf.dtype.type(val)
+
+        # Create a node with kernel-interface scalar params.
+        kernel_params: dict[str, int | float] = {
+            "num_reduction_stages": num_stages,
+            "clipping_threshold_t_pre": t_pre,
+            "epsilon": sp["epsilon"],
+            "total_batch_count": sp["total_batch_count"],
+            "padded_hidden_count": sp["padded_hidden_count"],
+            "total_modules_count": sp["total_modules_count"],
+            "padded_total_modules_count": sp["padded_total_modules_count"],
+        }
+        return replace(node, scalar_params=kernel_params)
 
     def _render_reduction_tree(
         self,

@@ -1027,17 +1027,29 @@ def build_learn_plan(
     # =====================================================================
 
     # Node 16: stabilize_and_reduce_grad_hidden_activations
+    # Allocate the per-stage threshold schedule buffer.
+    # Size using W = M (CPU reference rendering — maximum possible stages).
+    n16_max_k = policy.get_specialized_reduction_policy_k(
+        batch_size, hardware.max_reduce_fan_in)
+    n16_num_stages, _, _ = policy.render_node16_schedule(
+        model_spec.num_modules, model_spec.num_modules, n16_max_k)
+    # Minimum 1 element to avoid zero-size allocation when stages = 0.
+    b_n16_schedule = alloc.allocate(
+        "clipping_threshold_per_stage",
+        (max(1, n16_num_stages),),
+        elem_compute, BufferRole.BATCH_INTERMEDIATE, "compute",
+    )
     n16 = _dispatch(
         "stabilize_reduce_grad_h",
         frozenset({"item_sync_barrier"}),
         stabilize_reduce_grad_h_contract,
         {"clipped_grad_hidden_activations_permuted_soa": b_permuted_grad_h,
-         "summed_grad_hidden_activations": b_summed_grad_h},
-        {"fp_max": model_spec.precision.compute_fp_format_max,
-         "policy_t_algorithmic": policy.t_algorithmic,
+         "summed_grad_hidden_activations": b_summed_grad_h,
+         "clipping_threshold_per_stage": b_n16_schedule},
+        {"policy_t_algorithmic": policy.t_algorithmic,
          "policy_lambda": policy.lambda_,
-         "policy_max_k": policy.get_specialized_reduction_policy_k(
-             batch_size, hardware.max_reduce_fan_in),
+         "compute_fp_format_max": policy.compute_fp_format_max,
+         "policy_max_k": n16_max_k,
          "epsilon": model_spec.precision.compute_epsilon,
          "total_batch_count": batch_size,
          "padded_hidden_count": model_spec.padded_hidden_dim,
