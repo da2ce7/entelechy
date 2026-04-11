@@ -122,7 +122,7 @@ class FaithfulOracle:
                          logits (uniform for CCE, 0.5 for BCE), matching
                          Node 5's sample masking behavior.
         """
-        X = X.to(self.dtype)
+        X = X.to(self.dtype)  # pyright: ignore[reportConstantRedefinition]
         batch_size = X.shape[0]
 
         if sample_mask is None:
@@ -545,7 +545,7 @@ class FaithfulOracle:
         result = torch.zeros(flat.shape[0], dtype=self.dtype)
 
         for row_idx in range(flat.shape[0]):
-            current = flat[row_idx].tolist()
+            current: list[float] = flat[row_idx].tolist()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
             num_items = len(current)
 
             for s in range(num_stages):
@@ -611,10 +611,10 @@ class FaithfulOracle:
             for i in range(0, len(current), K):
                 group = current[i : i + K]
                 summed = torch.stack(group).sum(dim=0)
-                norm = summed.norm(2).item()
-                if threshold >= 0.0 and norm > threshold:
+                norm_val = float(summed.norm(2))  # pyright: ignore[reportUnknownMemberType]
+                if threshold >= 0.0 and norm_val > threshold:
                     summed = summed * (
-                        threshold / (norm + self.config.epsilon)
+                        threshold / (norm_val + self.config.epsilon)
                     )
                 next_level.append(summed)
             current = next_level
@@ -717,10 +717,10 @@ class _ClipStats:
         if threshold <= 0:
             return
         concat = torch.cat([g.flatten() for g in grad_list])
-        norm = concat.norm(2).item()
-        ratio = norm / threshold if threshold > 0 else 0.0
+        norm_val: float = float(concat.norm(2))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+        ratio: float = norm_val / threshold if threshold > 0 else 0.0
         self._norm_ratios.append(ratio)
-        if norm > threshold:
+        if norm_val > threshold:
             self.num_clipped += 1
 
     @property

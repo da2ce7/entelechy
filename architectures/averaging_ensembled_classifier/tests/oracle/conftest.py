@@ -3,17 +3,31 @@
 
 All tests in this package require PyTorch; the entire directory is
 auto-skipped when torch is not installed.
+
+Oracle D (NumPyPrecisionOracle) is always available — it depends only
+on numpy, not torch.
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import numpy as np
 import pytest
 
-torch = pytest.importorskip("torch", reason="Oracle tests require PyTorch")
+if TYPE_CHECKING:
+    import torch
+else:
+    torch = pytest.importorskip("torch", reason="Oracle tests require PyTorch")
 
 from .autograd_oracle import AutogradOracle
 from .convergence_oracle import ConvergenceOracle
 from .faithful_oracle import FaithfulOracle
 from .oracle_config import OracleConfig
+from .precision_oracle import (
+    NumpyPrecisionSpec,
+    NumPyPrecisionOracle,
+    OracleDConfig,
+)
 
 
 # ── Small problem configs for fast unit tests ────────────────────────
@@ -101,8 +115,8 @@ def init_with_seed(
 ) -> None:
     """Initialize oracle parameters with small deterministic values."""
     gen = torch.Generator().manual_seed(seed)
-    for name, param in oracle.named_params():
-        data = param if isinstance(param, torch.Tensor) else param.data
+    for _, param in oracle.named_params():
+        data = param.data if hasattr(param, 'data') else param
         # Small Xavier-like init
         fan_in = data.shape[-1] if data.dim() >= 2 else data.shape[0]
         std = 1.0 / fan_in**0.5

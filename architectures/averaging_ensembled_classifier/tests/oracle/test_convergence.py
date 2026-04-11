@@ -17,9 +17,14 @@ shared dependency is adam_update_fp64.  Divergence between C and A
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
-torch = pytest.importorskip("torch", reason="Oracle tests require PyTorch")
+if TYPE_CHECKING:
+    import torch
+else:
+    torch = pytest.importorskip("torch", reason="Oracle tests require PyTorch")
 
 from .autograd_oracle import AutogradOracle
 from .conftest import init_with_seed, sync_oracles
@@ -66,7 +71,11 @@ class TestSingleStepGradientParity:
     ATOL = 1e-9
     RTOL = 1e-9
 
-    def test_gradient_parity_cce(self, small_cce_config, small_cce_data):
+    def test_gradient_parity_cce(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         cfg = _make_unclipped_config(small_cce_config)
         oracle_b1 = AutogradOracle(cfg, mode="flat")
         oracle_c = ConvergenceOracle(cfg)
@@ -88,7 +97,11 @@ class TestSingleStepGradientParity:
                 f"max_diff={(grad_b1 - grad_c).abs().max().item():.2e}"
             )
 
-    def test_gradient_parity_bce(self, small_bce_config, small_bce_data):
+    def test_gradient_parity_bce(
+        self,
+        small_bce_config: OracleConfig,
+        small_bce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         cfg = _make_unclipped_config(small_bce_config)
         oracle_b1 = AutogradOracle(cfg, mode="flat")
         oracle_c = ConvergenceOracle(cfg)
@@ -110,7 +123,11 @@ class TestSingleStepGradientParity:
                 f"max_diff={(grad_b1 - grad_c).abs().max().item():.2e}"
             )
 
-    def test_gradient_parity_a_vs_c_cce(self, small_cce_config, small_cce_data):
+    def test_gradient_parity_a_vs_c_cce(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         """A vs C, no clipping. Manual formulas vs. independent autograd."""
         cfg = _make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
@@ -147,7 +164,12 @@ class TestMultiStepParity:
     ATOL = 1e-10
 
     @pytest.mark.parametrize("steps", [5, 50, 200])
-    def test_a_vs_c_trajectory_cce(self, small_cce_config, small_cce_data, steps):
+    def test_a_vs_c_trajectory_cce(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+        steps: int,
+    ) -> None:
         cfg = _make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_c = ConvergenceOracle(cfg)
@@ -155,7 +177,7 @@ class TestMultiStepParity:
         sync_oracles(oracle_a, oracle_c)
 
         X, targets = small_cce_data
-        for step in range(steps):
+        for _step in range(steps):
             oracle_a.step(X, targets)
             oracle_c.step(X, targets)
 
@@ -166,7 +188,12 @@ class TestMultiStepParity:
             )
 
     @pytest.mark.parametrize("steps", [5, 50, 200])
-    def test_a_vs_c_trajectory_bce(self, small_bce_config, small_bce_data, steps):
+    def test_a_vs_c_trajectory_bce(
+        self,
+        small_bce_config: OracleConfig,
+        small_bce_data: tuple[torch.Tensor, torch.Tensor],
+        steps: int,
+    ) -> None:
         cfg = _make_unclipped_config(small_bce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_c = ConvergenceOracle(cfg)
@@ -174,7 +201,7 @@ class TestMultiStepParity:
         sync_oracles(oracle_a, oracle_c)
 
         X, targets = small_bce_data
-        for step in range(steps):
+        for _step in range(steps):
             oracle_a.step(X, targets)
             oracle_c.step(X, targets)
 
@@ -185,7 +212,12 @@ class TestMultiStepParity:
             )
 
     @pytest.mark.parametrize("steps", [5, 50, 200])
-    def test_b2_vs_c_trajectory_cce(self, small_cce_config, small_cce_data, steps):
+    def test_b2_vs_c_trajectory_cce(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+        steps: int,
+    ) -> None:
         cfg = _make_unclipped_config(small_cce_config)
         oracle_b2 = AutogradOracle(cfg, mode="tiled")
         oracle_c = ConvergenceOracle(cfg)
@@ -193,7 +225,7 @@ class TestMultiStepParity:
         sync_oracles(oracle_b2, oracle_c)
 
         X, targets = small_cce_data
-        for step in range(steps):
+        for _step in range(steps):
             oracle_b2.step(X, targets)
             oracle_c.step(X, targets)
 
@@ -218,7 +250,12 @@ class TestMomentParity:
     ATOL = 1e-9
 
     @pytest.mark.parametrize("steps", [10, 100])
-    def test_moment_parity_a_vs_c_cce(self, small_cce_config, small_cce_data, steps):
+    def test_moment_parity_a_vs_c_cce(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+        steps: int,
+    ) -> None:
         cfg = _make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_c = ConvergenceOracle(cfg)
@@ -237,7 +274,12 @@ class TestMomentParity:
             )
 
     @pytest.mark.parametrize("steps", [10, 100])
-    def test_full_state_parity_a_vs_c_bce(self, small_bce_config, small_bce_data, steps):
+    def test_full_state_parity_a_vs_c_bce(
+        self,
+        small_bce_config: OracleConfig,
+        small_bce_data: tuple[torch.Tensor, torch.Tensor],
+        steps: int,
+    ) -> None:
         """Params + moments combined distance (BCE)."""
         cfg = _make_unclipped_config(small_bce_config)
         oracle_a = FaithfulOracle(cfg)
@@ -574,7 +616,11 @@ class TestLongRunStability:
             f"initial={trace.initial_loss:.4f}, final={trace.final_loss:.4f}"
         )
 
-    def test_step_counter_consistency(self, small_cce_config, small_cce_data):
+    def test_step_counter_consistency(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         """After N steps, both A and C report the same step counter."""
         cfg = _make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
@@ -605,7 +651,11 @@ class TestSampleMaskParity:
 
     ATOL = 1e-10
 
-    def test_masked_parity_cce(self, small_cce_config, small_cce_data):
+    def test_masked_parity_cce(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         cfg = _make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_c = ConvergenceOracle(cfg)

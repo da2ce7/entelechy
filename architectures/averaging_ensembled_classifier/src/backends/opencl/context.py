@@ -50,16 +50,16 @@ def load_and_compile_kernels(
     package = importlib.resources.files("averaging_ensembled_classifier.kernels")
     sources: list[str] = []
     for fname in _KERNEL_FILES:
-        sources.append(package.joinpath(fname).read_text())
+        sources.append(package.joinpath(fname).read_text())  # pyright: ignore[reportUnknownMemberType]
 
     # Add -I for the kernels directory so #include directives resolve
     # (e.g., fp8_lut.gen.h for FP8 storage, ADR-025 §6.1)
-    include_flags = []
+    include_flags: list[str] = []
     pkg_str = str(package)
     if os.path.isdir(pkg_str):
         include_flags.append(f"-I{pkg_str}")
 
-    program = cl.Program(context, "\n".join(sources))
+    program = cl.Program(context, "\n".join(sources))  # pyright: ignore[reportUnknownArgumentType]
     program.build(
         options=" ".join(include_flags + compiler_flags), devices=[device],
     )

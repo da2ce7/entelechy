@@ -16,7 +16,6 @@ import pathlib
 import platform
 import shutil
 import subprocess
-import sysconfig
 import tempfile
 
 logger = logging.getLogger(__name__)

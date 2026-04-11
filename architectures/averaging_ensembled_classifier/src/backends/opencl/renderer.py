@@ -122,7 +122,10 @@ class OpenCLPlanRenderer:
                 continue
             name = descriptor.logical_name
             total = int(np.prod(descriptor.padded_shape))
-            dtype = role_dtypes[descriptor.precision_role]
+            prole = descriptor.precision_role
+            if prole is None:
+                continue
+            dtype = role_dtypes[prole]
             if any(s in name for s in self._WEIGHT_SUBSTRINGS):
                 shape_for_fan = (
                     descriptor.logical_shape
@@ -156,7 +159,7 @@ class OpenCLPlanRenderer:
     def render(
         self,
         plan: ExecutionPlan,
-        data_injections: dict[str, NDArray] | None = None,
+        data_injections: dict[str, NDArray[Any]] | None = None,
     ) -> dict[str, RetrievalFuture]:
         """Render an execution plan using PyOpenCL's imperative dispatch model."""
         # Store plan reference for streaming loop body lookup

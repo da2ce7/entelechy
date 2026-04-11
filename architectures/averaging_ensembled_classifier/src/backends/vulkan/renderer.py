@@ -4,12 +4,13 @@ Records ExecutionPlan DAG nodes into Vulkan command buffers and submits
 them for GPU execution. Supports all five node types: KernelDispatchNode,
 ReductionTreeNode, StreamingLoopNode, BarrierNode, and RetrievalNode.
 """
+# pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
 from __future__ import annotations
 
 import ctypes
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -23,7 +24,6 @@ from ...shared.plan_types import (
     RetrievalNode,
     StreamingLoopNode,
 )
-from ...shared.reduction_tree_plan import ReductionTreePlan
 from ...shared.retrieval_future import RetrievalFuture
 from ...shared.stabilization_policy import render_node16_threshold_schedule
 from ...shared.streaming_loop_plan import StreamingLoopPlan
@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 else:
     try:
         import vulkan as vk
-        from vulkan._vulkan import ffi as _ffi
+        from vulkan._vulkan import ffi as _ffi  # pyright: ignore[reportMissingTypeStubs]
     except ImportError:
         vk = None  # type: ignore[assignment]
         _ffi = None  # type: ignore[assignment]
@@ -101,7 +101,7 @@ class VulkanPlanRenderer:
     def render(
         self,
         plan: ExecutionPlan,
-        data_injections: dict[str, NDArray] | None = None,
+        data_injections: dict[str, NDArray[Any]] | None = None,
     ) -> dict[str, RetrievalFuture]:
         """Record and submit the plan, returning futures for retrieval nodes."""
         # 1. Allocate device-local buffers and zero-fill them
@@ -155,7 +155,7 @@ class VulkanPlanRenderer:
                 self._record_streaming_loop(cmd, node, plan)
             elif isinstance(node, BarrierNode):
                 self._record_barrier(cmd)
-            elif isinstance(node, RetrievalNode):
+            else:  # RetrievalNode
                 staging = self._record_retrieval(cmd, node, plan)
                 future = VulkanRetrievalFuture(
                     context=self._ctx,
@@ -226,7 +226,10 @@ class VulkanPlanRenderer:
                 continue
             name = descriptor.logical_name
             total = int(np.prod(descriptor.padded_shape))
-            dtype = role_dtypes[descriptor.precision_role]
+            prole = descriptor.precision_role
+            if prole is None:
+                continue
+            dtype = role_dtypes[prole]
             host: np.ndarray | None = None
             if any(s in name for s in self._WEIGHT_SUBSTRINGS):
                 shape_for_fan = (
@@ -338,7 +341,7 @@ class VulkanPlanRenderer:
     # Per-element kernels (placement_strategy="linear_generic") need
     # workgroup count derived from scalar params rather than tile_count.
     # Maps kernel_name → callable(scalar_params, simd_width) → workgroup_count.
-    _WORKGROUP_COUNT_RESOLVERS: dict[str, Any] = {
+    _WORKGROUP_COUNT_RESOLVERS: dict[str, Callable[[dict[str, Any], int], int]] = {
         # Element-wise: ceil(N / simd_width) workgroups
         "normalize_gradients": lambda s, w: (
             (int(s["parameter_count"]) + w - 1) // w
@@ -367,6 +370,7 @@ class VulkanPlanRenderer:
 
         # Node 16: compute threshold schedule and upload to device buffer.
         scalar_params = node.scalar_params
+        schedule_data: list[float] = []
         if kernel == "stabilize_and_reduce_grad_hidden_activations":
             scalar_params, schedule_data = self._render_node16_schedule(
                 node, plan,

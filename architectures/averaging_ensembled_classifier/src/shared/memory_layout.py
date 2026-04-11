@@ -78,7 +78,7 @@ def pad_to_multiple(dim: int, multiple: int) -> int:
     """A pure, stateless utility to calculate the next highest multiple."""
     # WHY: A defensive guard. If the padding multiple is zero, it would cause a
     # division-by-zero error. This ensures the function is robust.
-    if multiple is None or multiple == 0:
+    if multiple == 0:
         return dim
     return (dim + multiple - 1) // multiple * multiple
 
@@ -102,7 +102,7 @@ class MemoryLayout:
         """Initializes a layout plan with its base logical shape."""
         # WHY: A defensive check to enforce the contract that a logical shape
         # must be composed of non-negative integers from the moment of creation.
-        if not all(isinstance(d, int) and d >= 0 for d in logical_shape):
+        if not all(d >= 0 for d in logical_shape):
             raise ValueError("Logical shape must be a tuple of non-negative integers.")
         self.logical_shape: Tuple[int, ...] = logical_shape
         self.strategies: List[PaddingStrategy] = []
@@ -118,8 +118,6 @@ class MemoryLayout:
         """
         # WHY: Ensures that only valid `PaddingStrategy` objects can be added
         # to the plan, upholding the integrity of the layout contract.
-        if not isinstance(strategy, PaddingStrategy):
-            raise TypeError("Can only add objects of type PaddingStrategy.")
         self.strategies.append(strategy)
         return self
 

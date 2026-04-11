@@ -23,7 +23,7 @@ class CPURetrievalFuture:
         logical_shape: tuple[int, ...],
     ) -> None:
         self._node_id = node_id
-        self._padded_buffer = padded_buffer
+        self._padded_buffer: np.ndarray | None = padded_buffer
         self._logical_shape = logical_shape
         self._released = False
 
@@ -49,5 +49,5 @@ class CPURetrievalFuture:
 
     def release(self) -> None:
         """Release the reference to the backing buffer."""
-        self._padded_buffer = None  # type: ignore[assignment]
+        self._padded_buffer = None
         self._released = True

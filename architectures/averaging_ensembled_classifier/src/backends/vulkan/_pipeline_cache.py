@@ -4,18 +4,16 @@ Loads compiled .spv modules via importlib.resources, creates VkShaderModule
 objects, and builds compute pipelines with specialization constants.
 Caches pipelines keyed by (shader_name, problem_type, variant_suffix).
 """
+# pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
 from __future__ import annotations
 
-import ctypes
 import importlib.resources
 import pathlib
 import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
-
-from ...shared.precision_config import FP8_DTYPES, FP8_E4M3, FP8_E5M2, PrecisionConfig
+from ...shared.precision_config import PrecisionConfig
 from ...shared.precision_suffix import (
     compute_only_suffix as _compute_only_suffix_bare,
     precision_to_suffix,
@@ -151,7 +149,7 @@ class VulkanPipelineCache:
             ),
         ]
         # vulkan cffi binding needs pData as a cffi pointer
-        from vulkan._vulkan import ffi as _ffi  # noqa: PLC0415
+        from vulkan._vulkan import ffi as _ffi  # noqa: PLC0415  # pyright: ignore[reportMissingTypeStubs]
         spec_buf = _ffi.new("char[]", spec_data)
         spec_info = vk.VkSpecializationInfo(
             mapEntryCount=4,

@@ -2,9 +2,8 @@
 """Backend-neutral plan rendering protocol (ADR-001)."""
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
-import numpy as np
 from numpy.typing import NDArray
 
 from .plan_types import ExecutionPlan
@@ -23,7 +22,7 @@ class PlanRenderer(Protocol):
     def render(
         self,
         plan: ExecutionPlan,
-        data_injections: dict[str, NDArray] | None = None,
+        data_injections: dict[str, NDArray[Any]] | None = None,
     ) -> dict[str, RetrievalFuture]:
         """Render an execution plan using the backend's native dispatch model.
 

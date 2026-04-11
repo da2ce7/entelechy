@@ -80,12 +80,12 @@ class LearnHandle:
         Transitions the associated ticket to CONSUMED state and releases
         device buffers. Idempotent — calling wait() multiple times is safe.
         """
-        if self._ticket._state == TicketState.CONSUMED:
+        if self._ticket._state == TicketState.CONSUMED:  # pyright: ignore[reportPrivateUsage]
             # Already waited; no-op for idempotency
             return
         self._future.wait()
         self._future.release()
-        self._ticket._state = TicketState.CONSUMED
+        self._ticket._state = TicketState.CONSUMED  # pyright: ignore[reportPrivateUsage]
 
 
 class WorkTicket:
@@ -200,7 +200,7 @@ class WorkTicket:
             self.get_prediction()
 
         # Dispatch the Learn plan via the Engine
-        learn_future = self._engine._dispatch_learn_plan(self._x_data, y_data)
+        learn_future = self._engine._dispatch_learn_plan(self._x_data, y_data)  # pyright: ignore[reportPrivateUsage]
 
         # Transition to RESOLVED and return the LearnHandle
         self._state = TicketState.RESOLVED

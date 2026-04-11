@@ -15,7 +15,7 @@ direct PlanRenderer). No legacy module references remain.
 
 import warnings
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 
@@ -170,9 +170,9 @@ class TrainingOrchestrator:
     # Checkpoint support (ADR-025 §8)
     # ------------------------------------------------------------------
 
-    def checkpoint_state(self) -> dict:
+    def checkpoint_state(self) -> dict[str, Any]:
         """Export state for checkpointing."""
-        state: dict = {
+        state: dict[str, Any] = {
             "training_step": getattr(self, '_training_step', 0),
         }
         if self.is_fp8_storage:
@@ -186,14 +186,14 @@ class TrainingOrchestrator:
             }
         return state
 
-    def restore_state(self, state: dict) -> None:
+    def restore_state(self, state: dict[str, Any]) -> None:
         """Restore state from checkpoint."""
-        self._training_step = state.get("training_step", 0)
+        self._training_step: int = state.get("training_step", 0)  # pyright: ignore[reportUnknownMemberType]
 
         # Restore FP8 scales with version checking and structure validation
         if "fp8_scales" in state:
-            fp8_data = state["fp8_scales"]
-            checkpoint_version = fp8_data.get("_version", 0)
+            fp8_data: dict[str, Any] = state["fp8_scales"]
+            checkpoint_version: Any = fp8_data.get("_version", 0)
 
             if checkpoint_version != FP8_SCALES_VERSION:
                 warnings.warn(
@@ -204,7 +204,7 @@ class TrainingOrchestrator:
             else:
                 # Defensive construction: catch TypeError if FP8ScaleInfo structure changed
                 try:
-                    scales_dict = fp8_data.get("scales", {})
+                    scales_dict: dict[str, Any] = fp8_data.get("scales", {})
                     self._activation_scales = {
                         name: FP8ScaleInfo(**info) for name, info in scales_dict.items()
                     }
@@ -341,14 +341,14 @@ if __name__ == "__main__":
         raise ValueError(f"Unknown backend: {BACKEND!r}. Use 'cpu', 'opencl', or 'vulkan'.")
 
     # --- 3. Model assembly ---
-    from sklearn.datasets import load_iris
-    iris = load_iris()
-    X_train = iris.data.astype(np.float32)  # type: ignore[union-attr]
-    y_train = iris.target.astype(np.int32)  # type: ignore[union-attr]
+    from sklearn.datasets import load_iris  # pyright: ignore[reportMissingTypeStubs]
+    iris: Any = load_iris()  # pyright: ignore[reportUnknownVariableType]
+    X_train: np.ndarray = iris.data.astype(np.float32)  # type: ignore[union-attr]  # pyright: ignore[reportUnknownMemberType]
+    y_train: np.ndarray = iris.target.astype(np.int32)  # type: ignore[union-attr]  # pyright: ignore[reportUnknownMemberType]
 
     model_spec = ModelSpec.float32(
-        input_dim=X_train.shape[1],
-        output_classes=len(np.unique(y_train)),
+        input_dim=int(X_train.shape[1]),
+        output_classes=int(np.unique(y_train).shape[0]),
         hidden_dim=HIDDEN_DIM,
         num_modules=NUM_MODULES,
         simd_width=hardware.simd_width,
@@ -362,6 +362,6 @@ if __name__ == "__main__":
         renderer=renderer,
         hyperparams=HYPERPARAMS,
         problem_type_name=PROBLEM_TYPE,
-        batch_size=X_train.shape[0],
+        batch_size=int(X_train.shape[0]),
     )
     orchestrator.train(X_train, y_train)

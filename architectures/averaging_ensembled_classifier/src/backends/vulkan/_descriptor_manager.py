@@ -5,6 +5,7 @@ Two-track strategy (VULKAN_BACKEND.md §Descriptor Set Strategy):
   - Dynamic pipelines (reduction engine): vkCmdPushDescriptorSetKHR or
     fallback to pre-allocated sets when push descriptors are unavailable.
 """
+# pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any

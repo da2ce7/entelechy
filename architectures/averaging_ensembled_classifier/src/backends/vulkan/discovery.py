@@ -1,4 +1,5 @@
 """Vulkan hardware discovery — HardwareProfile population (ADR-006)."""
+# pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
 from __future__ import annotations
 
 from typing import TYPE_CHECKING

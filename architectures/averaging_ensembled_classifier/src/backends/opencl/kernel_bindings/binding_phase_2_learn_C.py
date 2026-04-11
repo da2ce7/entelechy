@@ -207,7 +207,7 @@ class StabilizeReduceGradHBinding(KernelBinding):
         schedule_buf = get_buffer(buffer_bindings["clipping_threshold_per_stage"])
         if schedule:
             schedule_np = np.array(schedule, dtype=np.float32)
-            cl.enqueue_copy(schedule_buf.context.queue, schedule_buf, schedule_np)
+            cl.enqueue_copy(schedule_buf.context.queue, schedule_buf, schedule_np)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
 
         return [
             cl.LocalMemory(local_mem_size),

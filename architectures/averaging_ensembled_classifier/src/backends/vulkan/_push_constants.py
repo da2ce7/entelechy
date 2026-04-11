@@ -8,7 +8,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import ctypes
-from typing import ClassVar
 
 
 # ── Push Constant Structures ──
@@ -377,7 +376,8 @@ def marshal_push_constants(
 
     # Build field type lookup
     field_types: dict[str, type] = {}
-    for fname, ftype in struct_cls._fields_:  # type: ignore[reportAssignmentType]
+    for field_info in struct_cls._fields_:
+        fname, ftype = field_info[0], field_info[1]
         field_types[fname] = ftype
 
     for param_name, value in scalar_params.items():

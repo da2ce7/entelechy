@@ -11,7 +11,7 @@ Shared-layer purity:
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -315,7 +315,7 @@ class Engine:
 
         # Inject input data, targets, and sample mask into plan buffers
         sample_mask = _pack_sample_mask(batch_size)
-        injections: dict[str, NDArray] = {
+        injections: dict[str, NDArray[Any]] = {
             "input_data": x_data,
             "sample_mask": sample_mask,
             self._strategy.required_targets_buffer_name: y_data,

@@ -33,3 +33,6 @@ dev = [
     # You could add other tools here like 'black', 'pytest', etc.,
     # if you want a single command to install everything for all subprojects.
 ]
+
+[tool.pyright]
+typeCheckingMode = "strict"

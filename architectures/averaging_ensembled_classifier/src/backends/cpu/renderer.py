@@ -8,7 +8,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import POINTER, c_int32, c_uint32, c_void_p
 from dataclasses import replace
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -29,7 +29,6 @@ from .buffer_allocator import CPUBufferAllocator
 from .discovery import detect_thread_count
 from .retrieval import CPURetrievalFuture
 
-from ...shared.precision_config import FP8_DTYPES, FP8_E4M3, FP8_E5M2
 from ...shared.precision_suffix import precision_to_suffix
 
 c_uint_p = POINTER(c_uint32)
@@ -171,7 +170,7 @@ class CPUPlanRenderer:
             },
         )
         for descriptor in plan.buffers.values():
-            role_dtype = allocator._role_dtypes[descriptor.precision_role]
+            role_dtype = allocator.role_dtypes[descriptor.precision_role]
             key = (
                 descriptor.logical_name,
                 descriptor.padded_shape,
@@ -269,7 +268,7 @@ class CPUPlanRenderer:
     # Per-element kernels need their task count derived from scalar
     # params, not tile_count.  Each entry maps kernel_name to a
     # callable(scalar_params) → int that computes the task count.
-    _TASK_COUNT_RESOLVERS: dict[str, Any] = {
+    _TASK_COUNT_RESOLVERS: dict[str, Callable[[dict[str, Any]], int]] = {
         # Phase 1 — Act
         "forward_pass": lambda s: int(s["batch_chunk_count"]),
         "render_logits_chunk": lambda s: (
@@ -562,7 +561,8 @@ class CPUPlanRenderer:
 
         # Build a map of pointer field names -> field types for quick lookup
         pointer_fields: dict[str, type] = {}
-        for field_name, field_type in struct_cls._fields_:  # type: ignore[reportAssignmentType]
+        for field_info in struct_cls._fields_:
+            field_name, field_type = field_info[0], field_info[1]
             if field_type in self._POINTER_TYPES:
                 pointer_fields[field_name] = field_type
 
@@ -578,7 +578,7 @@ class CPUPlanRenderer:
         # For FP16 compute variants, float scalars that map to c_uint16 fields
         # (i.e., c_compute for FP16) must be converted to FP16 binary representation.
         # We detect these by inspecting the struct field type.
-        field_type_map = {name: ftype for name, ftype in struct_cls._fields_}  # type: ignore
+        field_type_map = {field[0]: field[1] for field in struct_cls._fields_}
         for param_name, value in node.scalar_params.items():
             field_name = self._param_to_field(param_name)
             if hasattr(args, field_name):

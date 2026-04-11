@@ -142,7 +142,7 @@ class AutogradOracle:
         Returns:
             probs: (num_modules, batch, output_classes).
         """
-        X = X.to(self.dtype)
+        X = X.to(self.dtype)  # pyright: ignore[reportConstantRedefinition]
         batch_size = X.shape[0]
 
         if sample_mask is None:
@@ -193,11 +193,11 @@ class AutogradOracle:
         self.last_loss = loss.item()
 
         # Backward via autograd
-        loss.backward()
+        loss.backward()  # pyright: ignore[reportUnknownMemberType]
 
         # Store reference gradients for cross-validation
         self.autograd_reference_grads = {
-            name: param.grad.data.detach().clone()
+            name: param.grad.data.detach().clone()  # pyright: ignore[reportOptionalMemberAccess]
             for name, param in self.named_params()
         }
 
@@ -644,7 +644,7 @@ class AutogradOracle:
         result = torch.zeros(flat.shape[0], dtype=self.dtype)
 
         for row_idx in range(flat.shape[0]):
-            current = flat[row_idx].tolist()
+            current: list[float] = flat[row_idx].tolist()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
             num_items = len(current)
 
             for s in range(num_stages):
@@ -708,10 +708,10 @@ class AutogradOracle:
             for i in range(0, len(current), K):
                 group = current[i : i + K]
                 summed = torch.stack(group).sum(dim=0)
-                norm = summed.norm(2).item()
-                if threshold >= 0.0 and norm > threshold:
+                norm_val = float(summed.norm(2))  # pyright: ignore[reportUnknownMemberType]
+                if threshold >= 0.0 and norm_val > threshold:
                     summed = summed * (
-                        threshold / (norm + self.config.epsilon)
+                        threshold / (norm_val + self.config.epsilon)
                     )
                 next_level.append(summed)
             current = next_level

@@ -12,9 +12,14 @@ Comparison Axes and §Recommended Test Progression.
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
-torch = pytest.importorskip("torch", reason="Oracle tests require PyTorch")
+if TYPE_CHECKING:
+    import torch
+else:
+    torch = pytest.importorskip("torch", reason="Oracle tests require PyTorch")
 
 from .autograd_oracle import AutogradOracle
 from .conftest import init_with_seed, sync_oracles
@@ -59,7 +64,11 @@ class TestAxisOneGradientCalculus:
             temp_max=base.temp_max,
         )
 
-    def test_forward_parity_cce(self, small_cce_config, small_cce_data):
+    def test_forward_parity_cce(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         """Forward pass: A and B1 produce identical probs and loss (CCE)."""
         cfg = self._make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
@@ -68,7 +77,7 @@ class TestAxisOneGradientCalculus:
         sync_oracles(oracle_a, oracle_b1)
 
         X, targets = small_cce_data
-        probs_a = oracle_a.step(X, targets)
+        oracle_a.step(X, targets)
         # Re-sync (step modified params), so forward-only comparison
         oracle_b1.load_state(oracle_a.export_state())
         # Need one step from B1 too to compare loss
@@ -77,15 +86,19 @@ class TestAxisOneGradientCalculus:
         init_with_seed(oracle_a)
         sync_oracles(oracle_a, oracle_b1)
 
-        probs_a = oracle_a.step(X, targets)
-        probs_b1 = oracle_b1.step(X, targets)
+        oracle_a.step(X, targets)
+        oracle_b1.step(X, targets)
 
         # Compare losses
         assert abs(oracle_a.last_loss - oracle_b1.last_loss) < ATOL, (
             f"Loss mismatch: A={oracle_a.last_loss}, B1={oracle_b1.last_loss}"
         )
 
-    def test_forward_parity_bce(self, small_bce_config, small_bce_data):
+    def test_forward_parity_bce(
+        self,
+        small_bce_config: OracleConfig,
+        small_bce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         """Forward pass parity under BCE."""
         cfg = self._make_unclipped_config(small_bce_config)
         oracle_a = FaithfulOracle(cfg)
@@ -94,12 +107,16 @@ class TestAxisOneGradientCalculus:
         sync_oracles(oracle_a, oracle_b1)
 
         X, targets = small_bce_data
-        probs_a = oracle_a.step(X, targets)
-        probs_b1 = oracle_b1.step(X, targets)
+        oracle_a.step(X, targets)
+        oracle_b1.step(X, targets)
 
         assert abs(oracle_a.last_loss - oracle_b1.last_loss) < ATOL
 
-    def test_gradient_parity_cce(self, small_cce_config, small_cce_data):
+    def test_gradient_parity_cce(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         """After one step, A and B1 have identical final_grads (CCE, no clip)."""
         cfg = self._make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
@@ -119,7 +136,11 @@ class TestAxisOneGradientCalculus:
                 f"max_diff={( grad_a - grad_b1).abs().max().item():.2e}"
             )
 
-    def test_gradient_parity_bce(self, small_bce_config, small_bce_data):
+    def test_gradient_parity_bce(
+        self,
+        small_bce_config: OracleConfig,
+        small_bce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         """Gradient parity under BCE."""
         cfg = self._make_unclipped_config(small_bce_config)
         oracle_a = FaithfulOracle(cfg)
@@ -171,7 +192,11 @@ class TestAxisTwoTileDecomposition:
             temp_max=base.temp_max,
         )
 
-    def test_gradient_parity_cce(self, small_cce_config, small_cce_data):
+    def test_gradient_parity_cce(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         cfg = self._make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_b2 = AutogradOracle(cfg, mode="tiled")
@@ -190,7 +215,11 @@ class TestAxisTwoTileDecomposition:
                 f"max_diff={(grad_a - grad_b2).abs().max().item():.2e}"
             )
 
-    def test_gradient_parity_bce(self, small_bce_config, small_bce_data):
+    def test_gradient_parity_bce(
+        self,
+        small_bce_config: OracleConfig,
+        small_bce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         cfg = self._make_unclipped_config(small_bce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_b2 = AutogradOracle(cfg, mode="tiled")
@@ -218,7 +247,11 @@ class TestAxisTwoTileDecomposition:
 class TestAxisThreeFullPipeline:
     """A vs B2 with clipping enabled. Same algorithm, two derivations."""
 
-    def test_gradient_parity_cce(self, small_cce_config, small_cce_data):
+    def test_gradient_parity_cce(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         oracle_a = FaithfulOracle(small_cce_config)
         oracle_b2 = AutogradOracle(small_cce_config, mode="tiled")
         init_with_seed(oracle_a)
@@ -236,7 +269,11 @@ class TestAxisThreeFullPipeline:
                 f"max_diff={(grad_a - grad_b2).abs().max().item():.2e}"
             )
 
-    def test_gradient_parity_bce(self, small_bce_config, small_bce_data):
+    def test_gradient_parity_bce(
+        self,
+        small_bce_config: OracleConfig,
+        small_bce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         oracle_a = FaithfulOracle(small_bce_config)
         oracle_b2 = AutogradOracle(small_bce_config, mode="tiled")
         init_with_seed(oracle_a)
@@ -282,7 +319,11 @@ class TestAxisFourAutogradSelfConsistency:
             temp_max=base.temp_max,
         )
 
-    def test_gradient_parity_cce(self, small_cce_config, small_cce_data):
+    def test_gradient_parity_cce(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         cfg = self._make_unclipped_config(small_cce_config)
         oracle_b1 = AutogradOracle(cfg, mode="flat")
         oracle_b2 = AutogradOracle(cfg, mode="tiled")
@@ -311,7 +352,12 @@ class TestMultiStepConvergence:
     """A vs B2 over multiple steps — trajectory parity."""
 
     @pytest.mark.parametrize("steps", [5, 20])
-    def test_trajectory_cce(self, small_cce_config, small_cce_data, steps):
+    def test_trajectory_cce(
+        self,
+        small_cce_config: OracleConfig,
+        small_cce_data: tuple[torch.Tensor, torch.Tensor],
+        steps: int,
+    ) -> None:
         oracle_a = FaithfulOracle(small_cce_config)
         oracle_b2 = AutogradOracle(small_cce_config, mode="tiled")
         init_with_seed(oracle_a)
@@ -331,7 +377,12 @@ class TestMultiStepConvergence:
                 )
 
     @pytest.mark.parametrize("steps", [5, 20])
-    def test_trajectory_bce(self, small_bce_config, small_bce_data, steps):
+    def test_trajectory_bce(
+        self,
+        small_bce_config: OracleConfig,
+        small_bce_data: tuple[torch.Tensor, torch.Tensor],
+        steps: int,
+    ) -> None:
         oracle_a = FaithfulOracle(small_bce_config)
         oracle_b2 = AutogradOracle(small_bce_config, mode="tiled")
         init_with_seed(oracle_a)
@@ -378,7 +429,11 @@ class TestLargerProblemWithTiling:
             temp_max=base.temp_max,
         )
 
-    def test_a_vs_b1_medium(self, medium_cce_config, medium_cce_data):
+    def test_a_vs_b1_medium(
+        self,
+        medium_cce_config: OracleConfig,
+        medium_cce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         """A vs B1, no clip, medium problem (multiple tiles)."""
         cfg = self._make_unclipped_config(medium_cce_config)
         oracle_a = FaithfulOracle(cfg)
@@ -398,7 +453,11 @@ class TestLargerProblemWithTiling:
                 f"max_diff={(grad_a - grad_b1).abs().max().item():.2e}"
             )
 
-    def test_a_vs_b2_medium(self, medium_cce_config, medium_cce_data):
+    def test_a_vs_b2_medium(
+        self,
+        medium_cce_config: OracleConfig,
+        medium_cce_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         """A vs B2, no clip, medium problem."""
         cfg = self._make_unclipped_config(medium_cce_config)
         oracle_a = FaithfulOracle(cfg)

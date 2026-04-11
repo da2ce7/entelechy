@@ -297,8 +297,7 @@ def render_node16_threshold_schedule(
     W = workgroup_size
 
     P = min(M, W)
-    K = min(max_fan_in, P)
-    K = max(K, 2)
+    K = max(min(max_fan_in, P), 2)
 
     if P <= 1:
         return (0, fp_max, [])

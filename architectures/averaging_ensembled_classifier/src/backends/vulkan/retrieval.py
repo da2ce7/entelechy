@@ -4,9 +4,8 @@ Implements the RetrievalFuture Protocol for the Vulkan backend.
 .wait() blocks on vkWaitForFences; .result() reads from the persistently
 mapped staging buffer and strips padding to return the logical shape.
 """
+# pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
 from __future__ import annotations
-
-import ctypes
 
 import numpy as np
 from numpy.typing import NDArray
@@ -79,7 +78,7 @@ class VulkanRetrievalFuture:
         # Read padded data from the mapped staging memory
         padded_elements = self._padded_size_bytes // self._dtype.itemsize
         padded_array = np.empty(padded_elements, dtype=self._dtype)
-        from vulkan._vulkan import ffi as _ffi  # noqa: PLC0415
+        from vulkan._vulkan import ffi as _ffi  # noqa: PLC0415  # pyright: ignore[reportMissingTypeStubs]
         _ffi.memmove(
             _ffi.from_buffer(padded_array.data),
             self._staging.mapped_buf,

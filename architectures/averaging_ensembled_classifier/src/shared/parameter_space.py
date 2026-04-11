@@ -20,7 +20,7 @@ review to ensure its memory plans faithfully reflect the specific computational
 contracts defined in the kernel headers.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Iterator, List
 
 # --- Foundational Imports from Sibling Architectural Modules ---
@@ -77,7 +77,7 @@ class ParameterSpace:
             self._create_flow("temperatures"),
             self._create_flow("hidden_activations", specialized_reduction=True),
         ]
-        return [f for f in flows if f is not None]
+        return flows
 
     def _create_flow(self, name: str, specialized_reduction: bool = False) -> ParameterFlowConfig:
         """A factory for generating a consistent set of buffer names."""

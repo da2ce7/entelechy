@@ -34,6 +34,11 @@ class CPUBufferAllocator:
         self._role_dtypes = role_dtypes
         self._buffers: dict[BufferHandle, np.ndarray] = {}
 
+    @property
+    def role_dtypes(self) -> dict[Literal["storage", "compute", "state"] | None, np.dtype]:
+        """Read-only access to the precision-role → dtype mapping."""
+        return self._role_dtypes
+
     def allocate(self, descriptor: BufferDescriptor) -> None:
         """Allocate a SIMD-aligned numpy array for the given descriptor."""
         total_elements = 1

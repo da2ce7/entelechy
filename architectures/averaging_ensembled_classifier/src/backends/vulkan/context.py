@@ -3,6 +3,7 @@
 Encapsulates VkInstance, VkDevice, VkQueue, VkCommandPool creation
 and deterministic teardown. Uses vulkan-python for all Vulkan API calls.
 """
+# pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
 from __future__ import annotations
 
 import logging
@@ -155,7 +156,8 @@ class VulkanContext:
     def _find_compute_queue_family(device: object) -> int:
         queue_families = vk.vkGetPhysicalDeviceQueueFamilyProperties(device)
         for i, qf in enumerate(queue_families):
-            if qf.queueFlags & vk.VK_QUEUE_COMPUTE_BIT:
+            qf_flags = qf.queueFlags
+            if qf_flags & vk.VK_QUEUE_COMPUTE_BIT:
                 return i
         return -1
 

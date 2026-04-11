@@ -60,9 +60,9 @@ class ConvergenceTrace:
     ``record_every`` in :meth:`ConvergenceOracle.train_n_steps`).
     """
 
-    loss_history: list[float] = field(default_factory=list)
-    grad_norm_history: dict[str, list[float]] = field(default_factory=dict)
-    param_norm_history: dict[str, list[float]] = field(default_factory=dict)
+    loss_history: list[float] = field(default_factory=lambda: [])
+    grad_norm_history: dict[str, list[float]] = field(default_factory=lambda: {})
+    param_norm_history: dict[str, list[float]] = field(default_factory=lambda: {})
 
     @property
     def num_recorded(self) -> int:
@@ -246,7 +246,7 @@ class ConvergenceOracle:
         Returns:
             probs: (num_modules, batch, output_classes) detached.
         """
-        X = X.to(self.dtype)
+        X = X.to(self.dtype)  # pyright: ignore[reportConstantRedefinition]
         batch_size = X.shape[0]
 
         if sample_mask is None:
@@ -266,7 +266,7 @@ class ConvergenceOracle:
         self.last_loss = loss.item()
 
         # --- Backward ---
-        loss.backward()
+        loss.backward()  # pyright: ignore[reportUnknownMemberType]
 
         # --- Record raw autograd gradients ---
         self.autograd_raw_grads = {}
@@ -276,13 +276,14 @@ class ConvergenceOracle:
                 f"No gradient for {name} — forward graph may be broken"
             )
             self.autograd_raw_grads[name] = param.grad.data.detach().clone()
-            self.last_grad_norms[name] = param.grad.data.norm(2).item()
+            self.last_grad_norms[name] = float(param.grad.data.norm(2))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
 
         # --- Node 21: normalize by effective batch size ---
         eps = self.config.epsilon
         N = float(effective_batch_size)
         self.final_grads = {}
         for name, param in self.named_params():
+            assert param.grad is not None
             self.final_grads[name] = param.grad.data / (N + eps)
 
         # --- Node 24: Adam update ---
@@ -350,7 +351,7 @@ class ConvergenceOracle:
                         self.last_grad_norms.get(name, 0.0),
                     )
                     trace.param_norm_history[name].append(
-                        param.data.norm(2).item(),
+                        float(param.data.norm(2)),  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
                     )
 
         return trace
@@ -366,7 +367,7 @@ class ConvergenceOracle:
         Returns:
             probs: (num_modules, batch, output_classes).
         """
-        X = X.to(self.dtype)
+        X = X.to(self.dtype)  # pyright: ignore[reportConstantRedefinition]
         batch_size = X.shape[0]
         if sample_mask is None:
             mask_float = torch.ones(batch_size, dtype=self.dtype)
@@ -415,7 +416,7 @@ class ConvergenceOracle:
         distances: dict[str, float] = {}
         for name, param in self.named_params():
             other = other_state[name].to(self.dtype)
-            distances[name] = (param.data - other).norm(2).item()
+            distances[name] = float((param.data - other).norm(2))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
         return distances
 
     def moment_distance(
@@ -429,9 +430,9 @@ class ConvergenceOracle:
             for param_name in self._param_names:
                 key = f"{mk_name}_{param_name}"
                 other = other_state[key].to(self.dtype)
-                distances[key] = (
-                    mk_dict[param_name] - other
-                ).norm(2).item()
+                distances[key] = float(
+                    (mk_dict[param_name] - other).norm(2),  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+                )
         return distances
 
     def full_state_distance(
@@ -521,23 +522,23 @@ class ConvergenceOracle:
         )
 
         # Random hyperplanes for each class
-        normals = torch.randn(
+        normals: torch.Tensor = torch.randn(
             num_classes, input_dim, generator=gen, dtype=dtype,
         )
-        normals = normals / normals.norm(dim=1, keepdim=True)
+        normals = normals / normals.norm(dim=1, keepdim=True)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
 
         # Bias to achieve approximate active_probability
         # P(w·x > b) ≈ active_probability for x ~ N(0,I)
         bias = torch.tensor(
-            torch.distributions.Normal(0, 1).icdf(
+            torch.distributions.Normal(0, 1).icdf(  # pyright: ignore[reportUnknownMemberType]
                 torch.tensor(1.0 - active_probability),
             ),
             dtype=dtype,
         )
-        projections = X @ normals.T  # (N, num_classes)
-        targets = (projections > bias).to(dtype) * separation
-        targets = (targets > 0).to(dtype)
-        return X, targets
+        projections: torch.Tensor = X @ normals.T  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        targets: torch.Tensor = (projections > bias).to(dtype) * separation  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        targets = (targets > 0).to(dtype)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        return X, targets  # pyright: ignore[reportUnknownVariableType]
 
     # =================================================================
     # Internal: forward pass

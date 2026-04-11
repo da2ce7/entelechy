@@ -14,7 +14,6 @@ from .buffer_lifecycle import BufferDescriptor, BufferHandle, BufferRole
 from .hardware_profile import HardwareProfile
 from .kernel_contracts import KernelContract
 from .optimizer_config import OptimizerConfig
-from .precision_config import PrecisionConfig
 from .kernel_contracts.phase_1_act import (
     forward_pass_contract,
     render_logits_chunk_contract,
@@ -54,7 +53,7 @@ from .streaming_loop_plan import (
     ParameterStride,
     StreamingLoopPlan,
 )
-from .workload_primitives import GatherPrimitive, LinearlyChunkedGather, ModuleBufferKind, ModuleChunkGather, TiledGather, TilingScheme
+from .workload_primitives import GatherPrimitive, LinearlyChunkedGather, TiledGather, TilingScheme
 
 
 # =========================================================================

@@ -12,8 +12,6 @@ import warnings
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
-
 from .precision_config import PrecisionConfig
 
 

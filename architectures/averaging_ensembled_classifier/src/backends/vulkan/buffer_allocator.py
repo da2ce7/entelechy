@@ -4,9 +4,9 @@ Translates BufferDescriptor plan-level declarations into physical
 VkBuffer + VkDeviceMemory allocations. Manages staging buffers for
 host-device data transfer.
 """
+# pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
 from __future__ import annotations
 
-import ctypes
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -91,7 +91,7 @@ class VulkanBufferAllocator:
         vk_buf = self._buffers[handle]
         size = vk_buf.size_bytes
         staging = self.allocate_staging(size)
-        from vulkan._vulkan import ffi as _ffi  # noqa: PLC0415
+        from vulkan._vulkan import ffi as _ffi  # noqa: PLC0415  # pyright: ignore[reportMissingTypeStubs]
         _ffi.memmove(staging.mapped_buf, bytes(size), size)
 
         begin_info = vk.VkCommandBufferBeginInfo(
@@ -152,7 +152,7 @@ class VulkanBufferAllocator:
         # Create transient staging buffer
         staging = self.allocate_staging(size)
         # Copy data to mapped staging memory via cffi
-        from vulkan._vulkan import ffi as _ffi  # noqa: PLC0415
+        from vulkan._vulkan import ffi as _ffi  # noqa: PLC0415  # pyright: ignore[reportMissingTypeStubs]
         _ffi.memmove(staging.mapped_buf, bytes(data.data), size)
 
         # Record copy command

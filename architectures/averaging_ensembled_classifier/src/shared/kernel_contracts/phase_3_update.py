@@ -1,7 +1,7 @@
 # src/shared/kernel_contracts/phase_3_update.py
 """Phase 3 (Update) kernel contracts — populated from kernels.cl.h."""
 from . import (
-    BufferParamSpec, KernelContract, KernelContractBlock, LocalMemorySpec,
+    BufferParamSpec, KernelContract, KernelContractBlock,
     PaddingContract, ScalarParamSpec,
 )
 
