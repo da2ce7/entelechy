@@ -26,9 +26,9 @@ PRECISION_SUFFIXES: tuple[str, ...] = (
     "s32c64x32", "s32c64x64",
     "s64c64x64",
     # FP8 E4M3 storage (ADR-025 §5.3)
-    "s8e4c32x32", "s8e4c32x64", "s8e4c64x64",
+    "s8e4c32x32", "s8e4c32x64", "s8e4c64x32", "s8e4c64x64",
     # FP8 E5M2 storage (ADR-025 §5.3)
-    "s8e5c32x32", "s8e5c32x64", "s8e5c64x64",
+    "s8e5c32x32", "s8e5c32x64", "s8e5c64x32", "s8e5c64x64",
 )
 
 # FP8 variants with FP16 compute — conditionally available per platform.
@@ -72,6 +72,7 @@ _FP8_SUFFIX_MAP: dict[tuple[np.dtype, type, type], str] = {
     (FP8_E4M3, np.float32, np.float32): "s8e4c32x32",
     (FP8_E4M3, np.float32, np.float64): "s8e4c32x64",
     (FP8_E4M3, np.float64, np.float16): "s8e4c64x16",
+    (FP8_E4M3, np.float64, np.float32): "s8e4c64x32",
     (FP8_E4M3, np.float64, np.float64): "s8e4c64x64",
     # E5M2 variants
     (FP8_E5M2, np.float16, np.float16): "s8e5c16x16",
@@ -81,6 +82,7 @@ _FP8_SUFFIX_MAP: dict[tuple[np.dtype, type, type], str] = {
     (FP8_E5M2, np.float32, np.float32): "s8e5c32x32",
     (FP8_E5M2, np.float32, np.float64): "s8e5c32x64",
     (FP8_E5M2, np.float64, np.float16): "s8e5c64x16",
+    (FP8_E5M2, np.float64, np.float32): "s8e5c64x32",
     (FP8_E5M2, np.float64, np.float64): "s8e5c64x64",
 }
 

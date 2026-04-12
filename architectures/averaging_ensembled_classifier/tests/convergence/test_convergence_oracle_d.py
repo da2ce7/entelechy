@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.slow
+
 from tests.oracle.precision_oracle import NumpyPrecisionSpec
 
 from .oracle_baseline import run_oracle_d_baseline

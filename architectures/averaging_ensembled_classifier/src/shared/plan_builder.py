@@ -712,7 +712,7 @@ def build_learn_plan(
 
     # Phase III intermediates
     b_partial_grad_sw = alloc.allocate(
-        "partial_grad_weights_shared",
+        "partial_grad_weights_shared_simd_major",
         (batch_size, model_spec.padded_input_dim,
          model_spec.padded_hidden_dim),
         elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
@@ -723,7 +723,7 @@ def build_learn_plan(
         elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
     b_clipped_grad_sw = alloc.allocate(
-        "clipped_partial_grad_weights_shared",
+        "clipped_partial_grad_weights_shared_simd_major",
         (batch_size, shared_w_param_count),
         elem_storage, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
@@ -1131,7 +1131,7 @@ def build_learn_plan(
          "hidden_mask": b_hidden_mask,
          "summed_grad_hidden_activations": b_summed_grad_h,
          "sample_mask": b_sample_mask,
-         "partial_grad_weights_shared": b_partial_grad_sw},
+         "partial_grad_weights_shared_simd_major": b_partial_grad_sw},
         {"batch_chunk_offset": 0, "batch_chunk_count": 1,
          "FLAG_use_explicit_hidden_mask": flag_explicit,
          "batch_chunk_index": 0,
@@ -1183,9 +1183,9 @@ def build_learn_plan(
         "clip_shared_grads",
         frozenset({"backprop_shared_weights", "backprop_shared_biases"}),
         clip_shared_gradients_contract,
-        {"partial_grad_weights_shared": b_partial_grad_sw,
+        {"partial_grad_weights_shared_simd_major": b_partial_grad_sw,
          "partial_grad_biases_shared": b_partial_grad_sb,
-         "clipped_partial_grad_weights_shared": b_clipped_grad_sw,
+         "clipped_partial_grad_weights_shared_simd_major": b_clipped_grad_sw,
          "clipped_partial_grad_biases_shared": b_clipped_grad_sb},
         {"clipping_threshold_t_pre": policy.get_leaf_safety_threshold(),
          "epsilon": model_spec.precision.compute_epsilon,

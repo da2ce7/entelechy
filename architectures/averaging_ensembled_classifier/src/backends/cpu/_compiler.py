@@ -96,6 +96,22 @@ def _get_march_flags(cc: str) -> list[str]:
     return []
 
 
+def _detect_float16_support(cc: str, march_flags: list[str]) -> bool:
+    """Check if the compiler supports _Float16 arithmetic."""
+    # Test snippet matches Meson's check: arithmetic, not just storage
+    test_code = b"_Float16 test_float16(_Float16 x) { return x * (_Float16)2.0; }\n"
+    try:
+        result = subprocess.run(
+            [cc, *march_flags, "-x", "c", "-c", "-o", "/dev/null", "-"],
+            input=test_code,
+            capture_output=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
 def _compile_library() -> pathlib.Path:
     """Compile the kernel sources into a shared library and cache the result."""
     cache = _cache_dir()
@@ -108,12 +124,17 @@ def _compile_library() -> pathlib.Path:
 
     cc = _find_compiler()
     march_flags = _get_march_flags(cc)
+    has_float16 = _detect_float16_support(cc, march_flags)
     system = platform.system()
 
     logger.info(
         "Compiling CPU kernel library with %s (this happens once per "
         "source version)...", cc
     )
+    if has_float16:
+        logger.debug("_Float16 support detected — FP16 compute variants enabled")
+    else:
+        logger.debug("_Float16 not supported — FP16 compute variants will be skipped")
 
     # Platform-specific shared library flags
     if system == "Darwin":
@@ -123,6 +144,9 @@ def _compile_library() -> pathlib.Path:
 
     # Link flags
     link_flags = ["-lm", "-lpthread"]
+
+    # Float16 detection
+    float16_flag = "-DHAS_FLOAT16=1" if has_float16 else "-DHAS_FLOAT16=0"
 
     # Compile in a temp directory, atomically move into cache
     with tempfile.TemporaryDirectory(prefix="aec_cpu_build_") as tmpdir:
@@ -134,6 +158,7 @@ def _compile_library() -> pathlib.Path:
             "-fPIC",
             "-O2",
             "-DCPU_KERNELS_BUILDING",
+            float16_flag,
             "-fvisibility=hidden",
             *march_flags,
             f"-I{_KERNEL_SOURCES_DIR}",

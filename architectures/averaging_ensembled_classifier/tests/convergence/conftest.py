@@ -5,6 +5,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+# Mark all convergence tests as slow — multi-epoch training
+pytestmark = pytest.mark.slow
+
 from src.shared.engine import Engine
 from src.shared.hardware_profile import HardwareProfile
 from src.shared.model_spec import ModelSpec

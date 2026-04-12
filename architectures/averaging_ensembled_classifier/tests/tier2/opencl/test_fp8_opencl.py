@@ -90,16 +90,8 @@ def _device_supports_fp64(device):
 # ── Full kernel set compilation ──────────────────────────────────────
 
 class TestFP8KernelCompilation:
-    """Verify the full kernel set compiles with FP8 precision flags.
+    """Verify the full kernel set compiles with FP8 precision flags."""
 
-    NOTE: These tests are xfail because several .cl.c kernel implementations
-    have pre-existing type mismatches (STORAGE_TYPE vs COMPUTE_TYPE for loss
-    and reduction output buffers) that are invisible when all types are float
-    but surface when STORAGE_TYPE=uchar (FP8). Fixing requires aligning
-    parameter types AND write calls across kernels and host bindings.
-    """
-
-    @pytest.mark.xfail(reason="Pre-existing STORAGE_TYPE/COMPUTE_TYPE mismatch in .cl.c kernels", strict=True)
     def test_e4m3_fp32_compile(self, cl_context, cl_device, hardware_profile):
         cfg = PrecisionConfig.fp8_e4m3()
         flags = build_compiler_flags(cfg, hardware_profile, c_tile_size=16)
@@ -107,7 +99,6 @@ class TestFP8KernelCompilation:
             cl_context, cl_device, flags, _KERNEL_DIR,
         )
 
-    @pytest.mark.xfail(reason="Pre-existing STORAGE_TYPE/COMPUTE_TYPE mismatch in .cl.c kernels", strict=True)
     def test_e5m2_fp32_compile(self, cl_context, cl_device, hardware_profile):
         cfg = PrecisionConfig.fp8_e5m2()
         flags = build_compiler_flags(cfg, hardware_profile, c_tile_size=16)
@@ -115,7 +106,6 @@ class TestFP8KernelCompilation:
             cl_context, cl_device, flags, _KERNEL_DIR,
         )
 
-    @pytest.mark.xfail(reason="Pre-existing STORAGE_TYPE/COMPUTE_TYPE mismatch in .cl.c kernels", strict=True)
     def test_e4m3_fp16_compile(self, cl_context, cl_device, hardware_profile):
         if not _device_supports_fp16(cl_device):
             pytest.skip("Device does not support cl_khr_fp16")
@@ -125,7 +115,6 @@ class TestFP8KernelCompilation:
             cl_context, cl_device, flags, _KERNEL_DIR,
         )
 
-    @pytest.mark.xfail(reason="Pre-existing STORAGE_TYPE/COMPUTE_TYPE mismatch in .cl.c kernels", strict=True)
     def test_e5m2_fp16_compile(self, cl_context, cl_device, hardware_profile):
         if not _device_supports_fp16(cl_device):
             pytest.skip("Device does not support cl_khr_fp16")
@@ -135,7 +124,6 @@ class TestFP8KernelCompilation:
             cl_context, cl_device, flags, _KERNEL_DIR,
         )
 
-    @pytest.mark.xfail(reason="Pre-existing STORAGE_TYPE/COMPUTE_TYPE mismatch in .cl.c kernels", strict=True)
     def test_e4m3_fp64_compile(self, cl_context, cl_device, hardware_profile):
         if not _device_supports_fp64(cl_device):
             pytest.skip("Device does not support cl_khr_fp64")
@@ -145,7 +133,6 @@ class TestFP8KernelCompilation:
             cl_context, cl_device, flags, _KERNEL_DIR,
         )
 
-    @pytest.mark.xfail(reason="Pre-existing STORAGE_TYPE/COMPUTE_TYPE mismatch in .cl.c kernels", strict=True)
     def test_e5m2_fp64_compile(self, cl_context, cl_device, hardware_profile):
         if not _device_supports_fp64(cl_device):
             pytest.skip("Device does not support cl_khr_fp64")

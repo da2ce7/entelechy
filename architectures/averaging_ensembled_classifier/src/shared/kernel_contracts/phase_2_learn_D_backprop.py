@@ -55,7 +55,7 @@ backprop_shared_weights_contract = KernelContract(
             precision_role=None,  # integer-typed bitmask (ADR-031)
         ),
         BufferParamSpec(
-            name="dest_buffer_GLOBAL_partial_grad_weights_shared", flow="dest", memory_scope="GLOBAL",
+            name="dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major", flow="dest", memory_scope="GLOBAL",
             tensor_shape=("num_batch_chunks", "padded_input_count", "padded_hidden_count"),
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("num_batch_chunks", "padded_input_count", "padded_hidden_count"),
@@ -162,7 +162,7 @@ clip_shared_gradients_contract = KernelContract(
     ),
     buffer_params=(
         BufferParamSpec(
-            name="src_buffer_GLOBAL_partial_grad_weights_shared", flow="src", memory_scope="GLOBAL",
+            name="src_buffer_GLOBAL_partial_grad_weights_shared_simd_major", flow="src", memory_scope="GLOBAL",
             tensor_shape=("weights_parameter_count",),
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("weights_parameter_count",),
@@ -178,7 +178,7 @@ clip_shared_gradients_contract = KernelContract(
             precision_role="storage",
         ),
         BufferParamSpec(
-            name="dest_buffer_GLOBAL_clipped_partial_grad_weights_shared", flow="dest", memory_scope="GLOBAL",
+            name="dest_buffer_GLOBAL_clipped_partial_grad_weights_shared_simd_major", flow="dest", memory_scope="GLOBAL",
             tensor_shape=("num_batch_chunks", "weights_parameter_count"),
             padding_contract=PaddingContract("NONE", None),
             calculability_proof=("num_batch_chunks", "weights_parameter_count"),

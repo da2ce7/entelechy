@@ -47,7 +47,7 @@ __kernel void backprop_shared_weights_chunk(
     // --- Padding Zero-Establishment (CONTRACT.md) ---
     // The kernel is the sole guarantor of zeros at padding positions. If this
     // work-group's (i,j) coordinate is in the padding region, write zero and exit.
-    const bool is_padding = (i_idx >= src_scalar_NATURAL_input_count) || (j_idx >= src_scalar_NATURAL_hidden_count);
+    const int is_padding = (i_idx >= src_scalar_NATURAL_input_count) || (j_idx >= src_scalar_NATURAL_hidden_count);
     if (is_padding) {
         if (lid == 0) {
             const uint hb   = j_idx / SIMD_WIDTH;
@@ -215,9 +215,9 @@ __kernel void backprop_shared_biases_chunk(
 // destination address explicitly provided by the host.
 __kernel void clip_shared_gradients_chunk(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_grad_weights_shared,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_grad_weights_shared_simd_major,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_grad_biases_shared,
-    __global STORAGE_TYPE       *dest_buffer_GLOBAL_clipped_partial_grad_weights_shared,
+    __global STORAGE_TYPE       *dest_buffer_GLOBAL_clipped_partial_grad_weights_shared_simd_major,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_clipped_partial_grad_biases_shared,
     COMPUTE_TYPE                 src_scalar_REAL_clipping_threshold_t_pre,
     COMPUTE_TYPE                 src_scalar_REAL_epsilon,
@@ -240,7 +240,7 @@ __kernel void clip_shared_gradients_chunk(
         COMPUTE_TYPE val;
         // This conditional logic maps the linear index `i` to the correct physical buffer.
         if (i < src_scalar_NATURAL_weights_parameter_count) {
-            val = load_storage(src_buffer_GLOBAL_partial_grad_weights_shared, i);
+            val = load_storage(src_buffer_GLOBAL_partial_grad_weights_shared_simd_major, i);
         } else {
             val = load_storage(src_buffer_GLOBAL_partial_grad_biases_shared, i - src_scalar_NATURAL_weights_parameter_count);
         }
@@ -281,10 +281,10 @@ __kernel void clip_shared_gradients_chunk(
     // writing the result to the host-specified destination offset.
     for (uint i = lid; i < total_elements; i += lsize) {
         if (i < src_scalar_NATURAL_weights_parameter_count) {
-            const COMPUTE_TYPE val = load_storage(src_buffer_GLOBAL_partial_grad_weights_shared, i);
+            const COMPUTE_TYPE val = load_storage(src_buffer_GLOBAL_partial_grad_weights_shared_simd_major, i);
             // This write operation is the fulfillment of the placement contract. The host provides the
             // exact base offset, and this kernel simply adds the element's relative index.
-            store_storage(dest_buffer_GLOBAL_clipped_partial_grad_weights_shared, dest_scalar_NATURAL_weights_write_offset + i, val * scale_factor);
+            store_storage(dest_buffer_GLOBAL_clipped_partial_grad_weights_shared_simd_major, dest_scalar_NATURAL_weights_write_offset + i, val * scale_factor);
         } else {
             const uint         relative_idx = i - src_scalar_NATURAL_weights_parameter_count;
             const COMPUTE_TYPE val          = load_storage(src_buffer_GLOBAL_partial_grad_biases_shared, relative_idx);

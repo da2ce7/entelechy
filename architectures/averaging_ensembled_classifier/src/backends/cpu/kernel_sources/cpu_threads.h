@@ -9,7 +9,11 @@
 #include <stdint.h>
 #include "cpu_export.h"
 
-typedef uint32_t uint;
+#ifndef cpu_uint
+typedef uint32_t cpu_uint;
+#endif
+#define uint cpu_uint
+
 typedef struct ThreadPool ThreadPool;
 
 /* Create a persistent thread pool with num_threads worker threads. */

@@ -73,10 +73,12 @@ PRECISION_C_TYPES: dict[str, tuple[type, type, type, type, type, type]] = {
     # FP8 E4M3 storage — cpu_fp8_e4m3 is a struct wrapping uint8_t (ADR-025 §5.1)
     "s8e4c32x32": (ctypes.c_uint8, c_uint8_p, c_float, POINTER(c_float), c_float, POINTER(c_float)),
     "s8e4c32x64": (ctypes.c_uint8, c_uint8_p, c_float, POINTER(c_float), c_double, POINTER(c_double)),
+    "s8e4c64x32": (ctypes.c_uint8, c_uint8_p, c_double, POINTER(c_double), c_float, POINTER(c_float)),
     "s8e4c64x64": (ctypes.c_uint8, c_uint8_p, c_double, POINTER(c_double), c_double, POINTER(c_double)),
     # FP8 E5M2 storage — cpu_fp8_e5m2 is a struct wrapping uint8_t (ADR-025 §5.1)
     "s8e5c32x32": (ctypes.c_uint8, c_uint8_p, c_float, POINTER(c_float), c_float, POINTER(c_float)),
     "s8e5c32x64": (ctypes.c_uint8, c_uint8_p, c_float, POINTER(c_float), c_double, POINTER(c_double)),
+    "s8e5c64x32": (ctypes.c_uint8, c_uint8_p, c_double, POINTER(c_double), c_float, POINTER(c_float)),
     "s8e5c64x64": (ctypes.c_uint8, c_uint8_p, c_double, POINTER(c_double), c_double, POINTER(c_double)),
     # FP8 FP16 compute variants (conditional on _Float16)
     "s8e4c16x32": (ctypes.c_uint8, c_uint8_p, c_uint16, POINTER(c_uint16), c_float, POINTER(c_float)),
@@ -103,7 +105,7 @@ _LAYOUT_CHECK_BASE_NAMES: list[tuple[str, str]] = [
     ("get_struct_size_temp_gradients_args", "TempGradientsArgs"),
     ("get_struct_size_clip_partials_args", "ClipPartialsArgs"),
     ("get_struct_size_gather_permute_args", "GatherPermuteArgs"),
-    ("get_struct_size_reduction_tree_plan", "ReductionTreePlanFFI"),
+    ("get_struct_size_reduction_tree_plan_storage_entry", "ReductionTreePlanStorageEntryFFI"),
     ("get_struct_size_reduction_tree_plan_compute_entry", "ReductionTreePlanComputeEntryFFI"),
     ("get_struct_size_stabilize_reduce_args", "StabilizeReduceArgs"),
     ("get_struct_size_clip_intermediate_args", "ClipIntermediateArgs"),
@@ -147,7 +149,7 @@ def make_precision_types(
         ("biases_shared", c_state_p),
         ("hidden_activations", c_storage_p),
         ("hidden_mask", c_storage_p),
-        ("FLAG_produce_hidden_mask", c_uint32),
+        ("produce_hidden_mask", c_uint32),
         ("batch_chunk_offset", c_uint32),
         ("batch_chunk_count", c_uint32),
         ("total_batch_count", c_uint32),
@@ -159,7 +161,7 @@ def make_precision_types(
     structs["RenderLogitsArgs"] = _s("RenderLogitsArgs", [
         ("hidden_activations", c_storage_p),
         ("hidden_mask", c_storage_p),
-        ("FLAG_use_explicit_hidden_mask", c_uint32),
+        ("use_explicit_hidden_mask", c_uint32),
         ("sample_mask", c_uint_p),
         ("weights_module", c_state_p),
         ("biases_module", c_state_p),
@@ -321,15 +323,15 @@ def make_precision_types(
         ("total_tile_count", c_uint32),
     ])
 
-    structs["ReductionTreePlanFFI"] = _s("ReductionTreePlanFFI", [
+    structs["ReductionTreePlanStorageEntryFFI"] = _s("ReductionTreePlanStorageEntryFFI", [
         ("partial_collection", c_storage_p),
-        ("offset_lists_flat", c_uint_p),
-        ("stage_offsets_into_list", c_uint_p),
+        ("offset_list_flat", c_uint_p),
+        ("stage_list_offset", c_uint_p),
         ("stage_fan_in", c_uint_p),
         ("stage_node_counts", c_uint_p),
-        ("staging_buffer_0", c_storage_p),
-        ("staging_buffer_1", c_storage_p),
-        ("output", c_compute_p),  # compute output
+        ("intermediate_partial_0", c_compute_p),  # ADR-026: COMPUTE_T for staging
+        ("intermediate_partial_1", c_compute_p),  # ADR-026: COMPUTE_T for staging
+        ("summed_partial", c_compute_p),  # compute output
         ("partial_width", c_uint32),
         ("num_stages", c_uint32),
         ("t_algorithmic", c_compute),
@@ -341,13 +343,13 @@ def make_precision_types(
     # ADR-026: Compute-entry variant for compute-role source buffers
     structs["ReductionTreePlanComputeEntryFFI"] = _s("ReductionTreePlanComputeEntryFFI", [
         ("partial_collection", c_compute_p),  # compute-role input
-        ("offset_lists_flat", c_uint_p),
-        ("stage_offsets_into_list", c_uint_p),
+        ("offset_list_flat", c_uint_p),
+        ("stage_list_offset", c_uint_p),
         ("stage_fan_in", c_uint_p),
         ("stage_node_counts", c_uint_p),
-        ("staging_buffer_0", c_compute_p),  # compute-role staging
-        ("staging_buffer_1", c_compute_p),  # compute-role staging
-        ("output", c_compute_p),
+        ("intermediate_partial_0", c_compute_p),  # compute-role staging
+        ("intermediate_partial_1", c_compute_p),  # compute-role staging
+        ("summed_partial", c_compute_p),
         ("partial_width", c_uint32),
         ("num_stages", c_uint32),
         ("t_algorithmic", c_compute),
@@ -382,10 +384,10 @@ def make_precision_types(
         ("input", c_storage_p),
         ("hidden_activations", c_storage_p),
         ("hidden_mask", c_storage_p),
-        ("FLAG_use_explicit_hidden_mask", c_uint32),
+        ("use_explicit_hidden_mask", c_uint32),
         ("summed_grad_hidden_activations", c_compute_p),  # compute output
         ("sample_mask", c_uint_p),
-        ("partial_grad_weights_shared", c_storage_p),
+        ("partial_grad_weights_shared_simd_major", c_storage_p),
         ("batch_chunk_offset", c_uint32),
         ("batch_chunk_count", c_uint32),
         ("batch_chunk_index", c_uint32),
@@ -401,7 +403,7 @@ def make_precision_types(
     structs["BackpropSharedBiasesArgs"] = _s("BackpropSharedBiasesArgs", [
         ("hidden_activations", c_storage_p),
         ("hidden_mask", c_storage_p),
-        ("FLAG_use_explicit_hidden_mask", c_uint32),
+        ("use_explicit_hidden_mask", c_uint32),
         ("summed_grad_hidden_activations", c_compute_p),  # compute output
         ("sample_mask", c_uint_p),
         ("partial_grad_biases_shared", c_storage_p),
@@ -416,9 +418,9 @@ def make_precision_types(
     ])
 
     structs["ClipSharedGradsArgs"] = _s("ClipSharedGradsArgs", [
-        ("partial_grad_weights_shared", c_storage_p),
+        ("partial_grad_weights_shared_simd_major", c_storage_p),
         ("partial_grad_biases_shared", c_storage_p),
-        ("clipped_partial_grad_weights_shared", c_storage_p),
+        ("clipped_partial_grad_weights_shared_simd_major", c_storage_p),
         ("clipped_partial_grad_biases_shared", c_storage_p),
         ("clipping_threshold_t_pre", c_compute),  # scalar compute param (ADR-024)
         ("epsilon", c_compute),                   # scalar compute param (ADR-024)
@@ -456,7 +458,7 @@ def make_precision_types(
     ])
 
     structs["ClampTemperaturesArgs"] = _s("ClampTemperaturesArgs", [
-        ("temperatures", c_state_p),
+        ("temps", c_state_p),
         ("min_value", c_compute),
         ("max_value", c_compute),
         ("parameter_offset", c_uint32),
@@ -503,7 +505,8 @@ BackpropToHiddenArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["BackpropToHiddenArgs"
 TempGradientsArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["TempGradientsArgs"]
 ClipPartialsArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["ClipPartialsArgs"]
 GatherPermuteArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["GatherPermuteArgs"]
-ReductionTreePlanFFI = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["ReductionTreePlanFFI"]
+ReductionTreePlanStorageEntryFFI = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["ReductionTreePlanStorageEntryFFI"]
+ReductionTreePlanFFI = ReductionTreePlanStorageEntryFFI  # legacy alias
 StabilizeReduceArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["StabilizeReduceArgs"]
 ClipIntermediateArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["ClipIntermediateArgs"]
 BackpropSharedWeightsArgs = PRECISION_STRUCTS[_DEFAULT_SUFFIX]["BackpropSharedWeightsArgs"]

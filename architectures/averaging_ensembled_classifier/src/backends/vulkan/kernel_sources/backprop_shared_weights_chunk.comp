@@ -24,7 +24,7 @@ layout(push_constant) uniform PushConstants {
     uint padded_input_count;
     uint hidden_count;
     uint padded_hidden_count;
-    uint final_grad_hidden_total_element_count;
+    uint final_grad_hidden_activations_total_count;
     uint FLAG_use_explicit_hidden_mask;
 } push;
 

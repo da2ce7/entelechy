@@ -417,13 +417,14 @@ class CPUPlanRenderer:
         if use_compute_entry:
             PlanStruct = PRECISION_STRUCTS[suffix]["ReductionTreePlanComputeEntryFFI"]
             c_collection_p = c_compute_p
-            staging_dtype = plan.precision.compute_dtype
             fn_name = f"execute_reduction_tree_from_compute_{suffix}"
         else:
-            PlanStruct = PRECISION_STRUCTS[suffix]["ReductionTreePlanFFI"]
+            PlanStruct = PRECISION_STRUCTS[suffix]["ReductionTreePlanStorageEntryFFI"]
             c_collection_p = c_storage_p
-            staging_dtype = plan.precision.storage_dtype
             fn_name = f"execute_reduction_tree_{suffix}"
+
+        # Intermediate staging buffers always use compute precision (ADR-026)
+        staging_dtype = plan.precision.compute_dtype
 
         offsets = rtp.initial_offset_list
         fan_in = rtp.fan_in
@@ -477,10 +478,10 @@ class CPUPlanRenderer:
             allocator.get_data_pointer(rtp.source_buffer),
             c_collection_p,
         )
-        c_plan.offset_lists_flat = ctypes.cast(
+        c_plan.offset_list_flat = ctypes.cast(
             offsets_array, ctypes.POINTER(ctypes.c_uint32)
         )
-        c_plan.stage_offsets_into_list = ctypes.cast(
+        c_plan.stage_list_offset = ctypes.cast(
             stage_offsets, ctypes.POINTER(ctypes.c_uint32)
         )
         c_plan.stage_fan_in = ctypes.cast(
@@ -489,9 +490,10 @@ class CPUPlanRenderer:
         c_plan.stage_node_counts = ctypes.cast(
             stage_node_counts, ctypes.POINTER(ctypes.c_uint32)
         )
-        c_plan.staging_buffer_0 = staging_0.ctypes.data_as(c_collection_p)
-        c_plan.staging_buffer_1 = staging_1.ctypes.data_as(c_collection_p)
-        c_plan.output = ctypes.cast(
+        # Intermediate staging buffers always use compute precision (ADR-026)
+        c_plan.intermediate_partial_0 = staging_0.ctypes.data_as(c_compute_p)
+        c_plan.intermediate_partial_1 = staging_1.ctypes.data_as(c_compute_p)
+        c_plan.summed_partial = ctypes.cast(
             allocator.get_data_pointer(rtp.destination_buffer),
             c_compute_p,
         )
@@ -592,14 +594,22 @@ class CPUPlanRenderer:
 
         return args
 
+    # CONTRACT.md §1.1 Canonical Abbreviations: plan-level names → struct field names
+    _CANONICAL_ABBREVIATIONS: dict[str, str] = {
+        "temperatures": "temps",
+        "probabilities": "probs",
+        "gradient": "grad",
+    }
+
     @staticmethod
     def _binding_to_field(binding_name: str) -> str:
         """Map a buffer binding name to its struct field name.
 
         CONTRACT.md naming: src_buffer_GLOBAL_<field_name> or
         dest_buffer_GLOBAL_<field_name> or update_buffer_GLOBAL_<field_name>.
-        Strip the prefix.
+        Strip the prefix, then apply canonical abbreviations (CONTRACT.md §1.1).
         """
+        field_name = binding_name
         for prefix in (
             "src_buffer_GLOBAL_",
             "dest_buffer_GLOBAL_",
@@ -607,8 +617,10 @@ class CPUPlanRenderer:
             "src_buffer_GLOBAL_CONST_",
         ):
             if binding_name.startswith(prefix):
-                return binding_name[len(prefix):]
-        return binding_name
+                field_name = binding_name[len(prefix):]
+                break
+        # Apply canonical abbreviations
+        return CPUPlanRenderer._CANONICAL_ABBREVIATIONS.get(field_name, field_name)
 
     @staticmethod
     def _param_to_field(param_name: str) -> str:
@@ -617,8 +629,9 @@ class CPUPlanRenderer:
         CONTRACT.md naming: src_scalar_NATURAL_<field_name> or
         src_scalar_REAL_<field_name> or src_scalar_FLAG_<field_name> or
         dest_scalar_NATURAL_<field_name>.
-        Strip the prefix.
+        Strip the prefix, then apply canonical abbreviations (CONTRACT.md §1.1).
         """
+        field_name = param_name
         for prefix in (
             "src_scalar_NATURAL_",
             "src_scalar_REAL_",
@@ -626,8 +639,10 @@ class CPUPlanRenderer:
             "dest_scalar_NATURAL_",
         ):
             if param_name.startswith(prefix):
-                return param_name[len(prefix):]
-        return param_name
+                field_name = param_name[len(prefix):]
+                break
+        # Apply canonical abbreviations
+        return CPUPlanRenderer._CANONICAL_ABBREVIATIONS.get(field_name, field_name)
 
     @staticmethod
     def _apply_strides(

@@ -14,6 +14,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
+# Mark all oracle tests as slow — they involve multi-step numerical validation
+pytestmark = pytest.mark.slow
+
 if TYPE_CHECKING:
     import torch
 else:

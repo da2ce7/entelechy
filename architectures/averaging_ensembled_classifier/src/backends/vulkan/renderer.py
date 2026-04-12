@@ -396,7 +396,11 @@ class VulkanPlanRenderer:
                 else:
                     raise KeyError(f"Unknown kernel {name}")
 
-            layout = self._descriptor_mgr.create_layout(binding_count)
+            # Reduction shaders use push descriptors when available
+            use_push_desc = name in _REDUCTION_SHADERS
+            layout = self._descriptor_mgr.create_layout(
+                binding_count, push_descriptor=use_push_desc
+            )
             self._descriptor_layouts[name] = layout
 
             push_struct = PUSH_CONSTANT_STRUCTS.get(name)
@@ -413,7 +417,8 @@ class VulkanPlanRenderer:
             )
             self._pipelines[name] = pipeline
 
-            # Pre-allocate descriptor set for fixed-binding kernels
+            # Pre-allocate descriptor set for fixed-binding kernels.
+            # Reduction shaders use push descriptors instead.
             if name not in _REDUCTION_SHADERS:
                 desc_set = self._descriptor_mgr.allocate_set(layout)
                 self._descriptor_sets[name] = desc_set
@@ -837,6 +842,12 @@ class VulkanPlanRenderer:
             # Get offset buffer for this stage
             offset_buf = self._allocator.get_buffer(offset_handles[stage])
 
+            # Bind pipeline FIRST, then descriptors (Vulkan command order requirement)
+            vk.vkCmdBindPipeline(
+                cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline,
+            )
+
             # Push descriptors: [src_collection, offset_list, dest]
             bindings = [
                 (0, current_src),
@@ -858,11 +869,6 @@ class VulkanPlanRenderer:
                     pipeline.layout,
                     0, 1, [tmp_set], 0, None,
                 )
-
-            vk.vkCmdBindPipeline(
-                cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-                pipeline.pipeline,
-            )
 
             # Get threshold for this stage (negative bypasses clip)
             threshold = -1.0  # Diagnostic mode by default
@@ -963,6 +969,12 @@ class VulkanPlanRenderer:
 
         offset_buf = self._allocator.get_buffer(offset_handle)
 
+        # Bind pipeline FIRST, then descriptors (Vulkan command order requirement)
+        vk.vkCmdBindPipeline(
+            cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.pipeline,
+        )
+
         # Push descriptors: [src, offset_list, dst]
         bindings = [
             (0, src_device_buf),
@@ -984,11 +996,6 @@ class VulkanPlanRenderer:
                 pipeline.layout,
                 0, 1, [tmp_set], 0, None,
             )
-
-        vk.vkCmdBindPipeline(
-            cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline.pipeline,
-        )
 
         # Push constants for aggregate
         params = {
@@ -1013,6 +1020,10 @@ class VulkanPlanRenderer:
         else:
             dispatch_x = (pw + simd_w - 1) // simd_w
         vk.vkCmdDispatch(cmd, dispatch_x, 1, 1)
+
+        # Barrier after aggregate dispatch to ensure writes complete before
+        # downstream nodes (retrieval) read the result
+        self._record_barrier(cmd)
 
     def _record_streaming_loop(
         self,

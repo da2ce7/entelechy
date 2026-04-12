@@ -74,11 +74,11 @@ class PaddingStrategy:
     target_dim_idx: int = -1
 
 
-def pad_to_multiple(dim: int, multiple: int) -> int:
+def pad_to_multiple(dim: int, multiple: int | None) -> int:
     """A pure, stateless utility to calculate the next highest multiple."""
-    # WHY: A defensive guard. If the padding multiple is zero, it would cause a
-    # division-by-zero error. This ensures the function is robust.
-    if multiple == 0:
+    # WHY: A defensive guard. If the padding multiple is zero or None, it would
+    # cause a division-by-zero error or TypeError. This ensures the function is robust.
+    if multiple is None or multiple == 0:
         return dim
     return (dim + multiple - 1) // multiple * multiple
 

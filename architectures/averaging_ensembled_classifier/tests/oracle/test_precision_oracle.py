@@ -24,6 +24,10 @@ Reference: doc_archive/Oracle.md §Option D: NumPy Precision Oracle
 """
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.slow
+
 from typing import TYPE_CHECKING, Any
 
 import numpy as np

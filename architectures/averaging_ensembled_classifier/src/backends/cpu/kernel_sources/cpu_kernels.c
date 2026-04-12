@@ -480,6 +480,32 @@
 #undef PRECISION_SUFFIX
 #pragma GCC diagnostic pop
 
+/* s8e4c64x32: E4M3 storage, FP64 compute, FP32 state */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-conversion"
+#define STORAGE_T        cpu_fp8_e4m3
+#define STORAGE_SUFFIX   fp8e4m3
+#define COMPUTE_T        double
+#define COMPUTE_SUFFIX   fp64
+#define STATE_T          float
+#define STATE_SUFFIX     fp32
+#define PRECISION_SUFFIX s8e4c64x32
+#include "cpu_precision.h"
+#include "phase_1_act.inc"
+#include "phase_2_learn_A_production.inc"
+#include "phase_2_learn_B_processing.inc"
+#include "phase_2_learn_C_reduction.inc"
+#include "phase_2_learn_D_backprop.inc"
+#include "phase_3_update.inc"
+#undef STORAGE_T
+#undef STORAGE_SUFFIX
+#undef COMPUTE_T
+#undef COMPUTE_SUFFIX
+#undef STATE_T
+#undef STATE_SUFFIX
+#undef PRECISION_SUFFIX
+#pragma GCC diagnostic pop
+
 /* ================================================================
  * FP8 E5M2 storage variants (ADR-025 §5.3)
  * ================================================================ */
@@ -550,6 +576,32 @@
 #define STATE_T          double
 #define STATE_SUFFIX     fp64
 #define PRECISION_SUFFIX s8e5c64x64
+#include "cpu_precision.h"
+#include "phase_1_act.inc"
+#include "phase_2_learn_A_production.inc"
+#include "phase_2_learn_B_processing.inc"
+#include "phase_2_learn_C_reduction.inc"
+#include "phase_2_learn_D_backprop.inc"
+#include "phase_3_update.inc"
+#undef STORAGE_T
+#undef STORAGE_SUFFIX
+#undef COMPUTE_T
+#undef COMPUTE_SUFFIX
+#undef STATE_T
+#undef STATE_SUFFIX
+#undef PRECISION_SUFFIX
+#pragma GCC diagnostic pop
+
+/* s8e5c64x32: E5M2 storage, FP64 compute, FP32 state */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-conversion"
+#define STORAGE_T        cpu_fp8_e5m2
+#define STORAGE_SUFFIX   fp8e5m2
+#define COMPUTE_T        double
+#define COMPUTE_SUFFIX   fp64
+#define STATE_T          float
+#define STATE_SUFFIX     fp32
+#define PRECISION_SUFFIX s8e5c64x32
 #include "cpu_precision.h"
 #include "phase_1_act.inc"
 #include "phase_2_learn_A_production.inc"
@@ -846,3 +898,10 @@
 uint get_simd_width(void) {
     return SIMD_WIDTH;
 }
+
+/* Enum constant getters — eliminates Python-side constant drift (ADR-015 §4.2) */
+uint get_problem_type_cce(void)      { return PROBLEM_TYPE_CCE; }
+uint get_problem_type_bce(void)      { return PROBLEM_TYPE_BCE; }
+uint get_agg_mode_sum(void)          { return AGG_MODE_SUM; }
+uint get_agg_mode_average(void)      { return AGG_MODE_AVERAGE; }
+uint get_sentinel_absent_partial(void) { return SENTINEL_ABSENT_PARTIAL; }

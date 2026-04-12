@@ -513,7 +513,7 @@ BUFFER_BINDING_ORDER: dict[str, tuple[str | None, ...]] = {
     # Node 17
     "backprop_shared_weights_chunk": (
         "input", "hidden_activations", "summed_grad_hidden_activations",
-        "sample_mask", "hidden_mask", "partial_grad_weights_shared",
+        "sample_mask", "hidden_mask", "partial_grad_weights_shared_simd_major",
     ),
     # Node 18
     "backprop_shared_biases_chunk": (
@@ -522,8 +522,8 @@ BUFFER_BINDING_ORDER: dict[str, tuple[str | None, ...]] = {
     ),
     # Node 19
     "clip_shared_gradients_chunk": (
-        "partial_grad_weights_shared", "partial_grad_biases_shared",
-        "clipped_partial_grad_weights_shared", "clipped_partial_grad_biases_shared",
+        "partial_grad_weights_shared_simd_major", "partial_grad_biases_shared",
+        "clipped_partial_grad_weights_shared_simd_major", "clipped_partial_grad_biases_shared",
     ),
     # Node 21 (all instances share this order)
     "normalize_gradients": (

@@ -44,7 +44,7 @@ class BackpropSharedWeightsBinding(KernelBinding):
             np.uint32(scalar_params["FLAG_use_explicit_hidden_mask"]),
             get_buffer(buffer_bindings["summed_grad_hidden_activations"]),
             get_buffer(buffer_bindings["sample_mask"]),
-            get_buffer(buffer_bindings["partial_grad_weights_shared"]),
+            get_buffer(buffer_bindings["partial_grad_weights_shared_simd_major"]),
             np.uint32(scalar_params["batch_chunk_offset"]),
             np.uint32(scalar_params["batch_chunk_count"]),
             np.uint32(scalar_params["batch_chunk_index"]),
@@ -119,9 +119,9 @@ class ClipSharedGradientsBinding(KernelBinding):
         local_mem_size = self._workgroup_size * element_size
         return [
             cl.LocalMemory(local_mem_size),
-            get_buffer(buffer_bindings["partial_grad_weights_shared"]),
+            get_buffer(buffer_bindings["partial_grad_weights_shared_simd_major"]),
             get_buffer(buffer_bindings["partial_grad_biases_shared"]),
-            get_buffer(buffer_bindings["clipped_partial_grad_weights_shared"]),
+            get_buffer(buffer_bindings["clipped_partial_grad_weights_shared_simd_major"]),
             get_buffer(buffer_bindings["clipped_partial_grad_biases_shared"]),
             compute_scalar(scalar_params["clipping_threshold_t_pre"], scalar_params),
             compute_scalar(scalar_params["epsilon"], scalar_params),

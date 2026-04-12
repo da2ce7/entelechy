@@ -66,11 +66,11 @@ def build_dispatch_table(
         ),
         # Learn phase C — reduction
         "gather_and_permute_grad_hidden_activations": (
-            _fn_ptr(lib, f"task_gather_permute_grad_h_{suffix}"),
+            _fn_ptr(lib, f"task_gather_permute_grad_hidden_activations_{suffix}"),
             s["GatherPermuteArgs"],
         ),
         "stabilize_and_reduce_grad_hidden_activations": (
-            _fn_ptr(lib, f"task_stabilize_reduce_grad_h_{suffix}"),
+            _fn_ptr(lib, f"task_stabilize_reduce_grad_hidden_activations_{suffix}"),
             s["StabilizeReduceArgs"],
         ),
         "clip_intermediate_grad": (

@@ -1,6 +1,6 @@
 # CPU Back-End: Architecture for SIMD + Multi-Core
 
-> **Implementation Status: ✅ Complete** — Phase 3 implemented; Phase 7 mixed-precision migration complete; Phase 9C FP8 CPU backend complete; Phase 10 state-precision accumulation complete. All components described in this document have been realized in `src/backends/cpu/` (10 Python modules + 1 generated module, 2 C source files, 7 C headers) with a full Tier 2 test suite (19 test modules in `tests/tier2/cpu/`). The Meson `shared_library('cpu_kernels', ...)` build target produces `libcpu_kernels.so` with up to 25 precision-variant instantiations via the three-axis `STORAGE_T`/`COMPUTE_T`/`STATE_T` macro system (ADR-023, ADR-025): 15 FP16/FP32/FP64 variants (unconditional), 6 FP8 E4M3/E5M2 variants with FP32/FP64 compute (unconditional), and 4 FP8 variants with FP16 compute (conditional on `_Float16` availability). See [PHASE-3A](plan/PHASE-3A-CPU-KERNEL-LIBRARY-AND-BUILD.md), [PHASE-3B](plan/PHASE-3B-CPU-FFI-AND-RENDERER.md), [PHASE-3C](plan/PHASE-3C-CPU-TIER2-TESTS.md) for base implementation, [PHASE-7C](plan/PHASE-7C-MIXED-PRECISION-CPU-VULKAN-AND-FINAL.md) for the precision migration, [PHASE-9C](plan/PHASE-9C-FP8-CPU-BACKEND.md) for FP8 support, and [PHASE-10](plan/PHASE-10-STATE-PRECISION-ACCUMULATION.md) for state-precision accumulation.
+> **Implementation Status: ✅ Complete** — Phase 3 implemented; Phase 7 mixed-precision migration complete; Phase 9C FP8 CPU backend complete; Phase 10 state-precision accumulation complete. All components described in this document have been realized in `src/backends/cpu/` (10 Python modules + 1 generated module, 2 C source files, 7 C headers) with a full Tier 2 test suite (21 test modules in `tests/tier2/cpu/`). The Meson `shared_library('cpu_kernels', ...)` build target produces `libcpu_kernels.so` with up to 32 precision-variant instantiations via the three-axis `STORAGE_T`/`COMPUTE_T`/`STATE_T` macro system (ADR-023, ADR-025): 5 FP32/FP64-storage variants (unconditional), 8 FP8 E4M3/E5M2 variants with FP32/FP64 compute (unconditional), and 9 FP16-storage variants plus 10 FP8 variants with FP16 compute/state (conditional on `_Float16` availability). See [PHASE-3A](plan/PHASE-3A-CPU-KERNEL-LIBRARY-AND-BUILD.md), [PHASE-3B](plan/PHASE-3B-CPU-FFI-AND-RENDERER.md), [PHASE-3C](plan/PHASE-3C-CPU-TIER2-TESTS.md) for base implementation, [PHASE-7C](plan/PHASE-7C-MIXED-PRECISION-CPU-VULKAN-AND-FINAL.md) for the precision migration, [PHASE-9C](plan/PHASE-9C-FP8-CPU-BACKEND.md) for FP8 support, and [PHASE-10](plan/PHASE-10-STATE-PRECISION-ACCUMULATION.md) for state-precision accumulation.
 
 ## Design Constraints
 
@@ -108,19 +108,19 @@ void execute_learn_phase(PipelineContext* ctx, ThreadPool* pool) {
 
     // Phase I: All tiles are independent — full parallelism
     // Each task processes one flat_tile_index
-    pool_dispatch_and_wait(pool, task_compute_module_grads,
+    pool_dispatch_and_wait(pool, task_calculate_module_param_grads_chunk,
                            ctx, ctx->total_tile_count);      // Node 8
-    pool_dispatch_and_wait(pool, task_backprop_to_hidden,
+    pool_dispatch_and_wait(pool, task_backprop_error_to_hidden_chunk,
                            ctx, ctx->total_tile_count);      // Node 9
-    pool_dispatch_and_wait(pool, task_compute_temp_grads,
+    pool_dispatch_and_wait(pool, task_calculate_chunk_temp_gradients,
                            ctx, ctx->total_tile_count);      // Node 10
-    pool_dispatch_and_wait(pool, task_clip_partial_grads,
+    pool_dispatch_and_wait(pool, task_clip_partial_gradients,
                            ctx, ctx->total_tile_count);      // Node 11
 
     // Node 13: Item Synchronization Barrier
     // (dispatches across output elements, reads all tiles)
     uint grad_h_elements = ctx->total_batch_count * ctx->padded_hidden_count;
-    pool_dispatch_and_wait(pool, task_gather_permute_grad_h,
+    pool_dispatch_and_wait(pool, task_gather_and_permute_grad_hidden_activations,
                            ctx, grad_h_elements);            // Node 13
 
     // Phase II: Reduction of module/temp grads
@@ -129,15 +129,15 @@ void execute_learn_phase(PipelineContext* ctx, ThreadPool* pool) {
     execute_reduction_tree(pool, ctx, GRAD_TEMPS);           // Node 15
 
     // Specialized Grad_H reduction — parallel across rows
-    pool_dispatch_and_wait(pool, task_stabilize_reduce_grad_h,
+    pool_dispatch_and_wait(pool, task_stabilize_and_reduce_grad_hidden_activations,
                            ctx, grad_h_elements);            // Node 16
 
     // Phase III: Streaming shared backprop — each chunk is a task
-    pool_dispatch_and_wait(pool, task_backprop_shared_weights,
+    pool_dispatch_and_wait(pool, task_backprop_shared_weights_chunk,
                            ctx, ctx->num_batch_chunks);      // Node 17
-    pool_dispatch_and_wait(pool, task_backprop_shared_biases,
+    pool_dispatch_and_wait(pool, task_backprop_shared_biases_chunk,
                            ctx, ctx->num_batch_chunks);      // Node 18
-    pool_dispatch_and_wait(pool, task_clip_shared_grads,
+    pool_dispatch_and_wait(pool, task_clip_shared_gradients_chunk,
                            ctx, ctx->num_batch_chunks);      // Node 19
 
     // Phase IV: Final reduction & normalize
@@ -447,24 +447,26 @@ void dispatch_forward_pass(ThreadPool* pool, ForwardPassArgs* args) {
 
 Not all kernels benefit equally from SIMD. The architecture's kernels fall into two categories:
 
-| Kernel                                  | Bottleneck              | SIMD Value   | Threading Value |
-| --------------------------------------- | ----------------------- | ------------ | --------------- |
-| `forward_pass` (Node 4)                 | Compute (matmul)        | **Critical** | **Critical**    |
-| `render_logits_chunk` (Node 5)          | Compute (matmul)        | **Critical** | **Critical**    |
-| `compute_probs_loss_cce` (Node 6)       | Mixed (exp, log)        | High         | High            |
-| `compute_probs_loss_bce` (Node 7)       | Mixed (sigmoid, log)    | High         | High            |
-| `calc_module_param_grads` (Node 8)      | Compute (outer product) | **Critical** | **Critical**    |
-| `backprop_error_to_hidden` (Node 9)     | Compute (matmul)        | **Critical** | **Critical**    |
-| `calc_temp_gradients` (Node 10)         | Mixed                   | Medium       | High            |
-| `clip_partial_gradients` (Node 11)      | Memory (norm scan)      | Medium       | High            |
-| `gather_and_permute` (Node 13)          | Memory (scatter/gather) | Low-Medium   | **Critical**    |
-| `aggregate_*` (Node 14/15/20)           | Memory (streaming sum)  | Medium       | Medium          |
-| `clip_intermediate_grad` (Node 15b/20b) | Memory (norm + scale)   | Medium       | Low-Medium      |
-| `stabilize_reduce_grad_h` (Node 16)     | Mixed                   | High         | High            |
-| `backprop_shared_weights` (Node 17)     | Compute (outer product) | **Critical** | **Critical**    |
-| `backprop_shared_biases` (Node 18)      | Memory (reduction)      | Medium       | High            |
-| `normalize_gradients` (Node 21)         | Memory (element-wise)   | Low          | High            |
-| `adam_update` (Node 24)                 | Memory (element-wise)   | Medium       | High            |
+| Kernel                                                    | Bottleneck              | SIMD Value   | Threading Value |
+| --------------------------------------------------------- | ----------------------- | ------------ | --------------- |
+| `forward_pass` (Node 4)                                   | Compute (matmul)        | **Critical** | **Critical**    |
+| `render_logits_chunk` (Node 5)                            | Compute (matmul)        | **Critical** | **Critical**    |
+| `compute_probs_loss_cce_chunk` (Node 6)                   | Mixed (exp, log)        | High         | High            |
+| `compute_probs_loss_bce_chunk` (Node 7)                   | Mixed (sigmoid, log)    | High         | High            |
+| `calculate_module_param_grads_chunk` (Node 8)             | Compute (outer product) | **Critical** | **Critical**    |
+| `backprop_error_to_hidden_chunk` (Node 9)                 | Compute (matmul)        | **Critical** | **Critical**    |
+| `calculate_chunk_temp_gradients` (Node 10)                | Mixed                   | Medium       | High            |
+| `clip_partial_gradients` (Node 11)                        | Memory (norm scan)      | Medium       | High            |
+| `gather_and_permute_grad_hidden_activations` (Node 13)    | Memory (scatter/gather) | Low-Medium   | **Critical**    |
+| `aggregate_register_reduce` / `aggregate_local_reduce` (Node 14/15a/20a) | Memory (streaming sum)  | Medium       | Medium          |
+| `clip_intermediate_grad` (Node 15b/20b)                   | Memory (norm + scale)   | Medium       | Low-Medium      |
+| `stabilize_and_reduce_grad_hidden_activations` (Node 16)  | Mixed                   | High         | High            |
+| `backprop_shared_weights_chunk` (Node 17)                 | Compute (outer product) | **Critical** | **Critical**    |
+| `backprop_shared_biases_chunk` (Node 18)                  | Memory (reduction)      | Medium       | High            |
+| `clip_shared_gradients_chunk` (Node 19)                   | Memory (norm + scale)   | Medium       | High            |
+| `normalize_gradients` (Node 21)                           | Memory (element-wise)   | Low          | High            |
+| `adam_update` (Node 24)                                   | Memory (element-wise)   | Medium       | High            |
+| `clamp_temperatures` (Node 25)                            | Memory (element-wise)   | Low          | High            |
 
 The matmul kernels (4, 5, 8, 9, 17) dominate runtime. These are where SIMD investment pays off most.
 
@@ -693,22 +695,30 @@ This is the correct baseline — AVX-512 has no FP8 instructions, so scalar-loop
 
 ### FP8 Precision Suffix Variants
 
-FP8 introduces 10 new three-axis suffix variants (ADR-025 §5.3):
+FP8 introduces 18 new three-axis suffix variants (ADR-025 §5.3):
 
 | Suffix | Storage | Compute | State | Condition |
 | :--- | :--- | :--- | :--- | :--- |
 | `s8e4c32x32` | E4M3 | FP32 | FP32 | Always |
 | `s8e4c32x64` | E4M3 | FP32 | FP64 | Always |
+| `s8e4c64x32` | E4M3 | FP64 | FP32 | Always |
 | `s8e4c64x64` | E4M3 | FP64 | FP64 | Always |
 | `s8e5c32x32` | E5M2 | FP32 | FP32 | Always |
 | `s8e5c32x64` | E5M2 | FP32 | FP64 | Always |
+| `s8e5c64x32` | E5M2 | FP64 | FP32 | Always |
 | `s8e5c64x64` | E5M2 | FP64 | FP64 | Always |
+| `s8e4c16x16` | E4M3 | FP16 | FP16 | `_Float16` available |
 | `s8e4c16x32` | E4M3 | FP16 | FP32 | `_Float16` available |
 | `s8e4c16x64` | E4M3 | FP16 | FP64 | `_Float16` available |
+| `s8e4c32x16` | E4M3 | FP32 | FP16 | `_Float16` available |
+| `s8e4c64x16` | E4M3 | FP64 | FP16 | `_Float16` available |
+| `s8e5c16x16` | E5M2 | FP16 | FP16 | `_Float16` available |
 | `s8e5c16x32` | E5M2 | FP16 | FP32 | `_Float16` available |
 | `s8e5c16x64` | E5M2 | FP16 | FP64 | `_Float16` available |
+| `s8e5c32x16` | E5M2 | FP32 | FP16 | `_Float16` available |
+| `s8e5c64x16` | E5M2 | FP64 | FP16 | `_Float16` available |
 
-The 6 FP32/FP64 compute variants are always compiled. The 4 FP16 compute variants are conditional on `_Float16` support (C23 / GCC 12+ / Clang 15+ with `-std=c2x`), detected at Meson configure time via `cc.compiles()`.
+The 8 FP32/FP64-only compute/state variants are always compiled. The 10 FP16 compute or state variants are conditional on `_Float16` support (C23 / GCC 12+ / Clang 15+ with `-std=c2x`), detected at Meson configure time via `cc.compiles()`.
 
 ### `_Float16` Availability
 
@@ -717,7 +727,7 @@ The 6 FP32/FP64 compute variants are always compiled. The 4 FP16 compute variant
 1. **Meson detects** `_Float16` support via `cc.compiles('_Float16 x = 1.0f16; x = x * 2.0f16;', args: ['-std=c2x'])`
 2. **C flag:** `-DHAS_FLOAT16=1` or `-DHAS_FLOAT16=0` passed to all kernel source compilation
 3. **Generated Python:** `_fp8_variants.py` (from `_fp8_variants.py.in`) exposes `HAS_FLOAT16: bool` and `AVAILABLE_FP8_VARIANTS: list[str]` to the Python FFI layer
-4. **Runtime:** `_ffi_types.py` imports `_fp8_variants` to conditionally include the 4 FP16 compute suffixes in `ALL_PRECISION_SUFFIXES`
+4. **Runtime:** `_ffi_types.py` imports `_fp8_variants` to conditionally include the FP16 compute/state suffixes in `ALL_PRECISION_SUFFIXES`
 
 **Cross-backend note:** A `PrecisionConfig` like `fp8_e4m3_f16()` (E4M3 storage, FP16 compute) may work on OpenCL/Vulkan but fail on CPU if the C compiler lacks `_Float16` support. The CPU backend gracefully omits these variants rather than failing at build time.
 
@@ -906,20 +916,24 @@ typedef struct {
 // Task Functions (called by thread pool)
 // ============================================================
 // Each takes (void* args, uint task_index, uint thread_id)
+//
+// Naming Convention: task_<kernel_name> where <kernel_name> is the
+// exact kernel name from kernels.cl.h. Each task function implements
+// the CPU-parallelized equivalent of the corresponding OpenCL kernel.
 
 void task_forward_pass(void* args, uint task_index, uint thread_id);
-void task_render_logits(void* args, uint task_index, uint thread_id);
-void task_cce_probs_loss(void* args, uint task_index, uint thread_id);
-void task_bce_probs_loss(void* args, uint task_index, uint thread_id);
-void task_module_param_grads(void* args, uint task_index, uint thread_id);
-void task_backprop_to_hidden(void* args, uint task_index, uint thread_id);
-void task_temp_gradients(void* args, uint task_index, uint thread_id);
-void task_clip_partial_grads(void* args, uint task_index, uint thread_id);
-void task_gather_permute_grad_h(void* args, uint task_index, uint thread_id);
-void task_stabilize_reduce_grad_h(void* args, uint task_index, uint thread_id);
-void task_backprop_shared_weights(void* args, uint task_index, uint thread_id);
-void task_backprop_shared_biases(void* args, uint task_index, uint thread_id);
-void task_clip_shared_grads(void* args, uint task_index, uint thread_id);
+void task_render_logits_chunk(void* args, uint task_index, uint thread_id);
+void task_compute_probs_loss_cce_chunk(void* args, uint task_index, uint thread_id);
+void task_compute_probs_loss_bce_chunk(void* args, uint task_index, uint thread_id);
+void task_calculate_module_param_grads_chunk(void* args, uint task_index, uint thread_id);
+void task_backprop_error_to_hidden_chunk(void* args, uint task_index, uint thread_id);
+void task_calculate_chunk_temp_gradients(void* args, uint task_index, uint thread_id);
+void task_clip_partial_gradients(void* args, uint task_index, uint thread_id);
+void task_gather_and_permute_grad_hidden_activations(void* args, uint task_index, uint thread_id);
+void task_stabilize_and_reduce_grad_hidden_activations(void* args, uint task_index, uint thread_id);
+void task_backprop_shared_weights_chunk(void* args, uint task_index, uint thread_id);
+void task_backprop_shared_biases_chunk(void* args, uint task_index, uint thread_id);
+void task_clip_shared_gradients_chunk(void* args, uint task_index, uint thread_id);
 void task_normalize_gradients(void* args, uint task_index, uint thread_id);
 void task_adam_update(void* args, uint task_index, uint thread_id);
 void task_clamp_temperatures(void* args, uint task_index, uint thread_id);
@@ -948,6 +962,53 @@ void execute_reduction_tree(ThreadPool* pool, ReductionTreePlan* plan);
 
 #endif // KERNELS_INTERFACE_CPU_H
 ```
+
+---
+
+## CPU-Specific Naming Conventions
+
+The CPU backend uses a formal naming convention that maintains direct correspondence with the kernel names defined in `kernels.cl.h`, while also introducing backend-specific constructs.
+
+### Task Function Naming
+
+Task functions follow the pattern `task_<kernel_name>` where `<kernel_name>` is the exact kernel name from `kernels.cl.h`. This naming convention ensures:
+
+1. **Traceability**: Each task function can be trivially mapped to its corresponding OpenCL kernel
+2. **Consistency**: Code review and debugging benefit from identical naming across backends
+3. **Documentation alignment**: References to kernel contracts in `kernels.cl.h` apply directly to their CPU task counterparts
+
+| OpenCL Kernel (`kernels.cl.h`)                  | CPU Task Function                                             |
+| ----------------------------------------------- | ------------------------------------------------------------- |
+| `forward_pass`                                  | `task_forward_pass`                                           |
+| `render_logits_chunk`                           | `task_render_logits_chunk`                                    |
+| `compute_probs_loss_cce_chunk`                  | `task_compute_probs_loss_cce_chunk`                           |
+| `compute_probs_loss_bce_chunk`                  | `task_compute_probs_loss_bce_chunk`                           |
+| `calculate_module_param_grads_chunk`            | `task_calculate_module_param_grads_chunk`                     |
+| `backprop_error_to_hidden_chunk`                | `task_backprop_error_to_hidden_chunk`                         |
+| `calculate_chunk_temp_gradients`                | `task_calculate_chunk_temp_gradients`                         |
+| `clip_partial_gradients`                        | `task_clip_partial_gradients`                                 |
+| `gather_and_permute_grad_hidden_activations`    | `task_gather_and_permute_grad_hidden_activations`             |
+| `stabilize_and_reduce_grad_hidden_activations`  | `task_stabilize_and_reduce_grad_hidden_activations`           |
+| `backprop_shared_weights_chunk`                 | `task_backprop_shared_weights_chunk`                          |
+| `backprop_shared_biases_chunk`                  | `task_backprop_shared_biases_chunk`                           |
+| `clip_shared_gradients_chunk`                   | `task_clip_shared_gradients_chunk`                            |
+| `normalize_gradients`                           | `task_normalize_gradients`                                    |
+| `adam_update`                                   | `task_adam_update`                                            |
+| `clamp_temperatures`                            | `task_clamp_temperatures`                                     |
+
+### CPU-Specific Primitives
+
+The following are backend-specific primitives without direct OpenCL kernel counterparts:
+
+| CPU-Specific Name           | Purpose                                                        | Replaces                                           |
+| --------------------------- | -------------------------------------------------------------- | -------------------------------------------------- |
+| `execute_reduction_tree`    | Multi-stage reduction with staged clipping (tree execution)   | `aggregate_*` + `clip_intermediate_grad` sequences |
+| `task_reduce_one_node`      | Per-node partial summation within a reduction stage            | Internal to `aggregate_register_reduce` / `aggregate_local_reduce` |
+| `task_clip_one_node`        | Per-node L2 clip within a reduction stage                      | Internal to `clip_intermediate_grad`               |
+| `pool_dispatch_and_wait`    | Thread pool dispatch primitive (synchronization barrier)       | `clEnqueueNDRangeKernel` + event wait              |
+| `ThreadPool` / `TaskBatch`  | Thread pool management structures                              | OpenCL command queue                               |
+
+**Design rationale**: The reduction engine kernels (`aggregate_register_reduce`, `aggregate_local_reduce`, `reduce_k_fan_in_and_clip`, etc.) operate on individual nodes in a reduction tree. On the CPU backend, the tree traversal is explicit via `execute_reduction_tree`, which dispatches `task_reduce_one_node` and `task_clip_one_node` across nodes at each stage. This refactoring exploits CPU threading semantics (barriers via function return) rather than emulating GPU work-group synchronization.
 
 ---
 

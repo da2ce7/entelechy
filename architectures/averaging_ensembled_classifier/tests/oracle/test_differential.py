@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+pytestmark = pytest.mark.slow
+
 if TYPE_CHECKING:
     import torch
 else:

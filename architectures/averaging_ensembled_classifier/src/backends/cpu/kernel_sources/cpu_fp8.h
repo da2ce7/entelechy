@@ -23,6 +23,10 @@
 typedef struct { uint8_t bits; } cpu_fp8_e4m3;
 typedef struct { uint8_t bits; } cpu_fp8_e5m2;
 
+/* Defense-in-depth (CONTRACT Article 1.4b): Buffer pointer arithmetic assumes sizeof == 1 */
+_Static_assert(sizeof(cpu_fp8_e4m3) == 1, "FP8 E4M3 wrapper must be 1 byte");
+_Static_assert(sizeof(cpu_fp8_e5m2) == 1, "FP8 E5M2 wrapper must be 1 byte");
+
 /* --- E4M3 Constants ---
  * sign(1) + exp(4) + mantissa(3), bias=7, max=448, no inf/nan
  */

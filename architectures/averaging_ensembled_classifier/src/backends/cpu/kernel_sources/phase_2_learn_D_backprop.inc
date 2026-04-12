@@ -6,6 +6,10 @@
  * Buffer role assignments (ADR-023 §2.5):
  *   - sample_mask, hidden_activations, input, partial_grad_*, clipped_partial_grad_* → storage
  *   - summed_grad_hidden_activations → compute (COMPUTE_T*)
+ *
+ * Argument naming convention (ADR-013):
+ *   Struct field accesses match exactly the full-form @param names defined in
+ *   kernels/kernels.cl.h.
  */
 
 /* ================================================================
@@ -15,61 +19,61 @@ void PREC_FN(task_backprop_shared_weights)(void* raw_args, uint task_index, uint
     (void)thread_id;
     PREC_TY(BackpropSharedWeightsArgs)* a = (PREC_TY(BackpropSharedWeightsArgs)*)raw_args;
 
-    const uint i_idx = task_index / a->padded_hidden_count;
-    const uint j_idx = task_index % a->padded_hidden_count;
+    const uint i_idx = task_index / a->src_scalar_NATURAL_padded_hidden_count;
+    const uint j_idx = task_index % a->src_scalar_NATURAL_padded_hidden_count;
 
-    if (i_idx >= a->padded_input_count || j_idx >= a->padded_hidden_count)
+    if (i_idx >= a->src_scalar_NATURAL_padded_input_count || j_idx >= a->src_scalar_NATURAL_padded_hidden_count)
         return;
 
     /* Padding Zero-Establishment (CONTRACT.md): The kernel is the sole
      * guarantor of zeros at padding positions. */
-    const bool is_padding = (i_idx >= a->input_count) || (j_idx >= a->hidden_count);
+    const bool is_padding = (i_idx >= a->src_scalar_NATURAL_input_count) || (j_idx >= a->src_scalar_NATURAL_hidden_count);
     if (is_padding) {
-        const size_t chunk_base = (size_t)a->batch_chunk_index
-            * a->padded_input_count * a->padded_hidden_count;
+        const size_t chunk_base = (size_t)a->src_scalar_NATURAL_batch_chunk_index
+            * a->src_scalar_NATURAL_padded_input_count * a->src_scalar_NATURAL_padded_hidden_count;
         const uint hb   = j_idx / SIMD_WIDTH;
         const uint lane = j_idx % SIMD_WIDTH;
         const size_t out_idx = chunk_base
-            + (size_t)hb * a->padded_input_count * SIMD_WIDTH
+            + (size_t)hb * a->src_scalar_NATURAL_padded_input_count * SIMD_WIDTH
             + (size_t)i_idx * SIMD_WIDTH + lane;
-        scalar_store_storage(a->partial_grad_weights_shared, out_idx, (COMPUTE_T)0.0);
+        scalar_store_storage(a->dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major, out_idx, (COMPUTE_T)0.0);
         return;
     }
 
     COMPUTE_T grad_sw = (COMPUTE_T)0.0;
-    for (uint b_local = 0; b_local < a->batch_chunk_count; b_local++) {
-        const uint b_global = a->batch_chunk_offset + b_local;
+    for (uint b_local = 0; b_local < a->src_scalar_NATURAL_batch_chunk_count; b_local++) {
+        const uint b_global = a->src_scalar_NATURAL_batch_chunk_offset + b_local;
 
-        if (!load_sample_mask(a->sample_mask, b_global))
+        if (!load_sample_mask(a->src_buffer_GLOBAL_sample_mask, b_global))
             continue;
 
-        const size_t h_off = (size_t)b_global * a->padded_hidden_count + j_idx;
-        const COMPUTE_T grad_h    = a->summed_grad_hidden_activations[h_off];  /* COMPUTE_T* compute */
-        const COMPUTE_T hidden_val = (COMPUTE_T)scalar_load_storage(a->hidden_activations, h_off);
+        const size_t h_off = (size_t)b_global * a->src_scalar_NATURAL_padded_hidden_count + j_idx;
+        const COMPUTE_T grad_h    = a->src_buffer_GLOBAL_summed_grad_hidden_activations[h_off];  /* COMPUTE_T* compute */
+        const COMPUTE_T hidden_val = (COMPUTE_T)scalar_load_storage(a->src_buffer_GLOBAL_hidden_activations, h_off);
 
         COMPUTE_T d_act;
-        if (a->FLAG_use_explicit_hidden_mask) {
-            d_act = (COMPUTE_T)scalar_load_storage(a->hidden_mask, h_off);
+        if (a->src_scalar_FLAG_use_explicit_hidden_mask) {
+            d_act = (COMPUTE_T)scalar_load_storage(a->src_buffer_GLOBAL_hidden_mask, h_off);
         } else {
             d_act = (hidden_val > (COMPUTE_T)0.0) ? (COMPUTE_T)1.0 : (COMPUTE_T)0.0;
         }
         const COMPUTE_T dL_dZ = grad_h * d_act;
 
-        const COMPUTE_T input_val = (COMPUTE_T)scalar_load_storage(a->input,
-            (size_t)b_global * a->padded_input_count + i_idx);
+        const COMPUTE_T input_val = (COMPUTE_T)scalar_load_storage(a->src_buffer_GLOBAL_input,
+            (size_t)b_global * a->src_scalar_NATURAL_padded_input_count + i_idx);
         grad_sw += dL_dZ * input_val;
     }
 
-    const size_t chunk_base = (size_t)a->batch_chunk_index
-        * a->padded_input_count * a->padded_hidden_count;
+    const size_t chunk_base = (size_t)a->src_scalar_NATURAL_batch_chunk_index
+        * a->src_scalar_NATURAL_padded_input_count * a->src_scalar_NATURAL_padded_hidden_count;
     /* SIMD-major layout: [h_block][input][SIMD_WIDTH] matches
      * forward_pass weight addressing so Adam updates the correct element. */
     const uint hb   = j_idx / SIMD_WIDTH;
     const uint lane  = j_idx % SIMD_WIDTH;
     const size_t out_idx = chunk_base
-        + (size_t)hb * a->padded_input_count * SIMD_WIDTH
+        + (size_t)hb * a->src_scalar_NATURAL_padded_input_count * SIMD_WIDTH
         + (size_t)i_idx * SIMD_WIDTH + lane;
-    scalar_store_storage(a->partial_grad_weights_shared, out_idx, grad_sw);
+    scalar_store_storage(a->dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major, out_idx, grad_sw);
 }
 
 /* ================================================================
@@ -80,39 +84,39 @@ void PREC_FN(task_backprop_shared_biases)(void* raw_args, uint task_index, uint 
     PREC_TY(BackpropSharedBiasesArgs)* a = (PREC_TY(BackpropSharedBiasesArgs)*)raw_args;
 
     const uint j_idx = task_index;
-    if (j_idx >= a->padded_hidden_count)
+    if (j_idx >= a->src_scalar_NATURAL_padded_hidden_count)
         return;
 
     /* Padding Zero-Establishment (CONTRACT.md): The kernel is the sole
      * guarantor of zeros at padding positions. */
-    if (j_idx >= a->hidden_count) {
-        const size_t chunk_base = (size_t)a->batch_chunk_index * a->padded_hidden_count;
-        scalar_store_storage(a->partial_grad_biases_shared, chunk_base + j_idx, (COMPUTE_T)0.0);
+    if (j_idx >= a->src_scalar_NATURAL_hidden_count) {
+        const size_t chunk_base = (size_t)a->src_scalar_NATURAL_batch_chunk_index * a->src_scalar_NATURAL_padded_hidden_count;
+        scalar_store_storage(a->dest_buffer_GLOBAL_partial_grad_biases_shared, chunk_base + j_idx, (COMPUTE_T)0.0);
         return;
     }
 
     COMPUTE_T grad_sb = (COMPUTE_T)0.0;
-    for (uint b_local = 0; b_local < a->batch_chunk_count; b_local++) {
-        const uint b_global = a->batch_chunk_offset + b_local;
+    for (uint b_local = 0; b_local < a->src_scalar_NATURAL_batch_chunk_count; b_local++) {
+        const uint b_global = a->src_scalar_NATURAL_batch_chunk_offset + b_local;
 
-        if (!load_sample_mask(a->sample_mask, b_global))
+        if (!load_sample_mask(a->src_buffer_GLOBAL_sample_mask, b_global))
             continue;
 
-        const size_t h_off = (size_t)b_global * a->padded_hidden_count + j_idx;
-        const COMPUTE_T grad_h    = a->summed_grad_hidden_activations[h_off];  /* COMPUTE_T* compute */
-        const COMPUTE_T hidden_val = (COMPUTE_T)scalar_load_storage(a->hidden_activations, h_off);
+        const size_t h_off = (size_t)b_global * a->src_scalar_NATURAL_padded_hidden_count + j_idx;
+        const COMPUTE_T grad_h    = a->src_buffer_GLOBAL_summed_grad_hidden_activations[h_off];  /* COMPUTE_T* compute */
+        const COMPUTE_T hidden_val = (COMPUTE_T)scalar_load_storage(a->src_buffer_GLOBAL_hidden_activations, h_off);
 
         COMPUTE_T d_act;
-        if (a->FLAG_use_explicit_hidden_mask) {
-            d_act = (COMPUTE_T)scalar_load_storage(a->hidden_mask, h_off);
+        if (a->src_scalar_FLAG_use_explicit_hidden_mask) {
+            d_act = (COMPUTE_T)scalar_load_storage(a->src_buffer_GLOBAL_hidden_mask, h_off);
         } else {
             d_act = (hidden_val > (COMPUTE_T)0.0) ? (COMPUTE_T)1.0 : (COMPUTE_T)0.0;
         }
         grad_sb += grad_h * d_act;
     }
 
-    const size_t chunk_base = (size_t)a->batch_chunk_index * a->padded_hidden_count;
-    scalar_store_storage(a->partial_grad_biases_shared, chunk_base + j_idx, grad_sb);
+    const size_t chunk_base = (size_t)a->src_scalar_NATURAL_batch_chunk_index * a->src_scalar_NATURAL_padded_hidden_count;
+    scalar_store_storage(a->dest_buffer_GLOBAL_partial_grad_biases_shared, chunk_base + j_idx, grad_sb);
 }
 
 /* ================================================================
@@ -123,34 +127,34 @@ void PREC_FN(task_clip_shared_grads)(void* raw_args, uint task_index, uint threa
     (void)task_index;
     PREC_TY(ClipSharedGradsArgs)* a = (PREC_TY(ClipSharedGradsArgs)*)raw_args;
 
-    const uint n_w = a->weights_parameter_count;
-    const uint n_b = a->biases_parameter_count;
+    const uint n_w = a->src_scalar_NATURAL_weights_parameter_count;
+    const uint n_b = a->src_scalar_NATURAL_biases_parameter_count;
 
     COMPUTE_T sum_sq = (COMPUTE_T)0.0;
     for (uint i = 0; i < n_w; i++) {
-        COMPUTE_T v = scalar_load_storage(a->partial_grad_weights_shared, i);
+        COMPUTE_T v = scalar_load_storage(a->src_buffer_GLOBAL_partial_grad_weights_shared_simd_major, i);
         sum_sq += v * v;
     }
     for (uint i = 0; i < n_b; i++) {
-        COMPUTE_T v = scalar_load_storage(a->partial_grad_biases_shared, i);
+        COMPUTE_T v = scalar_load_storage(a->src_buffer_GLOBAL_partial_grad_biases_shared, i);
         sum_sq += v * v;
     }
 
     COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
     COMPUTE_T scale = (COMPUTE_T)1.0;
     /* Diagnostic bypass: negative threshold skips all clipping */
-    if (a->clipping_threshold_t_pre >= (COMPUTE_T)0.0 && norm > (COMPUTE_T)a->clipping_threshold_t_pre) {
-        scale = (COMPUTE_T)a->clipping_threshold_t_pre / (norm + (COMPUTE_T)a->epsilon);
+    if (a->src_scalar_REAL_clipping_threshold_t_pre >= (COMPUTE_T)0.0 && norm > (COMPUTE_T)a->src_scalar_REAL_clipping_threshold_t_pre) {
+        scale = (COMPUTE_T)a->src_scalar_REAL_clipping_threshold_t_pre / (norm + (COMPUTE_T)a->src_scalar_REAL_epsilon);
     }
 
     for (uint i = 0; i < n_w; i++) {
-        COMPUTE_T v = scalar_load_storage(a->partial_grad_weights_shared, i);
-        scalar_store_storage(a->clipped_partial_grad_weights_shared,
-            a->weights_write_offset_elements + i, v * scale);
+        COMPUTE_T v = scalar_load_storage(a->src_buffer_GLOBAL_partial_grad_weights_shared_simd_major, i);
+        scalar_store_storage(a->dest_buffer_GLOBAL_clipped_partial_grad_weights_shared_simd_major,
+            a->dest_scalar_NATURAL_weights_write_offset + i, v * scale);
     }
     for (uint i = 0; i < n_b; i++) {
-        COMPUTE_T v = scalar_load_storage(a->partial_grad_biases_shared, i);
-        scalar_store_storage(a->clipped_partial_grad_biases_shared,
-            a->biases_write_offset_elements + i, v * scale);
+        COMPUTE_T v = scalar_load_storage(a->src_buffer_GLOBAL_partial_grad_biases_shared, i);
+        scalar_store_storage(a->dest_buffer_GLOBAL_clipped_partial_grad_biases_shared,
+            a->dest_scalar_NATURAL_biases_write_offset + i, v * scale);
     }
 }

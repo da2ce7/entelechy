@@ -7,6 +7,10 @@
  * Buffer role assignments (ADR-023 §2.5):
  *   - summed_grad, final_grad → compute (COMPUTE_T*)
  *   - parameters, m1, m2, temperatures → state
+ *
+ * Argument naming convention (ADR-013):
+ *   Struct field accesses match exactly the full-form @param names defined in
+ *   kernels/kernels.cl.h.
  */
 
 /* ================================================================
@@ -16,11 +20,11 @@ void PREC_FN(task_normalize_gradients)(void* raw_args, uint task_index, uint thr
     (void)thread_id;
     PREC_TY(NormalizeGradientsArgs)* a = (PREC_TY(NormalizeGradientsArgs)*)raw_args;
 
-    if (task_index >= a->parameter_count)
+    if (task_index >= a->src_scalar_NATURAL_parameter_count)
         return;
 
-    const COMPUTE_T normalizer = (COMPUTE_T)1.0 / (a->effective_batch_size + a->epsilon);
-    a->final_grad[task_index] = a->summed_grad[task_index] * normalizer;
+    const COMPUTE_T normalizer = (COMPUTE_T)1.0 / (a->src_scalar_REAL_effective_batch_size + a->src_scalar_REAL_epsilon);
+    a->dest_buffer_GLOBAL_final_grad[task_index] = a->src_buffer_GLOBAL_summed_grad[task_index] * normalizer;
 }
 
 /* ================================================================
@@ -38,23 +42,23 @@ void PREC_FN(task_adam_update)(void* raw_args, uint task_index, uint thread_id) 
     (void)thread_id;
     PREC_TY(AdamUpdateArgs)* a = (PREC_TY(AdamUpdateArgs)*)raw_args;
 
-    if (task_index >= a->parameter_count)
+    if (task_index >= a->src_scalar_NATURAL_parameter_count)
         return;
 
     /* ADR-030: Compute the actual index into state-role buffers */
-    const uint state_idx = a->parameter_offset + task_index;
+    const uint state_idx = a->src_scalar_NATURAL_parameter_offset + task_index;
 
     /* Load gradient in COMPUTE_T (precision role: compute) — zero-indexed per-dispatch */
-    const COMPUTE_T g = a->final_grad[task_index];
+    const COMPUTE_T g = a->src_buffer_GLOBAL_final_grad[task_index];
 
     /* State-Precision Accumulation: load moments at full state precision */
-    const ACCUM_T m_prev = scalar_load_state_for_accum(a->m1, state_idx);
-    const ACCUM_T v_prev = scalar_load_state_for_accum(a->m2, state_idx);
+    const ACCUM_T m_prev = scalar_load_state_for_accum(a->update_buffer_GLOBAL_m1, state_idx);
+    const ACCUM_T v_prev = scalar_load_state_for_accum(a->update_buffer_GLOBAL_m2, state_idx);
 
     /* EMA updates in ACCUM_T (preserves state precision) */
     const ACCUM_T g_accum     = scalar_widen_to_accum(g);
-    const ACCUM_T beta1_accum = scalar_widen_to_accum(a->beta1);
-    const ACCUM_T beta2_accum = scalar_widen_to_accum(a->beta2);
+    const ACCUM_T beta1_accum = scalar_widen_to_accum(a->src_scalar_REAL_beta1);
+    const ACCUM_T beta2_accum = scalar_widen_to_accum(a->src_scalar_REAL_beta2);
 
     /* First moment: m_new = β₁ · m_prev + (1 - β₁) · g */
     const ACCUM_T m_new = beta1_accum * m_prev +
@@ -65,21 +69,21 @@ void PREC_FN(task_adam_update)(void* raw_args, uint task_index, uint thread_id) 
                           ((ACCUM_T)1.0 - beta2_accum) * (g_accum * g_accum);
 
     /* Store updated moments at state precision */
-    scalar_store_state_from_accum(a->m1, state_idx, m_new);
-    scalar_store_state_from_accum(a->m2, state_idx, v_new);
+    scalar_store_state_from_accum(a->update_buffer_GLOBAL_m1, state_idx, m_new);
+    scalar_store_state_from_accum(a->update_buffer_GLOBAL_m2, state_idx, v_new);
 
     /* Bias correction in COMPUTE_T (transformative) */
     const COMPUTE_T m_hat = scalar_narrow_from_accum(m_new) /
-                            ((COMPUTE_T)1.0 - a->beta1_pow_t);
+                            ((COMPUTE_T)1.0 - a->src_scalar_REAL_beta1_pow_t);
     const COMPUTE_T v_hat = scalar_narrow_from_accum(v_new) /
-                            ((COMPUTE_T)1.0 - a->beta2_pow_t);
+                            ((COMPUTE_T)1.0 - a->src_scalar_REAL_beta2_pow_t);
 
     /* Parameter update: delta in COMPUTE_T, subtraction in ACCUM_T (accumulative) */
-    const COMPUTE_T update = a->learning_rate * m_hat
-        / (COMPUTE_SQRT(v_hat) + a->epsilon);
+    const COMPUTE_T update = a->src_scalar_REAL_learning_rate * m_hat
+        / (COMPUTE_SQRT(v_hat) + a->src_scalar_REAL_epsilon);
 
-    const ACCUM_T param_val = scalar_load_state_for_accum(a->parameters, state_idx);
-    scalar_store_state_from_accum(a->parameters, state_idx,
+    const ACCUM_T param_val = scalar_load_state_for_accum(a->update_buffer_GLOBAL_parameters, state_idx);
+    scalar_store_state_from_accum(a->update_buffer_GLOBAL_parameters, state_idx,
                                   param_val - scalar_widen_to_accum(update));
 }
 
@@ -92,16 +96,16 @@ void PREC_FN(task_clamp_temperatures)(void* raw_args, uint task_index, uint thre
     (void)thread_id;
     PREC_TY(ClampTemperaturesArgs)* a = (PREC_TY(ClampTemperaturesArgs)*)raw_args;
 
-    if (task_index >= a->parameter_count)
+    if (task_index >= a->src_scalar_NATURAL_parameter_count)
         return;
 
     /* ADR-030: Compute the actual index into the state buffer */
-    const uint state_idx = a->parameter_offset + task_index;
+    const uint state_idx = a->src_scalar_NATURAL_parameter_offset + task_index;
 
-    COMPUTE_T val = scalar_load_state(a->temperatures, state_idx);
-    if (val < a->min_value) val = a->min_value;
-    if (val > a->max_value) val = a->max_value;
-    scalar_store_state(a->temperatures, state_idx, val);
+    COMPUTE_T val = scalar_load_state(a->update_buffer_GLOBAL_temps, state_idx);
+    if (val < a->src_scalar_REAL_min_value) val = a->src_scalar_REAL_min_value;
+    if (val > a->src_scalar_REAL_max_value) val = a->src_scalar_REAL_max_value;
+    scalar_store_state(a->update_buffer_GLOBAL_temps, state_idx, val);
 }
 
 /* ================================================================
@@ -116,7 +120,7 @@ size_t PREC_FN(get_struct_size_backprop_to_hidden_args)(void)    { return sizeof
 size_t PREC_FN(get_struct_size_temp_gradients_args)(void)        { return sizeof(PREC_TY(TempGradientsArgs)); }
 size_t PREC_FN(get_struct_size_clip_partials_args)(void)         { return sizeof(PREC_TY(ClipPartialsArgs)); }
 size_t PREC_FN(get_struct_size_gather_permute_args)(void)        { return sizeof(PREC_TY(GatherPermuteArgs)); }
-size_t PREC_FN(get_struct_size_reduction_tree_plan)(void)        { return sizeof(PREC_TY(ReductionTreePlanC)); }
+size_t PREC_FN(get_struct_size_reduction_tree_plan_storage_entry)(void)  { return sizeof(PREC_TY(ReductionTreePlanStorageEntry)); }
 size_t PREC_FN(get_struct_size_reduction_tree_plan_compute_entry)(void) { return sizeof(PREC_TY(ReductionTreePlanComputeEntry)); }
 size_t PREC_FN(get_struct_size_stabilize_reduce_args)(void)      { return sizeof(PREC_TY(StabilizeReduceArgs)); }
 size_t PREC_FN(get_struct_size_clip_intermediate_args)(void)     { return sizeof(PREC_TY(ClipIntermediateArgs)); }

@@ -302,7 +302,7 @@ class _SingleKernelPlanBuilder:
         # Learn Phase III — streaming backprop
         "backprop_shared_weights_chunk": (
             "_learn_cce", "backprop_shared_weights",
-            "partial_grad_weights_shared",
+            "partial_grad_weights_shared_simd_major",
         ),
         "backprop_shared_biases_chunk": (
             "_learn_cce", "backprop_shared_biases",
@@ -310,7 +310,7 @@ class _SingleKernelPlanBuilder:
         ),
         "clip_shared_gradients_chunk": (
             "_learn_cce", "clip_shared_grads",
-            "clipped_partial_grad_weights_shared",
+            "clipped_partial_grad_weights_shared_simd_major",
         ),
         # Learn Phase IV — normalization
         "normalize_gradients": (

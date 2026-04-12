@@ -6,6 +6,10 @@
  * Buffer role assignments (ADR-023 §2.5):
  *   - input, sample_mask, hidden_activations, hidden_mask, logits → storage
  *   - weights_*, biases_* → state
+ *
+ * Argument naming convention (ADR-013):
+ *   Struct field accesses match exactly the full-form @param names defined in
+ *   kernels/kernels.cl.h.
  */
 
 /* ================================================================
@@ -18,26 +22,26 @@ void PREC_FN(task_forward_pass)(void* raw_args, uint task_index, uint thread_id)
     (void)thread_id;
     PREC_TY(ForwardPassArgs)* a = (PREC_TY(ForwardPassArgs)*)raw_args;
 
-    if (task_index >= a->batch_chunk_count) return;
+    if (task_index >= a->src_scalar_NATURAL_batch_chunk_count) return;
 
-    const uint sample = a->batch_chunk_offset + task_index;
-    const uint mask_val = (uint)load_sample_mask(a->sample_mask, sample);
+    const uint sample = a->src_scalar_NATURAL_batch_chunk_offset + task_index;
+    const uint mask_val = (uint)load_sample_mask(a->src_buffer_GLOBAL_sample_mask, sample);
 
-    STORAGE_T* hidden_row     = a->hidden_activations + (size_t)sample * a->padded_hidden_count;
-    STORAGE_T* hidden_msk_row = a->hidden_mask + (size_t)sample * a->padded_hidden_count;
+    STORAGE_T* hidden_row     = a->dest_buffer_GLOBAL_hidden_activations + (size_t)sample * a->src_scalar_NATURAL_padded_hidden_count;
+    STORAGE_T* hidden_msk_row = a->dest_buffer_GLOBAL_hidden_mask + (size_t)sample * a->src_scalar_NATURAL_padded_hidden_count;
 
     /* Padded samples: zero out and return */
     if (!mask_val) {
-        memset(hidden_row, 0, a->padded_hidden_count * PREC_SIZEOF_STORAGE);
-        if (a->FLAG_produce_hidden_mask) {
-            memset(hidden_msk_row, 0, a->padded_hidden_count * PREC_SIZEOF_STORAGE);
+        memset(hidden_row, 0, a->src_scalar_NATURAL_padded_hidden_count * PREC_SIZEOF_STORAGE);
+        if (a->dest_scalar_FLAG_produce_hidden_mask) {
+            memset(hidden_msk_row, 0, a->src_scalar_NATURAL_padded_hidden_count * PREC_SIZEOF_STORAGE);
         }
         return;
     }
 
-    const STORAGE_T* input_row = a->input + (size_t)sample * a->padded_input_count;
-    const uint padded_input  = a->padded_input_count;
-    const uint padded_hidden = a->padded_hidden_count;
+    const STORAGE_T* input_row = a->src_buffer_GLOBAL_input + (size_t)sample * a->src_scalar_NATURAL_padded_input_count;
+    const uint padded_input  = a->src_scalar_NATURAL_padded_input_count;
+    const uint padded_hidden = a->src_scalar_NATURAL_padded_hidden_count;
     const uint num_h_blocks  = padded_hidden / SIMD_WIDTH;
 
     const simd_float v_zero = simd_zero();
@@ -47,11 +51,11 @@ void PREC_FN(task_forward_pass)(void* raw_args, uint task_index, uint thread_id)
         const uint h_offset = hb * SIMD_WIDTH;
 
         /* Initialize with bias (state-role buffer) */
-        simd_float accum = simd_load_state(&a->biases_shared[h_offset]);
+        simd_float accum = simd_load_state(&a->src_buffer_GLOBAL_CONST_biases_shared[h_offset]);
 
         /* Weight pointer for this h_block (state-role buffer):
          * weights_simd_major[hb * padded_input * SIMD_WIDTH + i * SIMD_WIDTH] */
-        const STATE_T* w_block = a->weights_shared_simd_major
+        const STATE_T* w_block = a->src_buffer_GLOBAL_CONST_weights_shared_simd_major
                                + (size_t)hb * padded_input * SIMD_WIDTH;
 
         /* Dot product across all input dimensions */
@@ -71,7 +75,7 @@ void PREC_FN(task_forward_pass)(void* raw_args, uint task_index, uint thread_id)
         simd_store_storage(&hidden_row[h_offset], activated);
 
         /* Hidden mask: 1.0 where pre-ReLU > 0 AND sample is valid */
-        if (a->FLAG_produce_hidden_mask) {
+        if (a->dest_scalar_FLAG_produce_hidden_mask) {
             simd_float relu_mask = simd_select(v_zero, v_mask, accum);
             simd_store_storage(&hidden_msk_row[h_offset], relu_mask);
         }
@@ -92,55 +96,55 @@ void PREC_FN(task_render_logits)(void* raw_args, uint task_index, uint thread_id
      * task_index = module_local * (batch_chunk_count * class_chunk_count)
      *            + batch_local * class_chunk_count
      *            + class_local */
-    const uint mc_bc = a->batch_chunk_count * a->class_chunk_count;
+    const uint mc_bc = a->src_scalar_NATURAL_batch_chunk_count * a->src_scalar_NATURAL_class_chunk_count;
     const uint module_local_idx = task_index / mc_bc;
     const uint remainder        = task_index % mc_bc;
-    const uint batch_local_idx  = remainder / a->class_chunk_count;
-    const uint class_local_idx  = remainder % a->class_chunk_count;
+    const uint batch_local_idx  = remainder / a->src_scalar_NATURAL_class_chunk_count;
+    const uint class_local_idx  = remainder % a->src_scalar_NATURAL_class_chunk_count;
 
-    if (module_local_idx >= a->module_chunk_count ||
-        batch_local_idx  >= a->batch_chunk_count ||
-        class_local_idx  >= a->class_chunk_count)
+    if (module_local_idx >= a->src_scalar_NATURAL_module_chunk_count ||
+        batch_local_idx  >= a->src_scalar_NATURAL_batch_chunk_count ||
+        class_local_idx  >= a->src_scalar_NATURAL_class_chunk_count)
         return;
 
-    const uint module_global = a->module_chunk_offset + module_local_idx;
-    const uint batch_global  = a->batch_chunk_offset + batch_local_idx;
-    const uint class_global  = a->class_chunk_offset + class_local_idx;
+    const uint module_global = a->src_scalar_NATURAL_module_chunk_offset + module_local_idx;
+    const uint batch_global  = a->src_scalar_NATURAL_batch_chunk_offset + batch_local_idx;
+    const uint class_global  = a->src_scalar_NATURAL_class_chunk_offset + class_local_idx;
 
     /* Output address (storage-role buffer) */
-    const size_t out_idx = (size_t)module_global * a->total_batch_count
-                              * a->padded_total_output_class_count
-                         + (size_t)batch_global * a->padded_total_output_class_count
+    const size_t out_idx = (size_t)module_global * a->src_scalar_NATURAL_total_batch_count
+                              * a->src_scalar_NATURAL_padded_total_output_class_count
+                         + (size_t)batch_global * a->src_scalar_NATURAL_padded_total_output_class_count
                          + class_global;
 
     /* Sample mask check (ADR-031) — skip invalid/padded samples */
-    if (!load_sample_mask(a->sample_mask, batch_global)) {
-        scalar_store_storage(a->logits, out_idx, (COMPUTE_T)0);
+    if (!load_sample_mask(a->src_buffer_GLOBAL_sample_mask, batch_global)) {
+        scalar_store_storage(a->dest_buffer_GLOBAL_logits, out_idx, (COMPUTE_T)0);
         return;
     }
 
     /* Initialize with bias (state-role buffer) */
-    COMPUTE_T logit = scalar_load_state(a->biases_module,
-                      (size_t)module_global * a->padded_total_output_class_count + class_global);
+    COMPUTE_T logit = scalar_load_state(a->src_buffer_GLOBAL_CONST_biases_module,
+                      (size_t)module_global * a->src_scalar_NATURAL_padded_total_output_class_count + class_global);
 
     /* Sparse dot product over hidden dimension */
-    const size_t h_base = (size_t)batch_global * a->padded_hidden_count;
-    for (uint h = 0; h < a->hidden_count; h++) {
-        const COMPUTE_T h_val = (COMPUTE_T)scalar_load_storage(a->hidden_activations, h_base + h);
+    const size_t h_base = (size_t)batch_global * a->src_scalar_NATURAL_padded_hidden_count;
+    for (uint h = 0; h < a->src_scalar_NATURAL_hidden_count; h++) {
+        const COMPUTE_T h_val = (COMPUTE_T)scalar_load_storage(a->src_buffer_GLOBAL_hidden_activations, h_base + h);
         COMPUTE_T h_mask;
-        if (a->FLAG_use_explicit_hidden_mask) {
-            h_mask = (COMPUTE_T)scalar_load_storage(a->hidden_mask, h_base + h);
+        if (a->src_scalar_FLAG_use_explicit_hidden_mask) {
+            h_mask = (COMPUTE_T)scalar_load_storage(a->src_buffer_GLOBAL_hidden_mask, h_base + h);
         } else {
             h_mask = h_val > (COMPUTE_T)0 ? (COMPUTE_T)1 : (COMPUTE_T)0;
         }
         if (h_mask > (COMPUTE_T)0.5) {
-            const size_t w_idx = (size_t)module_global * a->padded_hidden_count
-                                   * a->padded_total_output_class_count
-                               + (size_t)h * a->padded_total_output_class_count
+            const size_t w_idx = (size_t)module_global * a->src_scalar_NATURAL_padded_hidden_count
+                                   * a->src_scalar_NATURAL_padded_total_output_class_count
+                               + (size_t)h * a->src_scalar_NATURAL_padded_total_output_class_count
                                + class_global;
-            logit += h_val * (COMPUTE_T)scalar_load_state(a->weights_module, w_idx);
+            logit += h_val * (COMPUTE_T)scalar_load_state(a->src_buffer_GLOBAL_CONST_weights_module, w_idx);
         }
     }
 
-    scalar_store_storage(a->logits, out_idx, logit);
+    scalar_store_storage(a->dest_buffer_GLOBAL_logits, out_idx, logit);
 }

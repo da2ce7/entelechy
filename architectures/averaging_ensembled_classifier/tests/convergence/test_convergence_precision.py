@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.slow
+
 from src.shared.optimizer_config import OptimizerConfig
 from src.shared.precision_config import PrecisionConfig
 

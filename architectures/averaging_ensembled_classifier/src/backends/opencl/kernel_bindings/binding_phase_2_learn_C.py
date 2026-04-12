@@ -213,7 +213,9 @@ class StabilizeReduceGradHBinding(KernelBinding):
             # Schedule values must match COMPUTE_TYPE precision
             compute_dtype = scalar_params.get("_compute_dtype", np.float32)
             schedule_np = np.array(schedule, dtype=compute_dtype)
-            cl.enqueue_copy(schedule_buf.context.queue, schedule_buf, schedule_np)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
+            queue = scalar_params.get("_opencl_queue")
+            if queue is not None:
+                cl.enqueue_copy(queue, schedule_buf, schedule_np)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
 
         return [
             cl.LocalMemory(local_mem_size),

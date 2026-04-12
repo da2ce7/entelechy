@@ -2309,7 +2309,7 @@ __kernel void clip_shared_gradients_chunk(
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
     /**
-     * @param src_buffer_GLOBAL_partial_grad_weights_shared The partial weight gradients for a single
+     * @param src_buffer_GLOBAL_partial_grad_weights_shared_simd_major The partial weight gradients for a single
      *        data chunk, produced by Node 17.
      *        - Tensor Shape: (src_scalar_NATURAL_weights_parameter_count)
      *        - Padding Contract: {Type: NONE}
@@ -2318,7 +2318,7 @@ __kernel void clip_shared_gradients_chunk(
      *        - Validation Preconditions: Host shall ensure this buffer is a contiguous memory
      *          region containing the complete partial weight gradient for the chunk being processed.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_grad_weights_shared,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_grad_weights_shared_simd_major,
 
     /**
      * @param src_buffer_GLOBAL_partial_grad_biases_shared The partial bias gradients for a single
@@ -2333,7 +2333,7 @@ __kernel void clip_shared_gradients_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_grad_biases_shared,
 
     /**
-     * @param dest_buffer_GLOBAL_clipped_partial_grad_weights_shared The COLLECTION buffer for all clipped
+     * @param dest_buffer_GLOBAL_clipped_partial_grad_weights_shared_simd_major The COLLECTION buffer for all clipped
      *        partial weight gradients, ready for consumption by an aggregate_* kernel (Node 20).
      *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_weights_parameter_count)
      *        - Padding Contract: {Type: NONE}
@@ -2345,7 +2345,7 @@ __kernel void clip_shared_gradients_chunk(
      *          src_scalar_NATURAL_weights_parameter_count) <=
      *          (src_scalar_NATURAL_num_batch_chunks * src_scalar_NATURAL_weights_parameter_count).
      */
-    __global STORAGE_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_weights_shared,
+    __global STORAGE_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_weights_shared_simd_major,
 
     /**
      * @param dest_buffer_GLOBAL_clipped_partial_grad_biases_shared The COLLECTION buffer for all clipped

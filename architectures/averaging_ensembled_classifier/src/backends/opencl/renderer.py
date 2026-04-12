@@ -426,6 +426,8 @@ class OpenCLPlanRenderer:
         # ADR-024: Include compute_dtype for COMPUTE_TYPE scalar marshalling
         if hasattr(self, "_plan") and self._plan is not None:
             enriched["_compute_dtype"] = self._plan.precision.compute_dtype
+        # Inject queue for bindings that need to perform buffer uploads
+        enriched["_opencl_queue"] = self._queue  # pyright: ignore[reportArgumentType]
         return enriched
 
     # ------------------------------------------------------------------

@@ -36,8 +36,18 @@ class VulkanDescriptorManager:
 
         self._create_pool()
 
-    def create_layout(self, binding_count: int) -> Any:
-        """Create a VkDescriptorSetLayout with N storage buffer bindings."""
+    def create_layout(
+        self,
+        binding_count: int,
+        push_descriptor: bool = False,
+    ) -> Any:
+        """Create a VkDescriptorSetLayout with N storage buffer bindings.
+
+        Args:
+            binding_count: Number of storage buffer bindings.
+            push_descriptor: If True, create layout compatible with
+                VK_KHR_push_descriptor (cannot be used with allocate_set).
+        """
         bindings = [
             vk.VkDescriptorSetLayoutBinding(
                 binding=i,
@@ -47,7 +57,11 @@ class VulkanDescriptorManager:
             )
             for i in range(binding_count)
         ]
+        flags = 0
+        if push_descriptor and self._ctx.has_push_descriptors:
+            flags = vk.VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR
         layout_info = vk.VkDescriptorSetLayoutCreateInfo(
+            flags=flags,
             bindingCount=binding_count,
             pBindings=bindings,
         )

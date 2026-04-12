@@ -28,6 +28,14 @@ ninja -C builddir
 
 Do not assume an editable Python reinstall will recompile the native CPU library.
 
+## Replacing a File
+
+When a file needs significant rewriting, avoid accumulating many in-place edits — they are error-prone. Instead:
+
+1. Read the file.
+2. `rm` the file.
+3. Recreate the file with the full updated content.
+
 ## Running Tests
 
 When running tests or lints, tee to a temp file (`/tmp/...`) and then grep that
