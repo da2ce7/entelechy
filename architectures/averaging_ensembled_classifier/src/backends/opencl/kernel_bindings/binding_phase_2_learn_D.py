@@ -9,6 +9,7 @@ import pyopencl as cl
 
 from ....shared.buffer_lifecycle import BufferHandle
 from ....shared.memory_layout import pad_to_multiple
+from ..type_mapping import compute_scalar
 from .base import KernelBinding
 
 
@@ -122,8 +123,8 @@ class ClipSharedGradientsBinding(KernelBinding):
             get_buffer(buffer_bindings["partial_grad_biases_shared"]),
             get_buffer(buffer_bindings["clipped_partial_grad_weights_shared"]),
             get_buffer(buffer_bindings["clipped_partial_grad_biases_shared"]),
-            np.float32(scalar_params["clipping_threshold_t_pre"]),
-            np.float32(scalar_params["epsilon"]),
+            compute_scalar(scalar_params["clipping_threshold_t_pre"], scalar_params),
+            compute_scalar(scalar_params["epsilon"], scalar_params),
             np.uint32(scalar_params["weights_parameter_count"]),
             np.uint32(scalar_params["biases_parameter_count"]),
             np.uint32(scalar_params["weights_write_offset"]),

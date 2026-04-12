@@ -57,6 +57,9 @@ markers = [
     "oracle: Oracle tests requiring PyTorch (differential triangulation)",
 ]
 
+[tool.pyright]
+typeCheckingMode = "strict"
+
 [tool.black]
 line-length = 120
 target-version = ['py310', 'py311', 'py312']

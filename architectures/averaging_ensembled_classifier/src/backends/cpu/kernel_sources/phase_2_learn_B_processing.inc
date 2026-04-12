@@ -24,7 +24,7 @@ void PREC_FN(task_backprop_to_hidden)(void* raw_args, uint task_index, uint thre
 
     if (module_local_idx >= a->modules_per_chunk ||
         batch_idx >= a->total_batch_count ||
-        h_idx >= a->hidden_count)
+        h_idx >= a->padded_hidden_count)
         return;
 
     const size_t tile_size = (size_t)a->modules_per_chunk
@@ -36,6 +36,12 @@ void PREC_FN(task_backprop_to_hidden)(void* raw_args, uint task_index, uint thre
     const size_t out_idx = tile_base + local_off;
 
     if (!load_sample_mask(a->sample_mask, batch_idx)) {
+        scalar_store_storage(a->partial_grad_hidden_activations_aos, out_idx, 0.0f);
+        return;
+    }
+
+    /* Padding Zero-Establishment: write zero for positions in the padded hidden dimension. */
+    if (h_idx >= a->hidden_count) {
         scalar_store_storage(a->partial_grad_hidden_activations_aos, out_idx, 0.0f);
         return;
     }

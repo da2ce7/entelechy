@@ -21,6 +21,21 @@ void PREC_FN(task_backprop_shared_weights)(void* raw_args, uint task_index, uint
     if (i_idx >= a->padded_input_count || j_idx >= a->padded_hidden_count)
         return;
 
+    /* Padding Zero-Establishment (CONTRACT.md): The kernel is the sole
+     * guarantor of zeros at padding positions. */
+    const bool is_padding = (i_idx >= a->input_count) || (j_idx >= a->hidden_count);
+    if (is_padding) {
+        const size_t chunk_base = (size_t)a->batch_chunk_index
+            * a->padded_input_count * a->padded_hidden_count;
+        const uint hb   = j_idx / SIMD_WIDTH;
+        const uint lane = j_idx % SIMD_WIDTH;
+        const size_t out_idx = chunk_base
+            + (size_t)hb * a->padded_input_count * SIMD_WIDTH
+            + (size_t)i_idx * SIMD_WIDTH + lane;
+        scalar_store_storage(a->partial_grad_weights_shared, out_idx, (COMPUTE_T)0.0);
+        return;
+    }
+
     COMPUTE_T grad_sw = (COMPUTE_T)0.0;
     for (uint b_local = 0; b_local < a->batch_chunk_count; b_local++) {
         const uint b_global = a->batch_chunk_offset + b_local;
@@ -67,6 +82,14 @@ void PREC_FN(task_backprop_shared_biases)(void* raw_args, uint task_index, uint 
     const uint j_idx = task_index;
     if (j_idx >= a->padded_hidden_count)
         return;
+
+    /* Padding Zero-Establishment (CONTRACT.md): The kernel is the sole
+     * guarantor of zeros at padding positions. */
+    if (j_idx >= a->hidden_count) {
+        const size_t chunk_base = (size_t)a->batch_chunk_index * a->padded_hidden_count;
+        scalar_store_storage(a->partial_grad_biases_shared, chunk_base + j_idx, (COMPUTE_T)0.0);
+        return;
+    }
 
     COMPUTE_T grad_sb = (COMPUTE_T)0.0;
     for (uint b_local = 0; b_local < a->batch_chunk_count; b_local++) {
@@ -116,7 +139,7 @@ void PREC_FN(task_clip_shared_grads)(void* raw_args, uint task_index, uint threa
     COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
     COMPUTE_T scale = (COMPUTE_T)1.0;
     /* Diagnostic bypass: negative threshold skips all clipping */
-    if (a->clipping_threshold_t_pre >= 0.0f && norm > (COMPUTE_T)a->clipping_threshold_t_pre) {
+    if (a->clipping_threshold_t_pre >= (COMPUTE_T)0.0 && norm > (COMPUTE_T)a->clipping_threshold_t_pre) {
         scale = (COMPUTE_T)a->clipping_threshold_t_pre / (norm + (COMPUTE_T)a->epsilon);
     }
 

@@ -45,6 +45,7 @@ from __future__ import annotations
 import math
 import struct
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -595,7 +596,7 @@ class NumPyPrecisionOracle:
         config: OracleDConfig,
         precision: NumpyPrecisionSpec,
         seed: int = 42,
-        **kwargs: object,
+        **kwargs: Any,
     ) -> NumPyPrecisionOracle:
         """Create an oracle with Xavier/Glorot uniform weight initialization.
 

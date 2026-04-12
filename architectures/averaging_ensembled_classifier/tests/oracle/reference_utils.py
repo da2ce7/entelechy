@@ -71,7 +71,7 @@ def group_wise_clip(
         return [torch.zeros_like(g) for g in grad_list]
 
     concat = torch.cat([g.flatten() for g in grad_list])
-    norm_val = float(concat.norm(2))  # pyright: ignore[reportUnknownMemberType]
+    norm_val = float(concat.norm(2))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
     if norm_val > threshold:
         scale = threshold / (norm_val + eps)
         return [g * scale for g in grad_list]

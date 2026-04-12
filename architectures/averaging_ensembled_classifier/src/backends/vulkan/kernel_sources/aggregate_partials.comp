@@ -30,7 +30,8 @@ layout(push_constant) uniform PushConstants {
 
 layout(set = 0, binding = 0) readonly buffer SrcCollection { STORAGE_TYPE data[]; } src_collection;
 layout(set = 0, binding = 1) readonly buffer OffsetList    { uint          data[]; } src_offsets;
-layout(set = 0, binding = 2) writeonly buffer DestPartial  { STORAGE_TYPE data[]; } dest;
+// Compute-role output: COMPUTE_TYPE written directly (no narrowing).
+layout(set = 0, binding = 2) writeonly buffer DestPartial  { COMPUTE_TYPE data[]; } dest;
 
 void main() {
     uint lid   = gl_LocalInvocationID.x;
@@ -53,7 +54,7 @@ void main() {
             accum /= COMPUTE_TYPE(push.partial_offset_list_count);
         }
 
-        dest.data[elem] = write_storage(accum);
+        dest.data[elem] = accum;
 
     } else {
         // ── Local Tier ──
@@ -75,7 +76,7 @@ void main() {
             if (push.operation_type == AGG_MODE_AVERAGE && push.partial_offset_list_count > 0) {
                 total /= COMPUTE_TYPE(push.partial_offset_list_count);
             }
-            dest.data[elem] = write_storage(total);
+            dest.data[elem] = total;
         }
     }
 }

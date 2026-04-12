@@ -2,8 +2,8 @@
 //
 // Algorithmic reference: kernels.cl.h §compute_probs_loss_cce_chunk
 // Strategy B — separate shader for CCE (no specialization constant branch).
-// Dispatch: vkCmdDispatch(tile_count, 1, 1)
-//   gl_WorkGroupID.x → flat tile index
+// Dispatch: vkCmdDispatch(ceil(total_items / SIMD_WIDTH), 1, 1)
+//   where total_items = total_tile_count * modules_per_chunk * total_batch_count
 // Each invocation handles one (module_local, batch) pair: computes numerically
 // stable softmax over the full class dimension, renders partial probs for its
 // tile's class chunk, and scatter-writes the final loss.
@@ -32,20 +32,20 @@ layout(set = 0, binding = 4) writeonly buffer ProbsBuf  { STORAGE_TYPE data[]; }
 layout(set = 0, binding = 5) writeonly buffer LossBuf   { COMPUTE_TYPE data[]; } dest_loss;
 
 void main() {
-    // 2D logical: (module_local, batch) per invocation
+    // Each invocation handles one (tile, module_local, batch) triple.
+    // Dispatch: vkCmdDispatch(ceil(total_items / SIMD_WIDTH), 1, 1)
+    //   where total_items = total_tile_count * modules_per_chunk * total_batch_count
     uint gid = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
-    uint flat_tile_index = gid / (push.modules_per_chunk * push.total_batch_count);
-    uint rem = gid % (push.modules_per_chunk * push.total_batch_count);
 
-    // Re-derive: one invocation per (flat_tile, module_local, batch)
-    // Actually, the dispatch is simpler: one workgroup per tile, threads cover (module, batch) pairs
-    uint tile_idx = gl_WorkGroupID.x;
+    // Derive logical coordinates from flat gid
+    uint items_per_tile = push.modules_per_chunk * push.total_batch_count;
+    uint tile_idx = gid / items_per_tile;
+    uint rem = gid % items_per_tile;
+    uint module_local_idx = rem / push.total_batch_count;
+    uint batch_idx = rem % push.total_batch_count;
+
+    // Bounds check
     if (tile_idx >= push.total_tile_count) return;
-
-    uint local_id = gl_LocalInvocationID.x;
-    uint module_local_idx = local_id / push.total_batch_count;
-    uint batch_idx        = local_id % push.total_batch_count;
-
     if (module_local_idx >= push.modules_per_chunk || batch_idx >= push.total_batch_count) return;
 
     // Decompose flat tile index
@@ -58,13 +58,13 @@ void main() {
     uint loss_out_idx = module_global_idx * push.total_batch_count + batch_idx;
 
     // Handle padded samples
+    // Loss write skipped: ZERO_REQUIRED initialization contract guarantees the buffer is pre-zeroed.
     if (load_sample_mask(src_sample_mask.data[batch_idx >> 5u], batch_idx) == 0u) {
-        dest_loss.data[loss_out_idx] = COMPUTE_TYPE(0.0);
-        uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
+        uint64_t prob_tile_base = idx_u64(tile_idx) * idx_u64(push.modules_per_chunk) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk);
         for (uint c_local = 0; c_local < push.classes_per_chunk; ++c_local) {
-            uint prob_idx = prob_tile_base
-                          + module_local_idx * push.total_batch_count * push.classes_per_chunk
-                          + batch_idx * push.classes_per_chunk + c_local;
+            uint prob_idx = uint(prob_tile_base
+                          + idx_u64(module_local_idx) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk)
+                          + idx_u64(batch_idx) * idx_u64(push.classes_per_chunk) + idx_u64(c_local));
             dest_probs.data[prob_idx] = write_storage(COMPUTE_TYPE(0.0));
         }
         return;
@@ -72,8 +72,8 @@ void main() {
 
     // Numerically stable softmax
     COMPUTE_TYPE temp_inv = COMPUTE_TYPE(1.0) / read_state(src_temps.data[module_global_idx]);
-    uint base_logits = module_global_idx * push.total_batch_count * push.padded_total_output_class_count
-                     + batch_idx * push.padded_total_output_class_count;
+    uint base_logits = uint(idx_u64(module_global_idx) * idx_u64(push.total_batch_count) * idx_u64(push.padded_total_output_class_count)
+                     + idx_u64(batch_idx) * idx_u64(push.padded_total_output_class_count));
 
     // Pass 1: find max scaled logit
     COMPUTE_TYPE max_scaled_logit = COMPUTE_TYPE(-3.402823466e+38); // -FLT_MAX
@@ -92,16 +92,18 @@ void main() {
     COMPUTE_TYPE inv_sum_exp = (sum_exp > NUMERICAL_STABILITY_EPSILON) ? (COMPUTE_TYPE(1.0) / sum_exp) : COMPUTE_TYPE(0.0);
 
     // Partial probability rendering for this tile's class chunk
-    uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
+    uint64_t prob_tile_base = idx_u64(tile_idx) * idx_u64(push.modules_per_chunk) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk);
     for (uint c_local = 0; c_local < push.classes_per_chunk; ++c_local) {
         uint c_global = class_offset + c_local;
+        uint prob_idx = uint(prob_tile_base
+                      + idx_u64(module_local_idx) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk)
+                      + idx_u64(batch_idx) * idx_u64(push.classes_per_chunk) + idx_u64(c_local));
         if (c_global < push.total_output_class_count) {
             COMPUTE_TYPE logit = read_storage(src_logits.data[base_logits + c_global]);
             COMPUTE_TYPE prob  = COMPUTE_EXP(logit * temp_inv - max_scaled_logit) * inv_sum_exp;
-            uint prob_idx = prob_tile_base
-                          + module_local_idx * push.total_batch_count * push.classes_per_chunk
-                          + batch_idx * push.classes_per_chunk + c_local;
             dest_probs.data[prob_idx] = write_storage(prob);
+        } else {
+            dest_probs.data[prob_idx] = write_storage(COMPUTE_TYPE(0.0));
         }
     }
 

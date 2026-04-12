@@ -8,6 +8,7 @@ import numpy as np
 import pyopencl as cl
 
 from ....shared.buffer_lifecycle import BufferHandle
+from ..type_mapping import compute_scalar
 from .base import KernelBinding
 
 
@@ -25,8 +26,8 @@ class NormalizeGradientsBinding(KernelBinding):
         return [
             get_buffer(buffer_bindings["summed_grad"]),
             get_buffer(buffer_bindings["final_grad"]),
-            np.float32(scalar_params["effective_batch_size"]),
-            np.float32(scalar_params["epsilon"]),
+            compute_scalar(scalar_params["effective_batch_size"], scalar_params),
+            compute_scalar(scalar_params["epsilon"], scalar_params),
             np.uint32(scalar_params["parameter_count"]),
         ]
 
@@ -54,12 +55,12 @@ class AdamUpdateBinding(KernelBinding):
             get_buffer(buffer_bindings["parameters"]),
             get_buffer(buffer_bindings["m1"]),
             get_buffer(buffer_bindings["m2"]),
-            np.float32(scalar_params["learning_rate"]),
-            np.float32(scalar_params["beta1_pow_t"]),
-            np.float32(scalar_params["beta2_pow_t"]),
-            np.float32(scalar_params["beta1"]),
-            np.float32(scalar_params["beta2"]),
-            np.float32(scalar_params["epsilon"]),
+            compute_scalar(scalar_params["learning_rate"], scalar_params),
+            compute_scalar(scalar_params["beta1_pow_t"], scalar_params),
+            compute_scalar(scalar_params["beta2_pow_t"], scalar_params),
+            compute_scalar(scalar_params["beta1"], scalar_params),
+            compute_scalar(scalar_params["beta2"], scalar_params),
+            compute_scalar(scalar_params["epsilon"], scalar_params),
             np.uint32(scalar_params["parameter_offset"]),
             np.uint32(scalar_params["parameter_count"]),
             np.uint32(scalar_params["total_parameter_count"]),
@@ -83,8 +84,8 @@ class ClampTemperaturesBinding(KernelBinding):
     def marshal_args(self, get_buffer: Callable[[BufferHandle], cl.Buffer], buffer_bindings: dict[str, BufferHandle], scalar_params: dict[str, int | float], tile_index: int) -> list[Any]:
         return [
             get_buffer(buffer_bindings["temperatures"]),
-            np.float32(scalar_params["min_value"]),
-            np.float32(scalar_params["max_value"]),
+            compute_scalar(scalar_params["min_value"], scalar_params),
+            compute_scalar(scalar_params["max_value"], scalar_params),
             np.uint32(scalar_params["parameter_offset"]),
             np.uint32(scalar_params["parameter_count"]),
             np.uint32(scalar_params["total_parameter_count"]),

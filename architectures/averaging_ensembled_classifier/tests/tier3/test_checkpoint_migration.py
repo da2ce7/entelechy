@@ -1,10 +1,8 @@
 # tests/tier3/test_checkpoint_migration.py
+# pyright: reportPrivateUsage=false
 """Checkpoint version migration tests for FP8 scale compatibility."""
 
 import warnings
-
-import numpy as np
-import pytest
 
 from src.shared.precision_config import PrecisionConfig
 from src.shared.fp8_scaling import FP8_SCALES_VERSION, FP8ScaleInfo

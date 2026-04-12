@@ -56,6 +56,11 @@ __kernel void calculate_module_param_grads_chunk(
     const uint class_chunk_idx   = src_scalar_NATURAL_flat_tile_index % src_scalar_NATURAL_num_class_chunks;
     const uint class_global_idx  = class_chunk_idx * src_scalar_NATURAL_classes_per_chunk + class_local_idx;
 
+    // Padding Zero-Preservation: skip work-groups in final class chunk that exceed logical extent
+    if (class_global_idx >= src_scalar_NATURAL_total_output_class_count) {
+        return;
+    }
+
     // --- 3. Parallel Reduction over Batch Dimension ---
     COMPUTE_TYPE p_grad_w = COMPUTE_ZERO;
     COMPUTE_TYPE p_grad_b = COMPUTE_ZERO;
@@ -166,7 +171,7 @@ __kernel void backprop_error_to_hidden_chunk(
     const uint h_idx            = get_global_id(2);
 
     // Boundary check for the output component this work-item is assigned.
-    if (module_local_idx >= src_scalar_NATURAL_modules_per_chunk || batch_idx >= src_scalar_NATURAL_total_batch_count || h_idx >= src_scalar_NATURAL_hidden_count) {
+    if (module_local_idx >= src_scalar_NATURAL_modules_per_chunk || batch_idx >= src_scalar_NATURAL_total_batch_count || h_idx >= src_scalar_NATURAL_padded_hidden_count) {
         return;
     }
 
@@ -180,6 +185,12 @@ __kernel void backprop_error_to_hidden_chunk(
 
     // Early exit for padded samples, writing zero to the output to maintain correctness.
     if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, batch_idx)) {
+        store_storage(dest_buffer_GLOBAL_partial_grad_hidden_activations_aos, out_idx, COMPUTE_ZERO);
+        return;
+    }
+
+    // Padding Zero-Establishment: write zero for positions in the padded hidden dimension.
+    if (h_idx >= src_scalar_NATURAL_hidden_count) {
         store_storage(dest_buffer_GLOBAL_partial_grad_hidden_activations_aos, out_idx, COMPUTE_ZERO);
         return;
     }

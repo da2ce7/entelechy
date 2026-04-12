@@ -240,6 +240,29 @@ def get_tier3_tolerance(kernel_name: str, precision_label: str = "fp32") -> Tole
     return TIER3_FP32_DEFAULT if precision_label == "fp32" else TIER3_FP16_DEFAULT
 
 
+import math
+
+
+def get_tier3_convergence_tolerance(
+    step: int,
+    precision_label: str = "fp32",
+    *,
+    alpha: float = 1.0,
+) -> TolerancePair:
+    """Cumulative tolerance for multi-step convergence parity (ADR-034).
+
+    Tolerance grows as atol_base * (1 + alpha * sqrt(step)) to model
+    sub-linear error accumulation from per-step rounding differences
+    in reduction order, transcendental approximations, and FMA.
+
+    The base tolerances come from the single-step Tier 3 learn_plan_e2e
+    entry (loss comparison uses the softmax/loss kernel tolerance).
+    """
+    base = get_tier3_tolerance("learn_plan_e2e", precision_label)
+    growth = 1.0 + alpha * math.sqrt(step)
+    return TolerancePair(atol=base.atol * growth, rtol=base.rtol * growth)
+
+
 def precision_label_from_config(precision) -> str:
     """Derive the tolerance label from a PrecisionConfig instance.
 

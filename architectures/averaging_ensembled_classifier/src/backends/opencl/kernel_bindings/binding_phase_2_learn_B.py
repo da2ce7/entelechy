@@ -9,6 +9,7 @@ import pyopencl as cl
 
 from ....shared.buffer_lifecycle import BufferHandle
 from ....shared.memory_layout import pad_to_multiple
+from ..type_mapping import compute_scalar
 from .base import KernelBinding
 
 
@@ -53,8 +54,8 @@ class ClipPartialGradientsBinding(KernelBinding):
             get_buffer(buffer_bindings["clipped_partial_grad_hidden_activations_aos"]),
             np.uint32(scalar_params.get("use_per_item_norm", 0)),
             # Negative threshold bypasses clipping (diagnostic mode); do not default to 0.0
-            np.float32(scalar_params.get("clipping_threshold_t_pre", -1.0)),
-            np.float32(scalar_params["epsilon"]),
+            compute_scalar(scalar_params.get("clipping_threshold_t_pre", -1.0), scalar_params),
+            compute_scalar(scalar_params["epsilon"], scalar_params),
             np.uint32(tile_index),
             np.uint32(scalar_params["num_class_chunks"]),
             np.uint32(scalar_params["classes_per_chunk"]),

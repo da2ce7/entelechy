@@ -48,7 +48,7 @@ void main() {
     uint class_chunk_idx   = tile_idx % push.num_class_chunks;
     uint class_offset      = class_chunk_idx * push.classes_per_chunk;
 
-    uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
+    uint64_t prob_tile_base = idx_u64(tile_idx) * idx_u64(push.modules_per_chunk) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk);
 
     // Three-level reduction: batch (strided per thread) × class chunk (serial) → workgroup reduce
     COMPUTE_TYPE p_grad_sum = COMPUTE_TYPE(0.0);
@@ -60,9 +60,9 @@ void main() {
         for (uint c_local = 0; c_local < push.classes_per_chunk; c_local++) {
             uint c_global = class_offset + c_local;
             if (c_global < push.total_output_class_count) {
-                uint prob_idx = prob_tile_base
-                              + module_local_idx * push.total_batch_count * push.classes_per_chunk
-                              + b * push.classes_per_chunk + c_local;
+                uint prob_idx = uint(prob_tile_base
+                              + idx_u64(module_local_idx) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk)
+                              + idx_u64(b) * idx_u64(push.classes_per_chunk) + idx_u64(c_local));
                 COMPUTE_TYPE prob = read_storage(src_probs.data[prob_idx]);
 
                 COMPUTE_TYPE d_loss_d_logit;
@@ -74,8 +74,8 @@ void main() {
                     d_loss_d_logit = prob - target;
                 }
 
-                uint logit_idx = module_global_idx * push.total_batch_count * push.padded_total_output_class_count
-                               + b * push.padded_total_output_class_count + c_global;
+                uint logit_idx = uint(idx_u64(module_global_idx) * idx_u64(push.total_batch_count) * idx_u64(push.padded_total_output_class_count)
+                               + idx_u64(b) * idx_u64(push.padded_total_output_class_count) + idx_u64(c_global));
                 grad_contribution += d_loss_d_logit * read_storage(src_logits.data[logit_idx]);
             }
         }

@@ -1,0 +1,102 @@
+// reduce_k_fan_in_and_clip_from_compute.comp — ADR-019/ADR-026: Compute-Entry K-Fan-In Reduction
+//
+// Algorithmic reference: kernels.cl.h §reduce_k_fan_in_and_clip_from_compute
+// Compute-entry variant: identical algorithm, but reads COMPUTE_TYPE intermediates
+// directly (no read_storage conversion).
+//
+// Used for:
+//   - Interior stages of multi-stage reduction trees (stage >= 1)
+//   - Leaf stages whose source is natively compute-role (e.g., BCE loss partials)
+//
+// Dispatch: vkCmdDispatch(node_count, 1, 1)
+//   Each work-group independently: sums K partials → clips → writes one output vector.
+//
+// Push constants updated per reduction stage (threshold schedule from Quadratic
+// Scaling Policy).
+
+#version 450
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;
+
+// ADR-019: Sentinel value for absent partials in tail node
+const uint SENTINEL_ABSENT_PARTIAL = 0xFFFFFFFFu;
+
+layout(push_constant) uniform PushConstants {
+    uint fan_in;           // K: number of partials to reduce per node
+    uint node_count;       // Number of independent reduction nodes
+    uint partial_width;    // Elements per partial vector
+    COMPUTE_TYPE clipping_threshold;  // T_j for this stage; < 0 bypasses clip
+    COMPUTE_TYPE epsilon;  // Small constant for numerical stability
+} push;
+
+// Compute-entry: source collection is COMPUTE_TYPE (no precision conversion)
+layout(set = 0, binding = 0) readonly buffer SrcCollection { COMPUTE_TYPE data[]; } src_collection;
+// Flat offset list: K consecutive entries per node
+layout(set = 0, binding = 1) readonly buffer OffsetList    { uint          data[]; } src_offsets;
+// Compute-role output: COMPUTE_TYPE (read-modify-write for Phase 3 scaling)
+layout(set = 0, binding = 2) buffer DestPartial             { COMPUTE_TYPE data[]; } dest;
+
+void main() {
+    uint node_id = gl_WorkGroupID.x;
+    uint lid     = gl_LocalInvocationID.x;
+    uint lsize   = gl_WorkGroupSize.x;
+
+    if (node_id >= push.node_count) return;
+
+    uint offset_base = node_id * push.fan_in;
+    uint dest_base   = node_id * push.partial_width;
+
+    // ── Phase 1: Gather and Accumulate (element-parallel with striding) ────
+    // Each thread strides across the partial_width dimension, accumulating
+    // element-wise sums across all K input partials for this node.
+    // We accumulate the sum of squares simultaneously for the L2 norm.
+    COMPUTE_TYPE local_sq_sum = COMPUTE_TYPE(0.0);
+
+    for (uint elem = lid; elem < push.partial_width; elem += lsize) {
+        COMPUTE_TYPE accum = COMPUTE_TYPE(0.0);
+
+        for (uint k = 0; k < push.fan_in; ++k) {
+            uint offset = src_offsets.data[offset_base + k];
+            if (offset != SENTINEL_ABSENT_PARTIAL) {
+                // Direct COMPUTE_TYPE read (no precision conversion)
+                accum += src_collection.data[offset + elem];
+            }
+        }
+
+        // Store the accumulated sum in the destination (compute-role output),
+        // to be potentially scaled in-place during Phase 3.
+        dest.data[dest_base + elem] = accum;
+
+        // Accumulate the square for this thread's L2 norm contribution.
+        local_sq_sum += accum * accum;
+    }
+
+    // ── Phase 2: Per-Node L2 Norm via Subgroup-Accelerated Reduction ────
+    // Clipping is enabled for any non-negative threshold. Negative values
+    // (e.g., -1.0) bypass clipping entirely (diagnostic mode). Zero means
+    // "clip to zero norm", which zeroes all gradients — valid but destructive.
+    if (push.clipping_threshold >= COMPUTE_TYPE(0.0)) {
+        COMPUTE_TYPE total_sq = workgroup_reduce_add(local_sq_sum);
+
+        // Compute scaling factor (leader broadcasts via shared memory)
+        COMPUTE_TYPE scale_factor;
+        if (lid == 0) {
+            COMPUTE_TYPE norm = sqrt(total_sq);
+            scale_factor = COMPUTE_TYPE(1.0);
+            if (norm > push.clipping_threshold) {
+                scale_factor = push.clipping_threshold / (norm + push.epsilon);
+            }
+            _compute_scratch[0] = scale_factor;
+        }
+        barrier();
+        scale_factor = _compute_scratch[0];
+
+        // ── Phase 3: Conditional In-Place Scaling ────
+        if (scale_factor < COMPUTE_TYPE(1.0)) {
+            for (uint elem = lid; elem < push.partial_width; elem += lsize) {
+                dest.data[dest_base + elem] *= scale_factor;
+            }
+        }
+    }
+}

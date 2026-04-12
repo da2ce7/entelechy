@@ -529,12 +529,9 @@ class ConvergenceOracle:
 
         # Bias to achieve approximate active_probability
         # P(w·x > b) ≈ active_probability for x ~ N(0,I)
-        bias = torch.tensor(
-            torch.distributions.Normal(0, 1).icdf(  # pyright: ignore[reportUnknownMemberType]
-                torch.tensor(1.0 - active_probability),
-            ),
-            dtype=dtype,
-        )
+        bias = torch.distributions.Normal(0, 1).icdf(  # pyright: ignore[reportUnknownMemberType]
+            torch.tensor(1.0 - active_probability),
+        ).to(dtype)
         projections: torch.Tensor = X @ normals.T  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         targets: torch.Tensor = (projections > bias).to(dtype) * separation  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         targets = (targets > 0).to(dtype)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]

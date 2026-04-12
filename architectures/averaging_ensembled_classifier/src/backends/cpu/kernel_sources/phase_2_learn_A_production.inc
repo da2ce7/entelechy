@@ -31,7 +31,7 @@ void PREC_FN(task_cce_probs_loss)(void* raw_args, uint task_index, uint thread_i
     const size_t loss_out_idx = (size_t)module_global_idx * a->total_batch_count + batch_idx;
 
     if (!load_sample_mask(a->sample_mask, batch_idx)) {
-        a->final_loss[loss_out_idx] = (COMPUTE_T)0.0;  /* compute-role: direct write */
+        /* Loss write skipped: ZERO_REQUIRED initialization contract guarantees the buffer is pre-zeroed. */
         const size_t prob_tile_base = (size_t)a->flat_tile_index
             * a->modules_per_chunk * a->total_batch_count * a->classes_per_chunk;
         const size_t prob_base = prob_tile_base
@@ -79,15 +79,14 @@ void PREC_FN(task_cce_probs_loss)(void* raw_args, uint task_index, uint thread_i
         }
     }
 
-    const int   true_class_idx = a->targets[batch_idx];
-    const COMPUTE_T logit_true     = scalar_load_storage(a->logits, base_logits_idx + (uint)true_class_idx);
-    const COMPUTE_T prob_true      = COMPUTE_EXP(logit_true * inv_temp - max_scaled_logit) * inv_sum_exp;
-
     /* Only the tile containing the target class writes the loss (scatter-write predicate).
      * This prevents data races when multiple class chunks process the same (module, batch) pair. */
+    const int  true_class_idx      = a->targets[batch_idx];
     const bool target_in_this_chunk = ((uint)true_class_idx >= class_offset &&
                                        (uint)true_class_idx < class_offset + a->classes_per_chunk);
     if (target_in_this_chunk) {
+        const COMPUTE_T logit_true = scalar_load_storage(a->logits, base_logits_idx + (uint)true_class_idx);
+        const COMPUTE_T prob_true  = COMPUTE_EXP(logit_true * inv_temp - max_scaled_logit) * inv_sum_exp;
         a->final_loss[loss_out_idx] = -COMPUTE_LOG(COMPUTE_FMAX(prob_true, (COMPUTE_T)NUMERICAL_STABILITY_EPSILON));  /* compute-role */
     }
 }
@@ -123,7 +122,7 @@ void PREC_FN(task_bce_probs_loss)(void* raw_args, uint task_index, uint thread_i
             const size_t loss_idx = (size_t)a->flat_tile_index
                 * a->modules_per_chunk * a->total_batch_count
                 + (size_t)module_local_idx * a->total_batch_count + batch_idx;
-            scalar_store_storage(a->partial_loss, loss_idx, 0.0f);
+            a->partial_loss[loss_idx] = (COMPUTE_T)0.0;
         }
         return;
     }
@@ -167,7 +166,7 @@ void PREC_FN(task_bce_probs_loss)(void* raw_args, uint task_index, uint thread_i
         const size_t loss_idx = (size_t)a->flat_tile_index
             * a->modules_per_chunk * a->total_batch_count
             + (size_t)module_local_idx * a->total_batch_count + batch_idx;
-        scalar_store_storage(a->partial_loss, loss_idx, loss_sum);
+        a->partial_loss[loss_idx] = loss_sum;
     }
 }
 

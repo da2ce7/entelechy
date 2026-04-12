@@ -12,6 +12,8 @@
 layout(local_size_x_id = 0) in;
 
 layout(push_constant) uniform PushConstants {
+    uint batch_chunk_offset;
+    uint batch_chunk_count;
     uint num_class_chunks;
     uint classes_per_chunk;
     uint modules_per_chunk;
@@ -74,8 +76,11 @@ void main() {
     COMPUTE_TYPE inv_temp  = COMPUTE_TYPE(1.0) / read_state(src_temps.data[module_global_idx]);
     uint class_global_idx  = class_chunk_idx * push.classes_per_chunk + class_local_idx;
 
+    // Padding Zero-Preservation: skip invocations in final class chunk that exceed logical extent
+    if (class_global_idx >= push.total_output_class_count) return;
+
     // Partial probability base for this tile
-    uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
+    uint64_t prob_tile_base = idx_u64(tile_idx) * idx_u64(push.modules_per_chunk) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk);
 
     // Parallel reduction over batch
     COMPUTE_TYPE p_grad_w = COMPUTE_TYPE(0.0);
@@ -84,9 +89,9 @@ void main() {
     for (uint b = lid; b < push.total_batch_count; b += lsize) {
         if (load_sample_mask(src_sample_mask.data[b >> 5u], b) == 0u) continue;
 
-        uint prob_idx = prob_tile_base
-                      + module_local_idx * push.total_batch_count * push.classes_per_chunk
-                      + b * push.classes_per_chunk + class_local_idx;
+        uint prob_idx = uint(prob_tile_base
+                      + idx_u64(module_local_idx) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk)
+                      + idx_u64(b) * idx_u64(push.classes_per_chunk) + idx_u64(class_local_idx));
         COMPUTE_TYPE prob = read_storage(src_probs.data[prob_idx]);
 
         COMPUTE_TYPE d_loss_d_logit;
@@ -112,11 +117,11 @@ void main() {
     // Workgroup reduction for weight gradient
     COMPUTE_TYPE w_sum = workgroup_reduce_add(p_grad_w);
     if (lid == 0) {
-        uint w_tile_base = tile_idx * push.modules_per_chunk * push.padded_hidden_count * push.padded_total_output_class_count;
-        uint w_out = w_tile_base
-                   + module_local_idx * push.padded_hidden_count * push.padded_total_output_class_count
-                   + h_idx * push.padded_total_output_class_count
-                   + class_global_idx;
+        uint w_tile_base = uint(idx_u64(tile_idx) * idx_u64(push.modules_per_chunk) * idx_u64(push.padded_hidden_count) * idx_u64(push.padded_total_output_class_count));
+        uint w_out = uint(idx_u64(w_tile_base)
+                   + idx_u64(module_local_idx) * idx_u64(push.padded_hidden_count) * idx_u64(push.padded_total_output_class_count)
+                   + idx_u64(h_idx) * idx_u64(push.padded_total_output_class_count)
+                   + idx_u64(class_global_idx));
         dest_grad_w.data[w_out] = write_storage(w_sum);
     }
 
@@ -124,8 +129,8 @@ void main() {
     if (h_idx == 0) {
         COMPUTE_TYPE b_sum = workgroup_reduce_add(p_grad_b);
         if (lid == 0) {
-            uint b_tile_base = tile_idx * push.modules_per_chunk * push.padded_total_output_class_count;
-            uint b_out = b_tile_base + module_local_idx * push.padded_total_output_class_count + class_global_idx;
+            uint b_tile_base = uint(idx_u64(tile_idx) * idx_u64(push.modules_per_chunk) * idx_u64(push.padded_total_output_class_count));
+            uint b_out = uint(idx_u64(b_tile_base) + idx_u64(module_local_idx) * idx_u64(push.padded_total_output_class_count) + idx_u64(class_global_idx));
             dest_grad_b.data[b_out] = write_storage(b_sum);
         }
     }

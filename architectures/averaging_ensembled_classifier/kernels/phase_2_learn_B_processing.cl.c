@@ -96,9 +96,10 @@ __kernel void clip_partial_gradients(
         const COMPUTE_TYPE total_sum_sq = update_buffer_LOCAL_reduction_tile[0];
         const COMPUTE_TYPE norm         = MATH_FN sqrt(total_sum_sq);
 
-        COMPUTE_TYPE scale_factor = 1.0f;
-        // Only compute a new scale factor if the norm exceeds the threshold.
-        if (norm > threshold) {
+        COMPUTE_TYPE scale_factor = COMPUTE_ONE;
+        // Diagnostic bypass: negative threshold skips all clipping.
+        // Only compute a new scale factor if threshold is non-negative and norm exceeds it.
+        if (threshold >= COMPUTE_ZERO && norm > threshold) {
             // Add epsilon for numerical stability, preventing division by zero if norm is very close to threshold.
             scale_factor = threshold / (norm + src_scalar_REAL_epsilon);
         }

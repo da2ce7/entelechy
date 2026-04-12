@@ -33,7 +33,7 @@ __kernel void normalize_gradients(
     // Pre-calculate the reciprocal of the divisor. Multiplication is often faster
     // than division on GPU hardware. The epsilon term prevents division by zero
     // if the effective batch size is 0 (e.g., all samples were masked).
-    const COMPUTE_TYPE normalizer = 1.0f / (src_scalar_REAL_effective_batch_size + src_scalar_REAL_epsilon);
+    const COMPUTE_TYPE normalizer = COMPUTE_ONE / (src_scalar_REAL_effective_batch_size + src_scalar_REAL_epsilon);
 
     // Apply the normalization.
     dest_buffer_GLOBAL_final_grad[i] = src_buffer_GLOBAL_summed_grad[i] * normalizer;

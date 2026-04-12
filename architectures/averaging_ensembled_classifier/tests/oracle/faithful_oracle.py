@@ -611,7 +611,7 @@ class FaithfulOracle:
             for i in range(0, len(current), K):
                 group = current[i : i + K]
                 summed = torch.stack(group).sum(dim=0)
-                norm_val = float(summed.norm(2))  # pyright: ignore[reportUnknownMemberType]
+                norm_val = float(summed.norm(2))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
                 if threshold >= 0.0 and norm_val > threshold:
                     summed = summed * (
                         threshold / (norm_val + self.config.epsilon)

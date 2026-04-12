@@ -14,8 +14,8 @@
 layout(local_size_x_id = 0) in;
 
 layout(push_constant) uniform PushConstants {
-    float clipping_threshold;  // < 0 bypasses clipping (diagnostic mode)
-    float epsilon;
+    COMPUTE_TYPE clipping_threshold;  // < 0 bypasses clipping (diagnostic mode)
+    COMPUTE_TYPE epsilon;
     uint  weights_parameter_count;
     uint  biases_parameter_count;
     uint  weights_write_offset;
@@ -33,19 +33,6 @@ void main() {
     uint lsize = gl_WorkGroupSize.x;
     uint total_elements = push.weights_parameter_count + push.biases_parameter_count;
 
-    // Diagnostic bypass: negative threshold copies without clipping
-    if (push.clipping_threshold < 0.0) {
-        for (uint i = lid; i < total_elements; i += lsize) {
-            if (i < push.weights_parameter_count) {
-                dst_grad_w.data[push.weights_write_offset + i] = src_grad_w.data[i];
-            } else {
-                uint rel = i - push.weights_parameter_count;
-                dst_grad_b.data[push.biases_write_offset + rel] = src_grad_b.data[rel];
-            }
-        }
-        return;
-    }
-
     // ── Pass 1: Compute sum of squares for joint L2 norm ──
     COMPUTE_TYPE local_sq_sum = COMPUTE_TYPE(0.0);
     for (uint i = lid; i < total_elements; i += lsize) {
@@ -61,12 +48,13 @@ void main() {
     COMPUTE_TYPE total_sq = workgroup_reduce_add(local_sq_sum);
 
     // ── Compute scaling factor and broadcast ──
+    // Diagnostic bypass: negative threshold skips clipping (scale = 1.0)
     COMPUTE_TYPE scale_factor;
     if (lid == 0) {
         COMPUTE_TYPE norm = sqrt(total_sq);
         scale_factor = COMPUTE_TYPE(1.0);
-        if (norm > COMPUTE_TYPE(push.clipping_threshold)) {
-            scale_factor = COMPUTE_TYPE(push.clipping_threshold) / (norm + COMPUTE_TYPE(push.epsilon));
+        if (push.clipping_threshold >= COMPUTE_TYPE(0.0) && norm > push.clipping_threshold) {
+            scale_factor = push.clipping_threshold / (norm + push.epsilon);
         }
         _compute_scratch[0] = scale_factor;
     }

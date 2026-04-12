@@ -91,3 +91,27 @@ def _epsilon_literal(epsilon: float, is_half: int, is_double: int) -> str:
         return str(epsilon)  # No suffix for double literals in OpenCL C
     return f"{epsilon}f"
 
+
+def compute_scalar(value: float, scalar_params: dict) -> np.number:
+    """Convert a float to the appropriate compute dtype for kernel arguments.
+
+    This function ensures COMPUTE_TYPE scalar parameters (clipping_threshold,
+    epsilon, etc.) are marshalled with the correct precision per ADR-024.
+
+    Args:
+        value: The float value to convert.
+        scalar_params: The enriched scalar_params dict containing '_compute_dtype'.
+
+    Returns:
+        The value as np.float16, np.float32, or np.float64 based on compute dtype.
+    """
+    compute_dtype = scalar_params.get("_compute_dtype")
+    if compute_dtype is None:
+        # Fallback to FP32 for backwards compatibility
+        return np.float32(value)
+    if compute_dtype == np.float16:
+        return np.float16(value)
+    if compute_dtype == np.float64:
+        return np.float64(value)
+    return np.float32(value)
+

@@ -19,7 +19,7 @@ __kernel void backprop_shared_weights_chunk(
     uint                         src_scalar_FLAG_use_explicit_hidden_mask,
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_summed_grad_hidden_activations,
     __global const uint          *src_buffer_GLOBAL_sample_mask,
-    __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_weights_shared,
+    __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major,
     uint                         src_scalar_NATURAL_batch_chunk_offset,
     uint                         src_scalar_NATURAL_batch_chunk_count,
     uint                         src_scalar_NATURAL_batch_chunk_index,
@@ -31,9 +31,6 @@ __kernel void backprop_shared_weights_chunk(
     uint                         src_scalar_NATURAL_padded_hidden_count,
     uint                         src_scalar_NATURAL_final_grad_hidden_activations_total_count) {
 
-    (void)src_scalar_NATURAL_input_count;  // Interface completeness (R1); available for explicit zero-fill.
-    (void)src_scalar_NATURAL_hidden_count; // Interface completeness (R1); available for explicit zero-fill.
-
     // --- 1. Work-Group to Gradient Component Mapping ---
     // The 2D work-group ID maps to a coordinate in the shared weight matrix (input_dim, hidden_dim).
     const uint i_idx = get_group_id(0); // Index along the input dimension.
@@ -44,6 +41,21 @@ __kernel void backprop_shared_weights_chunk(
 
     // Boundary check for the gradient component this work-group is assigned.
     if (i_idx >= src_scalar_NATURAL_padded_input_count || j_idx >= src_scalar_NATURAL_padded_hidden_count) {
+        return;
+    }
+
+    // --- Padding Zero-Establishment (CONTRACT.md) ---
+    // The kernel is the sole guarantor of zeros at padding positions. If this
+    // work-group's (i,j) coordinate is in the padding region, write zero and exit.
+    const bool is_padding = (i_idx >= src_scalar_NATURAL_input_count) || (j_idx >= src_scalar_NATURAL_hidden_count);
+    if (is_padding) {
+        if (lid == 0) {
+            const uint hb   = j_idx / SIMD_WIDTH;
+            const uint lane = j_idx % SIMD_WIDTH;
+            const long chunk_base_offset = (long)src_scalar_NATURAL_batch_chunk_index * src_scalar_NATURAL_padded_input_count * src_scalar_NATURAL_padded_hidden_count;
+            const long grad_w_out_idx    = chunk_base_offset + (long)hb * src_scalar_NATURAL_padded_input_count * SIMD_WIDTH + (long)i_idx * SIMD_WIDTH + lane;
+            store_storage(dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major, grad_w_out_idx, COMPUTE_ZERO);
+        }
         return;
     }
 
@@ -88,14 +100,16 @@ __kernel void backprop_shared_weights_chunk(
 
     // The leader thread writes the final, reduced partial gradient for this chunk
     // to its unique slot in the collection buffer, fulfilling the placement contract.
-    // WHY: The write uses (hidden-major, input) order — j_idx * padded_input + i_idx —
-    // matching the forward_pass kernel's SIMD-major weight layout (h * padded_input + i).
-    // This ensures the flat gradient layout is element-wise compatible with the weight
-    // buffer, so the Adam update applies each gradient to the correct weight.
+    // WHY: The write uses SIMD-major (SoA) layout — matching the forward_pass kernel's
+    // weight buffer layout (h_block, padded_input, SIMD_lane). This ensures flat-index
+    // correspondence between gradient and parameter buffers, so Adam update pairs
+    // grad[k] with param[k] correctly.
     if (lid == 0) {
+        const uint hb   = j_idx / SIMD_WIDTH;
+        const uint lane = j_idx % SIMD_WIDTH;
         const long chunk_base_offset = (long)src_scalar_NATURAL_batch_chunk_index * src_scalar_NATURAL_padded_input_count * src_scalar_NATURAL_padded_hidden_count;
-        const long grad_w_out_idx    = chunk_base_offset + (long)j_idx * src_scalar_NATURAL_padded_input_count + i_idx;
-        store_storage(dest_buffer_GLOBAL_partial_grad_weights_shared, grad_w_out_idx, update_buffer_LOCAL_reduction_tile[0]);
+        const long grad_w_out_idx    = chunk_base_offset + (long)hb * src_scalar_NATURAL_padded_input_count * SIMD_WIDTH + (long)i_idx * SIMD_WIDTH + lane;
+        store_storage(dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major, grad_w_out_idx, update_buffer_LOCAL_reduction_tile[0]);
     }
 }
 
@@ -122,8 +136,6 @@ __kernel void backprop_shared_biases_chunk(
     uint                         src_scalar_NATURAL_padded_hidden_count,
     uint                         src_scalar_NATURAL_final_grad_hidden_activations_total_count) {
 
-    (void)src_scalar_NATURAL_hidden_count; // Interface completeness (R1); available for explicit zero-fill.
-
     // --- 1. Work-Group to Gradient Component Mapping ---
     // The 1D work-group ID maps to an index in the shared bias vector.
     const uint j_idx = get_group_id(0);
@@ -133,6 +145,17 @@ __kernel void backprop_shared_biases_chunk(
 
     // Boundary check for the gradient component this work-group is assigned.
     if (j_idx >= src_scalar_NATURAL_padded_hidden_count) {
+        return;
+    }
+
+    // --- Padding Zero-Establishment (CONTRACT.md) ---
+    // The kernel is the sole guarantor of zeros at padding positions.
+    // For indices >= hidden_count, write zero and exit early.
+    if (j_idx >= src_scalar_NATURAL_hidden_count) {
+        if (lid == 0) {
+            const long chunk_base_offset = (long)src_scalar_NATURAL_batch_chunk_index * src_scalar_NATURAL_padded_hidden_count;
+            store_storage(dest_buffer_GLOBAL_partial_grad_biases_shared, chunk_base_offset + j_idx, COMPUTE_ZERO);
+        }
         return;
     }
 
@@ -241,8 +264,9 @@ __kernel void clip_shared_gradients_chunk(
         const COMPUTE_TYPE total_sum_sq = update_buffer_LOCAL_reduction_tile[0];
         const COMPUTE_TYPE norm         = MATH_FN sqrt(total_sum_sq);
 
-        COMPUTE_TYPE scale_factor = 1.0f;
-        if (norm > src_scalar_REAL_clipping_threshold_t_pre) {
+        // Diagnostic bypass: negative threshold skips clipping (scale = 1.0)
+        COMPUTE_TYPE scale_factor = COMPUTE_ONE;
+        if (src_scalar_REAL_clipping_threshold_t_pre >= COMPUTE_ZERO && norm > src_scalar_REAL_clipping_threshold_t_pre) {
             scale_factor = src_scalar_REAL_clipping_threshold_t_pre / (norm + src_scalar_REAL_epsilon);
         }
         update_buffer_LOCAL_reduction_tile[0] = scale_factor;

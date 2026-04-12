@@ -177,10 +177,11 @@ class ParameterSpace:
             (grid.total_tiles, max_mods_per_tile, batch_size, spec.padded_hidden_dim)
         )
 
-        # WHY: The backprop_shared_weights_chunk kernel (after the transpose fix)
-        # writes gradients as flat[j * padded_input + i], matching the weight
-        # buffer's (hidden, padded_input) flat layout. Each chunk produces
-        # padded_hidden * padded_input elements.
+        # WHY: The backprop_shared_weights_chunk kernel writes gradients in SIMD-major
+        # (SoA) layout: (h_block, padded_input, SIMD_lane), matching the weight buffer's
+        # layout consumed by forward_pass. The flat element count remains
+        # padded_hidden * padded_input, ensuring flat-index correspondence with the
+        # parameter buffer through the layout-agnostic reduction pipeline.
         layouts["partial_grad_shared_weights"] = MemoryLayout(
             (num_batch_chunks, spec.padded_hidden_dim, spec.padded_input_dim)
         )

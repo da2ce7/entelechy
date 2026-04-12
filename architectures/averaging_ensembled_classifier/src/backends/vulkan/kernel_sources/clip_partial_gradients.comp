@@ -14,8 +14,8 @@ layout(local_size_x_id = 0) in;
 
 layout(push_constant) uniform PushConstants {
     uint  use_per_item_norm;
-    float clipping_threshold;
-    float epsilon;
+    COMPUTE_TYPE clipping_threshold;
+    COMPUTE_TYPE epsilon;
     uint  num_class_chunks;
     uint  classes_per_chunk;
     uint  modules_per_chunk;
@@ -46,17 +46,21 @@ void main() {
     uint lsize = gl_WorkGroupSize.x;
 
     // Per-buffer element counts
-    uint n_weights = push.modules_per_chunk * push.padded_hidden_count * push.padded_total_output_class_count;
-    uint n_biases  = push.modules_per_chunk * push.padded_total_output_class_count;
-    uint n_temps   = push.modules_per_chunk;
-    uint n_hidden  = push.modules_per_chunk * push.total_batch_count * push.padded_hidden_count;
+    uint64_t n_weights64 = idx_u64(push.modules_per_chunk) * idx_u64(push.padded_hidden_count) * idx_u64(push.padded_total_output_class_count);
+    uint64_t n_biases64  = idx_u64(push.modules_per_chunk) * idx_u64(push.padded_total_output_class_count);
+    uint64_t n_temps64   = idx_u64(push.modules_per_chunk);
+    uint64_t n_hidden64  = idx_u64(push.modules_per_chunk) * idx_u64(push.total_batch_count) * idx_u64(push.padded_hidden_count);
+    uint n_weights = uint(n_weights64);
+    uint n_biases  = uint(n_biases64);
+    uint n_temps   = uint(n_temps64);
+    uint n_hidden  = uint(n_hidden64);
     uint total_elements = n_weights + n_biases + n_temps + n_hidden;
 
     // Base offsets for this tile
-    uint w_base = tile_idx * n_weights;
-    uint b_base = tile_idx * n_biases;
-    uint t_base = tile_idx * n_temps;
-    uint h_base = tile_idx * n_hidden;
+    uint w_base = uint(idx_u64(tile_idx) * n_weights64);
+    uint b_base = uint(idx_u64(tile_idx) * n_biases64);
+    uint t_base = uint(idx_u64(tile_idx) * n_temps64);
+    uint h_base = uint(idx_u64(tile_idx) * n_hidden64);
 
     // Pass 1: sum of squares
     COMPUTE_TYPE local_sq_sum = COMPUTE_TYPE(0.0);

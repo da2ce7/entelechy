@@ -10,6 +10,7 @@ import pyopencl as cl
 from ....shared.buffer_lifecycle import BufferHandle
 from ....shared.memory_layout import pad_to_multiple
 from ....shared.stabilization_policy import render_node16_threshold_schedule
+from ..type_mapping import compute_scalar
 from .base import KernelBinding
 
 
@@ -136,8 +137,8 @@ class ClipIntermediateGradBinding(KernelBinding):
         return [
             cl.LocalMemory(local_mem_size),
             get_buffer(buffer_bindings["intermediate_grad"]),
-            np.float32(scalar_params["clipping_threshold"]),
-            np.float32(scalar_params["epsilon"]),
+            compute_scalar(scalar_params["clipping_threshold"], scalar_params),
+            compute_scalar(scalar_params["epsilon"], scalar_params),
             np.uint32(scalar_params["parameter_count"]),
         ]
 
@@ -149,13 +150,16 @@ class ClipIntermediateGradBinding(KernelBinding):
         epsilon: float,
         param_count: int,
         element_size: int = 4,
+        compute_dtype: np.dtype | None = None,
     ) -> list[Any]:
         local_mem_size = self._workgroup_size * element_size
+        # ADR-024: Convert COMPUTE_TYPE scalars to appropriate precision
+        dtype = compute_dtype if compute_dtype is not None else np.float32
         return [
             cl.LocalMemory(local_mem_size),
             buffer,
-            np.float32(threshold),
-            np.float32(epsilon),
+            np.dtype(dtype).type(threshold),
+            np.dtype(dtype).type(epsilon),
             np.uint32(param_count),
         ]
 
@@ -206,7 +210,9 @@ class StabilizeReduceGradHBinding(KernelBinding):
         # Fill the schedule buffer.
         schedule_buf = get_buffer(buffer_bindings["clipping_threshold_per_stage"])
         if schedule:
-            schedule_np = np.array(schedule, dtype=np.float32)
+            # Schedule values must match COMPUTE_TYPE precision
+            compute_dtype = scalar_params.get("_compute_dtype", np.float32)
+            schedule_np = np.array(schedule, dtype=compute_dtype)
             cl.enqueue_copy(schedule_buf.context.queue, schedule_buf, schedule_np)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
 
         return [
@@ -215,8 +221,8 @@ class StabilizeReduceGradHBinding(KernelBinding):
             get_buffer(buffer_bindings["summed_grad_hidden_activations"]),
             get_buffer(buffer_bindings["clipping_threshold_per_stage"]),
             np.uint32(num_stages),
-            np.float32(t_pre),
-            np.float32(scalar_params["epsilon"]),
+            compute_scalar(t_pre, scalar_params),
+            compute_scalar(scalar_params["epsilon"], scalar_params),
             np.uint32(scalar_params["total_batch_count"]),
             np.uint32(scalar_params["padded_hidden_count"]),
             np.uint32(scalar_params["total_modules_count"]),
@@ -262,8 +268,8 @@ class ReduceKFanInAndClipBinding(KernelBinding):
             np.uint32(scalar_params["fan_in"]),
             np.uint32(scalar_params["node_count"]),
             np.uint32(scalar_params["partial_width"]),
-            np.float32(scalar_params["clipping_threshold"]),
-            np.float32(scalar_params["epsilon"]),
+            compute_scalar(scalar_params["clipping_threshold"], scalar_params),
+            compute_scalar(scalar_params["epsilon"], scalar_params),
         ]
 
     # Reduction-specific interface for renderer direct use
@@ -278,8 +284,11 @@ class ReduceKFanInAndClipBinding(KernelBinding):
         clipping_threshold: float,
         epsilon: float,
         element_size: int = 4,
+        compute_dtype: np.dtype | None = None,
     ) -> list[Any]:
         local_mem_size = self._workgroup_size * element_size
+        # ADR-024: Convert COMPUTE_TYPE scalars to appropriate precision
+        dtype = compute_dtype if compute_dtype is not None else np.float32
         return [
             cl.LocalMemory(local_mem_size),
             source,
@@ -288,8 +297,8 @@ class ReduceKFanInAndClipBinding(KernelBinding):
             np.uint32(fan_in),
             np.uint32(node_count),
             np.uint32(partial_width),
-            np.float32(clipping_threshold),
-            np.float32(epsilon),
+            np.dtype(dtype).type(clipping_threshold),
+            np.dtype(dtype).type(epsilon),
         ]
 
     def compute_grid_fan_in(

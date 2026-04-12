@@ -20,6 +20,7 @@ layout(push_constant) uniform PushConstants {
     uint batch_chunk_index;
     uint total_batch_count;
     uint num_batch_chunks;
+    uint hidden_count;
     uint padded_hidden_count;
     uint final_grad_hidden_total_element_count;
     uint FLAG_use_explicit_hidden_mask;
@@ -38,6 +39,16 @@ void main() {
 
     if (j_idx >= push.padded_hidden_count) return;
 
+    // ── Padding Zero-Establishment (CONTRACT.md) ──
+    // The kernel is the sole guarantor of zeros at padding positions.
+    if (j_idx >= push.hidden_count) {
+        if (lid == 0u) {
+            uint chunk_base = push.batch_chunk_index * push.padded_hidden_count;
+            grad_sb_out.data[chunk_base + j_idx] = write_storage(COMPUTE_TYPE(0.0));
+        }
+        return;
+    }
+
     // ── Parallel reduction over the batch chunk ──
     COMPUTE_TYPE p_grad_sb = COMPUTE_TYPE(0.0);
 
@@ -48,7 +59,7 @@ void main() {
 
         // Chain rule: dL/dB_j = (dL/dA_j) * (dA_j/dZ_j) * 1
         // For biases, dZ_j/dB_j = 1.
-        uint  hidden_offset = b_global * push.padded_hidden_count + j_idx;
+        uint  hidden_offset = uint(idx_u64(b_global) * idx_u64(push.padded_hidden_count) + idx_u64(j_idx));
         COMPUTE_TYPE grad_h_val    = grad_h.data[hidden_offset];
         COMPUTE_TYPE hidden_val    = read_storage(hidden_acts.data[hidden_offset]);
 

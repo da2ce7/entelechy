@@ -37,11 +37,11 @@ void main() {
     // Flat invocation index decomposed into (module_local, batch, hidden)
     uint gid = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
 
-    uint total_work = push.modules_per_chunk * push.total_batch_count * push.hidden_count;
+    uint total_work = push.modules_per_chunk * push.total_batch_count * push.padded_hidden_count;
     if (gid >= total_work) return;
 
-    uint h_idx            = gid % push.hidden_count;
-    uint rem              = gid / push.hidden_count;
+    uint h_idx            = gid % push.padded_hidden_count;
+    uint rem              = gid / push.padded_hidden_count;
     uint batch_idx        = rem % push.total_batch_count;
     uint module_local_idx = rem / push.total_batch_count;
 
@@ -50,14 +50,20 @@ void main() {
     if (tile_idx >= push.total_tile_count) return;
 
     // Placement contract: AoS write address
-    uint tile_size    = push.modules_per_chunk * push.total_batch_count * push.padded_hidden_count;
-    uint tile_base    = tile_idx * tile_size;
-    uint local_offset = module_local_idx * push.total_batch_count * push.padded_hidden_count
-                      + batch_idx * push.padded_hidden_count + h_idx;
-    uint out_idx = tile_base + local_offset;
+    uint64_t tile_size = idx_u64(push.modules_per_chunk) * idx_u64(push.total_batch_count) * idx_u64(push.padded_hidden_count);
+    uint64_t tile_base = idx_u64(tile_idx) * tile_size;
+    uint64_t local_offset = idx_u64(module_local_idx) * idx_u64(push.total_batch_count) * idx_u64(push.padded_hidden_count)
+                      + idx_u64(batch_idx) * idx_u64(push.padded_hidden_count) + idx_u64(h_idx);
+    uint out_idx = uint(tile_base + local_offset);
 
     // Padded sample early exit
     if (load_sample_mask(src_sample_mask.data[batch_idx >> 5u], batch_idx) == 0u) {
+        dest_grad_h.data[out_idx] = write_storage(COMPUTE_TYPE(0.0));
+        return;
+    }
+
+    // Padding Zero-Establishment: write zero for positions in the padded hidden dimension.
+    if (h_idx >= push.hidden_count) {
         dest_grad_h.data[out_idx] = write_storage(COMPUTE_TYPE(0.0));
         return;
     }
@@ -69,16 +75,16 @@ void main() {
     uint class_chunk_idx   = tile_idx % push.num_class_chunks;
     uint class_offset      = class_chunk_idx * push.classes_per_chunk;
 
-    uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
+    uint64_t prob_tile_base = idx_u64(tile_idx) * idx_u64(push.modules_per_chunk) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk);
 
     // Reduction over class chunk
     COMPUTE_TYPE grad_h_accum = COMPUTE_TYPE(0.0);
     for (uint c_local = 0; c_local < push.classes_per_chunk; ++c_local) {
         uint c_global = class_offset + c_local;
         if (c_global < push.total_output_class_count) {
-            uint prob_idx = prob_tile_base
-                          + module_local_idx * push.total_batch_count * push.classes_per_chunk
-                          + batch_idx * push.classes_per_chunk + c_local;
+            uint prob_idx = uint(prob_tile_base
+                          + idx_u64(module_local_idx) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk)
+                          + idx_u64(batch_idx) * idx_u64(push.classes_per_chunk) + idx_u64(c_local));
             COMPUTE_TYPE prob = read_storage(src_probs.data[prob_idx]);
 
             COMPUTE_TYPE d_loss_d_logit;
@@ -93,8 +99,8 @@ void main() {
             // Apply temperature chain rule: dL/dz = dL/dz_s * (1/tau)
             d_loss_d_logit *= inv_temp;
 
-            uint w_idx = module_global_idx * push.padded_hidden_count * push.padded_total_output_class_count
-                       + h_idx * push.padded_total_output_class_count + c_global;
+            uint w_idx = uint(idx_u64(module_global_idx) * idx_u64(push.padded_hidden_count) * idx_u64(push.padded_total_output_class_count)
+                       + idx_u64(h_idx) * idx_u64(push.padded_total_output_class_count) + idx_u64(c_global));
             COMPUTE_TYPE w_val = read_state(src_weights.data[w_idx]);
             grad_h_accum += d_loss_d_logit * w_val;
         }

@@ -8,7 +8,6 @@ import numpy as np
 import pyopencl as cl
 
 from ....shared.buffer_lifecycle import BufferHandle
-from ....shared.memory_layout import pad_to_multiple
 from .base import KernelBinding
 
 
@@ -23,7 +22,7 @@ class ForwardPassBinding(KernelBinding):
         batch_chunk_count = int(scalar_params["batch_chunk_count"])
         padded_hidden_count = int(scalar_params["padded_hidden_count"])
         global_size = (
-            pad_to_multiple(batch_chunk_count, simd),
+            batch_chunk_count * simd,
             padded_hidden_count // simd,
         )
         local_size = (simd, 1)
@@ -100,7 +99,6 @@ class ComputeProbsLossCceBinding(KernelBinding):
         global_size = (
             int(scalar_params["modules_per_chunk"]),
             int(scalar_params["total_batch_count"]),
-            int(scalar_params["classes_per_chunk"]),
         )
         return global_size, None
 

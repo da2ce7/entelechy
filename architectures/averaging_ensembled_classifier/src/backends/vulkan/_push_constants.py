@@ -2,12 +2,20 @@
 
 Each ctypes.Structure mirrors the GLSL push_constant layout for a shader.
 The marshal function converts plan node scalar_params into packed bytes.
+
+Precision-Aware Push Constants (ADR-024):
+Some kernels (Node 11, Node 19) have COMPUTE_TYPE scalar parameters per the
+kernel spec. When COMPUTE_TYPE = double, the GLSL layout changes due to FP64
+alignment requirements. This module provides FP64 struct variants and a
+lookup mechanism that selects the correct variant based on compute_dtype.
 """
 from __future__ import annotations
 
 from collections.abc import Mapping
 
 import ctypes
+
+import numpy as np
 
 
 # ── Push Constant Structures ──
@@ -71,6 +79,7 @@ class GradientTilePush(ctypes.Structure):
 
 
 class ClipPartialsPush(ctypes.Structure):
+    """ClipPartialsPush for COMPUTE_TYPE = float (FP32)."""
     _fields_ = [
         ("use_per_item_norm", ctypes.c_uint32),
         ("clipping_threshold", ctypes.c_float),
@@ -88,13 +97,13 @@ class ClipPartialsPush(ctypes.Structure):
 class GatherPermutePush(ctypes.Structure):
     _fields_ = [
         ("total_batch_count", ctypes.c_uint32),
+        ("hidden_count", ctypes.c_uint32),
         ("padded_hidden_count", ctypes.c_uint32),
         ("total_modules_count", ctypes.c_uint32),
         ("padded_total_modules_count", ctypes.c_uint32),
-        ("num_class_chunks", ctypes.c_uint32),
-        ("classes_per_chunk", ctypes.c_uint32),
+        ("num_module_chunks", ctypes.c_uint32),
         ("modules_per_chunk", ctypes.c_uint32),
-        ("partial_stride", ctypes.c_uint32),
+        ("num_class_chunks", ctypes.c_uint32),
         ("total_tile_count", ctypes.c_uint32),
     ]
 
@@ -113,6 +122,17 @@ class ClipIntermediatePush(ctypes.Structure):
         ("clipping_threshold", ctypes.c_float),
         ("epsilon", ctypes.c_float),
         ("parameter_count", ctypes.c_uint32),
+    ]
+
+
+class ReduceKFanInPush(ctypes.Structure):
+    """Push constants for reduce_k_fan_in_and_clip (ADR-019) COMPUTE_TYPE = float."""
+    _fields_ = [
+        ("fan_in", ctypes.c_uint32),
+        ("node_count", ctypes.c_uint32),
+        ("partial_width", ctypes.c_uint32),
+        ("clipping_threshold", ctypes.c_float),
+        ("epsilon", ctypes.c_float),
     ]
 
 
@@ -135,7 +155,9 @@ class SharedBackpropWeightsPush(ctypes.Structure):
         ("batch_chunk_index", ctypes.c_uint32),
         ("total_batch_count", ctypes.c_uint32),
         ("num_batch_chunks", ctypes.c_uint32),
+        ("input_count", ctypes.c_uint32),
         ("padded_input_count", ctypes.c_uint32),
+        ("hidden_count", ctypes.c_uint32),
         ("padded_hidden_count", ctypes.c_uint32),
         ("final_grad_hidden_activations_total_count", ctypes.c_uint32),
         ("FLAG_use_explicit_hidden_mask", ctypes.c_uint32),
@@ -149,6 +171,7 @@ class SharedBackpropBiasesPush(ctypes.Structure):
         ("batch_chunk_index", ctypes.c_uint32),
         ("total_batch_count", ctypes.c_uint32),
         ("num_batch_chunks", ctypes.c_uint32),
+        ("hidden_count", ctypes.c_uint32),
         ("padded_hidden_count", ctypes.c_uint32),
         ("final_grad_hidden_activations_total_count", ctypes.c_uint32),
         ("FLAG_use_explicit_hidden_mask", ctypes.c_uint32),
@@ -156,6 +179,7 @@ class SharedBackpropBiasesPush(ctypes.Structure):
 
 
 class ClipSharedPush(ctypes.Structure):
+    """ClipSharedPush for COMPUTE_TYPE = float (FP32)."""
     _fields_ = [
         ("clipping_threshold", ctypes.c_float),
         ("epsilon", ctypes.c_float),
@@ -167,10 +191,182 @@ class ClipSharedPush(ctypes.Structure):
     ]
 
 
+# ── FP64 (double) Push Constant Variants (ADR-024) ──
+# These match GLSL std430 layout when COMPUTE_TYPE = double.
+# Padding fields account for double alignment requirements.
+
+
+class ClipPartialsPushFP64(ctypes.Structure):
+    """ClipPartialsPush for COMPUTE_TYPE = double (FP64).
+
+    std430 layout: uint32 followed by double requires 4 bytes padding.
+    """
+    _pack_ = 1  # Disable automatic padding; we add explicit padding
+    _fields_ = [
+        ("use_per_item_norm", ctypes.c_uint32),
+        ("_pad0", ctypes.c_uint32),  # Align to 8 bytes for double
+        ("clipping_threshold", ctypes.c_double),
+        ("epsilon", ctypes.c_double),
+        ("num_class_chunks", ctypes.c_uint32),
+        ("classes_per_chunk", ctypes.c_uint32),
+        ("modules_per_chunk", ctypes.c_uint32),
+        ("total_batch_count", ctypes.c_uint32),
+        ("padded_hidden_count", ctypes.c_uint32),
+        ("total_tile_count", ctypes.c_uint32),
+        ("partial_stride", ctypes.c_uint32),
+        ("_pad1", ctypes.c_uint32),  # Pad to 8-byte boundary at end
+    ]
+
+
+class ClipSharedPushFP64(ctypes.Structure):
+    """ClipSharedPush for COMPUTE_TYPE = double (FP64).
+
+    No leading padding since first field is already double.
+    """
+    _pack_ = 1
+    _fields_ = [
+        ("clipping_threshold", ctypes.c_double),
+        ("epsilon", ctypes.c_double),
+        ("weights_parameter_count", ctypes.c_uint32),
+        ("biases_parameter_count", ctypes.c_uint32),
+        ("weights_write_offset", ctypes.c_uint32),
+        ("biases_write_offset", ctypes.c_uint32),
+        ("num_batch_chunks", ctypes.c_uint32),
+        ("_pad0", ctypes.c_uint32),  # Pad to 8-byte boundary at end
+    ]
+
+
+class ClipIntermediatePushFP64(ctypes.Structure):
+    """ClipIntermediatePush for COMPUTE_TYPE = double (FP64).
+
+    No leading padding since first field is already double.
+    """
+    _pack_ = 1
+    _fields_ = [
+        ("clipping_threshold", ctypes.c_double),
+        ("epsilon", ctypes.c_double),
+        ("parameter_count", ctypes.c_uint32),
+        ("_pad0", ctypes.c_uint32),  # Pad to 8-byte boundary at end
+    ]
+
+
+class ReduceKFanInPushFP64(ctypes.Structure):
+    """ReduceKFanInPush for COMPUTE_TYPE = double (FP64, ADR-019).
+
+    std430 layout: 3 uints (12 bytes) + 4 bytes padding = 16 bytes align for doubles.
+    """
+    _pack_ = 1
+    _fields_ = [
+        ("fan_in", ctypes.c_uint32),
+        ("node_count", ctypes.c_uint32),
+        ("partial_width", ctypes.c_uint32),
+        ("_pad0", ctypes.c_uint32),  # Align to 8 bytes for double
+        ("clipping_threshold", ctypes.c_double),
+        ("epsilon", ctypes.c_double),
+    ]
+
+
+# ── FP16 (half) Push Constant Variants (ADR-024 compliance) ──
+# These match GLSL std430 layout when COMPUTE_TYPE = float16_t.
+# FP16 fields use c_uint16 to hold the IEEE 754 half-precision bit pattern;
+# marshal_push_constants converts Python floats to float16 bits.
+
+
+class ClipPartialsPushFP16(ctypes.Structure):
+    """ClipPartialsPush for COMPUTE_TYPE = float16_t (FP16).
+
+    std430 layout: uint followed by two float16 (each 2 bytes) is tightly packed.
+    """
+    _pack_ = 1
+    _fields_ = [
+        ("use_per_item_norm", ctypes.c_uint32),
+        ("clipping_threshold", ctypes.c_uint16),  # float16 as IEEE 754 bits
+        ("epsilon", ctypes.c_uint16),              # float16 as IEEE 754 bits
+        ("num_class_chunks", ctypes.c_uint32),
+        ("classes_per_chunk", ctypes.c_uint32),
+        ("modules_per_chunk", ctypes.c_uint32),
+        ("total_batch_count", ctypes.c_uint32),
+        ("padded_hidden_count", ctypes.c_uint32),
+        ("total_tile_count", ctypes.c_uint32),
+        ("partial_stride", ctypes.c_uint32),
+    ]
+
+
+class ClipSharedPushFP16(ctypes.Structure):
+    """ClipSharedPush for COMPUTE_TYPE = float16_t (FP16).
+
+    std430 layout: two float16 (4 bytes total) followed by uints.
+    """
+    _pack_ = 1
+    _fields_ = [
+        ("clipping_threshold", ctypes.c_uint16),  # float16 as IEEE 754 bits
+        ("epsilon", ctypes.c_uint16),              # float16 as IEEE 754 bits
+        ("weights_parameter_count", ctypes.c_uint32),
+        ("biases_parameter_count", ctypes.c_uint32),
+        ("weights_write_offset", ctypes.c_uint32),
+        ("biases_write_offset", ctypes.c_uint32),
+        ("num_batch_chunks", ctypes.c_uint32),
+    ]
+
+
+class ClipIntermediatePushFP16(ctypes.Structure):
+    """ClipIntermediatePush for COMPUTE_TYPE = float16_t (FP16).
+
+    std430 layout: two float16 (4 bytes total) followed by uint.
+    """
+    _pack_ = 1
+    _fields_ = [
+        ("clipping_threshold", ctypes.c_uint16),  # float16 as IEEE 754 bits
+        ("epsilon", ctypes.c_uint16),              # float16 as IEEE 754 bits
+        ("parameter_count", ctypes.c_uint32),
+    ]
+
+
+class ReduceKFanInPushFP16(ctypes.Structure):
+    """ReduceKFanInPush for COMPUTE_TYPE = float16_t (FP16, ADR-019).
+
+    std430 layout: 3 uints (12 bytes) + 2 float16 (4 bytes, packed) = 16 bytes.
+    """
+    _pack_ = 1
+    _fields_ = [
+        ("fan_in", ctypes.c_uint32),
+        ("node_count", ctypes.c_uint32),
+        ("partial_width", ctypes.c_uint32),
+        ("clipping_threshold", ctypes.c_uint16),  # float16 as IEEE 754 bits
+        ("epsilon", ctypes.c_uint16),              # float16 as IEEE 754 bits
+    ]
+
+
 class NormalizePush(ctypes.Structure):
     _fields_ = [
         ("effective_batch_size", ctypes.c_float),
         ("epsilon", ctypes.c_float),
+        ("parameter_count", ctypes.c_uint32),
+    ]
+
+
+class NormalizePushFP64(ctypes.Structure):
+    """NormalizePush for COMPUTE_TYPE = double (FP64).
+
+    std430 layout: two doubles (16 bytes) followed by uint with padding.
+    """
+    _fields_ = [
+        ("effective_batch_size", ctypes.c_double),
+        ("epsilon", ctypes.c_double),
+        ("parameter_count", ctypes.c_uint32),
+        ("_pad0", ctypes.c_uint32),  # Align to 8-byte boundary
+    ]
+
+
+class NormalizePushFP16(ctypes.Structure):
+    """NormalizePush for COMPUTE_TYPE = float16_t (FP16).
+
+    std430 layout: two float16 (4 bytes total) followed by uint.
+    """
+    _pack_ = 1
+    _fields_ = [
+        ("effective_batch_size", ctypes.c_uint16),  # float16 as IEEE 754 bits
+        ("epsilon", ctypes.c_uint16),                # float16 as IEEE 754 bits
         ("parameter_count", ctypes.c_uint32),
     ]
 
@@ -214,6 +410,8 @@ PUSH_CONSTANT_STRUCTS: dict[str, type[ctypes.Structure]] = {
     "aggregate_partials": AggregatePush,
     "aggregate_partials_from_compute": AggregatePush,  # ADR-026: shares push layout
     "clip_intermediate_grad": ClipIntermediatePush,
+    "reduce_k_fan_in_and_clip": ReduceKFanInPush,  # ADR-019: K-fan-in with per-node clip
+    "reduce_k_fan_in_and_clip_from_compute": ReduceKFanInPush,  # ADR-019/ADR-026: compute-entry
     "stabilize_and_reduce_grad_hidden_activations": StabilizeReducePush,
     "backprop_shared_weights_chunk": SharedBackpropWeightsPush,
     "backprop_shared_biases_chunk": SharedBackpropBiasesPush,
@@ -221,6 +419,30 @@ PUSH_CONSTANT_STRUCTS: dict[str, type[ctypes.Structure]] = {
     "normalize_gradients": NormalizePush,
     "adam_update": AdamUpdatePush,
     "clamp_temperatures": ClampTempsPush,
+}
+
+# ── FP64 variant overrides (ADR-024) ──
+# Kernels with COMPUTE_TYPE scalar parameters require different struct layouts
+# when COMPUTE_TYPE = double due to FP64 alignment requirements.
+PUSH_CONSTANT_STRUCTS_FP64: dict[str, type[ctypes.Structure]] = {
+    "clip_partial_gradients": ClipPartialsPushFP64,
+    "clip_shared_gradients_chunk": ClipSharedPushFP64,
+    "clip_intermediate_grad": ClipIntermediatePushFP64,
+    "reduce_k_fan_in_and_clip": ReduceKFanInPushFP64,  # ADR-019
+    "reduce_k_fan_in_and_clip_from_compute": ReduceKFanInPushFP64,  # ADR-019/ADR-026
+    "normalize_gradients": NormalizePushFP64,
+}
+
+# ── FP16 variant overrides (ADR-024 compliance) ──
+# Kernels with COMPUTE_TYPE scalar parameters require different struct layouts
+# when COMPUTE_TYPE = float16_t due to 2-byte field sizes.
+PUSH_CONSTANT_STRUCTS_FP16: dict[str, type[ctypes.Structure]] = {
+    "clip_partial_gradients": ClipPartialsPushFP16,
+    "clip_shared_gradients_chunk": ClipSharedPushFP16,
+    "clip_intermediate_grad": ClipIntermediatePushFP16,
+    "reduce_k_fan_in_and_clip": ReduceKFanInPushFP16,  # ADR-019
+    "reduce_k_fan_in_and_clip_from_compute": ReduceKFanInPushFP16,  # ADR-019/ADR-026
+    "normalize_gradients": NormalizePushFP16,
 }
 
 
@@ -333,6 +555,8 @@ DESCRIPTOR_BINDING_COUNTS: dict[str, int] = {
     "aggregate_partials": 3,
     "aggregate_partials_from_compute": 3,  # ADR-026: same layout as storage-entry
     "clip_intermediate_grad": 1,
+    "reduce_k_fan_in_and_clip": 3,  # ADR-019: [src_collection, offset_list, dest]
+    "reduce_k_fan_in_and_clip_from_compute": 3,  # ADR-019/ADR-026: same layout
     "stabilize_and_reduce_grad_hidden_activations": 3,
     "backprop_shared_weights_chunk": 6,
     "backprop_shared_biases_chunk": 5,
@@ -365,24 +589,52 @@ def _strip_param_prefix(param_name: str) -> str:
 def marshal_push_constants(
     kernel_name: str,
     scalar_params: Mapping[str, int | float],
+    compute_dtype: np.dtype | None = None,
 ) -> bytes:
     """Convert plan scalar_params into packed push constant bytes.
 
     Maps abstract parameter names (CONTRACT.md naming convention)
     to the corresponding ctypes push constant struct fields.
+
+    Args:
+        kernel_name: Name of the kernel.
+        scalar_params: Scalar parameters from the plan node.
+        compute_dtype: Optional compute dtype. When np.float64, selects FP64
+            struct variants; when np.float16, selects FP16 struct variants
+            for kernels with COMPUTE_TYPE scalar parameters.
+            Defaults to None (FP32 structs).
     """
-    struct_cls = PUSH_CONSTANT_STRUCTS[kernel_name]
+    # Select precision-specific struct variant if available
+    if compute_dtype is not None and compute_dtype == np.float64:
+        struct_cls = PUSH_CONSTANT_STRUCTS_FP64.get(
+            kernel_name, PUSH_CONSTANT_STRUCTS[kernel_name]
+        )
+    elif compute_dtype is not None and compute_dtype == np.float16:
+        struct_cls = PUSH_CONSTANT_STRUCTS_FP16.get(
+            kernel_name, PUSH_CONSTANT_STRUCTS[kernel_name]
+        )
+    else:
+        struct_cls = PUSH_CONSTANT_STRUCTS[kernel_name]
+
     struct = struct_cls()
 
-    # Build field type lookup
+    # Build field type lookup (skip padding fields)
     field_types: dict[str, type] = {}
     for field_info in struct_cls._fields_:
         fname, ftype = field_info[0], field_info[1]
-        field_types[fname] = ftype
+        if not fname.startswith("_pad"):  # Skip padding fields
+            field_types[fname] = ftype
 
     for param_name, value in scalar_params.items():
         field_name = _strip_param_prefix(param_name)
         if field_name in field_types:
-            setattr(struct, field_name, field_types[field_name](value))
+            ftype = field_types[field_name]
+            # Handle FP16 fields stored as uint16 bit patterns
+            if ftype == ctypes.c_uint16 and isinstance(value, float):
+                # Convert float to float16 IEEE 754 bits
+                bits = np.float16(value).view(np.uint16).item()
+                setattr(struct, field_name, bits)
+            else:
+                setattr(struct, field_name, ftype(value))
 
     return bytes(struct)

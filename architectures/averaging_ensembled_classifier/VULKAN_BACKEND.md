@@ -720,7 +720,7 @@ void main() {
 **Performance characteristics:**
 
 - Memory access: weight loads are coalesced (contiguous `lid` → contiguous addresses); input broadcast leverages L1 cache (all invocations in a subgroup read the same address)
-- Shared memory: eliminates redundant global reads when input tile is reused across weight iterations; bank padding guarantees conflict-free column access
+- Shared memory: weights are tiled into shared memory to enable column-wise access by all invocations; bank padding guarantees conflict-free access. Input is read directly from global memory, relying on L1 cache for broadcast efficiency.
 - Zero branching in the hot loop — `max()` and ternary compile to predicated instructions
 - Padding guarantees: every dimension is SIMD-aligned, so no scalar tail-loop cleanup
 
@@ -1259,10 +1259,13 @@ typedef struct {
     uint32_t num_batch_chunks;
 } ClipSharedPush;
 
+// Note: effective_batch_size and epsilon are COMPUTE_TYPE per the kernel contract.
+// Precision-specific variants (NormalizePushFP64, NormalizePushFP16) are defined
+// in _push_constants.py. The FP32 variant uses float.
 typedef struct {
-    float    effective_batch_size;
-    float    epsilon;
-    uint32_t parameter_count;
+    COMPUTE_TYPE effective_batch_size;
+    COMPUTE_TYPE epsilon;
+    uint32_t     parameter_count;
 } NormalizePush;
 
 typedef struct {

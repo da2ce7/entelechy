@@ -27,32 +27,14 @@ else:
     torch = pytest.importorskip("torch", reason="Oracle tests require PyTorch")
 
 from .autograd_oracle import AutogradOracle
-from .conftest import init_with_seed, sync_oracles
+from .conftest import _loss_close, init_with_seed, make_unclipped_config, sync_oracles
 from .convergence_oracle import ConvergenceOracle
 from .faithful_oracle import FaithfulOracle
 from .oracle_config import OracleConfig
+from .conftest import _generate_xor_data
 
 PARAM_NAMES = ["W_shared", "b_shared", "W_module", "b_module", "temps"]
 
-
-def _make_unclipped_config(base: OracleConfig) -> OracleConfig:
-    """Return config with effectively-infinite clip thresholds."""
-    return OracleConfig(
-        input_dim=base.input_dim,
-        hidden_dim=base.hidden_dim,
-        output_classes=base.output_classes,
-        num_modules=base.num_modules,
-        mode=base.mode,
-        learning_rate=base.learning_rate,
-        beta1=base.beta1,
-        beta2=base.beta2,
-        epsilon=base.epsilon,
-        t_algorithmic=float("inf"),
-        lambda_=base.lambda_,
-        compute_fp_format_max=float("inf"),
-        temp_min=base.temp_min,
-        temp_max=base.temp_max,
-    )
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -76,7 +58,7 @@ class TestSingleStepGradientParity:
         small_cce_config: OracleConfig,
         small_cce_data: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
-        cfg = _make_unclipped_config(small_cce_config)
+        cfg = make_unclipped_config(small_cce_config)
         oracle_b1 = AutogradOracle(cfg, mode="flat")
         oracle_c = ConvergenceOracle(cfg)
         init_with_seed(oracle_b1)
@@ -86,7 +68,7 @@ class TestSingleStepGradientParity:
         oracle_b1.step(X, targets)
         oracle_c.step(X, targets)
 
-        assert abs(oracle_b1.last_loss - oracle_c.last_loss) < self.ATOL, (
+        assert _loss_close(oracle_b1.last_loss, oracle_c.last_loss, atol=self.ATOL, rtol=self.RTOL), (
             f"Loss mismatch: B1={oracle_b1.last_loss}, C={oracle_c.last_loss}"
         )
         for name in PARAM_NAMES:
@@ -102,7 +84,7 @@ class TestSingleStepGradientParity:
         small_bce_config: OracleConfig,
         small_bce_data: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
-        cfg = _make_unclipped_config(small_bce_config)
+        cfg = make_unclipped_config(small_bce_config)
         oracle_b1 = AutogradOracle(cfg, mode="flat")
         oracle_c = ConvergenceOracle(cfg)
         init_with_seed(oracle_b1)
@@ -112,7 +94,7 @@ class TestSingleStepGradientParity:
         oracle_b1.step(X, targets)
         oracle_c.step(X, targets)
 
-        assert abs(oracle_b1.last_loss - oracle_c.last_loss) < self.ATOL, (
+        assert _loss_close(oracle_b1.last_loss, oracle_c.last_loss, atol=self.ATOL, rtol=self.RTOL), (
             f"Loss mismatch: B1={oracle_b1.last_loss}, C={oracle_c.last_loss}"
         )
         for name in PARAM_NAMES:
@@ -129,13 +111,64 @@ class TestSingleStepGradientParity:
         small_cce_data: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
         """A vs C, no clipping. Manual formulas vs. independent autograd."""
-        cfg = _make_unclipped_config(small_cce_config)
+        cfg = make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_c = ConvergenceOracle(cfg)
         init_with_seed(oracle_a)
         sync_oracles(oracle_a, oracle_c)
 
         X, targets = small_cce_data
+        oracle_a.step(X, targets)
+        oracle_c.step(X, targets)
+
+        for name in PARAM_NAMES:
+            grad_a = oracle_a.final_grads[name]
+            grad_c = oracle_c.final_grads[name]
+            assert torch.allclose(grad_a, grad_c, atol=self.ATOL, rtol=self.RTOL), (
+                f"A vs C gradient mismatch on {name}: "
+                f"max_diff={(grad_a - grad_c).abs().max().item():.2e}"
+            )
+
+    def test_gradient_parity_xor(
+        self,
+        xor_config: OracleConfig,
+        xor_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        """B1 vs C gradient parity on XOR (BCE, 1 output class)."""
+        cfg = make_unclipped_config(xor_config)
+        oracle_b1 = AutogradOracle(cfg, mode="flat")
+        oracle_c = ConvergenceOracle(cfg)
+        init_with_seed(oracle_b1)
+        sync_oracles(oracle_b1, oracle_c)
+
+        X, targets = xor_data
+        oracle_b1.step(X, targets)
+        oracle_c.step(X, targets)
+
+        assert _loss_close(oracle_b1.last_loss, oracle_c.last_loss, atol=self.ATOL, rtol=self.RTOL), (
+            f"Loss mismatch on XOR: B1={oracle_b1.last_loss}, C={oracle_c.last_loss}"
+        )
+        for name in PARAM_NAMES:
+            grad_b1 = oracle_b1.final_grads[name]
+            grad_c = oracle_c.final_grads[name]
+            assert torch.allclose(grad_b1, grad_c, atol=self.ATOL, rtol=self.RTOL), (
+                f"Gradient mismatch on {name}: "
+                f"max_diff={(grad_b1 - grad_c).abs().max().item():.2e}"
+            )
+
+    def test_gradient_parity_a_vs_c_xor(
+        self,
+        xor_config: OracleConfig,
+        xor_data: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        """A vs C gradient parity on XOR (BCE, 1 output class)."""
+        cfg = make_unclipped_config(xor_config)
+        oracle_a = FaithfulOracle(cfg)
+        oracle_c = ConvergenceOracle(cfg)
+        init_with_seed(oracle_a)
+        sync_oracles(oracle_a, oracle_c)
+
+        X, targets = xor_data
         oracle_a.step(X, targets)
         oracle_c.step(X, targets)
 
@@ -170,7 +203,7 @@ class TestMultiStepParity:
         small_cce_data: tuple[torch.Tensor, torch.Tensor],
         steps: int,
     ) -> None:
-        cfg = _make_unclipped_config(small_cce_config)
+        cfg = make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_c = ConvergenceOracle(cfg)
         init_with_seed(oracle_a)
@@ -194,7 +227,7 @@ class TestMultiStepParity:
         small_bce_data: tuple[torch.Tensor, torch.Tensor],
         steps: int,
     ) -> None:
-        cfg = _make_unclipped_config(small_bce_config)
+        cfg = make_unclipped_config(small_bce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_c = ConvergenceOracle(cfg)
         init_with_seed(oracle_a)
@@ -212,13 +245,37 @@ class TestMultiStepParity:
             )
 
     @pytest.mark.parametrize("steps", [5, 50, 200])
+    def test_a_vs_c_trajectory_xor(
+        self,
+        xor_config: OracleConfig,
+        xor_data: tuple[torch.Tensor, torch.Tensor],
+        steps: int,
+    ) -> None:
+        cfg = make_unclipped_config(xor_config)
+        oracle_a = FaithfulOracle(cfg)
+        oracle_c = ConvergenceOracle(cfg)
+        init_with_seed(oracle_a)
+        sync_oracles(oracle_a, oracle_c)
+
+        X, targets = xor_data
+        for _step in range(steps):
+            oracle_a.step(X, targets)
+            oracle_c.step(X, targets)
+
+        distances = oracle_c.parameter_distance(oracle_a.export_state())
+        for name, dist in distances.items():
+            assert dist < self.ATOL, (
+                f"A vs C param drift on {name} after {steps} steps: {dist:.2e}"
+            )
+
+    @pytest.mark.parametrize("steps", [5, 50, 200])
     def test_b2_vs_c_trajectory_cce(
         self,
         small_cce_config: OracleConfig,
         small_cce_data: tuple[torch.Tensor, torch.Tensor],
         steps: int,
     ) -> None:
-        cfg = _make_unclipped_config(small_cce_config)
+        cfg = make_unclipped_config(small_cce_config)
         oracle_b2 = AutogradOracle(cfg, mode="tiled")
         oracle_c = ConvergenceOracle(cfg)
         init_with_seed(oracle_b2)
@@ -256,13 +313,37 @@ class TestMomentParity:
         small_cce_data: tuple[torch.Tensor, torch.Tensor],
         steps: int,
     ) -> None:
-        cfg = _make_unclipped_config(small_cce_config)
+        cfg = make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_c = ConvergenceOracle(cfg)
         init_with_seed(oracle_a)
         sync_oracles(oracle_a, oracle_c)
 
         X, targets = small_cce_data
+        for _ in range(steps):
+            oracle_a.step(X, targets)
+            oracle_c.step(X, targets)
+
+        moment_dists = oracle_c.moment_distance(oracle_a.export_state())
+        for key, dist in moment_dists.items():
+            assert dist < self.ATOL, (
+                f"Moment drift on {key} after {steps} steps: {dist:.2e}"
+            )
+
+    @pytest.mark.parametrize("steps", [10, 100])
+    def test_moment_parity_a_vs_c_xor(
+        self,
+        xor_config: OracleConfig,
+        xor_data: tuple[torch.Tensor, torch.Tensor],
+        steps: int,
+    ) -> None:
+        cfg = make_unclipped_config(xor_config)
+        oracle_a = FaithfulOracle(cfg)
+        oracle_c = ConvergenceOracle(cfg)
+        init_with_seed(oracle_a)
+        sync_oracles(oracle_a, oracle_c)
+
+        X, targets = xor_data
         for _ in range(steps):
             oracle_a.step(X, targets)
             oracle_c.step(X, targets)
@@ -281,7 +362,7 @@ class TestMomentParity:
         steps: int,
     ) -> None:
         """Params + moments combined distance (BCE)."""
-        cfg = _make_unclipped_config(small_bce_config)
+        cfg = make_unclipped_config(small_bce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_c = ConvergenceOracle(cfg)
         init_with_seed(oracle_a)
@@ -378,6 +459,34 @@ class TestKnownSolutionConvergence:
             f"BCE loss reduction too small: ratio={trace.loss_reduction_ratio:.4f}"
         )
 
+    def test_xor_bce(self):
+        """BCE on XOR (non-linear separability): loss decreases."""
+        config = OracleConfig(
+            input_dim=2,
+            hidden_dim=16,
+            output_classes=1,
+            num_modules=8,
+            mode="BCE",
+            learning_rate=0.01,
+        )
+        oracle_c = ConvergenceOracle(config)
+        init_with_seed(oracle_c, seed=7)
+
+        X_np, targets_np = _generate_xor_data()
+        X = torch.from_numpy(X_np).to(torch.float64)
+        targets = torch.from_numpy(targets_np).to(torch.float64)
+
+        trace = oracle_c.train_n_steps(X, targets, n=1000, record_every=10)
+
+        assert trace.converged, (
+            f"XOR failed to converge: initial={trace.initial_loss:.4f}, "
+            f"final={trace.final_loss:.4f}"
+        )
+        assert trace.is_stable, "NaN/Inf detected during XOR convergence"
+        assert trace.loss_reduction_ratio < 0.5, (
+            f"XOR loss reduction too small: ratio={trace.loss_reduction_ratio:.4f}"
+        )
+
 
 # ═════════════════════════════════════════════════════════════════════
 # 5. Convergence under clipping: A vs C loss curves
@@ -408,7 +517,7 @@ class TestConvergenceUnderClipping:
             lambda_=0.1,
         )
         # No-clip config for C
-        unclipped_config = _make_unclipped_config(clipped_config)
+        unclipped_config = make_unclipped_config(clipped_config)
 
         oracle_a = FaithfulOracle(clipped_config)
         oracle_c = ConvergenceOracle(unclipped_config)
@@ -582,6 +691,31 @@ class TestLongRunStability:
             f"initial={trace.initial_loss:.4f}, final={trace.final_loss:.4f}"
         )
 
+    def test_stability_1k_steps_xor(self):
+        """1,000 steps XOR: no NaN/Inf."""
+        config = OracleConfig(
+            input_dim=2,
+            hidden_dim=16,
+            output_classes=1,
+            num_modules=8,
+            mode="BCE",
+            learning_rate=0.001,
+        )
+        oracle_c = ConvergenceOracle(config)
+        init_with_seed(oracle_c, seed=7)
+
+        X_np, targets_np = _generate_xor_data()
+        X = torch.from_numpy(X_np).to(torch.float64)
+        targets = torch.from_numpy(targets_np).to(torch.float64)
+
+        trace = oracle_c.train_n_steps(X, targets, n=1000, record_every=50)
+
+        assert trace.is_stable, "NaN/Inf during 1K-step XOR run"
+        assert trace.converged, (
+            f"XOR failed to converge over 1K steps: "
+            f"initial={trace.initial_loss:.4f}, final={trace.final_loss:.4f}"
+        )
+
     @pytest.mark.slow
     def test_marathon_100k_steps(self):
         """100K steps: the marathon. Validates Adam bias correction
@@ -622,7 +756,7 @@ class TestLongRunStability:
         small_cce_data: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
         """After N steps, both A and C report the same step counter."""
-        cfg = _make_unclipped_config(small_cce_config)
+        cfg = make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_c = ConvergenceOracle(cfg)
         init_with_seed(oracle_a)
@@ -656,7 +790,7 @@ class TestSampleMaskParity:
         small_cce_config: OracleConfig,
         small_cce_data: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
-        cfg = _make_unclipped_config(small_cce_config)
+        cfg = make_unclipped_config(small_cce_config)
         oracle_a = FaithfulOracle(cfg)
         oracle_c = ConvergenceOracle(cfg)
         init_with_seed(oracle_a)

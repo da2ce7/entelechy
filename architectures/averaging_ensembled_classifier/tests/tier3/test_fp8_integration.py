@@ -1,10 +1,14 @@
 # tests/tier3/test_fp8_integration.py
 """The Bandwidth Extremist: FP8 storage fidelity validation (ADR-025 §9.1)."""
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 import numpy as np
 
-from src.shared.precision_config import PrecisionConfig, FP8_E4M3, FP8_E5M2, FP8_DTYPES
+from src.shared.precision_config import PrecisionConfig
 from src.shared.fp8_scaling import (
     compute_fp8_scale,
     apply_fp8_scale,
@@ -60,7 +64,7 @@ class TestBandwidthExtremist:
     """ADR-025 §9.1: FP8 vs FP16 training comparison."""
 
     @pytest.fixture
-    def training_config(self):
+    def training_config(self) -> dict[str, Any]:
         """Standard training configuration for comparison."""
         return {
             "batch_size": 32,
@@ -82,7 +86,12 @@ class TestBandwidthExtremist:
         (PrecisionConfig.fp8_e5m2, PrecisionConfig.mixed_f16_f32),  # E5M2/FP32/FP32 vs FP16/FP32/FP32
         (PrecisionConfig.fp8_e5m2_f64, PrecisionConfig.float64),    # E5M2/FP64/FP64 vs FP64/FP64/FP64
     ])
-    def test_fp8_convergence_matches_baseline(self, training_config, fp8_factory, baseline_factory):
+    def test_fp8_convergence_matches_baseline(
+        self,
+        training_config: dict[str, Any],
+        fp8_factory: Callable[[], PrecisionConfig],
+        baseline_factory: Callable[[], PrecisionConfig],
+    ) -> None:
         """FP8 training converges within tolerance of baseline.
 
         Each FP8 config is paired with a baseline that has identical compute and state
@@ -101,10 +110,10 @@ class TestBandwidthExtremist:
         )
 
         # Run baseline
-        loss_baseline, params_baseline = self._run_training(cfg_baseline, training_config)
+        loss_baseline, _params_baseline = self._run_training(cfg_baseline, training_config)
 
         # Run FP8
-        loss_fp8, params_fp8 = self._run_training(cfg_fp8, training_config)
+        loss_fp8, _params_fp8 = self._run_training(cfg_fp8, training_config)
 
         # Assert convergence within tolerance (see module-level constants for rationale)
         final_loss_baseline = loss_baseline[-1]
@@ -132,7 +141,7 @@ class TestBandwidthExtremist:
             f"This may indicate quantization-induced divergence."
         )
 
-    def test_fp8_buffer_sizing(self, training_config):
+    def test_fp8_buffer_sizing(self, training_config: dict[str, Any]) -> None:
         """FP8 storage buffers are 1/2 the size of FP16."""
         cfg_fp8 = PrecisionConfig.fp8_e4m3()
         cfg_fp16 = PrecisionConfig.mixed_f16_f32()
@@ -146,7 +155,7 @@ class TestBandwidthExtremist:
             f"FP16 storage ({fp16_storage_bytes})"
         )
 
-    def test_quantization_error_bounded(self, training_config, calibration_mode):
+    def test_quantization_error_bounded(self, training_config: dict[str, Any], calibration_mode: bool) -> None:
         """Quantization error from FP8 storage is bounded and does not blow up."""
         cfg_fp8 = PrecisionConfig.fp8_e4m3()
 
@@ -233,7 +242,7 @@ class TestBandwidthExtremist:
             f"Combined FP8+loss_scaling P95 error {p95_error:.2%} is unreasonably large"
         )
 
-    def _run_training(self, precision, config):
+    def _run_training(self, precision: PrecisionConfig, config: dict[str, Any]) -> tuple[list[float], dict[str, Any]]:
         """Execute training with given precision config.
 
         Returns (loss_history: List[float], final_params: dict).
@@ -246,7 +255,6 @@ class TestBandwidthExtremist:
         from src.shared.model_spec import ModelSpec
         from src.shared.hardware_profile import HardwareProfile
         from src.backends.cpu.renderer import CPUPlanRenderer
-        from src.shared.problem_type_strategy import PlanCceStrategy
 
         np.random.seed(config["seed"])
 
@@ -288,11 +296,12 @@ class TestBandwidthExtremist:
         )
 
         # Generate synthetic data
-        X_train = np.random.randn(config["batch_size"], 4).astype(np.float32)
-        y_train = np.random.randint(0, 3, size=config["batch_size"]).astype(np.int32)
+        batch_size: int = config["batch_size"]
+        X_train = np.random.randn(batch_size, 4).astype(np.float32)
+        y_train = np.random.randint(0, 3, size=batch_size).astype(np.int32)
 
-        loss_history = []
-        for epoch in range(config["epochs"]):
+        loss_history: list[float] = []
+        for _epoch in range(config["epochs"]):
             # Use the orchestrator's train method for a single epoch
             probs = orchestrator.train(X_train, y_train)
             # Compute loss from probabilities
@@ -303,5 +312,5 @@ class TestBandwidthExtremist:
                 loss = -np.mean(log_probs[np.arange(len(y_train)), y_train])
                 loss_history.append(float(loss))
 
-        params = {}  # Placeholder — actual param extraction depends on orchestrator API
+        params: dict[str, Any] = {}  # Placeholder — actual param extraction depends on orchestrator API
         return loss_history, params

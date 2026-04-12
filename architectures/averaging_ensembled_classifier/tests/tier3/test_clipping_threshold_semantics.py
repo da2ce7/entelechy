@@ -10,20 +10,18 @@ These tests run across all available backends to ensure conformance.
 """
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 import pytest
 
 from tests.tier2.fixtures.analytical import ref_clip_l2_norm
 from tests.tier2.fixtures.data_generators import make_rng
 
-from .conftest import _get_available_backends
+from .conftest import get_available_backends
 
 
 def _backends_available() -> list[str]:
     """Return available backends at module load time."""
-    return _get_available_backends()
+    return get_available_backends()
 
 
 _BACKENDS = _backends_available()

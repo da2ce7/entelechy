@@ -16,6 +16,7 @@ role_bearing_shaders = [
     'gather_and_permute_grad_hidden_activations.comp',
     'aggregate_partials.comp',
     'clip_intermediate_grad.comp',
+    'reduce_k_fan_in_and_clip.comp',  # ADR-019: K-fan-in with per-node L2 clip
     'stabilize_and_reduce_grad_hidden_activations.comp',
     'backprop_shared_weights_chunk.comp',
     'backprop_shared_biases_chunk.comp',
@@ -28,6 +29,7 @@ role_bearing_shaders = [
 compute_only_shaders = [
     'normalize_gradients.comp',
     'aggregate_partials_from_compute.comp',  # ADR-026: Compute-entry variant
+    'reduce_k_fan_in_and_clip_from_compute.comp',  # ADR-019/ADR-026: Compute-entry K-fan-in
 ]
 
 # Precision variant definitions: [suffix, extra glslc flags]

@@ -166,6 +166,12 @@ class VulkanContext:
             self._physical_device
         )
 
+    def supports_int64(self) -> bool:
+        """Check if the Vulkan device supports shaderInt64 (mandatory)."""
+        if self._device_features is None:
+            return False
+        return bool(getattr(self._device_features, "shaderInt64", False))
+
     def supports_float64(self) -> bool:
         """Check if the Vulkan device supports FP64 shader operations."""
         if self._device_features is None:
@@ -247,8 +253,17 @@ class VulkanContext:
 
         self._enabled_extensions = set(extensions)
 
-        # Enable device features, including shaderFloat64 if available
+        # shaderInt64 is mandatory for overflow-safe buffer indexing.
+        if not self.supports_int64():
+            raise RuntimeError(
+                "Vulkan backend requires shaderInt64 for overflow-safe "
+                "buffer address calculations. This device does not "
+                "support it. Use the CPU or OpenCL backend instead."
+            )
+
+        # Enable device features: shaderInt64 (mandatory), shaderFloat64 (optional)
         enabled_features = vk.VkPhysicalDeviceFeatures(
+            shaderInt64=True,
             shaderFloat64=self.supports_float64(),
         )
 

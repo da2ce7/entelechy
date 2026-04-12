@@ -19,7 +19,7 @@ import pytest
 
 from tests.tolerance_config import get_tier3_tolerance
 
-from .conftest import _get_available_backends, _select_oracle
+from .conftest import get_available_backends, select_oracle
 
 # ---------------------------------------------------------------------------
 # Kernels whose zero-initialized-buffer parity is undefined.
@@ -74,8 +74,8 @@ STRATEGY_A_KERNELS = {
 
 def _build_comparison_pairs() -> list[tuple[str, str]]:
     """Build comparison pairs for parametrize at module load time."""
-    available = _get_available_backends()
-    oracle = _select_oracle()
+    available = get_available_backends()
+    oracle = select_oracle()
     pairs: list[tuple[str, str]] = []
     if oracle is not None:
         for b in available:

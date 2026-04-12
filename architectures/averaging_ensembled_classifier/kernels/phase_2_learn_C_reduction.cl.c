@@ -13,7 +13,7 @@
 __kernel void aggregate_register_reduce(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_collection,
     __global const uint         *src_buffer_GLOBAL_CONST_partial_offset_list,
-    __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_partial,
     uint                         src_scalar_NATURAL_partial_offset_list_count,
     uint                         src_scalar_NATURAL_partial_width,
     uint                         src_scalar_FLAG_operation_type) {
@@ -44,7 +44,8 @@ __kernel void aggregate_register_reduce(
         accum /= (COMPUTE_TYPE)src_scalar_NATURAL_partial_offset_list_count;
     }
 
-    store_storage(dest_buffer_GLOBAL_partial, element_idx, accum);
+    // Compute-role output: write directly in COMPUTE_TYPE (no narrowing).
+    dest_buffer_GLOBAL_partial[element_idx] = accum;
 }
 
 // --- Implementation: aggregate_local_reduce (Node 14, 15a, 20a) ---
@@ -56,7 +57,7 @@ __kernel void aggregate_local_reduce(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_collection,
     __global const uint         *src_buffer_GLOBAL_CONST_partial_offset_list,
-    __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_partial,
     uint                         src_scalar_NATURAL_partial_offset_list_count,
     uint                         src_scalar_NATURAL_partial_width,
     uint                         src_scalar_FLAG_operation_type) {
@@ -101,7 +102,8 @@ __kernel void aggregate_local_reduce(
         if (src_scalar_FLAG_operation_type == AGG_MODE_AVERAGE && src_scalar_NATURAL_partial_offset_list_count > 0) {
             result /= (COMPUTE_TYPE)src_scalar_NATURAL_partial_offset_list_count;
         }
-        store_storage(dest_buffer_GLOBAL_partial, element_idx, result);
+        // Compute-role output: write directly in COMPUTE_TYPE (no narrowing).
+        dest_buffer_GLOBAL_partial[element_idx] = result;
     }
 }
 
@@ -113,7 +115,7 @@ __kernel void aggregate_local_reduce(
 // lightweight primitive ideal for repeated use within a reduction tree.
 __kernel void clip_intermediate_grad(
     __local COMPUTE_TYPE  *update_buffer_LOCAL_reduction_tile,
-    __global STORAGE_TYPE *update_buffer_GLOBAL_intermediate_grad,
+    __global COMPUTE_TYPE *update_buffer_GLOBAL_intermediate_grad,
     COMPUTE_TYPE           src_scalar_REAL_clipping_threshold_t_j,
     COMPUTE_TYPE           src_scalar_REAL_epsilon,
     uint                   src_scalar_NATURAL_parameter_count) {
@@ -131,8 +133,9 @@ __kernel void clip_intermediate_grad(
     // --- 1. Pass 1: Parallel Reduction to find Sum of Squares ---
     COMPUTE_TYPE local_sq_sum = COMPUTE_ZERO;
     // Each thread in the work-group sums the squares from a strided slice of the input buffer.
+    // Compute-role buffer: read directly (no widening conversion).
     for (uint i = lid; i < src_scalar_NATURAL_parameter_count; i += lsize) {
-        COMPUTE_TYPE val = load_storage(update_buffer_GLOBAL_intermediate_grad, i);
+        COMPUTE_TYPE val = update_buffer_GLOBAL_intermediate_grad[i];
         local_sq_sum += val * val;
     }
 
@@ -153,7 +156,7 @@ __kernel void clip_intermediate_grad(
         const COMPUTE_TYPE total_sum_sq = update_buffer_LOCAL_reduction_tile[0];
         const COMPUTE_TYPE norm         = MATH_FN sqrt(total_sum_sq);
 
-        COMPUTE_TYPE scale_factor = 1.0f;
+        COMPUTE_TYPE scale_factor = COMPUTE_ONE;
         // Only trigger scaling if the norm exceeds the threshold for this reduction stage.
         if (norm > src_scalar_REAL_clipping_threshold_t_j) {
             scale_factor = src_scalar_REAL_clipping_threshold_t_j / (norm + src_scalar_REAL_epsilon);
@@ -169,15 +172,15 @@ __kernel void clip_intermediate_grad(
     // --- 3. Performance Optimization: Early Exit ---
     // If the scaling factor is 1.0, no clipping is needed. The entire work-group can
     // exit now, saving the cost of a full global memory read/write cycle.
-    if (scale_factor >= 1.0f) {
+    if (scale_factor >= COMPUTE_ONE) {
         return;
     }
 
     // --- 4. Pass 2: Conditional In-Place Scaling ---
     // This second pass only executes if clipping is required.
+    // Compute-role buffer: read/write directly (no precision conversion).
     for (uint i = lid; i < src_scalar_NATURAL_parameter_count; i += lsize) {
-        COMPUTE_TYPE val = load_storage(update_buffer_GLOBAL_intermediate_grad, i);
-        store_storage(update_buffer_GLOBAL_intermediate_grad, i, val * scale_factor);
+        update_buffer_GLOBAL_intermediate_grad[i] *= scale_factor;
     }
 }
 
@@ -267,11 +270,11 @@ __kernel void reduce_k_fan_in_and_clip(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_collection,
     __global const uint         *src_buffer_GLOBAL_CONST_offset_list_flat,
-    __global STORAGE_TYPE       *dest_buffer_GLOBAL_stage_partial,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_stage_partial,
     uint                         src_scalar_NATURAL_fan_in,
     uint                         src_scalar_NATURAL_node_count,
     uint                         src_scalar_NATURAL_partial_width,
-    COMPUTE_TYPE                 src_scalar_REAL_clipping_threshold,
+    COMPUTE_TYPE                 src_scalar_REAL_clipping_threshold_t_j,
     COMPUTE_TYPE                 src_scalar_REAL_epsilon) {
 
     // --- 0. Work-Group to Reduction Node Mapping ---
@@ -302,9 +305,9 @@ __kernel void reduce_k_fan_in_and_clip(
             }
         }
 
-        // Store the accumulated sum in the destination, to be potentially
-        // scaled in-place during Phase 3.
-        store_storage(dest_buffer_GLOBAL_stage_partial, dest_base + elem, accum);
+        // Store the accumulated sum in the destination (compute-role output),
+        // to be potentially scaled in-place during Phase 3.
+        dest_buffer_GLOBAL_stage_partial[dest_base + elem] = accum;
 
         // Accumulate the square for this thread's L2 norm contribution.
         local_sq_sum += accum * accum;
@@ -314,7 +317,7 @@ __kernel void reduce_k_fan_in_and_clip(
     // Clipping is enabled for any non-negative threshold. Negative values
     // (e.g., -1.0) bypass clipping entirely (diagnostic mode). Zero means
     // "clip to zero norm", which zeroes all gradients — valid but destructive.
-    if (src_scalar_REAL_clipping_threshold >= COMPUTE_ZERO) {
+    if (src_scalar_REAL_clipping_threshold_t_j >= COMPUTE_ZERO) {
         update_buffer_LOCAL_reduction_tile[lid] = local_sq_sum;
         barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -331,8 +334,8 @@ __kernel void reduce_k_fan_in_and_clip(
             const COMPUTE_TYPE norm         = MATH_FN sqrt(total_sum_sq);
 
             COMPUTE_TYPE scale_factor = (COMPUTE_TYPE)1.0f;
-            if (norm > src_scalar_REAL_clipping_threshold) {
-                scale_factor = src_scalar_REAL_clipping_threshold / (norm + src_scalar_REAL_epsilon);
+            if (norm > src_scalar_REAL_clipping_threshold_t_j) {
+                scale_factor = src_scalar_REAL_clipping_threshold_t_j / (norm + src_scalar_REAL_epsilon);
             }
             update_buffer_LOCAL_reduction_tile[0] = scale_factor;
         }
@@ -342,8 +345,9 @@ __kernel void reduce_k_fan_in_and_clip(
         // --- Phase 3: Conditional In-Place Scaling ---
         if (scale_factor < (COMPUTE_TYPE)1.0f) {
             for (uint elem = lid; elem < src_scalar_NATURAL_partial_width; elem += lsize) {
-                COMPUTE_TYPE val = load_storage(dest_buffer_GLOBAL_stage_partial, dest_base + elem);
-                store_storage(dest_buffer_GLOBAL_stage_partial, dest_base + elem, val * scale_factor);
+                // Direct COMPUTE_TYPE read/write (compute-role output).
+                COMPUTE_TYPE val = dest_buffer_GLOBAL_stage_partial[dest_base + elem];
+                dest_buffer_GLOBAL_stage_partial[dest_base + elem] = val * scale_factor;
             }
         }
     }
@@ -449,7 +453,7 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
     uint                         src_scalar_NATURAL_fan_in,
     uint                         src_scalar_NATURAL_node_count,
     uint                         src_scalar_NATURAL_partial_width,
-    COMPUTE_TYPE                 src_scalar_REAL_clipping_threshold,
+    COMPUTE_TYPE                 src_scalar_REAL_clipping_threshold_t_j,
     COMPUTE_TYPE                 src_scalar_REAL_epsilon) {
 
     const uint node_id = get_group_id(0);
@@ -486,7 +490,7 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
     // Phase 2: Per-node L2 norm via local memory parallel reduction.
     // Clipping is enabled for any non-negative threshold. Negative values
     // bypass clipping entirely (diagnostic mode).
-    if (src_scalar_REAL_clipping_threshold >= COMPUTE_ZERO) {
+    if (src_scalar_REAL_clipping_threshold_t_j >= COMPUTE_ZERO) {
         update_buffer_LOCAL_reduction_tile[lid] = local_sq_sum;
         barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -502,8 +506,8 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
             const COMPUTE_TYPE norm         = MATH_FN sqrt(total_sum_sq);
 
             COMPUTE_TYPE scale_factor = (COMPUTE_TYPE)1.0f;
-            if (norm > src_scalar_REAL_clipping_threshold) {
-                scale_factor = src_scalar_REAL_clipping_threshold / (norm + src_scalar_REAL_epsilon);
+            if (norm > src_scalar_REAL_clipping_threshold_t_j) {
+                scale_factor = src_scalar_REAL_clipping_threshold_t_j / (norm + src_scalar_REAL_epsilon);
             }
             update_buffer_LOCAL_reduction_tile[0] = scale_factor;
         }

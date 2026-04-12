@@ -125,7 +125,7 @@ typedef struct {                                                               \
     const STORAGE_T* targets;                                                  \
     const uint*      sample_mask;                                              \
     STORAGE_T*       partial_probs;                                            \
-    STORAGE_T*       partial_loss;                                             \
+    COMPUTE_T*       partial_loss;                                             \
     uint             flat_tile_index;                                          \
     uint             num_class_chunks;                                         \
     uint             classes_per_chunk;                                        \
@@ -213,8 +213,8 @@ typedef struct {                                                               \
     STORAGE_T*       clipped_partial_grad_temps;                               \
     STORAGE_T*       clipped_partial_grad_hidden_activations_aos;              \
     uint             use_per_item_norm;                                        \
-    float            clipping_threshold_t_pre;                                 \
-    float            epsilon;                                                  \
+    COMPUTE_T        clipping_threshold_t_pre;                                 \
+    COMPUTE_T        epsilon;                                                  \
     uint             flat_tile_index;                                          \
     uint             num_class_chunks;                                         \
     uint             classes_per_chunk;                                        \
@@ -246,8 +246,8 @@ typedef struct {                                                               \
     const uint*      stage_offsets_into_list;                                  \
     const uint*      stage_fan_in;                                             \
     const uint*      stage_node_counts;                                        \
-    STORAGE_T*       staging_buffer_0;                                         \
-    STORAGE_T*       staging_buffer_1;                                         \
+    COMPUTE_T*       staging_buffer_0;  /* ADR-026: COMPUTE_T for all stages */\
+    COMPUTE_T*       staging_buffer_1;                                         \
     COMPUTE_T*       output;                                                   \
     uint             partial_width;                                            \
     uint             num_stages;                                               \
@@ -338,8 +338,8 @@ typedef struct {                                                               \
     const STORAGE_T* partial_grad_biases_shared;                               \
     STORAGE_T*       clipped_partial_grad_weights_shared;                      \
     STORAGE_T*       clipped_partial_grad_biases_shared;                       \
-    float            clipping_threshold_t_pre;                                 \
-    float            epsilon;                                                  \
+    COMPUTE_T        clipping_threshold_t_pre;                                 \
+    COMPUTE_T        epsilon;                                                  \
     uint             weights_parameter_count;                                  \
     uint             biases_parameter_count;                                   \
     uint             weights_write_offset_elements;                            \

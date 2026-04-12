@@ -204,7 +204,7 @@ def make_precision_types(
         ("targets", c_storage_p),  # BCE targets in storage dtype
         ("sample_mask", c_uint_p),
         ("partial_probs", c_storage_p),
-        ("partial_loss", c_storage_p),  # BCE partial loss in storage dtype
+        ("partial_loss", c_compute_p),  # BCE partial loss in compute dtype
         ("flat_tile_index", c_uint32),
         ("num_class_chunks", c_uint32),
         ("classes_per_chunk", c_uint32),
@@ -293,8 +293,8 @@ def make_precision_types(
         ("clipped_partial_grad_temps", c_storage_p),
         ("clipped_partial_grad_hidden_activations_aos", c_storage_p),
         ("use_per_item_norm", c_uint32),
-        ("clipping_threshold_t_pre", c_float),  # scalar compute param
-        ("epsilon", c_float),
+        ("clipping_threshold_t_pre", c_compute),  # scalar compute param (ADR-024)
+        ("epsilon", c_compute),                   # scalar compute param (ADR-024)
         ("flat_tile_index", c_uint32),
         ("num_class_chunks", c_uint32),
         ("classes_per_chunk", c_uint32),
@@ -420,8 +420,8 @@ def make_precision_types(
         ("partial_grad_biases_shared", c_storage_p),
         ("clipped_partial_grad_weights_shared", c_storage_p),
         ("clipped_partial_grad_biases_shared", c_storage_p),
-        ("clipping_threshold_t_pre", c_float),
-        ("epsilon", c_float),
+        ("clipping_threshold_t_pre", c_compute),  # scalar compute param (ADR-024)
+        ("epsilon", c_compute),                   # scalar compute param (ADR-024)
         ("weights_parameter_count", c_uint32),
         ("biases_parameter_count", c_uint32),
         ("weights_write_offset", c_uint32),

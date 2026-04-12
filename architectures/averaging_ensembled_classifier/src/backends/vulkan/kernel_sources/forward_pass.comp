@@ -40,12 +40,12 @@ void main() {
 
     uint  h_idx      = hb * SPEC_SIMD_WIDTH + lid;
     uint  mask_val   = load_sample_mask(src_sample_mask.data[b_idx >> 5u], b_idx);
-    uint  input_base = b_idx * push.padded_input_count;
-    uint  w_base     = hb * push.padded_input_count * SPEC_SIMD_WIDTH;
+    uint  input_base = uint(idx_u64(b_idx) * idx_u64(push.padded_input_count));
+    uint  w_base     = uint(idx_u64(hb) * idx_u64(push.padded_input_count) * idx_u64(SPEC_SIMD_WIDTH));
 
     // Handle padded (masked-out) samples
     if (mask_val == 0u) {
-        uint out_idx = b_idx * push.padded_hidden_count + h_idx;
+        uint out_idx = uint(idx_u64(b_idx) * idx_u64(push.padded_hidden_count) + idx_u64(h_idx));
         dest_hidden.data[out_idx]      = write_storage(COMPUTE_TYPE(0.0));
         if (push.FLAG_produce_hidden_mask != 0u) {
             dest_hidden_mask.data[out_idx] = write_storage(COMPUTE_TYPE(0.0));
@@ -58,16 +58,22 @@ void main() {
 
     // Tiled dot product across input dimension
     for (uint it = 0; it < push.padded_input_count; it += SPEC_SIMD_WIDTH) {
-        // Cooperatively load weight tile into shared memory
+        // Cooperatively load weight tile into shared memory (bounds-guarded)
         for (uint k = 0; k < SPEC_SIMD_WIDTH; k++) {
-            simd_tile[lid][k] = read_state(src_weights.data[w_base + (it + lid) * SPEC_SIMD_WIDTH + k]);
+            if (it + lid < push.padded_input_count) {
+                simd_tile[lid][k] = read_state(src_weights.data[uint(idx_u64(w_base) + idx_u64(it + lid) * idx_u64(SPEC_SIMD_WIDTH) + idx_u64(k))]);
+            } else {
+                simd_tile[lid][k] = COMPUTE_TYPE(0.0);
+            }
         }
         barrier();
 
         // Column-wise access → bank-conflict-free due to padding
         for (uint j = 0; j < SPEC_SIMD_WIDTH; j++) {
-            COMPUTE_TYPE x = read_storage(src_input.data[input_base + it + j]);
-            accum = fma(simd_tile[j][lid], x, accum);
+            if (it + j < push.padded_input_count) {
+                COMPUTE_TYPE x = read_storage(src_input.data[input_base + it + j]);
+                accum = fma(simd_tile[j][lid], x, accum);
+            }
         }
         barrier();
     }
@@ -76,7 +82,7 @@ void main() {
     COMPUTE_TYPE activated = max(COMPUTE_TYPE(0.0), accum);
     COMPUTE_TYPE rmask     = (accum > COMPUTE_TYPE(0.0)) ? COMPUTE_TYPE(1.0) : COMPUTE_TYPE(0.0);
 
-    uint out_idx = b_idx * push.padded_hidden_count + h_idx;
+    uint out_idx = uint(idx_u64(b_idx) * idx_u64(push.padded_hidden_count) + idx_u64(h_idx));
     dest_hidden.data[out_idx] = write_storage(activated);
     if (push.FLAG_produce_hidden_mask != 0u) {
         dest_hidden_mask.data[out_idx] = write_storage(rmask);

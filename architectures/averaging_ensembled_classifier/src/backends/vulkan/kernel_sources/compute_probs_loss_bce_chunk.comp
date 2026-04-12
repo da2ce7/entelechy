@@ -28,7 +28,7 @@ layout(set = 0, binding = 1) readonly buffer TempsBuf   { STATE_TYPE   data[]; }
 layout(set = 0, binding = 2) readonly buffer TargetsBuf { STORAGE_TYPE data[]; } src_targets;
 layout(set = 0, binding = 3) readonly buffer MaskBuf    { uint data[]; } src_sample_mask;
 layout(set = 0, binding = 4) writeonly buffer ProbsBuf  { STORAGE_TYPE data[]; } dest_probs;
-layout(set = 0, binding = 5) writeonly buffer LossBuf   { STORAGE_TYPE data[]; } dest_loss;
+layout(set = 0, binding = 5) writeonly buffer LossBuf   { COMPUTE_TYPE data[]; } dest_loss;
 
 void main() {
     uint tile_idx = gl_WorkGroupID.x;
@@ -47,17 +47,17 @@ void main() {
     uint class_offset      = class_chunk_idx * push.classes_per_chunk;
 
     // Loss write index
-    uint loss_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count;
-    uint loss_idx       = loss_tile_base + module_local_idx * push.total_batch_count + batch_idx;
+    uint loss_tile_base = uint(idx_u64(tile_idx) * idx_u64(push.modules_per_chunk) * idx_u64(push.total_batch_count));
+    uint loss_idx       = uint(idx_u64(loss_tile_base) + idx_u64(module_local_idx) * idx_u64(push.total_batch_count) + idx_u64(batch_idx));
 
     // Handle padded samples
     if (load_sample_mask(src_sample_mask.data[batch_idx >> 5u], batch_idx) == 0u) {
-        dest_loss.data[loss_idx] = write_storage(COMPUTE_TYPE(0.0));
-        uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
+        dest_loss.data[loss_idx] = COMPUTE_TYPE(0.0);
+        uint64_t prob_tile_base = idx_u64(tile_idx) * idx_u64(push.modules_per_chunk) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk);
         for (uint c_local = 0; c_local < push.classes_per_chunk; ++c_local) {
-            uint prob_idx = prob_tile_base
-                          + module_local_idx * push.total_batch_count * push.classes_per_chunk
-                          + batch_idx * push.classes_per_chunk + c_local;
+            uint prob_idx = uint(prob_tile_base
+                          + idx_u64(module_local_idx) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk)
+                          + idx_u64(batch_idx) * idx_u64(push.classes_per_chunk) + idx_u64(c_local));
             dest_probs.data[prob_idx] = write_storage(COMPUTE_TYPE(0.0));
         }
         return;
@@ -67,13 +67,13 @@ void main() {
     COMPUTE_TYPE temp_inv = COMPUTE_TYPE(1.0) / read_state(src_temps.data[module_global_idx]);
     COMPUTE_TYPE partial_loss_accum = COMPUTE_TYPE(0.0);
 
-    uint prob_tile_base = tile_idx * push.modules_per_chunk * push.total_batch_count * push.classes_per_chunk;
+    uint64_t prob_tile_base = idx_u64(tile_idx) * idx_u64(push.modules_per_chunk) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk);
 
     for (uint c_local = 0; c_local < push.classes_per_chunk; ++c_local) {
         uint c_global = class_offset + c_local;
         if (c_global < push.total_output_class_count) {
-            uint base_read = module_global_idx * push.total_batch_count * push.padded_total_output_class_count
-                           + batch_idx * push.padded_total_output_class_count + c_global;
+            uint base_read = uint(idx_u64(module_global_idx) * idx_u64(push.total_batch_count) * idx_u64(push.padded_total_output_class_count)
+                           + idx_u64(batch_idx) * idx_u64(push.padded_total_output_class_count) + idx_u64(c_global));
             COMPUTE_TYPE logit = read_storage(src_logits.data[base_read]);
             COMPUTE_TYPE scaled_logit = logit * temp_inv;
 
@@ -87,9 +87,9 @@ void main() {
                 prob = e / (COMPUTE_TYPE(1.0) + e);
             }
 
-            uint prob_idx = prob_tile_base
-                          + module_local_idx * push.total_batch_count * push.classes_per_chunk
-                          + batch_idx * push.classes_per_chunk + c_local;
+            uint prob_idx = uint(prob_tile_base
+                          + idx_u64(module_local_idx) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk)
+                          + idx_u64(batch_idx) * idx_u64(push.classes_per_chunk) + idx_u64(c_local));
             dest_probs.data[prob_idx] = write_storage(prob);
 
             // BCE loss accumulation
@@ -97,8 +97,14 @@ void main() {
             COMPUTE_TYPE term1 = target_val * COMPUTE_LOG(max(prob, NUMERICAL_STABILITY_EPSILON));
             COMPUTE_TYPE term2 = (COMPUTE_TYPE(1.0) - target_val) * COMPUTE_LOG(max(COMPUTE_TYPE(1.0) - prob, NUMERICAL_STABILITY_EPSILON));
             partial_loss_accum += term1 + term2;
+        } else {
+            // Zero-fill trailing class positions beyond total_output_class_count.
+            uint prob_idx = uint(prob_tile_base
+                          + idx_u64(module_local_idx) * idx_u64(push.total_batch_count) * idx_u64(push.classes_per_chunk)
+                          + idx_u64(batch_idx) * idx_u64(push.classes_per_chunk) + idx_u64(c_local));
+            dest_probs.data[prob_idx] = write_storage(COMPUTE_TYPE(0.0));
         }
     }
 
-    dest_loss.data[loss_idx] = write_storage(-partial_loss_accum);
+    dest_loss.data[loss_idx] = -partial_loss_accum;
 }

@@ -12,8 +12,8 @@
 layout(local_size_x_id = 0) in;
 
 layout(push_constant) uniform PushConstants {
-    float effective_batch_size;
-    float epsilon;
+    COMPUTE_TYPE effective_batch_size;
+    COMPUTE_TYPE epsilon;
     uint  parameter_count;
 } push;
 
@@ -24,6 +24,6 @@ void main() {
     uint i = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
     if (i >= push.parameter_count) return;
 
-    COMPUTE_TYPE normalizer = COMPUTE_TYPE(1.0) / (COMPUTE_TYPE(push.effective_batch_size) + COMPUTE_TYPE(push.epsilon));
+    COMPUTE_TYPE normalizer = COMPUTE_TYPE(1.0) / (push.effective_batch_size + push.epsilon);
     dst_grad.data[i] = src_grad.data[i] * normalizer;
 }

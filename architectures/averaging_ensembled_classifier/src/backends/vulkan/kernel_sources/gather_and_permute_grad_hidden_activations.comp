@@ -46,15 +46,15 @@ void main() {
     for (uint class_chunk_idx = 0; class_chunk_idx < push.num_class_chunks; ++class_chunk_idx) {
         uint flat_tile_idx = module_chunk_idx * push.num_class_chunks + class_chunk_idx;
         if (flat_tile_idx < push.total_tile_count) {
-            uint tile_size = push.modules_per_chunk * push.total_batch_count * push.padded_hidden_count;
-            uint tile_base = flat_tile_idx * tile_size;
-            uint local_off = module_local_idx * push.total_batch_count * push.padded_hidden_count
-                           + batch_idx * push.padded_hidden_count + h_idx;
-            accum += read_storage(src_grad_h_aos.data[tile_base + local_off]);
+            uint64_t tile_size = idx_u64(push.modules_per_chunk) * idx_u64(push.total_batch_count) * idx_u64(push.padded_hidden_count);
+            uint64_t tile_base = idx_u64(flat_tile_idx) * tile_size;
+            uint64_t local_off = idx_u64(module_local_idx) * idx_u64(push.total_batch_count) * idx_u64(push.padded_hidden_count)
+                           + idx_u64(batch_idx) * idx_u64(push.padded_hidden_count) + idx_u64(h_idx);
+            accum += read_storage(src_grad_h_aos.data[uint(tile_base + local_off)]);
         }
     }
 
     // Write to SoA layout: [bh_flat_idx][module]
-    uint write_idx = bh_flat_idx * push.padded_total_modules_count + module_global_idx;
+    uint write_idx = uint(idx_u64(bh_flat_idx) * idx_u64(push.padded_total_modules_count) + idx_u64(module_global_idx));
     dest_grad_h_soa.data[write_idx] = write_storage(accum);
 }

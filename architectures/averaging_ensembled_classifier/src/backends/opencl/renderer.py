@@ -50,6 +50,13 @@ class OpenCLPlanRenderer:
         self._allocator = OpenCLBufferAllocator(context, queue)
         # Kernel cache to avoid repeated kernel retrieval (RepeatedKernelRetrieval warning)
         self._kernel_cache: dict[str, cl.Kernel] = {}
+        # Persistent MODEL_STATE buffer store (ADR-009).
+        # Keyed by (logical_name, padded_shape, dtype_name) so that
+        # MODEL_STATE buffers survive across render() calls, enabling
+        # multi-batch training where parameter updates accumulate.
+        self._persistent_model_state: dict[
+            tuple[str, tuple[int, ...], str], cl.Buffer
+        ] = {}
         # Reduction engine bindings (set externally after construction)
         # Storage-entry variants (existing)
         self._register_reduce_binding: Any | None = None
@@ -110,8 +117,17 @@ class OpenCLPlanRenderer:
         h = hashlib.sha256(f"{logical_name}{padded_shape}".encode()).hexdigest()
         return np.random.default_rng(int(h[:16], 16))
 
-    def _init_model_state_buffers(self, plan: ExecutionPlan) -> None:
-        """Upload Xavier/unit-initialized values for MODEL_STATE buffers."""
+    def _init_model_state_buffers(
+        self,
+        plan: ExecutionPlan,
+        *,
+        only_names: set[str] | None = None,
+    ) -> None:
+        """Upload Xavier/unit-initialized values for MODEL_STATE buffers.
+
+        When *only_names* is provided, only buffers whose logical_name is
+        in the set are initialized (used to skip already-persistent buffers).
+        """
         role_dtypes = {
             "storage": plan.precision.storage_dtype,
             "compute": plan.precision.compute_dtype,
@@ -121,6 +137,8 @@ class OpenCLPlanRenderer:
             if descriptor.role != BufferRole.MODEL_STATE:
                 continue
             name = descriptor.logical_name
+            if only_names is not None and name not in only_names:
+                continue
             total = int(np.prod(descriptor.padded_shape))
             prole = descriptor.precision_role
             if prole is None:
@@ -165,13 +183,65 @@ class OpenCLPlanRenderer:
         # Store plan reference for streaming loop body lookup
         self._plan = plan
 
-        # 1. Drain previous work, release stale buffers, allocate for this plan
+        role_dtypes = {
+            "storage": plan.precision.storage_dtype,
+            "compute": plan.precision.compute_dtype,
+            "state": plan.precision.state_dtype,
+        }
+
+        # 1. Drain previous work.  Remove persistent buffers from the
+        #    allocator (so release_all won't destroy them), then tear down
+        #    all stale handle mappings and re-allocate for this plan.
         self._queue.finish()
+
+        # Detach persistent cl.Buffers from the allocator before release_all
+        persistent_handles = set()
+        for key, cl_buf in self._persistent_model_state.items():
+            for h, buf in list(self._allocator._buffers.items()):
+                if buf is cl_buf:
+                    del self._allocator._buffers[h]
+                    self._allocator._descriptors.pop(h, None)
+                    persistent_handles.add(h)
+                    break
         self._allocator.release_all()
+
+        # Re-register persistent MODEL_STATE buffers under this plan's
+        # handles before allocate_plan_buffers runs its skip-if-exists check.
+        newly_allocated: set[str] = set()
+        for descriptor in plan.buffers.values():
+            if descriptor.role != BufferRole.MODEL_STATE:
+                continue
+            prole = descriptor.precision_role
+            dtype = role_dtypes.get(prole) if prole else None  # type: ignore[arg-type]
+            dtype_str = dtype.str if dtype is not None else ""
+            key = (descriptor.logical_name, descriptor.padded_shape, dtype_str)
+            if key in self._persistent_model_state:
+                # Inject the existing cl.Buffer under the new plan's handle
+                # so allocate_plan_buffers will see it and skip allocation.
+                self._allocator._buffers[descriptor.handle] = (
+                    self._persistent_model_state[key]
+                )
+                self._allocator._descriptors[descriptor.handle] = descriptor
+            else:
+                newly_allocated.add(descriptor.logical_name)
+
         self._allocator.allocate_plan_buffers(plan.buffers)
 
-        # 1b. Initialize MODEL_STATE buffers (Xavier for weights, unit for temps)
-        self._init_model_state_buffers(plan)
+        # Record newly-allocated MODEL_STATE buffers for future persistence
+        for descriptor in plan.buffers.values():
+            if descriptor.role != BufferRole.MODEL_STATE:
+                continue
+            if descriptor.logical_name in newly_allocated:
+                prole = descriptor.precision_role
+                dtype = role_dtypes.get(prole) if prole else None  # type: ignore[arg-type]
+                dtype_str = dtype.str if dtype is not None else ""
+                key = (descriptor.logical_name, descriptor.padded_shape, dtype_str)
+                self._persistent_model_state[key] = (
+                    self._allocator.get_buffer(descriptor.handle)
+                )
+
+        # 1b. Initialize only *newly-allocated* MODEL_STATE buffers
+        self._init_model_state_buffers(plan, only_names=newly_allocated or None)
 
         # 1c. Host-to-device data injection
         if data_injections:
@@ -184,12 +254,41 @@ class OpenCLPlanRenderer:
                 if desc is None:
                     continue
                 buf = self._allocator.get_buffer(desc.handle)
-                padded = np.zeros(
-                    int(np.prod(desc.padded_shape)),
-                    dtype=host_data.dtype,
-                )
-                flat = host_data.ravel()
-                padded[: len(flat)] = flat
+                total_elems = int(np.prod(desc.padded_shape))
+                prole = desc.precision_role
+                buf_dtype = role_dtypes.get(prole) if prole else np.dtype(np.uint32)  # type: ignore[arg-type]
+                if (
+                    logical_name == "targets_cce"
+                    and np.issubdtype(host_data.dtype, np.integer)
+                    and not np.issubdtype(buf_dtype, np.integer)
+                ):
+                    # CCE class indices: raw byte copy preserves int32 bit
+                    # pattern so the kernel can read the buffer as int*.
+                    padded = np.zeros(total_elems, dtype=buf_dtype)
+                    src_bytes = host_data.astype(np.int32).tobytes()
+                    padded_bytes = padded.view(np.uint8)
+                    n = min(len(src_bytes), len(padded_bytes))
+                    padded_bytes[:n] = np.frombuffer(src_bytes[:n], dtype=np.uint8)
+                elif host_data.ndim <= 1 or len(desc.padded_shape) <= 1:
+                    if len(desc.padded_shape) > 1 and host_data.ndim == 1:
+                        padded = np.zeros(total_elems, dtype=buf_dtype)
+                        reshaped = padded.reshape(desc.padded_shape)
+                        n_rows = min(len(host_data), desc.padded_shape[0])
+                        reshaped[:n_rows, 0] = host_data[:n_rows].astype(buf_dtype)
+                    else:
+                        padded = np.zeros(total_elems, dtype=buf_dtype)
+                        flat = host_data.astype(buf_dtype).flatten()
+                        n = min(len(flat), len(padded))
+                        padded[:n] = flat[:n]
+                else:
+                    padded = np.zeros(desc.padded_shape, dtype=buf_dtype)
+                    host = host_data.astype(buf_dtype)
+                    slices = tuple(
+                        slice(0, min(host.shape[d], desc.padded_shape[d]))
+                        for d in range(min(host.ndim, len(desc.padded_shape)))
+                    )
+                    padded[slices] = host[slices]
+                    padded = padded.ravel()
                 cl.enqueue_copy(self._queue, buf, padded)
 
         # 2. Traverse topological order, dispatching each node
@@ -324,6 +423,9 @@ class OpenCLPlanRenderer:
         enriched.setdefault("optimal_workgroup_size_1d_reduction", min(simd * 8, 256))
         enriched.setdefault("simd_width", simd)
         enriched.setdefault("element_size", 4)
+        # ADR-024: Include compute_dtype for COMPUTE_TYPE scalar marshalling
+        if hasattr(self, "_plan") and self._plan is not None:
+            enriched["_compute_dtype"] = self._plan.precision.compute_dtype
         return enriched
 
     # ------------------------------------------------------------------
@@ -443,6 +545,7 @@ class OpenCLPlanRenderer:
                 threshold=plan.threshold_schedule[0],
                 epsilon=1e-7,
                 param_count=plan.partial_width,
+                compute_dtype=self._plan.precision.compute_dtype if hasattr(self, "_plan") and self._plan else None,
             )
             clip_global, clip_local = clip_binding.compute_grid_clip(
                 param_count=plan.partial_width,
@@ -550,6 +653,7 @@ class OpenCLPlanRenderer:
                 partial_width=plan.partial_width,
                 clipping_threshold=threshold,
                 epsilon=1e-7,
+                compute_dtype=self._plan.precision.compute_dtype if hasattr(self, "_plan") and self._plan else None,
             )
             global_size, local_size = fan_in_binding.compute_grid_fan_in(
                 node_count=node_count,

@@ -17,8 +17,8 @@
 layout(local_size_x_id = 0) in;
 
 layout(push_constant) uniform PushConstants {
-    float clipping_threshold;  // T_j for this reduction stage; < 0 bypasses clipping
-    float epsilon;
+    COMPUTE_TYPE clipping_threshold;  // T_j for this reduction stage; < 0 bypasses clipping
+    COMPUTE_TYPE epsilon;
     uint  parameter_count;
 } push;
 

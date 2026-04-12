@@ -23,8 +23,6 @@ FP64-precision moment tracking with FP32 compute throughput.
 import pytest
 import numpy as np
 
-from src.shared.precision_config import PrecisionConfig
-
 # --- Tolerance Constants (ADR-027 §8) ---
 # State-precision accumulation preserves the accumulated portion (β * m_prev)
 # at full state precision, but the gradient contribution ((1-β) * g) enters
@@ -155,12 +153,12 @@ class TestAlchemistII:
     """ADR-027 §8: State-Precision Accumulation validation."""
 
     @pytest.fixture
-    def rng(self):
+    def rng(self) -> np.random.Generator:
         """Fixed-seed RNG for reproducibility."""
         return np.random.default_rng(42)
 
     @pytest.fixture
-    def adam_config(self):
+    def adam_config(self) -> dict[str, float]:
         """Standard Adam hyperparameters."""
         return {
             "beta1": 0.999,  # High β makes precision more critical
@@ -175,8 +173,8 @@ class TestAlchemistII:
         100000,    # Extended run (where FP32 erosion becomes measurable)
     ])
     def test_fp64_state_preserves_full_precision(
-        self, rng, adam_config, num_steps
-    ):
+        self, rng: np.random.Generator, adam_config: dict[str, float], num_steps: int
+    ) -> None:
         """mixed_f32_f64_state() preserves FP64 moment fidelity.
 
         Key insight: When ACCUM_TYPE = STATE_TYPE = FP64, the EMA updates
@@ -245,8 +243,8 @@ class TestAlchemistII:
 
     @pytest.mark.parametrize("num_steps", [1000, 10000, 100000])
     def test_fp32_state_shows_precision_erosion(
-        self, rng, adam_config, num_steps
-    ):
+        self, rng: np.random.Generator, adam_config: dict[str, float], num_steps: int
+    ) -> None:
         """float32() shows measurable precision erosion vs. FP64 reference.
 
         This test validates that FP32 state accumulation genuinely loses

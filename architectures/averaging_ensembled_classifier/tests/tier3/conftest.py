@@ -19,7 +19,7 @@ from tests.conftest import BUILD_CONFIG
 # Oracle selection (ADR-016 Option C)
 # ---------------------------------------------------------------------------
 
-def _select_oracle() -> str | None:
+def select_oracle() -> str | None:
     """Select the Tier 3 oracle backend.
 
     Returns the oracle backend name, or None if no oracle is available
@@ -30,7 +30,7 @@ def _select_oracle() -> str | None:
     return None
 
 
-def _get_available_backends() -> list[str]:
+def get_available_backends() -> list[str]:
     """Return names of all available backends."""
     return [b for b in ("cpu", "opencl", "vulkan") if BUILD_CONFIG.get(b, False)]
 
@@ -41,8 +41,8 @@ def _get_tier3_pairs(config: Any) -> list[tuple[str, str]]:
     Default: CPU-oracle vs each GPU backend.
     --all-pairs: adds GPU-vs-GPU pairs.
     """
-    available = _get_available_backends()
-    oracle = _select_oracle()
+    available = get_available_backends()
+    oracle = select_oracle()
 
     pairs: list[tuple[str, str]] = []
     if oracle is not None:
@@ -89,7 +89,6 @@ def _create_opencl_renderer() -> Any:
     from src.backends.opencl.context import load_and_compile_kernels_from_path
     from src.backends.opencl.renderer import OpenCLPlanRenderer
     from src.backends.opencl.type_mapping import build_compiler_flags
-    from src.shared.hardware_profile import HardwareProfile
     from src.shared.precision_config import PrecisionConfig
 
     ctx = cl.create_some_context(interactive=False)
@@ -123,7 +122,7 @@ def _create_vulkan_renderer() -> Any:
     return VulkanPlanRenderer(context=ctx)
 
 
-_BACKEND_FACTORIES: dict[str, Any] = {
+BACKEND_FACTORIES: dict[str, Any] = {
     "cpu": _create_cpu_renderer,
     "opencl": _create_opencl_renderer,
     "vulkan": _create_vulkan_renderer,
@@ -137,13 +136,13 @@ _BACKEND_FACTORIES: dict[str, Any] = {
 @pytest.fixture(scope="session")
 def oracle_backend() -> str | None:
     """The name of the oracle backend, or None."""
-    return _select_oracle()
+    return select_oracle()
 
 
 @pytest.fixture(scope="session")
 def available_backends() -> list[str]:
     """List of available backend names."""
-    return _get_available_backends()
+    return get_available_backends()
 
 
 @pytest.fixture(scope="session")
@@ -161,7 +160,7 @@ def renderer_factory():
         if backend_name in failed:
             pytest.skip(f"Backend '{backend_name}' unavailable: {failed[backend_name]}")
         if backend_name not in cache:
-            factory = _BACKEND_FACTORIES.get(backend_name)
+            factory = BACKEND_FACTORIES.get(backend_name)
             if factory is None:
                 failed[backend_name] = "no renderer factory registered"
                 pytest.skip(f"Backend '{backend_name}' unavailable: no renderer factory")
@@ -176,7 +175,7 @@ def renderer_factory():
 
 
 @pytest.fixture(scope="session")
-def tier3_pairs(request) -> list[tuple[str, str]]:
+def tier3_pairs(request: pytest.FixtureRequest) -> list[tuple[str, str]]:
     """Backend pairs for Tier 3 comparison."""
     return _get_tier3_pairs(request.config)
 
@@ -202,6 +201,7 @@ def _extract_node_plan(
     from src.shared.plan_types import (
         ExecutionPlan,
         KernelDispatchNode,
+        PlanNode,
         ReductionTreeNode,
         RetrievalNode,
     )
@@ -232,7 +232,7 @@ def _extract_node_plan(
 
     needed_handles.add(output_handle)
     buffers = {h: source_plan.buffers[h] for h in needed_handles}
-    nodes_dict = {node_id: isolated, "retrieval": retrieval}
+    nodes_dict: dict[str, PlanNode] = {node_id: isolated, "retrieval": retrieval}
     topo = (node_id, "retrieval")
 
     return ExecutionPlan(

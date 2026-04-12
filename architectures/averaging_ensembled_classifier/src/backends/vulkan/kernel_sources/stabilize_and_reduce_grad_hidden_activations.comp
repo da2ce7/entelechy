@@ -46,7 +46,7 @@ void main() {
     // Each thread accumulates ceil(total_modules_count / lsize) elements,
     // then clips to the host-prescribed pre-accumulation threshold.
     COMPUTE_TYPE thread_accum = COMPUTE_TYPE(0.0);
-    uint row_offset = row_idx * push.padded_total_modules_count;
+    uint row_offset = uint(idx_u64(row_idx) * idx_u64(push.padded_total_modules_count));
     for (uint i = lid; i < push.total_modules_count; i += lsize) {
         thread_accum += read_storage(src_grad_h.data[row_offset + i]);
     }

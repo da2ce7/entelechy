@@ -67,8 +67,22 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
 #endif
 
+// shaderInt64 — mandatory for overflow-safe multi-dimensional buffer indexing.
+// The Vulkan backend requires this unconditionally; devices that lack it are
+// rejected at context creation time.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_ballot     : require
+
+// ── Overflow-Safe Index Arithmetic ─────────────────────────────────────
+// GLSL SSBO array subscripts must be uint, but intermediate products of
+// multi-dimensional indices overflow uint at ~4.29B elements.  idx_u64()
+// widens a uint to uint64_t for safe intermediate arithmetic; the final
+// sum is narrowed back to uint at the array subscript site.
+//
+// Pattern:  buf.data[uint( idx_u64(a) * idx_u64(b) * idx_u64(c) + ... )]
+uint64_t idx_u64(uint v) { return uint64_t(v); }
 
 // ── Specialization Constants (Contract Article 6) ──────────────────────
 layout(constant_id = 0) const uint SPEC_SIMD_WIDTH            = 8;

@@ -29,8 +29,8 @@ __kernel void forward_pass(
     (void)src_scalar_NATURAL_input_count; // Interface completeness (R8); available for future iteration-bound optimizations.
 
     // --- 1. Work-Item to Logical Coordinate Mapping ---
-    // Each work-item is responsible for computing one element of the hidden activation tensor.
-    const uint bid     = get_global_id(0); // This thread's index along the batch dimension of the current chunk.
+    // Each work-GROUP processes one sample; each lane within computes one hidden neuron.
+    const uint bid     = get_group_id(0);  // One work-group per sample in the chunk.
     const uint h_block = get_global_id(1); // The block of hidden neurons this work-group is processing.
     const uint lid     = get_local_id(0);  // The SIMD lane index within the work-group.
 
@@ -220,7 +220,7 @@ __kernel void compute_probs_loss_cce_chunk(
     __global const int          *src_buffer_GLOBAL_targets,
     __global const uint          *src_buffer_GLOBAL_sample_mask,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_probs,
-    __global STORAGE_TYPE       *dest_buffer_GLOBAL_final_loss,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_final_loss,
     uint                         src_scalar_NATURAL_flat_tile_index,
     uint                         src_scalar_NATURAL_num_class_chunks,
     uint                         src_scalar_NATURAL_classes_per_chunk,
@@ -250,9 +250,9 @@ __kernel void compute_probs_loss_cce_chunk(
     const long loss_out_idx = (long)module_global_idx * src_scalar_NATURAL_total_batch_count + batch_idx;
 
     if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, batch_idx)) {
-        store_storage(dest_buffer_GLOBAL_final_loss, loss_out_idx, COMPUTE_ZERO);
-        // Also zero out the partial probabilities this tile is responsible for. This ensures
+        // Zero out the partial probabilities this tile is responsible for. This ensures
         // downstream gradient kernels receive correct zero inputs for padded samples.
+        // Loss write skipped: ZERO_REQUIRED initialization contract guarantees the buffer is pre-zeroed.
         const uint class_chunk_idx = src_scalar_NATURAL_flat_tile_index % src_scalar_NATURAL_num_class_chunks;
         const long prob_tile_base_offset
             = (long)src_scalar_NATURAL_flat_tile_index * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk;
@@ -295,13 +295,14 @@ __kernel void compute_probs_loss_cce_chunk(
 
     for (uint c_local = 0; c_local < src_scalar_NATURAL_classes_per_chunk; ++c_local) {
         const uint c_global = class_offset + c_local;
+        const long prob_write_idx = prob_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk
+                                    + (long)batch_idx * src_scalar_NATURAL_classes_per_chunk + c_local;
         if (c_global < src_scalar_NATURAL_total_output_class_count) {
             const COMPUTE_TYPE logit = load_storage(src_buffer_GLOBAL_logits, base_logits_idx + c_global);
             const COMPUTE_TYPE prob  = MATH_FN exp((logit * temp_inv) - max_scaled_logit) * inv_sum_exp;
-
-            const long prob_write_idx = prob_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk
-                                        + (long)batch_idx * src_scalar_NATURAL_classes_per_chunk + c_local;
             store_storage(dest_buffer_GLOBAL_partial_probs, prob_write_idx, prob);
+        } else {
+            store_storage(dest_buffer_GLOBAL_partial_probs, prob_write_idx, COMPUTE_ZERO);
         }
     }
 
@@ -321,7 +322,8 @@ __kernel void compute_probs_loss_cce_chunk(
         const COMPUTE_TYPE prob_true_class  = MATH_FN exp((logit_true_class * temp_inv) - max_scaled_logit) * inv_sum_exp;
 
         // The argument to log is bounded by the system's epsilon.
-        store_storage(dest_buffer_GLOBAL_final_loss, loss_out_idx, -MATH_FN log(fmax(prob_true_class, (COMPUTE_TYPE)NUMERICAL_STABILITY_EPSILON)));
+        // Precision role: compute — direct write, no narrowing.
+        dest_buffer_GLOBAL_final_loss[loss_out_idx] = -MATH_FN log(fmax(prob_true_class, (COMPUTE_TYPE)NUMERICAL_STABILITY_EPSILON));
     }
 }
 
@@ -337,7 +339,7 @@ __kernel void compute_probs_loss_bce_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_targets,
     __global const uint          *src_buffer_GLOBAL_sample_mask,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_probs,
-    __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_loss,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_partial_loss,
     uint                         src_scalar_NATURAL_flat_tile_index,
     uint                         src_scalar_NATURAL_num_class_chunks,
     uint                         src_scalar_NATURAL_classes_per_chunk,
@@ -368,7 +370,7 @@ __kernel void compute_probs_loss_bce_chunk(
     // --- 3. Handle Padded Samples ---
     if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, batch_idx)) {
         // For padded samples, we must zero out both outputs this tile is responsible for.
-        store_storage(dest_buffer_GLOBAL_partial_loss, loss_write_idx, COMPUTE_ZERO);
+        dest_buffer_GLOBAL_partial_loss[loss_write_idx] = COMPUTE_ZERO;
 
         // Calculate the base offset for this tile's slice of the probability buffer.
         const long prob_tile_base_offset
@@ -423,6 +425,11 @@ __kernel void compute_probs_loss_bce_chunk(
             const COMPUTE_TYPE term1      = target_val * MATH_FN log(fmax(prob, (COMPUTE_TYPE)NUMERICAL_STABILITY_EPSILON));
             const COMPUTE_TYPE term2      = (1.0f - target_val) * MATH_FN log(fmax(1.0f - prob, (COMPUTE_TYPE)NUMERICAL_STABILITY_EPSILON));
             partial_loss_accum += term1 + term2;
+        } else {
+            // Zero-fill trailing class positions beyond total_output_class_count.
+            const long prob_write_idx = prob_tile_base_offset + (long)module_local_idx * src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_classes_per_chunk
+                                        + (long)batch_idx * src_scalar_NATURAL_classes_per_chunk + c_local;
+            store_storage(dest_buffer_GLOBAL_partial_probs, prob_write_idx, COMPUTE_ZERO);
         }
     }
 
@@ -430,5 +437,5 @@ __kernel void compute_probs_loss_bce_chunk(
     // Write the final summed partial loss for this tile to its unique collection slot.
     // The outputs of this kernel are contractually obligated to be summed by a
     // subsequent reduction stage to get the final loss for the sample.
-    store_storage(dest_buffer_GLOBAL_partial_loss, loss_write_idx, -partial_loss_accum);
+    dest_buffer_GLOBAL_partial_loss[loss_write_idx] = -partial_loss_accum;
 }

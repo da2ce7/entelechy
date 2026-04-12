@@ -20,7 +20,9 @@ layout(push_constant) uniform PushConstants {
     uint batch_chunk_index;
     uint total_batch_count;
     uint num_batch_chunks;
+    uint input_count;
     uint padded_input_count;
+    uint hidden_count;
     uint padded_hidden_count;
     uint final_grad_hidden_total_element_count;
     uint FLAG_use_explicit_hidden_mask;
@@ -41,6 +43,20 @@ void main() {
 
     if (i_idx >= push.padded_input_count || j_idx >= push.padded_hidden_count) return;
 
+    // ── Padding Zero-Establishment (CONTRACT.md) ──
+    // The kernel is the sole guarantor of zeros at padding positions.
+    bool is_padding = (i_idx >= push.input_count) || (j_idx >= push.hidden_count);
+    if (is_padding) {
+        if (lid == 0) {
+            uint hb   = j_idx / SPEC_SIMD_WIDTH;
+            uint lane = j_idx % SPEC_SIMD_WIDTH;
+            uint chunk_base = uint(idx_u64(push.batch_chunk_index) * idx_u64(push.padded_input_count) * idx_u64(push.padded_hidden_count));
+            uint grad_w_idx = uint(idx_u64(chunk_base) + idx_u64(hb) * idx_u64(push.padded_input_count) * idx_u64(SPEC_SIMD_WIDTH) + idx_u64(i_idx) * idx_u64(SPEC_SIMD_WIDTH) + idx_u64(lane));
+            grad_sw_out.data[grad_w_idx] = write_storage(COMPUTE_TYPE(0.0));
+        }
+        return;
+    }
+
     // ── Parallel reduction over the batch chunk ──
     COMPUTE_TYPE p_grad_sw = COMPUTE_TYPE(0.0);
 
@@ -51,7 +67,7 @@ void main() {
         if (load_sample_mask(sample_mask.data[b_global >> 5u], b_global) == 0u) continue;
 
         // Chain rule: dL/dW_ij = (dL/dA_j) * (dA_j/dZ_j) * (dZ_j/dW_ij)
-        uint  hidden_offset = b_global * push.padded_hidden_count + j_idx;
+        uint  hidden_offset = uint(idx_u64(b_global) * idx_u64(push.padded_hidden_count) + idx_u64(j_idx));
         COMPUTE_TYPE grad_h_val    = grad_h.data[hidden_offset];       // dL/dA_j (compute-role)
         COMPUTE_TYPE hidden_val    = read_storage(hidden_acts.data[hidden_offset]);
 
@@ -65,7 +81,7 @@ void main() {
         COMPUTE_TYPE dL_dZ_j      = grad_h_val * d_activation;
 
         // dZ_j/dW_ij = input value
-        COMPUTE_TYPE input_val = read_storage(input_buf.data[b_global * push.padded_input_count + i_idx]);
+        COMPUTE_TYPE input_val = read_storage(input_buf.data[uint(idx_u64(b_global) * idx_u64(push.padded_input_count) + idx_u64(i_idx))]);
         p_grad_sw += dL_dZ_j * input_val;
     }
 
@@ -73,10 +89,14 @@ void main() {
     COMPUTE_TYPE total = workgroup_reduce_add(p_grad_sw);
 
     // Leader writes the final reduced partial gradient for this chunk.
-    // Write uses hidden-major order: j_idx * padded_input + i_idx (matches weight layout).
+    // Write uses SIMD-major (SoA) layout: (h_block, padded_input, SIMD_lane) — matching
+    // the forward_pass kernel's weight buffer layout. This ensures flat-index
+    // correspondence between gradient and parameter buffers for Adam.
     if (lid == 0) {
-        uint chunk_base = push.batch_chunk_index * push.padded_input_count * push.padded_hidden_count;
-        uint grad_w_idx = chunk_base + j_idx * push.padded_input_count + i_idx;
+        uint hb   = j_idx / SPEC_SIMD_WIDTH;
+        uint lane = j_idx % SPEC_SIMD_WIDTH;
+        uint chunk_base = uint(idx_u64(push.batch_chunk_index) * idx_u64(push.padded_input_count) * idx_u64(push.padded_hidden_count));
+        uint grad_w_idx = uint(idx_u64(chunk_base) + idx_u64(hb) * idx_u64(push.padded_input_count) * idx_u64(SPEC_SIMD_WIDTH) + idx_u64(i_idx) * idx_u64(SPEC_SIMD_WIDTH) + idx_u64(lane));
         grad_sw_out.data[grad_w_idx] = write_storage(total);
     }
 }

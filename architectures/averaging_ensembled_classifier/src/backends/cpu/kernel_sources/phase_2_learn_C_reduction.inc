@@ -154,6 +154,10 @@ void PREC_FN(task_clip_intermediate)(void* raw_args, uint task_index, uint threa
     (void)task_index;
     PREC_TY(ClipIntermediateArgs)* a = (PREC_TY(ClipIntermediateArgs)*)raw_args;
 
+    /* Diagnostic bypass: negative threshold skips all clipping (ADR-019) */
+    if (a->clipping_threshold_t_j < (COMPUTE_T)0.0)
+        return;
+
     COMPUTE_T sum_sq = (COMPUTE_T)0.0;
     for (uint i = 0; i < a->parameter_count; i++) {
         COMPUTE_T v = a->intermediate_grad[i];
@@ -161,10 +165,6 @@ void PREC_FN(task_clip_intermediate)(void* raw_args, uint task_index, uint threa
     }
 
     COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
-
-    /* Diagnostic bypass: negative threshold skips all clipping */
-    if (a->clipping_threshold_t_j < (COMPUTE_T)0.0)
-        return;
 
     if (norm <= a->clipping_threshold_t_j)
         return;
@@ -179,85 +179,35 @@ void PREC_FN(task_clip_intermediate)(void* raw_args, uint task_index, uint threa
 /* ================================================================
  * Internal: per-precision ReduceNodeArgs and helpers
  *
- * The reduction tree uses STORAGE_T* for intermediate staging buffers
- * but writes the final result to COMPUTE_T* output (compute role).
+ * ADR-026 Compliance: Stage 0 reads STORAGE_T and writes COMPUTE_T.
+ * All subsequent stages read/write COMPUTE_T exclusively.
  * ================================================================ */
+
+/* Stage-0 arguments: storage→compute transition (ADR-026 §3) */
 typedef struct {
-    const STORAGE_T* source;
+    const STORAGE_T* source;         /* STORAGE_T input (leaf stage) */
     const uint*      offset_list;
     uint             fan_in;
     uint             partial_width;
-    STORAGE_T*       staging_dest;   /* Intermediate stages write here */
+    COMPUTE_T*       compute_dest;   /* COMPUTE_T output */
     COMPUTE_T        threshold;
     COMPUTE_T        epsilon;
-} PREC_TY(ReduceNodeStagingArgs);
+} PREC_TY(ReduceNodeStage0Args);
 
-typedef struct {
-    const STORAGE_T* source;
-    const uint*      offset_list;
-    uint             fan_in;
-    uint             partial_width;
-    COMPUTE_T*       compute_dest;   /* Final stage writes here */
-    COMPUTE_T        threshold;
-    COMPUTE_T        epsilon;
-} PREC_TY(ReduceNodeFinalArgs);
-
-static void PREC_FN(task_reduce_staging)(void* raw_args, uint task_index, uint thread_id) {
+/* task_reduce_stage0 — storage-entry leaf: reads STORAGE_T, writes COMPUTE_T */
+static void PREC_FN(task_reduce_stage0)(void* raw_args, uint task_index, uint thread_id) {
     (void)thread_id;
-    PREC_TY(ReduceNodeStagingArgs)* a = (PREC_TY(ReduceNodeStagingArgs)*)raw_args;
-
-    const uint pw = a->partial_width;
-    const size_t dest_base = (size_t)task_index * pw;
-
-    /* Zero destination (staging buffer) */
-    for (uint e = 0; e < pw; e++) {
-        scalar_store_storage(a->staging_dest, dest_base + e, 0.0f);
-    }
-
-    /* Accumulate from sources */
-    const uint* offsets = a->offset_list + (size_t)task_index * a->fan_in;
-    COMPUTE_T accum[pw];
-    for (uint e = 0; e < pw; e++) accum[e] = (COMPUTE_T)0.0;
-
-    for (uint k = 0; k < a->fan_in; k++) {
-        uint off = offsets[k];
-        if (off == 0xFFFFFFFF) continue;
-        const size_t src_base = (size_t)off;
-        for (uint e = 0; e < pw; e++) {
-            accum[e] += (COMPUTE_T)scalar_load_storage(a->source, src_base + e);
-        }
-    }
-
-    /* Clip and store to staging */
-    COMPUTE_T sum_sq = (COMPUTE_T)0.0;
-    for (uint e = 0; e < pw; e++) {
-        sum_sq += accum[e] * accum[e];
-    }
-    COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
-    if (norm > a->threshold) {
-        COMPUTE_T scale = a->threshold / (norm + a->epsilon);
-        for (uint e = 0; e < pw; e++) {
-            accum[e] *= scale;
-        }
-    }
-    for (uint e = 0; e < pw; e++) {
-        scalar_store_storage(a->staging_dest, dest_base + e, accum[e]);
-    }
-}
-
-static void PREC_FN(task_reduce_final)(void* raw_args, uint task_index, uint thread_id) {
-    (void)thread_id;
-    PREC_TY(ReduceNodeFinalArgs)* a = (PREC_TY(ReduceNodeFinalArgs)*)raw_args;
+    PREC_TY(ReduceNodeStage0Args)* a = (PREC_TY(ReduceNodeStage0Args)*)raw_args;
 
     const uint pw = a->partial_width;
     COMPUTE_T* dest = a->compute_dest + (size_t)task_index * pw;
 
-    /* Zero destination (COMPUTE_T output) */
+    /* Zero destination (COMPUTE_T) */
     for (uint e = 0; e < pw; e++) {
         dest[e] = (COMPUTE_T)0.0;
     }
 
-    /* Accumulate from sources */
+    /* Accumulate from STORAGE_T sources (precision boundary conversion) */
     const uint* offsets = a->offset_list + (size_t)task_index * a->fan_in;
     for (uint k = 0; k < a->fan_in; k++) {
         uint off = offsets[k];
@@ -268,76 +218,33 @@ static void PREC_FN(task_reduce_final)(void* raw_args, uint task_index, uint thr
         }
     }
 
-    /* Clip */
-    COMPUTE_T sum_sq = (COMPUTE_T)0.0;
-    for (uint e = 0; e < pw; e++) {
-        sum_sq += dest[e] * dest[e];
-    }
-    COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
-    if (norm > a->threshold) {
-        COMPUTE_T scale = a->threshold / (norm + a->epsilon);
+    /* Diagnostic bypass: negative threshold skips all clipping (ADR-019) */
+    if (a->threshold >= (COMPUTE_T)0.0) {
+        /* Clip */
+        COMPUTE_T sum_sq = (COMPUTE_T)0.0;
         for (uint e = 0; e < pw; e++) {
-            dest[e] *= scale;
+            sum_sq += dest[e] * dest[e];
+        }
+        COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
+        if (norm > a->threshold) {
+            COMPUTE_T scale = a->threshold / (norm + a->epsilon);
+            for (uint e = 0; e < pw; e++) {
+                dest[e] *= scale;
+            }
         }
     }
 }
 
-/* ================================================================
- * execute_reduction_tree
- * ================================================================ */
-void PREC_FN(execute_reduction_tree)(ThreadPool* pool, PREC_TY(ReductionTreePlanC)* plan) {
-    if (plan->num_stages == 0) return;
-
-    const STORAGE_T* current_src = plan->partial_collection;
-    STORAGE_T* staging[2];
-    staging[0] = plan->staging_buffer_0;
-    staging[1] = plan->staging_buffer_1;
-    uint dst_idx = 0;
-
-    for (uint s = 0; s < plan->num_stages; s++) {
-        uint j = plan->num_stages - 1 - s;
-        COMPUTE_T T_policy = plan->t_algorithmic + plan->lambda * (COMPUTE_T)(j * j);
-        uint K = plan->stage_fan_in[s];
-        COMPUTE_T T_safety = (K > 0) ? (plan->fp_max / (COMPUTE_T)K) : plan->fp_max;
-        COMPUTE_T threshold = (T_policy < T_safety) ? T_policy : T_safety;
-
-        uint node_count = plan->stage_node_counts[s];
-        const uint* offsets = plan->offset_lists_flat + plan->stage_offsets_into_list[s];
-
-        if (s == plan->num_stages - 1) {
-            /* Final stage: write to COMPUTE_T* output */
-            PREC_TY(ReduceNodeFinalArgs) args;
-            args.source = current_src;
-            args.offset_list = offsets;
-            args.fan_in = K;
-            args.partial_width = plan->partial_width;
-            args.compute_dest = plan->output;
-            args.threshold = threshold;
-            args.epsilon = plan->epsilon;
-
-            pool_dispatch_and_wait(pool,
-                (void (*)(void*, uint, uint))PREC_FN(task_reduce_final),
-                &args, node_count);
-        } else {
-            /* Intermediate stage: write to STORAGE_T* staging */
-            PREC_TY(ReduceNodeStagingArgs) args;
-            args.source = current_src;
-            args.offset_list = offsets;
-            args.fan_in = K;
-            args.partial_width = plan->partial_width;
-            args.staging_dest = staging[dst_idx];
-            args.threshold = threshold;
-            args.epsilon = plan->epsilon;
-
-            pool_dispatch_and_wait(pool,
-                (void (*)(void*, uint, uint))PREC_FN(task_reduce_staging),
-                &args, node_count);
-
-            current_src = staging[dst_idx];
-            dst_idx = 1 - dst_idx;
-        }
-    }
-}
+/* Legacy structs kept for reference but no longer used in execute_reduction_tree */
+typedef struct {
+    const STORAGE_T* source;
+    const uint*      offset_list;
+    uint             fan_in;
+    uint             partial_width;
+    COMPUTE_T*       compute_dest;   /* Final stage writes here */
+    COMPUTE_T        threshold;
+    COMPUTE_T        epsilon;
+} PREC_TY(ReduceNodeFinalArgs);
 
 /* ================================================================
  * ADR-026: Precision-Typed Reduction Kernel Variants (Compute-Entry)
@@ -345,6 +252,9 @@ void PREC_FN(execute_reduction_tree)(ThreadPool* pool, PREC_TY(ReductionTreePlan
  * Used for:
  *   - Interior stages of multi-stage reduction trees
  *   - Leaf stages whose source is natively COMPUTE_T (e.g., BCE loss)
+ *
+ * NOTE: These are defined here (before execute_reduction_tree) so that
+ * execute_reduction_tree can reference them for stages >= 1.
  * ================================================================ */
 
 /* --- Compute-entry argument structs (read COMPUTE_T directly) --- */
@@ -396,16 +306,19 @@ static void PREC_FN(task_reduce_staging_from_compute)(void* raw_args, uint task_
         }
     }
 
-    /* Clip and store */
-    COMPUTE_T sum_sq = (COMPUTE_T)0.0;
-    for (uint e = 0; e < pw; e++) {
-        sum_sq += accum[e] * accum[e];
-    }
-    COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
-    if (norm > a->threshold) {
-        COMPUTE_T scale = a->threshold / (norm + a->epsilon);
+    /* Diagnostic bypass: negative threshold skips all clipping (ADR-019) */
+    if (a->threshold >= (COMPUTE_T)0.0) {
+        /* Clip and store */
+        COMPUTE_T sum_sq = (COMPUTE_T)0.0;
         for (uint e = 0; e < pw; e++) {
-            accum[e] *= scale;
+            sum_sq += accum[e] * accum[e];
+        }
+        COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
+        if (norm > a->threshold) {
+            COMPUTE_T scale = a->threshold / (norm + a->epsilon);
+            for (uint e = 0; e < pw; e++) {
+                accum[e] *= scale;
+            }
         }
     }
     for (uint e = 0; e < pw; e++) {
@@ -438,17 +351,97 @@ static void PREC_FN(task_reduce_final_from_compute)(void* raw_args, uint task_in
         }
     }
 
-    /* Clip */
-    COMPUTE_T sum_sq = (COMPUTE_T)0.0;
-    for (uint e = 0; e < pw; e++) {
-        sum_sq += dest[e] * dest[e];
-    }
-    COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
-    if (norm > a->threshold) {
-        COMPUTE_T scale = a->threshold / (norm + a->epsilon);
+    /* Diagnostic bypass: negative threshold skips all clipping (ADR-019) */
+    if (a->threshold >= (COMPUTE_T)0.0) {
+        /* Clip */
+        COMPUTE_T sum_sq = (COMPUTE_T)0.0;
         for (uint e = 0; e < pw; e++) {
-            dest[e] *= scale;
+            sum_sq += dest[e] * dest[e];
         }
+        COMPUTE_T norm = COMPUTE_SQRT(sum_sq);
+        if (norm > a->threshold) {
+            COMPUTE_T scale = a->threshold / (norm + a->epsilon);
+            for (uint e = 0; e < pw; e++) {
+                dest[e] *= scale;
+            }
+        }
+    }
+}
+
+/* NOTE: task_reduce_staging and task_reduce_final removed per ADR-026 compliance.
+ * Stage 0 now uses task_reduce_stage0 (storage→compute).
+ * Stages ≥1 use task_reduce_staging_from_compute / task_reduce_final_from_compute.
+ */
+
+/* ================================================================
+ * execute_reduction_tree (ADR-026 Compliant)
+ *
+ * Stage 0: reads STORAGE_T via task_reduce_stage0, writes COMPUTE_T
+ * Stages ≥1: reads/writes COMPUTE_T via _from_compute variants
+ * ================================================================ */
+void PREC_FN(execute_reduction_tree)(ThreadPool* pool, PREC_TY(ReductionTreePlanC)* plan) {
+    if (plan->num_stages == 0) return;
+
+    COMPUTE_T* staging[2];
+    staging[0] = plan->staging_buffer_0;
+    staging[1] = plan->staging_buffer_1;
+    uint dst_idx = 0;
+
+    for (uint s = 0; s < plan->num_stages; s++) {
+        uint j = plan->num_stages - 1 - s;
+        COMPUTE_T T_policy = plan->t_algorithmic + plan->lambda * (COMPUTE_T)(j * j);
+        uint K = plan->stage_fan_in[s];
+        COMPUTE_T T_safety = (K > 0) ? (plan->fp_max / (COMPUTE_T)K) : plan->fp_max;
+        COMPUTE_T threshold = (T_policy < T_safety) ? T_policy : T_safety;
+
+        uint node_count = plan->stage_node_counts[s];
+        const uint* offsets = plan->offset_lists_flat + plan->stage_offsets_into_list[s];
+
+        if (s == 0) {
+            /* Stage 0: storage-entry — reads STORAGE_T, writes COMPUTE_T */
+            PREC_TY(ReduceNodeStage0Args) args;
+            args.source = plan->partial_collection;
+            args.offset_list = offsets;
+            args.fan_in = K;
+            args.partial_width = plan->partial_width;
+            args.compute_dest = (s == plan->num_stages - 1) ? plan->output : staging[dst_idx];
+            args.threshold = threshold;
+            args.epsilon = plan->epsilon;
+
+            pool_dispatch_and_wait(pool,
+                (void (*)(void*, uint, uint))PREC_FN(task_reduce_stage0),
+                &args, node_count);
+        } else if (s == plan->num_stages - 1) {
+            /* Final stage (s >= 1): compute-entry, write to output */
+            PREC_TY(ReduceNodeFinalFromComputeArgs) args;
+            args.source = staging[1 - dst_idx];  /* previous stage's output */
+            args.offset_list = offsets;
+            args.fan_in = K;
+            args.partial_width = plan->partial_width;
+            args.compute_dest = plan->output;
+            args.threshold = threshold;
+            args.epsilon = plan->epsilon;
+
+            pool_dispatch_and_wait(pool,
+                (void (*)(void*, uint, uint))PREC_FN(task_reduce_final_from_compute),
+                &args, node_count);
+        } else {
+            /* Interior stage (1 <= s < num_stages-1): compute-entry, write to staging */
+            PREC_TY(ReduceNodeStagingFromComputeArgs) args;
+            args.source = staging[1 - dst_idx];  /* previous stage's output */
+            args.offset_list = offsets;
+            args.fan_in = K;
+            args.partial_width = plan->partial_width;
+            args.staging_dest = staging[dst_idx];
+            args.threshold = threshold;
+            args.epsilon = plan->epsilon;
+
+            pool_dispatch_and_wait(pool,
+                (void (*)(void*, uint, uint))PREC_FN(task_reduce_staging_from_compute),
+                &args, node_count);
+        }
+
+        dst_idx = 1 - dst_idx;
     }
 }
 
