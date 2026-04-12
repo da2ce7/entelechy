@@ -14,10 +14,11 @@ class OpenCLBufferAllocator:
     """Allocates and manages physical cl.Buffer objects for a single plan.
 
     Consumes BufferDescriptors from the plan and creates cl.Buffer objects
-    with appropriate memory flags. Manages the handle -> cl.Buffer mapping.
+    with appropriate memory flags.  Manages the handle → cl.Buffer mapping.
 
-    Lifetime: one allocator instance per renderer. Per-batch buffers are
-    freed after each render(); MODEL_STATE buffers persist across batches.
+    Lifetime: one allocator instance per renderer.  Per-batch buffers are
+    freed after each render(); MODEL_STATE buffers persist across batches
+    via the renderer's ``extract_buffers_by_role`` / ``inject_buffer`` flow.
     """
 
     def __init__(self, context: cl.Context, queue: cl.CommandQueue) -> None:
@@ -25,32 +26,86 @@ class OpenCLBufferAllocator:
         self._queue = queue
         self._buffers: dict[BufferHandle, cl.Buffer] = {}
         self._descriptors: dict[BufferHandle, BufferDescriptor] = {}
-        # Renderer-internal buffers (reduction intermediates, scratch, etc.)
         self._internal_buffers: list[cl.Buffer] = []
 
-    def allocate_plan_buffers(
-        self, descriptors: dict[BufferHandle, BufferDescriptor]
-    ) -> None:
-        """Allocate cl.Buffers for all descriptors in the plan.
+    # ------------------------------------------------------------------
+    # Plan-level allocation
+    # ------------------------------------------------------------------
 
-        MODEL_STATE buffers that already exist are kept (persisted across
-        batches). All other roles are freshly allocated.
+    def allocate_plan_buffers(
+        self, descriptors: dict[BufferHandle, BufferDescriptor],
+    ) -> None:
+        """Allocate cl.Buffers for all descriptors not already registered.
+
+        Buffers that were pre-registered via ``inject_buffer`` (e.g.
+        persistent MODEL_STATE) are skipped.
         """
-        zero_pattern = np.zeros(1, dtype=np.uint8)
         for handle, desc in descriptors.items():
             if handle in self._buffers:
-                # MODEL_STATE buffer already allocated from a previous batch
                 continue
             flags = self._flags_for_role(desc.role)
             buf = cl.Buffer(self._context, flags, size=desc.size_bytes)
-            # Zero-fill: GPU memory may contain residue from prior allocations
-            cl.enqueue_fill_buffer(self._queue, buf, zero_pattern, 0, desc.size_bytes)
+            # Zero-fill: GPU memory may contain residue from prior allocations.
+            cl.enqueue_fill_buffer(
+                self._queue, buf, np.zeros(1, dtype=np.uint8), 0, desc.size_bytes,
+            )
             self._buffers[handle] = buf
             self._descriptors[handle] = desc
 
+    # ------------------------------------------------------------------
+    # Handle resolution
+    # ------------------------------------------------------------------
+
     def get_buffer(self, handle: BufferHandle) -> cl.Buffer:
         """Retrieve the physical cl.Buffer for a plan-level handle."""
-        return self._buffers[handle]
+        try:
+            return self._buffers[handle]
+        except KeyError:
+            raise KeyError(
+                f"No cl.Buffer registered for handle {handle!r}.  "
+                f"Known handles: {sorted(self._buffers.keys())}"
+            ) from None
+
+    def has_buffer(self, handle: BufferHandle) -> bool:
+        """Check whether a handle is registered."""
+        return handle in self._buffers
+
+    # ------------------------------------------------------------------
+    # Persistent-state management (called by the renderer)
+    # ------------------------------------------------------------------
+
+    def inject_buffer(
+        self,
+        handle: BufferHandle,
+        buf: cl.Buffer,
+        desc: BufferDescriptor,
+    ) -> None:
+        """Register a pre-existing cl.Buffer under a new plan handle.
+
+        Used by the renderer to re-attach persistent MODEL_STATE buffers
+        when a new plan's handles differ from the previous plan's.
+        """
+        self._buffers[handle] = buf
+        self._descriptors[handle] = desc
+
+    def extract_buffers_by_role(
+        self, role: BufferRole,
+    ) -> list[tuple[BufferHandle, cl.Buffer, BufferDescriptor]]:
+        """Remove and return all buffers matching *role* without releasing them.
+
+        The returned cl.Buffers are detached from this allocator — subsequent
+        ``release_all`` will not destroy them.
+        """
+        extracted: list[tuple[BufferHandle, cl.Buffer, BufferDescriptor]] = []
+        for h in list(self._buffers):
+            desc = self._descriptors.get(h)
+            if desc is not None and desc.role == role:
+                extracted.append((h, self._buffers.pop(h), self._descriptors.pop(h)))
+        return extracted
+
+    # ------------------------------------------------------------------
+    # Transfers
+    # ------------------------------------------------------------------
 
     def upload(
         self,
@@ -58,13 +113,11 @@ class OpenCLBufferAllocator:
         data: np.ndarray[Any, Any],
         wait_for: list[cl.Event] | None = None,
     ) -> cl.Event:
-        """Enqueue an async host->device transfer."""
-        buf = self._buffers[handle]
-        event = cl.enqueue_copy(
-            self._queue, buf, data,
+        """Enqueue an async host→device transfer."""
+        return cl.enqueue_copy(
+            self._queue, self._buffers[handle], data,
             wait_for=wait_for, is_blocking=False,
         )
-        return event
 
     def enqueue_read(
         self,
@@ -72,31 +125,34 @@ class OpenCLBufferAllocator:
         host_buffer: np.ndarray[Any, Any],
         wait_for: list[cl.Event] | None = None,
     ) -> cl.Event:
-        """Enqueue an async device->host transfer into a pre-allocated host buffer."""
-        buf = self._buffers[handle]
-        event = cl.enqueue_copy(
-            self._queue, host_buffer, buf,
+        """Enqueue an async device→host transfer into a pre-allocated array."""
+        return cl.enqueue_copy(
+            self._queue, host_buffer, self._buffers[handle],
             wait_for=wait_for, is_blocking=False,
         )
-        return event
+
+    # ------------------------------------------------------------------
+    # Internal (renderer-owned) scratch buffers
+    # ------------------------------------------------------------------
 
     def allocate_internal(self, size_bytes: int) -> cl.Buffer:
-        """Allocate a renderer-internal buffer (reduction intermediates, scratch)."""
+        """Allocate a renderer-internal buffer (reduction intermediates, etc.)."""
         buf = cl.Buffer(self._context, cl.mem_flags.READ_WRITE, size=size_bytes)
         self._internal_buffers.append(buf)
         return buf
 
+    # ------------------------------------------------------------------
+    # Teardown
+    # ------------------------------------------------------------------
+
     def release_non_persistent(self) -> None:
-        """Release all buffers except MODEL_STATE (which persist across batches)."""
-        handles_to_remove = [
-            h for h, desc in self._descriptors.items()
-            if desc.role != BufferRole.MODEL_STATE
-        ]
-        for h in handles_to_remove:
-            buf = self._buffers.pop(h)
-            buf.release()
-            del self._descriptors[h]
-        # Release all internal buffers
+        """Release all buffers except MODEL_STATE."""
+        for h in list(self._buffers):
+            desc = self._descriptors.get(h)
+            if desc is not None and desc.role == BufferRole.MODEL_STATE:
+                continue
+            self._buffers.pop(h).release()
+            self._descriptors.pop(h, None)
         for buf in self._internal_buffers:
             buf.release()
         self._internal_buffers.clear()
@@ -111,9 +167,14 @@ class OpenCLBufferAllocator:
             buf.release()
         self._internal_buffers.clear()
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _flags_for_role(role: BufferRole) -> int:
-        """Map BufferRole to cl.mem_flags."""
         if role == BufferRole.BATCH_INPUT:
             return cl.mem_flags.READ_ONLY
+        if role == BufferRole.BATCH_OUTPUT:
+            return cl.mem_flags.WRITE_ONLY
         return cl.mem_flags.READ_WRITE

@@ -2,6 +2,9 @@
 """PrecisionConfig -> OpenCL compiler flags and dtype mapping (ADR-008, ADR-020 §7.1, ADR-025 §6.1)."""
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 import numpy as np
 
 from ...shared.precision_config import PrecisionConfig, FP8_E4M3, FP8_E5M2, FP8_DTYPES
@@ -15,43 +18,40 @@ def build_compiler_flags(
 ) -> list[str]:
     """Produce OpenCL -D compiler flags from plan-level configuration.
 
-    Generates flags for all CONTRACT.md Article 6 mandatory symbols (amended by ADR-020 §3.6, ADR-024 §2, ADR-025 §3):
-    STORAGE_TYPE, COMPUTE_TYPE, STATE_TYPE,
-    STORAGE_TYPE_IS_FP8, STORAGE_TYPE_IS_E4M3, STORAGE_TYPE_IS_E5M2,
-    STORAGE_TYPE_IS_HALF, STORAGE_TYPE_IS_FLOAT, STORAGE_TYPE_IS_DOUBLE,
-    COMPUTE_TYPE_IS_HALF, COMPUTE_TYPE_IS_FLOAT, COMPUTE_TYPE_IS_DOUBLE,
-    STATE_TYPE_IS_HALF, STATE_TYPE_IS_FLOAT, STATE_TYPE_IS_DOUBLE,
-    SIMD_WIDTH, C_TILE_SIZE, NUMERICAL_STABILITY_EPSILON, LOCAL_MEM_BANK_PADDING.
+    Generates flags for all CONTRACT.md Article 6 mandatory symbols.
+    LOCAL_MEM_BANK_PADDING is intentionally NOT emitted — it is a
+    kernel-internal constant defined in kernels.cl.h (CONTRACT Article 6,
+    Retired Build-Time Symbols).
     """
     storage_cl = _dtype_to_cl_type(precision.storage_dtype)
     compute_cl = _dtype_to_cl_type(precision.compute_dtype)
     state_cl = _dtype_to_cl_type(precision.state_dtype)
-    
+
     # Storage role type flags (complete taxonomy)
     is_fp8 = precision.storage_dtype in FP8_DTYPES
-    storage_is_half = 1 if precision.storage_dtype == np.dtype(np.float16) else 0
-    storage_is_float = 1 if precision.storage_dtype == np.dtype(np.float32) else 0
-    storage_is_double = 1 if precision.storage_dtype == np.dtype(np.float64) else 0
-    is_e4m3 = 1 if precision.storage_dtype == FP8_E4M3 else 0
-    is_e5m2 = 1 if precision.storage_dtype == FP8_E5M2 else 0
-    
-    # Compute role type flags (complete taxonomy)
-    compute_is_half = 1 if precision.compute_dtype == np.dtype(np.float16) else 0
-    compute_is_float = 1 if precision.compute_dtype == np.dtype(np.float32) else 0
-    compute_is_double = 1 if precision.compute_dtype == np.dtype(np.float64) else 0
-    
-    # State role type flags (complete taxonomy)
-    state_is_half = 1 if precision.state_dtype == np.dtype(np.float16) else 0
-    state_is_float = 1 if precision.state_dtype == np.dtype(np.float32) else 0
-    state_is_double = 1 if precision.state_dtype == np.dtype(np.float64) else 0
-    
+    storage_is_half = int(precision.storage_dtype == np.dtype(np.float16))
+    storage_is_float = int(precision.storage_dtype == np.dtype(np.float32))
+    storage_is_double = int(precision.storage_dtype == np.dtype(np.float64))
+    is_e4m3 = int(precision.storage_dtype == FP8_E4M3)
+    is_e5m2 = int(precision.storage_dtype == FP8_E5M2)
+
+    # Compute role type flags
+    compute_is_half = int(precision.compute_dtype == np.dtype(np.float16))
+    compute_is_float = int(precision.compute_dtype == np.dtype(np.float32))
+    compute_is_double = int(precision.compute_dtype == np.dtype(np.float64))
+
+    # State role type flags
+    state_is_half = int(precision.state_dtype == np.dtype(np.float16))
+    state_is_float = int(precision.state_dtype == np.dtype(np.float32))
+    state_is_double = int(precision.state_dtype == np.dtype(np.float64))
+
     eps = _epsilon_literal(precision.compute_epsilon, compute_is_half, compute_is_double)
-    
-    flags = [
+
+    return [
         f"-DSTORAGE_TYPE={storage_cl}",
         f"-DCOMPUTE_TYPE={compute_cl}",
         f"-DSTATE_TYPE={state_cl}",
-        f"-DSTORAGE_TYPE_IS_FP8={1 if is_fp8 else 0}",
+        f"-DSTORAGE_TYPE_IS_FP8={int(is_fp8)}",
         f"-DSTORAGE_TYPE_IS_E4M3={is_e4m3}",
         f"-DSTORAGE_TYPE_IS_E5M2={is_e5m2}",
         f"-DSTORAGE_TYPE_IS_HALF={storage_is_half}",
@@ -66,52 +66,47 @@ def build_compiler_flags(
         f"-DSIMD_WIDTH={hardware.simd_width}",
         f"-DC_TILE_SIZE={c_tile_size}",
         f"-DNUMERICAL_STABILITY_EPSILON={eps}",
-        "-DLOCAL_MEM_BANK_PADDING=1",
+        # NOTE: LOCAL_MEM_BANK_PADDING is NOT emitted here.
+        # It is a kernel-internal constant (#define in kernels.cl.h).
+        # CONTRACT Article 6 Retired Build-Time Symbols: "Build system
+        # MUST NOT provide via -D."
     ]
-    return flags
 
 
-def _dtype_to_cl_type(dtype: np.dtype) -> str:
+def _dtype_to_cl_type(dtype: np.dtype[Any]) -> str:
     """Map numpy dtype to OpenCL C type name."""
     mapping = {
         np.dtype(np.float32): "float",
         np.dtype(np.float16): "half",
         np.dtype(np.float64): "double",
-        FP8_E4M3: "uchar",  # FP8 E4M3 as byte (software emulation, ADR-025 §6.1)
-        FP8_E5M2: "uchar",  # FP8 E5M2 as byte (software emulation, ADR-025 §6.1)
+        FP8_E4M3: "uchar",
+        FP8_E5M2: "uchar",
     }
     return mapping[dtype]
 
 
 def _epsilon_literal(epsilon: float, is_half: int, is_double: int) -> str:
-    """Format epsilon as appropriate C literal for the target precision."""
+    """Format epsilon as an appropriate C literal for the target precision."""
     if is_half:
-        return str(epsilon)  # No 'f' suffix for half literals
+        return str(epsilon)
     if is_double:
-        return str(epsilon)  # No suffix for double literals in OpenCL C
+        return str(epsilon)
     return f"{epsilon}f"
 
 
-def compute_scalar(value: float, scalar_params: dict) -> np.number:
-    """Convert a float to the appropriate compute dtype for kernel arguments.
+def compute_scalar(
+    value: float, scalar_params: Mapping[str, object],
+) -> np.number[Any]:
+    """Convert a float to the active COMPUTE_TYPE numpy scalar.
 
-    This function ensures COMPUTE_TYPE scalar parameters (clipping_threshold,
-    epsilon, etc.) are marshalled with the correct precision per ADR-024.
-
-    Args:
-        value: The float value to convert.
-        scalar_params: The enriched scalar_params dict containing '_compute_dtype'.
-
-    Returns:
-        The value as np.float16, np.float32, or np.float64 based on compute dtype.
+    Ensures COMPUTE_TYPE scalar parameters (thresholds, epsilon, etc.)
+    are marshalled with the correct precision per ADR-024.
     """
     compute_dtype = scalar_params.get("_compute_dtype")
     if compute_dtype is None:
-        # Fallback to FP32 for backwards compatibility
         return np.float32(value)
     if compute_dtype == np.float16:
         return np.float16(value)
     if compute_dtype == np.float64:
         return np.float64(value)
     return np.float32(value)
-

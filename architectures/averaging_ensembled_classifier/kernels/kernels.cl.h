@@ -127,19 +127,28 @@
 #define COMPUTE_ONE  ((COMPUTE_TYPE)1.0f)
 #endif
 
+// --- Compute-Precision Extremal Constant ---
+// Maximum finite value representable in COMPUTE_TYPE. Used for
+// reduction sentinels (e.g., softmax max-finding initialization)
+// and numerical stability guards. Derived from the same
+// COMPUTE_TYPE_IS_* flags that govern COMPUTE_ZERO/COMPUTE_ONE.
+//
+// Corresponds to PrecisionConfig.compute_fp_format_max on the host.
+// The two are guaranteed to agree because they derive from the same
+// underlying type.
+#if COMPUTE_TYPE_IS_DOUBLE
+#define COMPUTE_FP_MAX DBL_MAX
+#elif COMPUTE_TYPE_IS_HALF
+#define COMPUTE_FP_MAX HALF_MAX
+#else
+#define COMPUTE_FP_MAX FLT_MAX
+#endif
+
 // KERNEL_ATTR provides a work-group size hint for backends that choose to
 // apply it. This header specifies interfaces only; actual application of
 // the attribute is a backend rendering-tier concern (OpenCL may apply it,
 // Vulkan uses specialization constants, CPU backend has no work-groups).
 #define KERNEL_ATTR __attribute__((work_group_size_hint(SIMD_WIDTH, 1, 1)))
-
-// --- Mandatory Architectural Constants (Article 5) ---
-
-// The System Contract defines LOCAL_MEM_BANK_PADDING as a fixed
-// architectural constant. The build system MUST provide this exact value.
-#if !defined(LOCAL_MEM_BANK_PADDING) || (LOCAL_MEM_BANK_PADDING != 1)
-#error "System Contract Violation: LOCAL_MEM_BANK_PADDING must be defined and have a value of exactly 1."
-#endif
 
 // --- Precision Boundary Abstractions (ADR-020 §4.4, ADR-023 §1, ADR-025 §6) ---
 // These are the sole mechanism for crossing precision role boundaries.
@@ -256,16 +265,16 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
         return;
     }
 #endif
-    
+
     // Handle sign
     uint sign = (fval < 0.0f) ? 1 : 0;
     fval = fabs(fval);
-    
+
 #if STORAGE_TYPE_IS_E4M3
     // E4M3: bias=7, max=448, min_subnormal=2^-9
     const float MAX_VAL = 448.0f;
     const float MIN_SUBNORMAL = 0.001953125f;  // 2^-9
-    
+
     if (fval >= MAX_VAL) {
         buf[idx] = sign ? 0xFE : 0x7E;  // Max magnitude (saturation, no inf)
         return;
@@ -274,15 +283,15 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
         buf[idx] = sign ? 0x80 : 0x00;  // Zero
         return;
     }
-    
+
     // Extract FP32 exponent and mantissa via bit cast
     uint fbits = as_uint(fval);
     int exp32 = ((fbits >> 23) & 0xFF) - 127;  // Unbiased exponent
     uint mant32 = fbits & 0x7FFFFF;            // 23-bit mantissa
-    
+
     // Compute FP8 exponent
     int exp8 = exp32 + 7;  // E4M3 bias = 7
-    
+
     // Handle subnormals
     // NOTE: Subnormal rounding omits shifted-out bits from sticky calculation.
     // Max error: 1 ULP of FP8 subnormal (2^-9). Below quantization floor; no fix required.
@@ -301,7 +310,7 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
         buf[idx] = sign ? 0xFE : 0x7E;
         return;
     }
-    
+
     // Round mantissa to 3 bits (round-to-nearest-even)
     uint round_bit = (mant32 >> 19) & 1u;
     uint sticky = mant32 & ((1u << 19) - 1u);
@@ -322,14 +331,14 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
         buf[idx] = sign ? 0xFE : 0x7E;
         return;
     }
-    
+
     buf[idx] = (sign << 7) | (exp8 << 3) | (mant8 & 0x7);
-    
+
 #elif STORAGE_TYPE_IS_E5M2
     // E5M2: bias=15, max=57344, min_subnormal=2^-16
     const float MAX_VAL = 57344.0f;
     const float MIN_SUBNORMAL = 0.0000152587890625f;  // 2^-16, exact
-    
+
     if (fval >= MAX_VAL) {
         buf[idx] = sign ? 0xFB : 0x7B;  // Max magnitude
         return;
@@ -338,15 +347,15 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
         buf[idx] = sign ? 0x80 : 0x00;  // Zero
         return;
     }
-    
+
     // Extract FP32 exponent and mantissa via bit cast
     uint fbits = as_uint(fval);
     int exp32 = ((fbits >> 23) & 0xFF) - 127;
     uint mant32 = fbits & 0x7FFFFF;
-    
+
     // Compute FP8 exponent
     int exp8 = exp32 + 15;  // E5M2 bias = 15
-    
+
     // Handle subnormals
     // NOTE: Subnormal rounding omits shifted-out bits from sticky calculation.
     // Max error: 1 ULP of FP8 E5M2 subnormal (2^-16). Below quantization floor; no fix required.
@@ -362,7 +371,7 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
         buf[idx] = sign ? 0xFB : 0x7B;
         return;
     }
-    
+
     // Round mantissa to 2 bits (round-to-nearest-even)
     uint round_bit = (mant32 >> 20) & 1u;
     uint sticky = mant32 & ((1u << 20) - 1u);
@@ -378,9 +387,9 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
             return;
         }
     }
-    
+
     buf[idx] = (sign << 7) | (exp8 << 2) | (mant8 & 0x3);
-    
+
 #endif
 }
 
@@ -566,9 +575,6 @@ static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
 #define uint unsigned int
 #endif
 #define KERNEL_ATTR
-#ifndef LOCAL_MEM_BANK_PADDING
-#define LOCAL_MEM_BANK_PADDING 1
-#endif
 #ifndef STORAGE_TYPE
 #define STORAGE_TYPE float
 #endif
@@ -625,6 +631,9 @@ static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
 #endif
 #ifndef COMPUTE_ONE
 #define COMPUTE_ONE 1.0f
+#endif
+#ifndef COMPUTE_FP_MAX
+#define COMPUTE_FP_MAX FLT_MAX
 #endif
 #ifndef SIMD_WIDTH
 #define SIMD_WIDTH 1
@@ -686,20 +695,44 @@ inline ACCUM_TYPE widen_to_accum(COMPUTE_TYPE val) { return (ACCUM_TYPE)val; }
 inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val) { return (COMPUTE_TYPE)val; }
 #endif // __OPENCL_VERSION__
 
+// --- Kernel-Internal Constants ---
+// Bank-conflict avoidance: +1 element per row stride in local memory.
+// This is a well-known constant of the bank-conflict avoidance technique,
+// not a hardware-dependent parameter. It is kernel-internal and is NOT a
+// build-time symbol — the build system does not provide it via -D flags.
+// Retained for any kernel source that uses the stride-padding pattern in
+// local memory (e.g., tiled matrix transposes).
+#ifndef LOCAL_MEM_BANK_PADDING
+#define LOCAL_MEM_BANK_PADDING 1
+#endif
+
 // --- Host-configurable Flags and Enums ---
 #define PROBLEM_TYPE_CCE 0 // Selects Softmax/Cross-Entropy Loss math path
 #define PROBLEM_TYPE_BCE 1 // Selects Sigmoid/Binary Cross-Entropy math path
 #define AGG_MODE_SUM 0     // Selects summation for aggregation
 #define AGG_MODE_AVERAGE 1 // Selects averaging for aggregation
 
-// --- Common Math Configuration ---
+// --- Precision-Gated Math Function Macros ---
+// native_* intrinsics exist only for float in OpenCL.
+// When COMPUTE_TYPE is half or double, fast-math is not applicable.
 #ifndef USE_FAST_MATH
 #define USE_FAST_MATH 0
 #endif
-#if USE_FAST_MATH
-#define MATH_FN native_
+#ifdef __OPENCL_VERSION__
+#if USE_FAST_MATH && COMPUTE_TYPE_IS_FLOAT
+#define MATH_EXP  native_exp
+#define MATH_LOG  native_log
+#define MATH_SQRT native_sqrt
 #else
-#define MATH_FN
+#define MATH_EXP  exp
+#define MATH_LOG  log
+#define MATH_SQRT sqrt
+#endif
+#else
+// Host-mode stubs (fast math is never applicable):
+#define MATH_EXP  exp
+#define MATH_LOG  log
+#define MATH_SQRT sqrt
 #endif
 
 // --- Phase 4: Shared Layer Forward Pass ---
@@ -710,16 +743,19 @@ inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val) { return (COMPUTE_TYPE)val
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Streamable"
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs loaded via load_storage(); state-role inputs loaded via load_state(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Hidden mask production is controlled by `dest_scalar_FLAG_produce_hidden_mask`. When 1: the ReLU derivative mask capturing compute-precision truth is written to `dest_buffer_GLOBAL_hidden_mask`. When 0: mask writes are skipped; the Host MAY pass a minimal stub buffer. This FLAG enables policy-tier control over mask lifecycle based on the precision configuration. Padding Zero Propagation (Emergent): Hidden-dimension padding positions (indices >= padded_hidden_count's logical extent) in dest_buffer_GLOBAL_hidden_activations and dest_buffer_GLOBAL_hidden_mask carry zero when all three conditions hold: (a) input-dimension padding in src_buffer_GLOBAL_input is zero, (b) hidden-dimension padding in weights is zero, (c) hidden-dimension padding in biases is zero. This is a mathematical consequence of the affine transform (W*x + b) and ReLU(0) = 0, not an active zeroing step. The kernel does not distinguish padding from logical positions — it receives only padded dimensions (padded_input_count, padded_hidden_count). The host initialization and optimizer (Node 24) are the co-guarantors of the three preconditions."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs loaded via load_storage(); state-role inputs loaded via load_state(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Hidden mask production is controlled by `dest_scalar_FLAG_produce_hidden_mask`. When 1: the ReLU derivative mask capturing compute-precision truth is written to `dest_buffer_GLOBAL_hidden_mask`. When 0: mask writes are skipped; the Host MAY pass a minimal stub buffer. This FLAG enables policy-tier control over mask lifecycle based on the precision configuration. Padding Zero Propagation (Emergent): Hidden-dimension padding positions (indices >= padded_hidden_count's logical extent) in dest_buffer_GLOBAL_hidden_activations and dest_buffer_GLOBAL_hidden_mask carry zero when all three conditions hold: (a) input-dimension padding in src_buffer_GLOBAL_input is zero, (b) hidden-dimension padding in weights is zero, (c) hidden-dimension padding in biases is zero. This is a mathematical consequence of the affine transform (W*x + b) and ReLU(0) = 0, not an active zeroing step. The kernel is not required to distinguish padding from logical positions — it receives only padded dimensions (padded_input_count, padded_hidden_count). Implementations MAY skip computation at padding indices as a performance optimization; both approaches satisfy Padding Zero-Propagation. The host initialization and optimizer (Node 24) are the co-guarantors of the three preconditions."
  */
 __kernel void forward_pass(
     /**
-     * @param update_buffer_LOCAL_simd_tile A local memory resource for tiling to optimize SIMD operations.
-     *        - Tensor Shape: (SIMD_WIDTH, SIMD_WIDTH + LOCAL_MEM_BANK_PADDING)
-     *        - Padding Contract: {Type: BANK_CONFLICT_AVOIDANCE, Formula: "Pad row stride by LOCAL_MEM_BANK_PADDING"}
+     * @param update_buffer_LOCAL_simd_tile Local memory for tiled matrix-vector multiplication.
+     *        - Allocation Formula: (SIMD_WIDTH + SIMD_WIDTH * SIMD_WIDTH) * sizeof(COMPUTE_TYPE)
      *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Calculability Proof: [Compile-time constant: SIMD_WIDTH, System Contract constant: LOCAL_MEM_BANK_PADDING]
-     *        - Validation Preconditions: Host shall allocate size according to the formula derived from this contract.
+     *        - Internal Layout Note: "Partitioned into two contiguous sub-arrays:
+     *          tile_input[SIMD_WIDTH] (broadcast tile for the input vector slice)
+     *          at offset 0, followed by tile_weights[SIMD_WIDTH][SIMD_WIDTH]
+     *          (weight matrix tile, row-major, stride = SIMD_WIDTH) at offset
+     *          SIMD_WIDTH. Access pattern is stride-1 across threads for both
+     *          sub-arrays; no bank-conflict avoidance padding is required."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_simd_tile,
 
@@ -1102,21 +1138,21 @@ __kernel void compute_probs_loss_bce_chunk(
 // --- Phase 8-10: Parallel Gradient Computation ---
 
 /**
- * @brief (Node 8) Computes partial module param gradients (Weights, Biases) for a tile.
+ * @brief (Node 8) Computes partial module param gradients (Weights, Biases) for a tile and batch chunk.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. Padding Zero-Preservation: For padded dimensions where the logical extent (hidden_count, total_output_class_count) is less than the padded extent (padded_hidden_count, padded_total_output_class_count), the kernel SHALL NOT write non-zero values to positions at indices >= the logical extent. Each tile accumulates only into [class_chunk_offset, class_chunk_offset + classes_per_chunk) and never touches padding positions. The host initialization (ZERO_REQUIRED_ADDITIVE) is the sole guarantor of zeros at padding positions."
- *        - Idempotency: "Associatively Non-Idempotent"
- *        - Synchronization Model: "Dual Partial Renderer. Uses flat_tile_index for both weight and bias gradient outputs."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. Padding Zero-Preservation: The kernel writes computed gradients only within its assigned class chunk range [class_offset, class_offset + classes_per_chunk) for each (module, hidden) position within its tile and batch chunk. Positions outside this range — including other tiles' class ranges and class-dimension padding — are never written; the ZERO_REQUIRED initialization of the destination buffer is the primary guarantor of zeros at these positions. For hidden-dimension padding (h >= hidden_count) within the class chunk range, the computation produces zero because upstream hidden activations at padding indices are zero (Zero-Propagation Theorem precondition (b): weight padding is zero, precondition (c): bias padding is zero, therefore hidden activation padding is zero, therefore 0 × (prob - target) = 0). The kernel is not required to special-case these positions — the zero output is a mathematical consequence of the upstream invariant chain. Implementations MAY skip computation at padding indices as a performance optimization; both approaches satisfy Padding Zero-Preservation."
+ *        - Idempotency: "Strictly Idempotent"
+ *        - Synchronization Model: "Dual Partial Renderer. Uses (flat_tile_index, batch_chunk_index) composite placement for both weight and bias gradient outputs. Per Principle §3 Inter-Dispatch Reduction Delegation, each dispatch writes to a unique slot; batch-chunk summation is delegated to a ReductionTreeNode inserted before Node 11."
  */
 __kernel void calculate_module_param_grads_chunk(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reductions.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel reduction.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
      *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Used for tree-structured parallel reduction of per-sample gradient
+     *          contributions across the work-group."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
@@ -1179,42 +1215,50 @@ __kernel void calculate_module_param_grads_chunk(
     __global const STATE_TYPE *src_buffer_GLOBAL_CONST_temps,
 
     /**
-     * @param dest_buffer_GLOBAL_partial_grad_weights_module The collection buffer for this tile's computed weight gradients.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
+     * @param dest_buffer_GLOBAL_partial_grad_weights_module The collection buffer for this (tile, batch_chunk) pair's computed weight gradients.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {
      *            dim[0] ("total_tile_count"): {Type: NONE},
-     *            dim[1] ("modules_per_chunk"): {Type: NONE},
-     *            dim[2] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
-     *            dim[3] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
+     *            dim[1] ("num_batch_chunks"): {Type: NONE},
+     *            dim[2] ("modules_per_chunk"): {Type: NONE},
+     *            dim[3] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
+     *            dim[4] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
      *          }
-     *        - Initialization Contract: {Type: ZERO_REQUIRED_ADDITIVE}
+     *        - Initialization Contract: {Type: ZERO_REQUIRED}
      *        - Precision Role: "storage"
-     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
-     *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
-     *        - Validation Preconditions: [1] The write tile index must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] Host shall allocate
-     * exactly [src_scalar_NATURAL_total_tile_count * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_total_output_class_count * sizeof(STORAGE_TYPE)] bytes.
-     * [3] Each tile writes only `classes_per_chunk` positions within the `padded_total_output_class_count`-wide innermost dimension. The consumer (Node 11) reads the full padded extent for its L2 norm computation.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count]
+     *        - Placement Contract: grid_mod_cls_batch(src_scalar_NATURAL_flat_tile_index, src_scalar_NATURAL_batch_chunk_index)
+     *        - Validation Preconditions: [1] The write tile index must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] The batch chunk index must be valid, as proven by: src_scalar_NATURAL_batch_chunk_index < src_scalar_NATURAL_num_batch_chunks. [3] Host shall allocate
+     * exactly [src_scalar_NATURAL_total_tile_count * src_scalar_NATURAL_num_batch_chunks * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_padded_hidden_count * src_scalar_NATURAL_padded_total_output_class_count * sizeof(STORAGE_TYPE)] bytes.
+     * [4] Host shall zero-initialize this buffer prior to dispatch. Each (tile, batch_chunk) writes only `classes_per_chunk` positions within the `padded_total_output_class_count`-wide innermost dimension; the ZERO_REQUIRED initialization covers all unwritten positions. A batch-chunk ReductionTreeNode sums across batch chunks before Node 11.
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_partial_grad_weights_module,
 
     /**
-     * @param dest_buffer_GLOBAL_partial_grad_biases_module The collection buffer for this tile's computed bias gradients.
-     *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count)
-     *        - Padding Contract: {Type: SIMD, Formula: "SIMD_WIDTH alignment via padded_total_output_class_count"}
-     *        - Initialization Contract: {Type: ZERO_REQUIRED_ADDITIVE}
+     * @param dest_buffer_GLOBAL_partial_grad_biases_module The collection buffer for this (tile, batch_chunk) pair's computed bias gradients.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count)
+     *        - Padding Contract: {
+     *            dim[0] ("total_tile_count"): {Type: NONE},
+     *            dim[1] ("num_batch_chunks"): {Type: NONE},
+     *            dim[2] ("modules_per_chunk"): {Type: NONE},
+     *            dim[3] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
+     *          }
+     *        - Initialization Contract: {Type: ZERO_REQUIRED}
      *        - Precision Role: "storage"
-     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count]
-     *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
-     *        - Validation Preconditions: [1] The write tile index must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] Host shall allocate
-     * exactly [src_scalar_NATURAL_total_tile_count * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_padded_total_output_class_count * sizeof(STORAGE_TYPE)] bytes.
-     * [3] Each tile writes only `classes_per_chunk` positions within the `padded_total_output_class_count`-wide innermost dimension. The consumer (Node 11) reads the full padded extent for its L2 norm computation.
+     *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count]
+     *        - Placement Contract: grid_mod_cls_batch(src_scalar_NATURAL_flat_tile_index, src_scalar_NATURAL_batch_chunk_index)
+     *        - Validation Preconditions: [1] The write tile index must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] The batch chunk index must be valid, as proven by: src_scalar_NATURAL_batch_chunk_index < src_scalar_NATURAL_num_batch_chunks. [3] Host shall allocate
+     * exactly [src_scalar_NATURAL_total_tile_count * src_scalar_NATURAL_num_batch_chunks * src_scalar_NATURAL_modules_per_chunk * src_scalar_NATURAL_padded_total_output_class_count * sizeof(STORAGE_TYPE)] bytes.
+     * [4] Host shall zero-initialize this buffer prior to dispatch. Each (tile, batch_chunk) writes only `classes_per_chunk` positions within the `padded_total_output_class_count`-wide innermost dimension; the ZERO_REQUIRED initialization covers all unwritten positions. A batch-chunk ReductionTreeNode sums across batch chunks before Node 11.
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_partial_grad_biases_module,
 
     uint src_scalar_FLAG_problem_type,
     uint src_scalar_NATURAL_flat_tile_index,
+    uint src_scalar_NATURAL_batch_chunk_index,
     uint src_scalar_NATURAL_batch_chunk_offset,
     uint src_scalar_NATURAL_batch_chunk_count,
+    uint src_scalar_NATURAL_num_batch_chunks,
     uint src_scalar_NATURAL_num_class_chunks,
     uint src_scalar_NATURAL_classes_per_chunk,
     uint src_scalar_NATURAL_modules_per_chunk,
@@ -1340,12 +1384,12 @@ __kernel void backprop_error_to_hidden_chunk(
  */
 __kernel void calculate_chunk_temp_gradients(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reductions.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel reduction.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
      *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Used for tree-structured parallel reduction of per-sample
+     *          temperature gradient contributions across the work-group."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
@@ -1441,18 +1485,20 @@ __kernel void calculate_chunk_temp_gradients(
  *        - Holistic Constraints: "The kernel processes the complete set of partial gradients for a single logical work item (`flat_tile_index`). The clipping threshold is determined by
  * `src_scalar_FLAG_use_per_item_norm`."
  *        - Behavioral Invariants: "[1] Implements a two-pass algorithm: Norm calculation followed by conditional scaling. [2] An epsilon term shall be used to prevent division by zero when
- * calculating the scaling factor. [3] The L2 norm is computed over the logical concatenation of all four input gradient buffers (weights, biases, temperatures, hidden activations). A single derived scaling factor is applied uniformly to all four output buffers. Independent per-buffer norms are a contract violation. Precision Boundary Conversion: storage-role inputs widened via load_storage(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. FP8 Quantization Note: When STORAGE_TYPE is FP8, the clip-then-store sequence introduces re-quantization error. Gradient components scaled below the FP8 quantization floor (2^-9 for E4M3, 2^-16 for E5M2) may round to zero, effectively zeroing a subset of the gradient. This is an accepted consequence of the Primacy of Memory Strategy — the architecture trades gradient fidelity for 4x bandwidth compression. The Quadratic Scaling Policy's threshold schedule accounts for this by maintaining gradients well above the quantization floor. Padding Zero-Preservation: The uniform-scaling algorithm applies a single multiplicative factor derived from the joint L2 norm to all positions in all four output buffers. No per-element additive term exists. Zero-valued positions in the input (established by Node 9's Padding Zero-Establishment for Grad_H, and by Node 8's Padding Zero-Preservation for Grad_ModW and Grad_ModB) are mapped to zero in the output for all finite scaling factors. This is a mathematical consequence of the single-scale-factor design, not an active zeroing step."
+ * calculating the scaling factor. [3] The L2 norm is computed over the logical concatenation of all four input gradient buffers (weights, biases, temperatures, hidden activations). A single derived scaling factor is applied uniformly to all four output buffers. Independent per-buffer norms are a contract violation. Precision Boundary Conversion: storage-role inputs widened via load_storage(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. FP8 Quantization Note: When STORAGE_TYPE is FP8, the clip-then-store sequence introduces re-quantization error. Gradient components scaled below the FP8 quantization floor (2^-9 for E4M3, 2^-16 for E5M2) may round to zero, effectively zeroing a subset of the gradient. This is an accepted consequence of the Primacy of Memory Strategy — the architecture trades gradient fidelity for 4x bandwidth compression. The Quadratic Scaling Policy's threshold schedule accounts for this by maintaining gradients well above the quantization floor. Padding Zero-Preservation: The uniform-scaling algorithm applies a single multiplicative factor derived from the joint L2 norm to all positions in all four output buffers. No per-element additive term exists. Zero-valued positions in the input (established by Node 9's Padding Zero-Establishment for Grad_H, and by Node 8's Padding Zero-Preservation for Grad_ModW and Grad_ModB) are mapped to zero in the output for all finite scaling factors. This is a mathematical consequence of the single-scale-factor design, not an active zeroing step. Implementations MAY skip computation at padding indices as a performance optimization."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Utility / Stability Primitive. Acts as a barrier for a single item's partial results before reduction."
  */
 __kernel void clip_partial_gradients(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reduction of the sum-of-squares.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel reduction of the sum-of-squares.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
      *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Used for tree-structured parallel reduction to compute the L2 norm
+     *          (sum of squares) across the concatenated gradient vector. Each
+     *          thread accumulates partial sums of squares for its assigned
+     *          elements, then the work-group reduces to a single scalar."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
@@ -1705,12 +1751,15 @@ __kernel void aggregate_register_reduce(
  */
 __kernel void aggregate_local_reduce(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for performing the intra-work-group reduction.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel reduction.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
      *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Used for tree-structured parallel summation of per-element
+     *          contributions from scattered partials. Each thread loads and
+     *          accumulates its share of the partial_offset_list entries, then
+     *          the work-group reduces to produce one output element per
+     *          reduction round."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
@@ -1810,12 +1859,13 @@ __kernel void aggregate_register_reduce_from_compute(
  */
 __kernel void aggregate_local_reduce_from_compute(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for performing the intra-work-group reduction.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel reduction.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
      *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Identical access pattern to aggregate_local_reduce; the only
+     *          difference is that source reads are COMPUTE_TYPE rather than
+     *          STORAGE_TYPE."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
@@ -1864,12 +1914,14 @@ __kernel void aggregate_local_reduce_from_compute(
  */
 __kernel void clip_intermediate_grad(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for performing the intra-work-group reduction of the sum-of-squares for the L2 norm.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel reduction of the sum-of-squares for the L2 norm.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
      *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Used for tree-structured parallel reduction to compute a single
+     *          L2 norm over the entire intermediate gradient buffer. Each thread
+     *          accumulates partial sums of squares, then the work-group reduces
+     *          to a single scalar used for the conditional scaling decision."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
@@ -1957,14 +2009,15 @@ __kernel void clip_intermediate_grad(
 __kernel void stabilize_and_reduce_grad_hidden_activations(
     /**
      * @param update_buffer_LOCAL_reduction_tile Work-group exclusive memory
-     *        for high-bandwidth parallel reduction.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
+     *        for staged parallel reduction with interleaved clipping.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
      *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal
-     *          to the work-group size in dimension 0 multiplied by
-     *          sizeof(COMPUTE_TYPE).
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Serves dual purpose: (1) holds each thread's pre-accumulation
+     *          result (sum of ceil(total_modules_count / get_local_size(0))
+     *          elements), then (2) is reused across multiple staged reduction
+     *          rounds with interleaved per-element clipping. Thread 0 reads the
+     *          final scalar result after the last reduction stage."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
@@ -2086,12 +2139,14 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
  */
 __kernel void backprop_shared_weights_chunk(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reductions.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel reduction.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
      *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Used for tree-structured parallel reduction of per-sample outer
+     *          product contributions (input[i] * grad_h[h] * relu_mask[h])
+     *          across the batch chunk to produce a single partial weight
+     *          gradient element."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
@@ -2198,12 +2253,13 @@ __kernel void backprop_shared_weights_chunk(
  */
 __kernel void backprop_shared_biases_chunk(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reductions.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel reduction.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
      *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Used for tree-structured parallel reduction of per-sample bias
+     *          gradient contributions (grad_h[h] * relu_mask[h]) across the
+     *          batch chunk to produce a single partial bias gradient element."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
@@ -2298,13 +2354,15 @@ __kernel void backprop_shared_biases_chunk(
  */
 __kernel void clip_shared_gradients_chunk(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for work-group reduction of the sum-of-squares.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel reduction of the sum-of-squares.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
      *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to the work-group
-     *          size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Used for tree-structured parallel reduction to compute a single
+     *          L2 norm over the concatenated (weights, biases) gradient vector
+     *          for one batch chunk. Each thread accumulates partial sums of
+     *          squares for its assigned elements across both sub-buffers, then
+     *          the work-group reduces to a single scalar."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
@@ -2427,7 +2485,7 @@ __kernel void normalize_gradients(
  * @brief (Node 24) Applies Adam optimizer update to an entire parameter group. Single dispatch.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction terms (`beta1_pow_t`, `beta2_pow_t`) to ensure long-term numerical stability. State-Precision Accumulation: EMA updates on m1 and m2 use ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Moment vectors loaded via load_state_for_accum(); gradients widened via widen_to_accum(); EMA arithmetic in ACCUM_TYPE; results stored via store_state_from_accum(). Bias-corrected values and the final parameter update delta are transformative operations using COMPUTE_TYPE (narrowed via narrow_from_accum()). Parameter buffer subtraction is accumulative in ACCUM_TYPE. Hyperparameter Precision Note: Hyperparameter scalars (β₁, β₂, ε, lr) are received in COMPUTE_TYPE and widened to ACCUM_TYPE for EMA arithmetic. The widening preserves only COMPUTE_TYPE precision for these constants. For β₁ = 0.999 with COMPUTE_TYPE = float, the contribution factor (1 − β₁) carries ~7 significant digits regardless of ACCUM_TYPE. Bias Correction Precision Ceiling: The `beta1_pow_t` and `beta2_pow_t` scalars are computed by the Host in FP64 and narrowed to COMPUTE_TYPE at the interface boundary. Under mixed_f32_f64_state() (FP32 compute, FP64 state), beta1^t values below ~1.4e-45 round to FP32 zero, losing FP64 precision. This is currently sound — at t ≈ 100K, 1/(1-beta1^t) ≈ 1.0, so the loss is negligible. A future revision may accept these scalars in STATE_TYPE for full consistency with the state role's unbounded-training-stability guarantee. This interface typing is the last remaining non-state-precision bottleneck in the Adam path; see CONCEPT.md §11 (state-precision accumulation design). ADR-030: State-role buffers are indexed via [parameter_offset + i]. The slice access invariant (parameter_offset + parameter_count) <= total_parameter_count ensures no out-of-bounds access. Padding Zero-Preservation (Inductive): The kernel processes all positions in [parameter_offset, parameter_offset + parameter_count). At padding positions where the gradient is zero and moment vectors are zero (both host-initialized), the Adam recurrence produces zero moment updates and zero parameter change: m1 <- beta1*0 + (1-beta1)*0 = 0, m2 <- beta2*0 + (1-beta2)*0 = 0, delta_w = 0. This preserves padding zeros by mathematical induction over training steps — the kernel does not distinguish padding from logical positions."
+ *        - Behavioral Invariants: "The implementation is strictly forbidden from using `pown` or any equivalent function. The host is solely responsible for providing pre-computed bias correction terms (`beta1_pow_t`, `beta2_pow_t`) to ensure long-term numerical stability. State-Precision Accumulation: EMA updates on m1 and m2 use ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE). Moment vectors loaded via load_state_for_accum(); gradients widened via widen_to_accum(); EMA arithmetic in ACCUM_TYPE; results stored via store_state_from_accum(). Bias-corrected values and the final parameter update delta are transformative operations using COMPUTE_TYPE (narrowed via narrow_from_accum()). Parameter buffer subtraction is accumulative in ACCUM_TYPE. Hyperparameter Precision Note: Hyperparameter scalars (β₁, β₂, ε, lr) are received in COMPUTE_TYPE and widened to ACCUM_TYPE for EMA arithmetic. The widening preserves only COMPUTE_TYPE precision for these constants. For β₁ = 0.999 with COMPUTE_TYPE = float, the contribution factor (1 − β₁) carries ~7 significant digits regardless of ACCUM_TYPE. Bias Correction Precision Ceiling: The `beta1_pow_t` and `beta2_pow_t` scalars are computed by the Host in FP64 and narrowed to COMPUTE_TYPE at the interface boundary. Under mixed_f32_f64_state() (FP32 compute, FP64 state), beta1^t values below ~1.4e-45 round to FP32 zero, losing FP64 precision. This is currently sound — at t ≈ 100K, 1/(1-beta1^t) ≈ 1.0, so the loss is negligible. A future revision may accept these scalars in STATE_TYPE for full consistency with the state role's unbounded-training-stability guarantee. This interface typing is the last remaining non-state-precision bottleneck in the Adam path; see CONCEPT.md §11 (state-precision accumulation design). ADR-030: State-role buffers are indexed via [parameter_offset + i]. The slice access invariant (parameter_offset + parameter_count) <= total_parameter_count ensures no out-of-bounds access. Padding Zero-Preservation (Inductive): The kernel processes all positions in [parameter_offset, parameter_offset + parameter_count). At padding positions where the gradient is zero and moment vectors are zero (both host-initialized), the Adam recurrence produces zero moment updates and zero parameter change: m1 <- beta1*0 + (1-beta1)*0 = 0, m2 <- beta2*0 + (1-beta2)*0 = 0, delta_w = 0. This preserves padding zeros by mathematical induction over training steps — the kernel is not required to distinguish padding from logical positions. Implementations MAY skip computation at padding indices as a performance optimization; both approaches satisfy Padding Zero-Preservation."
  *        - Idempotency: "Fundamentally Non-Idempotent (Stateful). Modifies multiple state buffers in-place."
  *        - Synchronization Model: "Stateful Optimizer Update. Consumes final gradients after the Batch Synchronization Point."
  */
@@ -2535,14 +2593,16 @@ __kernel void clamp_temperatures(
  */
 __kernel void reduce_k_fan_in_and_clip(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group
-     *        parallel L2 norm reduction.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "compute"
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to
-     *          the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel L2 norm reduction.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
+     *        - Precision Role: "compute" (LOCAL scratch)
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Used for tree-structured parallel reduction to compute the per-node
+     *          L2 norm (sum of squares) over partial_width elements. Each thread
+     *          accumulates partial sums of squares for its assigned elements of
+     *          the summed K-partial vector, then the work-group reduces to a
+     *          single scalar for the conditional scaling decision. One work-group
+     *          per reduction node."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
@@ -2643,14 +2703,13 @@ __kernel void reduce_k_fan_in_and_clip(
  */
 __kernel void reduce_k_fan_in_and_clip_from_compute(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group
-     *        parallel L2 norm reduction.
-     *        - Tensor Shape: (get_local_size(0))
-     *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "compute"
-     *        - Calculability Proof: [Implicit from work-group dispatch]
-     *        - Validation Preconditions: Host shall allocate local memory equal to
-     *          the work-group size in dimension 0 multiplied by `sizeof(COMPUTE_TYPE)`.
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel L2 norm reduction.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
+     *        - Precision Role: "compute" (LOCAL scratch)
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Identical access pattern to reduce_k_fan_in_and_clip; the only
+     *          difference is that source reads are COMPUTE_TYPE rather than
+     *          STORAGE_TYPE."
      */
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 

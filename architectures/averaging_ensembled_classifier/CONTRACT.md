@@ -1,28 +1,28 @@
-### **System Contract: Host-Device Kernel Interface (Revision 8)**
+# System Contract: Host-Device Kernel Interface (Revision 9)
 
-#### **Preamble**
+## Preamble
 
 This document constitutes the definitive and inviolable contract governing all interactions across the Host-Device boundary. Its articles are not guidelines but fundamental laws of the system architecture. Adherence is mandatory and absolute. This contract supersedes all prior conventions and informal agreements.
 
 ---
 
-### **Article 1: Foundational Axioms**
+## Article 1: Foundational Axioms
 
 The architecture is immutably founded upon the following axioms.
 
-#### 1.1. Axiom of Jurisdictional Separation.
+### 1.1. Axiom of Jurisdictional Separation.
 
 A parameter's syntactic structure (**Name**) defines its machine-enforced contract. A parameter's semantic block (**Commentary**) defines its human-verifiable and logical contract. These two jurisdictions are distinct and exhaustive.
 
-#### 1.2. Axiom of Semantic Uniqueness.
+### 1.2. Axiom of Semantic Uniqueness.
 
 Information encoded within the syntactic jurisdiction (Name) is prohibited from being duplicated within the semantic jurisdiction (Commentary), and vice versa. There shall exist no redundancy between the two.
 
-#### 1.3. Axiom of Memory Layout.
+### 1.3. Axiom of Memory Layout.
 
 All multi-dimensional buffers are contractually obligated to be stored in a **row-major memory layout**. The physical address of an element is calculated accordingly. Any deviation from this layout must be explicitly signaled by a canonical layout suffix (e.g., `_soa`).
 
-#### 1.4: Axiom of Collaborative Interface Verifiability
+### 1.4: Axiom of Collaborative Interface Verifiability
 
 A kernel's public interface constitutes a **closed logical system** for verification. Validation follows a layered responsibility model:
 
@@ -36,11 +36,14 @@ A kernel's public interface constitutes a **closed logical system** for verifica
 
 - **1.4.1. Inviolable Constraint:** All parameters used in each `Calculability Proof` and `Validation Preconditions` must exist in the interface, preserving the closed system. Redundancy for assurance doesn't violate minimalism when serving this axiom.
 
-### **Article 2: Parameter Lexical Mandate**
+---
+
+## Article 2: Parameter Lexical Mandate
 
 The structure of a parameter name is formally specified. This grammar is not a convention but a mandatory syntactical requirement for interface validity.
 
-**2.1. Buffer Name Grammar**
+### 2.1. Buffer Name Grammar
+
 A buffer identifier shall be constructed as:
 `[Flow] :: "buffer" :: [MemoryScope] :: [ContextAndUsage]`
 
@@ -48,7 +51,7 @@ A buffer identifier shall be constructed as:
 - **`[MemoryScope]`**: `GLOBAL_` | `LOCAL_` | `GLOBAL_CONST_` | `DEVICE_CONST_`
 - **`[ContextAndUsage]`**: A canonical identifier defined exclusively in **Article 8: Canonical Lexicon**.
 
-**2.1.1. Memory Scope Token Definitions**
+#### 2.1.1. Memory Scope Token Definitions
 
 - **`GLOBAL_`**: Standard `__global` device memory for pipeline data. Buffers in this scope represent transient, per-dispatch data flowing through the computational DAG (inputs, activations, masks, partials, intermediates). They may carry the `const` qualifier in the C declaration when used as a read-only source.
 - **`LOCAL_`**: Work-group exclusive `__local` memory.
@@ -57,7 +60,8 @@ A buffer identifier shall be constructed as:
 
 > **Note (Article 1.2 — Axiom of Semantic Uniqueness):** A buffer's precision role is determined by its C type declaration (`STORAGE_TYPE`, `COMPUTE_TYPE`, or `STATE_TYPE`) and formally specified in the parameter's `Precision Role` commentary key (Article 3). It is not encoded in the buffer name's `[ContextAndUsage]` component. The C declaration encodes the precision role via the type symbol. Duplicating this in the name would violate the prohibition on cross-jurisdictional redundancy.
 
-**2.2. Scalar Name Grammar**
+### 2.2. Scalar Name Grammar
+
 A scalar identifier shall be constructed as:
 `[Flow] :: "scalar" :: [NumberType] :: [ContextAndUsage]`
 
@@ -65,37 +69,48 @@ A scalar identifier shall be constructed as:
 - **`[NumberType]`**: A mandatory prefix defining the parameter's abstract numerical domain.
 - **`[ContextAndUsage]`**: A canonical identifier defined exclusively in **Article 8: Canonical Lexicon**.
 
-**2.3. Scalar `[NumberType]` Taxonomy**
+### 2.3. Scalar `[NumberType]` Taxonomy
+
 The `[NumberType]` component defines the set of valid values for a scalar.
 
-| Token      | Abstract Numerical Domain            | Core Constraint                                                      |
-| :--------- | :----------------------------------- | :------------------------------------------------------------------- |
+| Token      | Abstract Numerical Domain             | Core Constraint                                                      |
+| :--------- | :------------------------------------ | :------------------------------------------------------------------- |
 | `NATURAL_` | Natural Numbers (ℕ₀: {0, 1, 2, ...}) | Value must be non-negative. Defines counts, indices, and sizes.      |
 | `INTEGER_` | Integers (ℤ: {..., -1, 0, 1, ...})   | Value may be negative. Defines offsets and signed quantities.        |
-| `REAL_`    | Real Numbers (ℝ)                     | Value represents a continuous quantity. Defines thresholds and data. |
-| `FLAG_`    | Boolean Set ({0, 1})                 | Value must be `0` or `1`. Defines logical switches.                  |
+| `REAL_`    | Real Numbers (ℝ)                      | Value represents a continuous quantity. Defines thresholds and data. |
+| `FLAG_`    | Boolean Set ({0, 1})                  | Value must be `0` or `1`. Defines logical switches.                  |
 
-### **Article 3: Parameter Commentary Contract**
+---
 
-The `@param` block constitutes the complete logical specification for a parameter. It shall contain the following keys as required:
+## Article 3: Parameter Commentary Contract
 
-- **`Tensor Shape`**: The logical dimensions of the tensor.
-- **`Padding Contract`**: A key-value object literal specifying padding strategy. > Under the three-role precision model, padding byte counts use the element size of the buffer's actual `precision_role` type: `sizeof(STORAGE_TYPE)`, `sizeof(COMPUTE_TYPE)`, or `sizeof(STATE_TYPE)` as appropriate. Using a different role's `sizeof` in a `Padding Contract` expression is a contract violation.
-- **`Precision Role`**: One of `"storage"`, `"compute"`, `"state"`, or `"flag-conditional"`. Declares which precision-role dtype from the active `PrecisionConfig` governs this buffer's element type and allocation size. **Mandatory** for all floating-point buffer parameters. Integer-typed buffers (`int`, `uint`, `atomic_uint`) whose element size is format-independent are exempt. When the role is `"flag-conditional"`, the buffer's element type depends on a FLAG scalar parameter's value; the commentary block MUST enumerate each flag value and its corresponding interpretation (role+type). Host-side validation operates on the runtime flag value.
-- **`Calculability Proof`**: Defines the derivation of buffer dimensions or scalar values through a constructive arithmetic expression composed solely of parameters present within the kernel's interface. All terms in this expression shall correspond to kernel arguments, satisfying the Axiom of Interface Verifiability (1.4).
-- **`Initialization Contract`**: For `dest_` flow buffers, declares whether the Host must pre-initialize the buffer contents before the producing kernel(s) are dispatched. Omission is equivalent to `{Type: NONE}`.
-- **`Validation Preconditions`**: Mandatory conditions the host must meet.
+The `@param` block constitutes the complete logical specification for a parameter. The applicable contract keys depend on the parameter's memory scope:
+
+**Global-scope buffers** (`GLOBAL_`, `GLOBAL_CONST_`, `DEVICE_CONST_`): Use the full key set defined below.
+
+**Local-scope buffers** (`LOCAL_`): Use **only** the following restricted key set: `Allocation Formula`, `Precision Role`, and optionally `Internal Layout Note`. The keys `Tensor Shape`, `Padding Contract`, `Initialization Contract`, `Placement Contract`, and `Calculability Proof` are **inapplicable** to local-scope parameters; their presence on a `LOCAL_` parameter is a contract violation. This restriction reflects the jurisdictional boundary: the host's sole obligation for local memory is to allocate the correct number of bytes. Internal structure — sub-array partitioning, row strides, bank-padding techniques — is exclusively an Execution-tier concern (CONCEPT.md §5).
+
+The following keys are recognized:
+
+- **`Tensor Shape`** *(global-scope only)*: The logical dimensions of the tensor.
+- **`Padding Contract`** *(global-scope only)*: A key-value object literal specifying padding strategy. Under the three-role precision model, padding byte counts use the element size of the buffer's actual `precision_role` type: `sizeof(STORAGE_TYPE)`, `sizeof(COMPUTE_TYPE)`, or `sizeof(STATE_TYPE)` as appropriate. Using a different role's `sizeof` in a `Padding Contract` expression is a contract violation.
+- **`Precision Role`**: One of `"storage"`, `"compute"`, `"state"`, or `"flag-conditional"`. Declares which precision-role dtype from the active `PrecisionConfig` governs this buffer's element type and allocation size. **Mandatory** for all floating-point buffer parameters. Integer-typed buffers (`int`, `uint`, `atomic_uint`) whose element size is format-independent are exempt. When the role is `"flag-conditional"`, the buffer's element type depends on a FLAG scalar parameter's value; the commentary block MUST enumerate each flag value and its corresponding interpretation (role+type). Host-side validation operates on the runtime flag value. For local-scope parameters, the Precision Role documents the element type used in the `Allocation Formula`'s `sizeof()` term.
+- **`Allocation Formula`** *(local-scope only)*: A constructive arithmetic expression yielding the required allocation size **in bytes**. The expression may reference compile-time constants (`SIMD_WIDTH`), dispatch geometry (`get_local_size(0)`), and literal integers. It must be self-contained — all terms are either kernel interface parameters, compile-time symbols (Article 6), or OpenCL work-group query functions. This formula is the **complete** host obligation for the local buffer: the host computes the value, allocates that many bytes, and passes the pointer. No further reasoning about shape, stride, or padding is required.
+- **`Internal Layout Note`** *(local-scope only, optional)*: A free-text description of how the kernel internally partitions or accesses the allocated local memory. This key is **purely informational** — it imposes no obligation on the host and is not subject to machine validation. Its purpose is to assist human reviewers in understanding the kernel's memory access patterns (e.g., sub-array partitioning, bank-conflict avoidance stride padding, reduction tree structure).
+- **`Calculability Proof`** *(global-scope only)*: Defines the derivation of buffer dimensions or scalar values through a constructive arithmetic expression composed solely of parameters present within the kernel's interface. All terms in this expression shall correspond to kernel arguments, satisfying the Axiom of Interface Verifiability (1.4).
+- **`Initialization Contract`** *(global-scope only)*: For `dest_` flow buffers, declares whether the Host must pre-initialize the buffer contents before the producing kernel(s) are dispatched. Omission is equivalent to `{Type: NONE}`.
+- **`Validation Preconditions`** *(global-scope only)*: Mandatory conditions the host must meet.
 - **`Performance Notes`**: Optional, non-binding performance optimization hints.
 
-**3.1. Padding Contract Specification**
-The `Padding Contract` field `Type` key accepts the following string literals:
+### 3.1. Padding Contract Specification
 
-| Type Token                | Definition                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| :------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CACHE`                   | Padding to align data to a hardware cache line boundary.                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `BANK_CONFLICT_AVOIDANCE` | Padding to the stride of a local memory array to prevent bank conflicts.                                                                                                                                                                                                                                                                                                                                                                                                |
-| `SIMD`                    | Padding to align a dimension to the natural SIMD vector width.                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `NONE`                    | No independent padding strategy is applied to this buffer. The buffer's allocation dimensions may incorporate padding from `padded_*` dimension parameters, which are host-computed scalars satisfying the union of alignment constraints across all buffers sharing those dimensions. When `padded_*` parameters appear in the Tensor Shape, the padding is fully determined by those parameter values; no additional buffer-specific padding calculation is required. |
+The `Padding Contract` field (applicable to global-scope buffers only; see Article 3 scope dichotomy) `Type` key accepts the following string literals:
+
+| Type Token | Definition                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| :--------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CACHE`    | Padding to align data to a hardware cache line boundary.                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `SIMD`     | Padding to align a dimension to the natural SIMD vector width.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `NONE`     | No independent padding strategy is applied to this buffer. The buffer's allocation dimensions may incorporate padding from `padded_*` dimension parameters, which are host-computed scalars satisfying the union of alignment constraints across all buffers sharing those dimensions. When `padded_*` parameters appear in the Tensor Shape, the padding is fully determined by those parameter values; no additional buffer-specific padding calculation is required. |
 
 When a buffer has multiple independently padded dimensions, the `Padding Contract` field SHALL use a per-dimension dictionary format that specifies the padding `Type` for each dimension individually:
 
@@ -111,9 +126,11 @@ Each dimension entry uses the notation `dim[N] ("natural_name" → "padded_name"
 
 Buffers with a single padded dimension (or no padding) continue to use the flat `{Type: X}` format.
 
-**3.1.1. Initialization Contract Specification**
+The per-dimension format and the flat `{Type: X}` format are both exclusive to global-scope buffers. Local-scope buffers use `Allocation Formula` (Article 3) instead.
 
-The `Initialization Contract` field declares whether the Host must pre-initialize a destination buffer before the producing kernel(s) are dispatched.
+#### 3.1.1. Initialization Contract Specification
+
+The `Initialization Contract` field (applicable to global-scope `dest_` buffers only) declares whether the Host must pre-initialize a destination buffer before the producing kernel(s) are dispatched.
 
 | Type Token               | Definition                                                                                                                                                                                                                         |
 | :----------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -121,15 +138,19 @@ The `Initialization Contract` field declares whether the Host must pre-initializ
 | `ZERO_REQUIRED_ADDITIVE` | Host must zero-fill the buffer before the _first_ dispatch of a streaming series. The producing kernel adds to existing values on each dispatch; downstream consumers read only after the complete series.                         |
 | `NONE`                   | No initialization required. The producing kernel(s) guarantee that all positions read by downstream consumers are written before consumption.                                                                                      |
 
+> **Guidance — Sparse-Write Partial Renderers:** When a Partial Renderer writes to a destination buffer whose allocated extent per tile is wider than the tile's logical write footprint (e.g., when the buffer is deliberately over-allocated to enable contiguous downstream access patterns), `{Type: NONE}` is not appropriate unless the kernel actively fills all unwritten positions. Use `{Type: ZERO_REQUIRED}` with `Padding Zero-Preservation` to delegate unwritten-position responsibility to the host. See Node 8's class-chunk amplification pattern for the canonical example.
+
 **Default:** When a `dest_` buffer's commentary block omits the `Initialization Contract` field, the contract is implicitly `{Type: NONE}`. This field is not applicable to `src_` flow parameters (produced by prior pipeline stages), `update_buffer_GLOBAL_` parameters (persisted state), or `update_buffer_LOCAL_` parameters (transient work-group scratch).
 
-**3.2. Partial Renderer Contract**
+### 3.2. Partial Renderer Contract
 
-**3.2.1. Principle**
+#### 3.2.1. Principle
 
 A kernel designated a "Partial Renderer" writes its output to a discrete, non-overlapping slice of a larger collection buffer. This is governed by a **`Placement Contract`**, which defines the precise strategy for calculating a write offset from a host-provided key.
 
-**3.2.2. Specification**
+The Placement Contract is applicable only to global-scope destination buffers. Local-scope buffers do not participate in placement strategies.
+
+#### 3.2.2. Specification
 
 The contract is specified within a parameter's commentary block using the `Placement Contract` key. The value of this key **shall** be a string literal adhering to a function-like grammar:
 
@@ -138,17 +159,18 @@ The contract is specified within a parameter's commentary block using the `Place
 - `strategy_name`: A canonical, lowercase identifier for the placement strategy, as defined in Article 3.2.3.
 - `key_parameter`: The full, canonical name of the scalar parameter that serves as the unique placement key for the kernel invocation.
 
-**3.2.3. Canonical Placement Strategies**
+#### 3.2.3. Canonical Placement Strategies
 
 The following strategy names are exhaustive. Their use contractually binds the implementation to the specified calculation logic.
 
-| `strategy_name`  | Definition                                                                        | Mandatory Key Parameter                  | Required Context Parameters            |
-| :--------------- | :-------------------------------------------------------------------------------- | :--------------------------------------- | :------------------------------------- |
-| `grid_mod_cls`   | Decomposes a 2D logical grid of (Module, Class) chunks from a flattened 1D index. | `src_scalar_NATURAL_flat_tile_index`     | `src_scalar_NATURAL_num_class_chunks`  |
-| `linear_batch`   | Decomposes by linear chunking of the batch dimension.                             | `src_scalar_NATURAL_batch_chunk_index`   | None, beyond buffer/stride dimensions. |
-| `linear_generic` | Decomposes by linear chunking of an arbitrary dimension.                          | An appropriate `..._chunk_index` scalar. | None, beyond buffer/stride dimensions. |
+| `strategy_name`    | Definition                                                                                                                                       | Mandatory Key Parameter(s)                                                         | Required Context Parameters                                                   |
+| :----------------- | :----------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------- | :---------------------------------------------------------------------------- |
+| `grid_mod_cls`     | Decomposes a 2D logical grid of (Module, Class) chunks from a flattened 1D index.                                                                | `src_scalar_NATURAL_flat_tile_index`                                               | `src_scalar_NATURAL_num_class_chunks`                                         |
+| `grid_mod_cls_batch` | Decomposes a 3D logical grid of (Module, Class, Batch) chunks from a flattened tile index and a batch chunk index.                            | `src_scalar_NATURAL_flat_tile_index`, `src_scalar_NATURAL_batch_chunk_index`       | `src_scalar_NATURAL_num_class_chunks`, `src_scalar_NATURAL_num_batch_chunks`  |
+| `linear_batch`     | Decomposes by linear chunking of the batch dimension.                                                                                            | `src_scalar_NATURAL_batch_chunk_index`                                             | None, beyond buffer/stride dimensions.                                        |
+| `linear_generic`   | Decomposes by linear chunking of an arbitrary dimension.                                                                                         | An appropriate `..._chunk_index` scalar.                                           | None, beyond buffer/stride dimensions.                                        |
 
-**3.3. Conditional Buffer Contract**
+### 3.3. Conditional Buffer Contract
 
 When a buffer parameter's access is gated by a FLAG scalar (the _controlling flag_), the parameter's commentary block SHALL include:
 
@@ -157,11 +179,19 @@ When a buffer parameter's access is gated by a FLAG scalar (the _controlling fla
 
 The `[CONDITIONAL]` annotation is a documentation convention; it does not introduce a new flow prefix or memory scope. The buffer's `[Flow]` prefix (`src_` or `dest_`) reflects its role when active.
 
-### **Article 4: The Kernel Contract Block**
+The Conditional Buffer Contract applies exclusively to global-scope buffer parameters. Local-scope buffers are unconditionally allocated per their `Allocation Formula`.
 
-**4.1. Mandate of Inclusion.** Every kernel interface specification **shall** begin with a `@kernel_contract` block. This block is mandatory and must precede the parameter list. Its purpose is to declare holistic constraints that apply to the kernel as a single unit.
+---
 
-**4.2. Formal Structure.** The block shall be a key-value list. The following keys are recognized:
+## Article 4: The Kernel Contract Block
+
+### 4.1. Mandate of Inclusion.
+
+Every kernel interface specification **shall** begin with a `@kernel_contract` block. This block is mandatory and must precede the parameter list. Its purpose is to declare holistic constraints that apply to the kernel as a single unit.
+
+### 4.2. Formal Structure.
+
+The block shall be a key-value list. The following keys are recognized:
 
 | Key                         | Definition                                                                                 | Status        |
 | :-------------------------- | :----------------------------------------------------------------------------------------- | :------------ |
@@ -191,11 +221,12 @@ The `[CONDITIONAL]` annotation is a documentation convention; it does not introd
 
 5. **Kernel Bifurcation**: Documents that this kernel is one half of a CONCEPT.md Principle 3(B) bifurcated pair. The value SHALL include: (1) an explicit reference to Principle 3(B), (2) identification of the peer kernel, and (3) a summary of the structural incompatibility (differing buffer types, shapes, or DAG edges) that prevents unification under a single interface with a FLAG parameter. This key is applicable only when the §7.0 Exception criteria are met.
 
-**4.3. Padding Invariant Mandate.**
+### 4.3. Padding Invariant Mandate.
 
 Every kernel whose output buffer has a padded dimension consumed by a downstream kernel at the full padded extent **SHALL** declare exactly one of: `Padding Zero-Establishment`, `Padding Zero-Preservation`, or `Padding Zero Propagation (Emergent)` with its preconditions in the `Behavioral Invariants` key. Omission is not equivalent to "no padding concern" — it is a contract violation if the Zero-Propagation Theorem's proof chain (CONCEPT.md §3.6) traverses that kernel.
 
-**4.4. Canonical Behavioral Vocabulary.**
+### 4.4. Canonical Behavioral Vocabulary.
+
 This section defines the canonical terms used to describe a kernel's behavior or its role in the system DAG, typically within the `Synchronization Model` key.
 
 | Term                 | Definition                                                                                                                                                                                                                                  |
@@ -208,15 +239,19 @@ This section defines the canonical terms used to describe a kernel's behavior or
 | `Conditional Writer` | A kernel that writes to a destination buffer only when a data-dependent predicate (specified in Behavioral Invariants) is satisfied for the current work item. Positions not satisfying the predicate remain at their initialization state. |
 | `Utility`            | A generic, reusable kernel that performs a common, low-level operation (e.g., copy, transpose, element-wise scaling) and is not specific to the core learning algorithm.                                                                    |
 
-### **Article 5: Architectural Constants**
+---
+
+## Article 5: Architectural Constants
 
 This article defines fixed, system-wide constants that are contractually binding on both host and device implementations. The device implementation shall enforce these values at compile-time.
 
-- `LOCAL_MEM_BANK_PADDING`: Defined with a mandatory value of **`1`**.
+*No system-wide architectural constants are currently defined.* `LOCAL_MEM_BANK_PADDING` was retired in Revision 9 — it is now a kernel-internal constant defined in `kernels.cl.h`. The value `1` is a consequence of the bank-conflict avoidance technique (adding 1 element to a power-of-two stride breaks modular alignment with typical bank counts), not a hardware-dependent parameter. Future constants that must be shared across the host-device boundary are registered here.
 
 `PrecisionConfig` is a frozen dataclass with three independent dtype fields — `storage_dtype`, `compute_dtype`, `state_dtype` — and five derived scalar constants: `storage_fp_format_max`, `storage_fp_min_positive`, `storage_mantissa_bits`, `compute_fp_format_max`, and `compute_epsilon`. The invariant `storage_dtype.itemsize ≤ compute_dtype.itemsize` and `storage_dtype.itemsize ≤ state_dtype.itemsize` is enforced by `__post_init__`. FP8 compute and FP8 state are architecturally prohibited and raise `ValueError` at construction time. Twelve factory classmethods are defined: `float32()` (all FP32), `mixed_f16_f32()` (FP16 storage, FP32 compute, FP32 state), `float64()` (all FP64), `mixed_f32_f64_state()` (FP32 storage, FP32 compute, FP64 state), `mixed_f16_f64_state()` (FP16 storage, FP32 compute, FP64 state), `mixed_f32_f64()` (FP32 storage, FP64 compute, FP64 state), `fp8_e4m3()` (E4M3 storage, FP32 compute, FP32 state), `fp8_e5m2()` (E5M2 storage, FP32 compute, FP32 state), `fp8_e4m3_f16()` (E4M3 storage, FP16 compute, FP32 state), `fp8_e5m2_f16()` (E5M2 storage, FP16 compute, FP32 state), `fp8_e4m3_f64()` (E4M3 storage, FP64 compute, FP64 state), `fp8_e5m2_f64()` (E5M2 storage, FP64 compute, FP64 state). Additional FP8 combinations (e.g., FP16 compute + FP64 state) are constructed directly. The state role has no ordering constraint relative to compute — `state_dtype.itemsize` may be greater than, equal to, or (when storage is narrower than state) less than `compute_dtype.itemsize`. The retired fields `numpy_dtype`, `fp_format_max`, and `epsilon` do not exist in this type. The uniform `float16()` factory (all FP16) was deleted in Phase 9A — FP16 state provides insufficient mantissa for EMA stability (10 bits vs. FP32's 23); for β₁ = 0.999, the per-step gradient contribution 0.001 × g rounds to zero for small gradients. Use `mixed_f16_f32()` instead. Direct construction with `state_dtype=np.float16` continues to be supported for expert use.
 
-### **Article 6: Mandatory Build-Time Symbols**
+---
+
+## Article 6: Mandatory Build-Time Symbols
 
 This article defines symbols that must be provided by the host build environment at compile time (e.g., via `-D` flags). Their values constitute the "hardware target profile" for a given compilation.
 
@@ -254,7 +289,13 @@ This article defines symbols that must be provided by the host build environment
 | `ACCUM_TYPE`                  | OpenCL/C type name | Element type for accumulative operations in stateful-update kernels. Equals `max(COMPUTE_TYPE, STATE_TYPE)`. When `STATE_TYPE > COMPUTE_TYPE`, this is `STATE_TYPE`; otherwise `COMPUTE_TYPE`. |
 | `ACCUM_IS_WIDER_THAN_COMPUTE` | `int` (0 or 1)     | 1 when `STATE_TYPE > COMPUTE_TYPE`, indicating that accumulation uses the wider state type rather than compute type; otherwise 0.                                                              |
 
-The symbols `SCALAR_TYPE` and `SCALAR_IS_HALF` are **retired**. They do not appear in any kernel source file; all kernel signatures use the three-role precision model (`STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE`).
+**Retired Build-Time Symbols.** The following symbols were previously provided by the build system and are no longer emitted:
+
+| Symbol                   | Reason for Retirement                                                                       | Current Status                                                                  |
+| :----------------------- | :------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------------ |
+| `LOCAL_MEM_BANK_PADDING` | Invariant value (`1`) across all hardware targets; not a hardware profile parameter.        | Kernel-internal `#define` in `kernels.cl.h`. Build system MUST NOT provide via `-D`. |
+| `SCALAR_TYPE`            | Replaced by three-role precision model (`STORAGE_TYPE`, `COMPUTE_TYPE`, `STATE_TYPE`).      | Does not exist in any kernel source.                                            |
+| `SCALAR_IS_HALF`         | Replaced by three-role precision model (`STORAGE_TYPE_IS_HALF`, `COMPUTE_TYPE_IS_HALF`).    | Does not exist in any kernel source.                                            |
 
 **Compile-time invariant enforcement.** The kernel header validates the following invariants via `#if` guards, producing `#error` on violation:
 
@@ -270,7 +311,9 @@ These guards provide defense-in-depth against build-system misconfigurations, co
 
 **CPU backend FP8 implementation (Phase 9C):** The CPU backend represents FP8 values as C struct wrappers (`cpu_fp8_e4m3`, `cpu_fp8_e5m2`) containing a `uint8_t bits` field. Conversion between FP8 and compute types uses LUT-based decode (256-entry lookup tables from `cpu_fp8_lut.gen.h`) and algorithmic round-to-nearest-even encode (in `cpu_fp8.h`). The precision macro system uses `STORAGE_SUFFIX` token pasting: `STORAGE_SUFFIX=fp8e4m3` generates `scalar_load_real_fp8e4m3()` etc. FP16 compute variants (`s8e4c16x32`, `s8e4c16x64`, `s8e5c16x32`, `s8e5c16x64`) are conditionally compiled when `_Float16` is available, detected by Meson and exposed via `HAS_FLOAT16`.
 
-### **Article 7: Canonical Interface Instantiation**
+---
+
+## Article 7: Canonical Interface Instantiation
 
 The following formal notation illustrates the sole valid method for specifying a kernel interface in adherence to this contract.
 
@@ -314,11 +357,12 @@ __kernel void illustrative_kernel_name(
     __global STORAGE_TYPE* dest_buffer_GLOBAL_partial_results,
 
     /**
-    * @param update_buffer_LOCAL_transpose_tile A work-group exclusive memory resource for a tiled matrix transpose.
-    *        - Tensor Shape: (TILE_DIM, TILE_DIM + LOCAL_MEM_BANK_PADDING)
-    *        - Padding Contract: {Type: BANK_CONFLICT_AVOIDANCE, Formula: "Pad row stride to (TILE_DIM + LOCAL_MEM_BANK_PADDING) elements"}
-    *        - Precision Role: "compute"
-    *        - Validation Preconditions: Host shall allocate size according to the formula derived from this contract, using the value of `LOCAL_MEM_BANK_PADDING` defined in System Contract Article 5.
+    * @param update_buffer_LOCAL_transpose_tile Work-group exclusive memory for a tiled matrix transpose.
+    *        - Allocation Formula: TILE_DIM * (TILE_DIM + LOCAL_MEM_BANK_PADDING) * sizeof(COMPUTE_TYPE)
+    *        - Precision Role: "compute" (LOCAL scratch)
+    *        - Internal Layout Note: "2D tile with padded stride (TILE_DIM + 1) to
+    *          avoid bank conflicts during column-wise access. LOCAL_MEM_BANK_PADDING
+    *          is a kernel-internal constant (value: 1), not a build-time symbol."
     */
     __local COMPUTE_TYPE* update_buffer_LOCAL_transpose_tile,
 
@@ -340,13 +384,15 @@ __kernel void illustrative_kernel_name(
 );
 ```
 
-### **Article 8: Canonical Lexicon for `[ContextAndUsage]`**
+---
 
-#### **1.0 Mandate**
+## Article 8: Canonical Lexicon for `[ContextAndUsage]`
+
+### 1.0 Mandate
 
 This Lexicon establishes the sole binding definitions for the `[ContextAndUsage]` component. Usage of any term not defined herein is a violation.
 
-#### **1.1 Canonical Abbreviations**
+### 1.1 Canonical Abbreviations
 
 The following abbreviations are formally blessed as equivalent short-form representations of their corresponding Lexicon terms. They may be used interchangeably in `[ContextAndUsage]` components.
 
@@ -356,13 +402,13 @@ The following abbreviations are formally blessed as equivalent short-form repres
 | `probabilities` | `probs`      |
 | `gradient`      | `grad`       |
 
-#### **1.2 Pluralization Rule**
+### 1.2 Pluralization Rule
 
 The Canonical Lexicon defines terms in their singular form. Plural forms of defined terms are implicitly valid when they appear as dimensional components — specifically when combined with `num_`, `total_`, `_count`, `_per_*`, or analogous cardinality modifiers. The plural is the natural morphological form for expressing "how many of this entity." Singular and plural forms carry no semantic distinction beyond grammatical number; they refer to the same Lexicon entry.
 
-#### **2.0 Core Data Role Primitives**
+### 2.0 Core Data Role Primitives
 
-#### **Group 1: Foundational Inputs & Ground Truth**
+#### Group 1: Foundational Inputs & Ground Truth
 
 _These are the primary external data sources for a complete Act/Learn cycle._
 
@@ -375,7 +421,7 @@ _These are the primary external data sources for a complete Act/Learn cycle._
 
 1. **`input` dimensional usage**: When used as a dimensional qualifier (e.g., `padded_input_count`, `input_count`), denotes the feature dimensionality of the primary input data. This dimensional usage is distinct from the data-role usage, which denotes the data buffer itself.
 
-#### **Group 2: Learnable Model Parameters**
+#### Group 2: Learnable Model Parameters
 
 _These are the stateful, learnable components of the model._
 
@@ -386,7 +432,7 @@ _These are the stateful, learnable components of the model._
 | `temperatures` | The set of learnable temperature parameters for logit scaling. |
 | `parameters`   | A generic learnable parameter buffer (e.g., for optimizers).   |
 
-#### **Group 3: Forward Pass Data Flow**
+#### Group 3: Forward Pass Data Flow
 
 _These represent data as it is transformed during the `Act` (inference) phase._
 
@@ -396,7 +442,7 @@ _These represent data as it is transformed during the `Act` (inference) phase._
 | `logits`             | The pre-activation, real-valued output tensor of the final system layer.      |
 | `probabilities`      | The post-activation, normalized probability tensor of the final system layer. |
 
-#### **Group 4: Learning Process Artifacts**
+#### Group 4: Learning Process Artifacts
 
 _These are the primary data structures generated and consumed during the `Learn` phase._
 
@@ -406,7 +452,7 @@ _These are the primary data structures generated and consumed during the `Learn`
 | `gradient`      | The gradient tensor derived from a specified parameter.     |
 | `normalization` | An L2 norm, typically of a gradient vector or its partials. |
 
-#### **Group 5: Parallel Processing & Reduction Primitives**
+#### Group 5: Parallel Processing & Reduction Primitives
 
 _These terms define the core mechanics of the distributed and scalable computation model._
 
@@ -416,7 +462,7 @@ _These terms define the core mechanics of the distributed and scalable computati
 | `partial_collection` | A generic memory pool containing multiple, potentially non-contiguous, `partial` results.     |
 | `offset_list`        | An indirection table containing a list of memory offsets, used for scatter/gather operations. |
 
-#### **Group 6: Control, Scoping & Dimensionality Primitives**
+#### Group 6: Control, Scoping & Dimensionality Primitives
 
 _These terms define the scope, validity, or dimension of other data structures._
 
@@ -442,7 +488,7 @@ _These terms define the scope, validity, or dimension of other data structures._
 
 3. **`tile` vs `flat_tile`**: Produced by the flattening of a logical problem grid. Distinguished from `flat_tile` (§3.0) which denotes the specific decomposition strategy; `tile` is the resulting work unit itself.
 
-#### **Group 7: Utility Primitives**
+#### Group 7: Utility Primitives
 
 _Generic terms for special cases._
 
@@ -450,7 +496,7 @@ _Generic terms for special cases._
 | :-------- | :-------------------------------------------------------------- |
 | `generic` | A type-punned buffer whose interpretation is context-dependent. |
 
-#### **3.0 Decomposition Strategy Primitives**
+### 3.0 Decomposition Strategy Primitives
 
 | Term           | Definition                                                           |
 | :------------- | :------------------------------------------------------------------- |
@@ -459,7 +505,7 @@ _Generic terms for special cases._
 | `class_chunk`  | A contiguous 1D partition of the output class dimension.             |
 | `module_chunk` | A contiguous 1D partition of the module (classifier head) dimension. |
 
-#### **4.0 Context Modifiers**
+### 4.0 Context Modifiers
 
 | Type   | Term            | Function                                                                                                                                                                 |
 | :----- | :-------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -492,7 +538,7 @@ _Generic terms for special cases._
 
 2. **`write_` vs `out_`**: Distinct from `out_` (which marks buffer affinity) in that `write_` qualifies an address offset calculated by the host for placement within a collection buffer.
 
-#### **5.0 Domain and Utility Primitives**
+### 5.0 Domain and Utility Primitives
 
 | Domain               | Term                                         | Type           | Definition                                                                                                       |
 | :------------------- | :------------------------------------------- | :------------- | :--------------------------------------------------------------------------------------------------------------- |
@@ -524,7 +570,7 @@ _Generic terms for special cases._
 
 2. **`stride` full definition**: The physical displacement, in elements, required to move from the start of one row to the start of the next consecutive row.
 
-#### **6.0 Canonical Flag Identifiers**
+### 6.0 Canonical Flag Identifiers
 
 | Term                       | Definition                                                                                                  |
 | :------------------------- | :---------------------------------------------------------------------------------------------------------- |
@@ -540,16 +586,17 @@ _Generic terms for special cases._
 
 2. **`use_explicit_hidden_mask`**: When 0, the mask is derived internally from stored activations (`activation > 0`). When 1, the mask is read from an explicit `hidden_mask` buffer.
 
-#### **7.0 Forbidden & Deprecated Terms**
+### 7.0 Forbidden & Deprecated Terms
 
 The following terms are contractually forbidden and must be refactored if found in existing code.
-| Term | Reason | Replacement |
-| :--- | :--- | :--- |
-| `param` | Too generic. | Use `parameters`, or a specific learnable (`weights`, `biases`).|
-| `h` | Ambiguous abbreviation. | Use the full canonical term `hidden_activations`. |
-| `elements` | Redundant with `_count`. | Standardize on the canonical `_count` suffix. |
-| `_leading_dim` | Ambiguous library-specific term. | `stride` |
-| `cce`/`bce` | Problem-specific type in name. | Use generic terms (`loss`, `targets`); type is handled by a `FLAG` param. |
+
+| Term           | Reason                         | Replacement                                                                                |
+| :------------- | :----------------------------- | :----------------------------------------------------------------------------------------- |
+| `param`        | Too generic.                   | Use `parameters`, or a specific learnable (`weights`, `biases`).                           |
+| `h`            | Ambiguous abbreviation.        | Use the full canonical term `hidden_activations`.                                          |
+| `elements`     | Redundant with `_count`.       | Standardize on the canonical `_count` suffix.                                              |
+| `_leading_dim` | Ambiguous library-specific term. | `stride`                                                                                   |
+| `cce`/`bce`    | Problem-specific type in name. | Use generic terms (`loss`, `targets`); type is handled by a `FLAG` param.                  |
 
 **Exception: Architecturally-Mandated Kernel Bifurcation.**
 When CONCEPT.md Principle 3(B) requires separate kernels due to incompatible type signatures, memory layouts, or downstream DAG topologies, those kernels may use otherwise-forbidden terms to distinguish the variant. This exception applies only when:

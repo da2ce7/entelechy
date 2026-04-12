@@ -2,18 +2,22 @@
 """Generate FP8 lookup tables for OpenCL and CPU backends (ADR-025 §6.1).
 
 Usage:
-  # Generate OpenCL header:
-  python scripts/generate_fp8_lut.py --backend opencl --output kernels/fp8_lut.gen.h
+    # Generate OpenCL header:
+    python scripts/generate_fp8_lut.py --backend opencl \\
+        --output kernels/fp8_lut.gen.h
 
-  # Generate CPU header:
-  python scripts/generate_fp8_lut.py --backend cpu --output src/backends/cpu/kernel_sources/cpu_fp8_lut.gen.h
+    # Generate CPU header:
+    python scripts/generate_fp8_lut.py --backend cpu \\
+        --output src/backends/cpu/kernel_sources/cpu_fp8_lut.gen.h
 
 Note: The Vulkan backend uses arithmetic conversion (bit manipulation + exp2())
-instead of lookup tables. See Phase 9D Technical Notes for rationale. Do NOT
+instead of lookup tables.  See Phase 9D Technical Notes for rationale.  Do NOT
 add a --backend vulkan option.
 
 Regenerate whenever ml_dtypes version changes.
 """
+
+from __future__ import annotations
 
 import argparse
 import math
@@ -22,73 +26,177 @@ from pathlib import Path
 import ml_dtypes
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# E5M2 max finite value — used as the defensive fallback for ±infinity
+# entries in the LUT.  The store path saturates to this value, so infinity
+# bit patterns should never be loaded; the fallback prevents silent
+# corruption if a consumer reads one regardless.
+# ---------------------------------------------------------------------------
+_E5M2_MAX_FINITE: float = 57344.0
 
-def generate_e4m3_lut() -> list[float]:
-    """Generate E4M3 → float32 lookup table (256 entries)."""
-    values = []
+
+# ---------------------------------------------------------------------------
+# LUT generation
+# ---------------------------------------------------------------------------
+
+def _generate_e4m3_lut() -> list[float]:
+    """Generate E4M3 → float32 lookup table (256 entries).
+
+    Each index i ∈ [0, 255] is reinterpreted as a float8_e4m3fn bit pattern
+    and converted to its exact float32 representation.  NaN patterns (0x7F,
+    0xFF) map to Python ``float('nan')``.
+    """
+    values: list[float] = []
     for i in range(256):
         arr = np.array([i], dtype=np.uint8).view(ml_dtypes.float8_e4m3fn)
         values.append(float(arr[0]))
     return values
 
 
-def generate_e5m2_lut() -> list[float]:
-    """Generate E5M2 → float32 lookup table (256 entries)."""
-    values = []
+def _generate_e5m2_lut() -> list[float]:
+    """Generate E5M2 → float32 lookup table (256 entries).
+
+    Each index i ∈ [0, 255] is reinterpreted as a float8_e5m2 bit pattern
+    and converted to its exact float32 representation.  Infinity and NaN
+    patterns (0x7C–0x7F, 0xFC–0xFF) map to the corresponding Python special
+    float values.
+    """
+    values: list[float] = []
     for i in range(256):
         arr = np.array([i], dtype=np.uint8).view(ml_dtypes.float8_e5m2)
         values.append(float(arr[0]))
     return values
 
 
-def format_c_float(v: float) -> str:
-    """Format a float for C, handling inf/NaN specially.
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
 
-    Note: E5M2 includes inf/NaN bit patterns (indices 0x7C-0x7F, 0xFC-0xFF),
-    but the store path NEVER writes these. We use max finite value as a
-    defensive fallback — loading these indices returns a finite value rather
-    than crashing or producing undefined behavior.
+def _validate_tables(e4m3: list[float], e5m2: list[float]) -> None:
+    """Validate LUT correctness against known reference values.
+
+    Assertions cover:
+      - E4M3: zero, ±1.0, ±max (448), NaN patterns
+      - E5M2: zero, ±1.0, ±max finite (57344), ±inf, NaN patterns
+    """
+    # --- E4M3 positive values ---
+    assert e4m3[0x00] == 0.0, \
+        f"E4M3[0x00]: expected 0.0, got {e4m3[0x00]}"
+    assert abs(e4m3[0x38] - 1.0) < 1e-6, \
+        f"E4M3[0x38]: expected 1.0, got {e4m3[0x38]}"
+    assert abs(e4m3[0x7E] - 448.0) < 1e-6, \
+        f"E4M3[0x7E]: expected 448.0 (max), got {e4m3[0x7E]}"
+
+    # --- E4M3 NaN patterns ---
+    assert math.isnan(e4m3[0x7F]), \
+        f"E4M3[0x7F]: expected NaN, got {e4m3[0x7F]}"
+    assert math.isnan(e4m3[0xFF]), \
+        f"E4M3[0xFF]: expected NaN, got {e4m3[0xFF]}"
+
+    # --- E4M3 negative values (copysign verifies the sign of −0.0) ---
+    assert e4m3[0x80] == 0.0 and math.copysign(1.0, e4m3[0x80]) == -1.0, \
+        f"E4M3[0x80]: expected -0.0, got {e4m3[0x80]}"
+    assert abs(e4m3[0xB8] - (-1.0)) < 1e-6, \
+        f"E4M3[0xB8]: expected -1.0, got {e4m3[0xB8]}"
+    assert abs(e4m3[0xFE] - (-448.0)) < 1e-6, \
+        f"E4M3[0xFE]: expected -448.0 (min), got {e4m3[0xFE]}"
+
+    # --- E5M2 positive values ---
+    assert e5m2[0x00] == 0.0, \
+        f"E5M2[0x00]: expected 0.0, got {e5m2[0x00]}"
+    assert abs(e5m2[0x3C] - 1.0) < 1e-6, \
+        f"E5M2[0x3C]: expected 1.0, got {e5m2[0x3C]}"
+    assert abs(e5m2[0x7B] - 57344.0) < 1e-6, \
+        f"E5M2[0x7B]: expected 57344.0 (max finite), got {e5m2[0x7B]}"
+
+    # --- E5M2 special values ---
+    assert math.isinf(e5m2[0x7C]) and e5m2[0x7C] > 0, \
+        f"E5M2[0x7C]: expected +inf, got {e5m2[0x7C]}"
+    assert math.isnan(e5m2[0x7D]), \
+        f"E5M2[0x7D]: expected NaN, got {e5m2[0x7D]}"
+    assert math.isinf(e5m2[0xFC]) and e5m2[0xFC] < 0, \
+        f"E5M2[0xFC]: expected -inf, got {e5m2[0xFC]}"
+    assert math.isnan(e5m2[0xFD]), \
+        f"E5M2[0xFD]: expected NaN, got {e5m2[0xFD]}"
+
+    # --- E5M2 negative values ---
+    assert e5m2[0x80] == 0.0 and math.copysign(1.0, e5m2[0x80]) == -1.0, \
+        f"E5M2[0x80]: expected -0.0, got {e5m2[0x80]}"
+    assert abs(e5m2[0xBC] - (-1.0)) < 1e-6, \
+        f"E5M2[0xBC]: expected -1.0, got {e5m2[0xBC]}"
+    assert abs(e5m2[0xFB] - (-57344.0)) < 1e-6, \
+        f"E5M2[0xFB]: expected -57344.0 (min finite), got {e5m2[0xFB]}"
+
+    print("LUT validation passed.")
+    print("  Note: LUT generation maps inf → ±57344.0f, NaN → 0.0f for C")
+    print("  compatibility.  The store path never writes non-finite patterns,")
+    print("  so these entries should never be loaded at runtime.")
+
+
+# ---------------------------------------------------------------------------
+# C / OpenCL formatting
+# ---------------------------------------------------------------------------
+
+def _format_c_float(v: float) -> str:
+    """Format a Python float as a C float literal.
+
+    Special-value mapping (defensive; the store path never writes these):
+      - NaN  → ``0.0f``         (safe zero — no parameter update)
+      - ±inf → ``±57344.0f``    (E5M2 max finite — saturation fallback)
     """
     if math.isnan(v):
-        return "0.0f"  # NaN → zero (defensive; should never be loaded)
-    elif math.isinf(v):
-        if v > 0:
-            return "57344.0f"  # +inf → E5M2 max finite (defensive)
-        else:
-            return "-57344.0f"  # -inf → E5M2 min finite (defensive)
-    else:
-        return f"{v:.10e}f"
+        return "0.0f"
+    if math.isinf(v):
+        sign = "-" if v < 0 else ""
+        return f"{sign}{_E5M2_MAX_FINITE:.1f}f"
+    return f"{v:.10e}f"
 
 
-def format_c_array(name: str, values: list[float], is_opencl: bool = False) -> str:
-    """Format lookup table as C/OpenCL constant array."""
+def _format_c_array(
+    name: str,
+    values: list[float],
+    *,
+    is_opencl: bool,
+) -> str:
+    """Format a 256-entry lookup table as a C/OpenCL constant array."""
     qualifier = "__constant" if is_opencl else "static const"
-    rows = []
+    rows: list[str] = []
     for i in range(0, 256, 8):
-        row = ", ".join(format_c_float(v) for v in values[i:i + 8])
+        row = ", ".join(_format_c_float(v) for v in values[i : i + 8])
         rows.append(f"    {row}")
     body = ",\n".join(rows)  # Join rows with commas between (none trailing)
     return f"{qualifier} float {name}[256] = {{\n{body}\n}};"
 
 
+# ---------------------------------------------------------------------------
+# Header generation
+# ---------------------------------------------------------------------------
+
 def _get_ml_dtypes_version() -> str:
-    """Get ml_dtypes version, with fallback for older versions."""
+    """Return the installed ml_dtypes version string."""
     try:
         return ml_dtypes.__version__
     except AttributeError:
         return "unknown (pre-0.2.0)"
 
 
-def generate_header(e4m3_values: list[float], e5m2_values: list[float],
-                    is_opencl: bool, output_path: Path) -> None:
-    """Generate a complete header file with both lookup tables."""
-    guard = "FP8_LUT_CPU_GEN_H" if not is_opencl else "FP8_LUT_OPENCL_GEN_H"
-    array_prefix = "cpu_" if not is_opencl else ""
+def _generate_header(
+    e4m3_values: list[float],
+    e5m2_values: list[float],
+    *,
+    is_opencl: bool,
+    output_path: Path,
+) -> None:
+    """Generate a complete C/OpenCL header file with both lookup tables."""
+    guard = "FP8_LUT_OPENCL_GEN_H" if is_opencl else "FP8_LUT_CPU_GEN_H"
+    array_prefix = "" if is_opencl else "cpu_"
+    backend_name = "opencl" if is_opencl else "cpu"
     ml_version = _get_ml_dtypes_version()
+
     header = f"""\
 /* Auto-generated by scripts/generate_fp8_lut.py — DO NOT EDIT
  * ml_dtypes version: {ml_version}
- * Regenerate with: python scripts/generate_fp8_lut.py --backend {'opencl' if is_opencl else 'cpu'} --output {output_path}
+ * Regenerate with: python scripts/generate_fp8_lut.py --backend {backend_name} --output {output_path}
  */
 
 #ifndef {guard}
@@ -109,7 +217,7 @@ def generate_header(e4m3_values: list[float], e5m2_values: list[float],
  *   0xFE = 0b11111110 → sign=1, exp=15, mant=6 → -448.0 (min)
  *   0xFF = 0b11111111 → NaN (mapped to 0.0f in LUT)
  */
-{format_c_array(f"{array_prefix}fp8_e4m3_to_float_lut", e4m3_values, is_opencl)}
+{_format_c_array(f"{array_prefix}fp8_e4m3_to_float_lut", e4m3_values, is_opencl=is_opencl)}
 
 /* E5M2: sign(1) + exp(5) + mantissa(2), bias=15, max=57344, IEEE-like inf/NaN
  *
@@ -130,7 +238,7 @@ def generate_header(e4m3_values: list[float], e5m2_values: list[float],
  *   0xBC = 0b10111100 → sign=1, exp=15, mant=0 → -1.0
  *   0xFB = 0b11111011 → sign=1, exp=30, mant=3 → -57344.0 (min finite)
  */
-{format_c_array(f"{array_prefix}fp8_e5m2_to_float_lut", e5m2_values, is_opencl)}
+{_format_c_array(f"{array_prefix}fp8_e5m2_to_float_lut", e5m2_values, is_opencl=is_opencl)}
 
 #endif /* {guard} */
 """
@@ -139,54 +247,42 @@ def generate_header(e4m3_values: list[float], e5m2_values: list[float],
     print(f"Generated: {output_path}")
 
 
-def validate_tables(e4m3: list[float], e5m2: list[float]) -> None:
-    """Validate LUT correctness against known values."""
-    # E4M3 positive values
-    assert e4m3[0] == 0.0, "E4M3 index 0x00 should be 0.0"
-    assert abs(e4m3[0x38] - 1.0) < 1e-6, f"E4M3 index 0x38 should be 1.0, got {e4m3[0x38]}"
-    assert abs(e4m3[0x7E] - 448.0) < 1e-6, f"E4M3 index 0x7E should be 448.0 (max), got {e4m3[0x7E]}"
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
-    # E4M3 negative values
-    assert abs(e4m3[0x80] - 0.0) < 1e-10, f"E4M3 index 0x80 should be -0.0, got {e4m3[0x80]}"
-    assert abs(e4m3[0xB8] - (-1.0)) < 1e-6, f"E4M3 index 0xB8 should be -1.0, got {e4m3[0xB8]}"
-    assert abs(e4m3[0xFE] - (-448.0)) < 1e-6, f"E4M3 index 0xFE should be -448.0 (min), got {e4m3[0xFE]}"
-
-    # E5M2 positive values
-    assert e5m2[0] == 0.0, "E5M2 index 0x00 should be 0.0"
-    assert abs(e5m2[0x3C] - 1.0) < 1e-6, f"E5M2 index 0x3C should be 1.0, got {e5m2[0x3C]}"
-    assert abs(e5m2[0x7B] - 57344.0) < 1e-6, f"E5M2 index 0x7B should be 57344.0 (max finite), got {e5m2[0x7B]}"
-
-    # E5M2 special values
-    assert math.isinf(e5m2[0x7C]), f"E5M2 index 0x7C should be +inf, got {e5m2[0x7C]}"
-    assert math.isnan(e5m2[0x7D]), f"E5M2 index 0x7D should be NaN, got {e5m2[0x7D]}"
-    assert math.isinf(e5m2[0xFC]) and e5m2[0xFC] < 0, f"E5M2 index 0xFC should be -inf, got {e5m2[0xFC]}"
-
-    print("Note: LUT generation replaces inf→57344.0f, NaN→0.0f for C compatibility.")
-    print("      The store path never writes these patterns, so they should never be loaded.")
-
-    # E5M2 negative values
-    assert abs(e5m2[0x80] - 0.0) < 1e-10, f"E5M2 index 0x80 should be -0.0, got {e5m2[0x80]}"
-    assert abs(e5m2[0xBC] - (-1.0)) < 1e-6, f"E5M2 index 0xBC should be -1.0, got {e5m2[0xBC]}"
-    assert abs(e5m2[0xFB] - (-57344.0)) < 1e-6, f"E5M2 index 0xFB should be -57344.0 (min finite), got {e5m2[0xFB]}"
-
-    print("LUT validation passed.")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Generate FP8 lookup tables")
-    parser.add_argument("--backend", choices=["opencl", "cpu"], required=True,
-                        help="Target backend: opencl or cpu")
-    parser.add_argument("--output", type=Path, required=True,
-                        help="Output path for generated header")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate FP8 lookup tables for OpenCL and CPU backends.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["opencl", "cpu"],
+        required=True,
+        help="Target backend: opencl or cpu",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Output path for generated header",
+    )
     args = parser.parse_args()
 
-    e4m3 = generate_e4m3_lut()
-    e5m2 = generate_e5m2_lut()
+    # --- Generate raw tables from ml_dtypes ---
+    e4m3 = _generate_e4m3_lut()
+    e5m2 = _generate_e5m2_lut()
 
-    validate_tables(e4m3, e5m2)
+    # --- Validate against known reference values ---
+    _validate_tables(e4m3, e5m2)
 
-    is_opencl = args.backend == "opencl"
-    generate_header(e4m3, e5m2, is_opencl=is_opencl, output_path=args.output)
+    # --- Emit backend-specific header ---
+    _generate_header(
+        e4m3,
+        e5m2,
+        is_opencl=(args.backend == "opencl"),
+        output_path=args.output,
+    )
 
 
 if __name__ == "__main__":

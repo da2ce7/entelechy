@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -48,17 +48,17 @@ class OpenCLPlanRenderer:
         self._bindings = kernel_bindings
         self._hardware = hardware
         self._allocator = OpenCLBufferAllocator(context, queue)
-        # Kernel cache to avoid repeated kernel retrieval (RepeatedKernelRetrieval warning)
         self._kernel_cache: dict[str, cl.Kernel] = {}
-        # Persistent MODEL_STATE buffer store (ADR-009).
-        # Keyed by (logical_name, padded_shape, dtype_name) so that
-        # MODEL_STATE buffers survive across render() calls, enabling
-        # multi-batch training where parameter updates accumulate.
+        self._plan: ExecutionPlan | None = None
+
+        # Persistent MODEL_STATE store keyed by (logical_name, padded_shape,
+        # dtype_str) so buffers survive across render() calls with different
+        # plan handle namespaces.
         self._persistent_model_state: dict[
             tuple[str, tuple[int, ...], str], cl.Buffer
         ] = {}
-        # Reduction engine bindings (set externally after construction)
-        # Storage-entry variants (existing)
+
+        # Reduction engine bindings (set by set_reduction_bindings)
         self._register_reduce_binding: Any | None = None
         self._local_reduce_binding: Any | None = None
         self._clip_intermediate_binding: Any | None = None
@@ -79,17 +79,14 @@ class OpenCLPlanRenderer:
         local_reduce_from_compute: Any | None = None,
         k_fan_in_from_compute: Any | None = None,
     ) -> None:
-        """Inject reduction engine bindings (consumed by _render_reduction_tree).
+        """Inject reduction engine bindings for the reduction-tree renderer.
 
-        ADR-026: Accepts both storage-entry and compute-entry variant bindings.
-        Compute-entry variants are used when the source buffer's precision_role
-        is "compute" (e.g., BCE loss partials, interior reduction stages).
+        ADR-026: Accepts both storage-entry and compute-entry variants.
         """
         self._register_reduce_binding = register_reduce
         self._local_reduce_binding = local_reduce
         self._clip_intermediate_binding = clip_intermediate
         self._k_fan_in_binding = k_fan_in
-        # ADR-026: Compute-entry variants
         self._register_reduce_from_compute_binding = register_reduce_from_compute
         self._local_reduce_from_compute_binding = local_reduce_from_compute
         self._k_fan_in_from_compute_binding = k_fan_in_from_compute
@@ -99,20 +96,69 @@ class OpenCLPlanRenderer:
         return self._allocator
 
     def _get_kernel(self, name: str) -> cl.Kernel:
-        """Get a cached kernel instance, creating it if needed."""
         if name not in self._kernel_cache:
             self._kernel_cache[name] = cl.Kernel(self._program, name)
         return self._kernel_cache[name]
 
-    # ---------------------------------------------------------------
-    # MODEL_STATE initialization (must match CPU renderer for parity)
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Hardware scalar injection
+    # ------------------------------------------------------------------
+
+    def _enrich_scalar_params(
+        self, scalar_params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Inject hardware-derived and precision-derived metadata that
+        OpenCL bindings expect alongside the plan's scalar parameters.
+        """
+        enriched: dict[str, Any] = dict(scalar_params)
+        hw = self._hardware
+        simd = hw.simd_width if hw else 16
+
+        # Bindings access "SIMD_WIDTH" (uppercase), matching CONTRACT Article 6
+        enriched.setdefault("SIMD_WIDTH", simd)
+
+        # Compute-type metadata from the active plan's PrecisionConfig
+        if self._plan is not None:
+            pc = self._plan.precision
+            enriched.setdefault("_compute_type_size_bytes", pc.compute_dtype.itemsize)
+            enriched.setdefault("_compute_dtype", pc.compute_dtype)
+            enriched.setdefault("_compute_fp_format_max", pc.compute_fp_format_max)
+        else:
+            enriched.setdefault("_compute_type_size_bytes", 4)
+            enriched.setdefault("_compute_dtype", np.float32)
+
+        # Queue for bindings that upload data at marshal time (Node 16)
+        enriched.setdefault("_opencl_queue", self._queue)
+        return enriched
+
+    # ------------------------------------------------------------------
+    # Persistent key helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _persistent_key(
+        desc: Any, precision: Any,
+    ) -> tuple[str, tuple[int, ...], str]:
+        """Identity key for a MODEL_STATE buffer across plan generations."""
+        role_dtypes = {
+            "storage": precision.storage_dtype,
+            "compute": precision.compute_dtype,
+            "state": precision.state_dtype,
+        }
+        dtype = role_dtypes.get(desc.precision_role, np.dtype(np.float32))
+        return (desc.logical_name, desc.padded_shape, dtype.str)
+
+    # ------------------------------------------------------------------
+    # MODEL_STATE initialization
+    # ------------------------------------------------------------------
+
     _WEIGHT_SUBSTRINGS = ("weight",)
     _UNIT_INIT_SUBSTRINGS = ("temperature",)
 
     @staticmethod
-    def _buffer_rng(logical_name: str, padded_shape: tuple[int, ...]) -> np.random.Generator:
-        """Deterministic per-buffer RNG seeded by buffer identity."""
+    def _buffer_rng(
+        logical_name: str, padded_shape: tuple[int, ...],
+    ) -> np.random.Generator:
         import hashlib
         h = hashlib.sha256(f"{logical_name}{padded_shape}".encode()).hexdigest()
         return np.random.default_rng(int(h[:16], 16))
@@ -120,13 +166,11 @@ class OpenCLPlanRenderer:
     def _init_model_state_buffers(
         self,
         plan: ExecutionPlan,
-        *,
-        only_names: set[str] | None = None,
+        only_names: set[str],
     ) -> None:
         """Upload Xavier/unit-initialized values for MODEL_STATE buffers.
 
-        When *only_names* is provided, only buffers whose logical_name is
-        in the set are initialized (used to skip already-persistent buffers).
+        Only buffers whose ``logical_name`` is in *only_names* are touched.
         """
         role_dtypes = {
             "storage": plan.precision.storage_dtype,
@@ -137,13 +181,17 @@ class OpenCLPlanRenderer:
             if descriptor.role != BufferRole.MODEL_STATE:
                 continue
             name = descriptor.logical_name
-            if only_names is not None and name not in only_names:
+            if name not in only_names:
                 continue
-            total = int(np.prod(descriptor.padded_shape))
             prole = descriptor.precision_role
             if prole is None:
                 continue
-            dtype = role_dtypes[prole]
+            dtype = role_dtypes.get(prole)
+            if dtype is None:
+                continue
+
+            total = int(np.prod(descriptor.padded_shape))
+
             if any(s in name for s in self._WEIGHT_SUBSTRINGS):
                 shape_for_fan = (
                     descriptor.logical_shape
@@ -153,14 +201,10 @@ class OpenCLPlanRenderer:
                 if len(shape_for_fan) >= 2:
                     fan_in_plus_out = shape_for_fan[-2] + shape_for_fan[-1]
                 else:
-                    fan_in_plus_out = max(
-                        shape_for_fan[0] if shape_for_fan else total, 2,
-                    )
+                    fan_in_plus_out = max(shape_for_fan[0] if shape_for_fan else total, 2)
                 limit = float(np.sqrt(6.0 / fan_in_plus_out))
                 rng = self._buffer_rng(name, descriptor.padded_shape)
-                host = rng.uniform(
-                    -limit, limit, size=total,
-                ).astype(dtype)
+                host = rng.uniform(-limit, limit, size=total).astype(dtype)
                 cl.enqueue_copy(
                     self._queue,
                     self._allocator.get_buffer(descriptor.handle),
@@ -174,170 +218,160 @@ class OpenCLPlanRenderer:
                     host,
                 )
 
-    def render(
+    # ------------------------------------------------------------------
+    # Data injection
+    # ------------------------------------------------------------------
+
+    def _upload_data_injections(
         self,
         plan: ExecutionPlan,
-        data_injections: dict[str, NDArray[Any]] | None = None,
-    ) -> dict[str, RetrievalFuture]:
-        """Render an execution plan using PyOpenCL's imperative dispatch model."""
-        # Store plan reference for streaming loop body lookup
-        self._plan = plan
-
+        injections: dict[str, NDArray[Any]],
+    ) -> None:
+        """Upload host data arrays into their corresponding device buffers."""
+        name_to_desc = {d.logical_name: d for d in plan.buffers.values()}
         role_dtypes = {
             "storage": plan.precision.storage_dtype,
             "compute": plan.precision.compute_dtype,
             "state": plan.precision.state_dtype,
         }
 
-        # 1. Drain previous work.  Remove persistent buffers from the
-        #    allocator (so release_all won't destroy them), then tear down
-        #    all stale handle mappings and re-allocate for this plan.
+        for name, host_data in injections.items():
+            desc = name_to_desc.get(name)
+            if desc is None:
+                continue
+
+            # Determine the upload dtype from the buffer's precision role.
+            # "flag-conditional", "exempt", or None → use the host data's
+            # native type (preserves integer class indices, uint masks, etc.)
+            prole = desc.precision_role
+            if prole is not None and prole in role_dtypes:
+                buf_dtype = role_dtypes[prole]
+            else:
+                buf_dtype = host_data.dtype
+
+            ps = desc.padded_shape
+            padded = np.zeros(ps, dtype=buf_dtype)
+            src = host_data if host_data.dtype == buf_dtype else host_data.astype(buf_dtype)
+
+            # Copy logical extent into padded array
+            if src.ndim == len(ps) and src.ndim > 0:
+                slices = tuple(
+                    slice(0, min(src.shape[d], ps[d]))
+                    for d in range(src.ndim)
+                )
+                padded[slices] = src[slices]
+            elif src.size > 0:
+                flat_dst = padded.ravel()
+                flat_src = src.ravel()
+                n = min(len(flat_src), len(flat_dst))
+                flat_dst[:n] = flat_src[:n]
+
+            cl.enqueue_copy(
+                self._queue,
+                self._allocator.get_buffer(desc.handle),
+                padded.ravel(),
+            )
+
+    # ==================================================================
+    # Main entry point
+    # ==================================================================
+
+    def render(
+        self,
+        plan: ExecutionPlan,
+        data_injections: dict[str, NDArray[Any]] | None = None,
+    ) -> dict[str, RetrievalFuture]:
+        """Render an execution plan using PyOpenCL's imperative dispatch model."""
+        self._plan = plan
         self._queue.finish()
 
-        # Detach persistent cl.Buffers from the allocator before release_all
-        persistent_handles = set()
-        for key, cl_buf in self._persistent_model_state.items():
-            for h, buf in list(self._allocator._buffers.items()):
-                if buf is cl_buf:
-                    del self._allocator._buffers[h]
-                    self._allocator._descriptors.pop(h, None)
-                    persistent_handles.add(h)
-                    break
+        # --- Persistent MODEL_STATE management ---
+        # 1. Extract MODEL_STATE buffers before release (keeps cl.Buffers alive)
+        for _, cl_buf, desc in self._allocator.extract_buffers_by_role(
+            BufferRole.MODEL_STATE,
+        ):
+            key = self._persistent_key(desc, plan.precision)
+            self._persistent_model_state[key] = cl_buf
+
+        # 2. Release everything still in the allocator
         self._allocator.release_all()
 
-        # Re-register persistent MODEL_STATE buffers under this plan's
-        # handles before allocate_plan_buffers runs its skip-if-exists check.
-        newly_allocated: set[str] = set()
-        for descriptor in plan.buffers.values():
-            if descriptor.role != BufferRole.MODEL_STATE:
+        # 3. Re-inject persistent buffers under the new plan's handles
+        newly_needed: set[str] = set()
+        for desc in plan.buffers.values():
+            if desc.role != BufferRole.MODEL_STATE:
                 continue
-            prole = descriptor.precision_role
-            dtype = role_dtypes.get(prole) if prole else None  # type: ignore[arg-type]
-            dtype_str = dtype.str if dtype is not None else ""
-            key = (descriptor.logical_name, descriptor.padded_shape, dtype_str)
+            key = self._persistent_key(desc, plan.precision)
             if key in self._persistent_model_state:
-                # Inject the existing cl.Buffer under the new plan's handle
-                # so allocate_plan_buffers will see it and skip allocation.
-                self._allocator._buffers[descriptor.handle] = (
-                    self._persistent_model_state[key]
+                self._allocator.inject_buffer(
+                    desc.handle, self._persistent_model_state[key], desc,
                 )
-                self._allocator._descriptors[descriptor.handle] = descriptor
             else:
-                newly_allocated.add(descriptor.logical_name)
+                newly_needed.add(desc.logical_name)
 
+        # 4. Allocate remaining buffers (skips pre-injected handles)
         self._allocator.allocate_plan_buffers(plan.buffers)
 
-        # Record newly-allocated MODEL_STATE buffers for future persistence
-        for descriptor in plan.buffers.values():
-            if descriptor.role != BufferRole.MODEL_STATE:
-                continue
-            if descriptor.logical_name in newly_allocated:
-                prole = descriptor.precision_role
-                dtype = role_dtypes.get(prole) if prole else None  # type: ignore[arg-type]
-                dtype_str = dtype.str if dtype is not None else ""
-                key = (descriptor.logical_name, descriptor.padded_shape, dtype_str)
-                self._persistent_model_state[key] = (
-                    self._allocator.get_buffer(descriptor.handle)
+        # 5. Record newly-allocated MODEL_STATE for future render() calls
+        for desc in plan.buffers.values():
+            if desc.role == BufferRole.MODEL_STATE and desc.logical_name in newly_needed:
+                key = self._persistent_key(desc, plan.precision)
+                self._persistent_model_state[key] = self._allocator.get_buffer(
+                    desc.handle,
                 )
 
-        # 1b. Initialize only *newly-allocated* MODEL_STATE buffers
-        self._init_model_state_buffers(plan, only_names=newly_allocated or None)
+        # 6. Initialize only *new* MODEL_STATE buffers
+        if newly_needed:
+            self._init_model_state_buffers(plan, only_names=newly_needed)
 
-        # 1c. Host-to-device data injection
+        # 7. Host→device data injection
         if data_injections:
-            name_to_desc = {
-                desc.logical_name: desc
-                for desc in plan.buffers.values()
-            }
-            for logical_name, host_data in data_injections.items():
-                desc = name_to_desc.get(logical_name)
-                if desc is None:
-                    continue
-                buf = self._allocator.get_buffer(desc.handle)
-                total_elems = int(np.prod(desc.padded_shape))
-                prole = desc.precision_role
-                buf_dtype = role_dtypes.get(prole) if prole else np.dtype(np.uint32)  # type: ignore[arg-type]
-                if (
-                    logical_name == "targets_cce"
-                    and np.issubdtype(host_data.dtype, np.integer)
-                    and not np.issubdtype(buf_dtype, np.integer)
-                ):
-                    # CCE class indices: raw byte copy preserves int32 bit
-                    # pattern so the kernel can read the buffer as int*.
-                    padded = np.zeros(total_elems, dtype=buf_dtype)
-                    src_bytes = host_data.astype(np.int32).tobytes()
-                    padded_bytes = padded.view(np.uint8)
-                    n = min(len(src_bytes), len(padded_bytes))
-                    padded_bytes[:n] = np.frombuffer(src_bytes[:n], dtype=np.uint8)
-                elif host_data.ndim <= 1 or len(desc.padded_shape) <= 1:
-                    if len(desc.padded_shape) > 1 and host_data.ndim == 1:
-                        padded = np.zeros(total_elems, dtype=buf_dtype)
-                        reshaped = padded.reshape(desc.padded_shape)
-                        n_rows = min(len(host_data), desc.padded_shape[0])
-                        reshaped[:n_rows, 0] = host_data[:n_rows].astype(buf_dtype)
-                    else:
-                        padded = np.zeros(total_elems, dtype=buf_dtype)
-                        flat = host_data.astype(buf_dtype).flatten()
-                        n = min(len(flat), len(padded))
-                        padded[:n] = flat[:n]
-                else:
-                    padded = np.zeros(desc.padded_shape, dtype=buf_dtype)
-                    host = host_data.astype(buf_dtype)
-                    slices = tuple(
-                        slice(0, min(host.shape[d], desc.padded_shape[d]))
-                        for d in range(min(host.ndim, len(desc.padded_shape)))
-                    )
-                    padded[slices] = host[slices]
-                    padded = padded.ravel()
-                cl.enqueue_copy(self._queue, buf, padded)
+            self._upload_data_injections(plan, data_injections)
 
-        # 2. Traverse topological order, dispatching each node
+        # 8. DAG traversal
         event_map: dict[str, cl.Event] = {}
         futures: dict[str, RetrievalFuture] = {}
 
         try:
             for node_id in plan.topological_order:
                 node = plan.nodes[node_id]
-                wait_for = self._collect_dependency_events(node.depends_on, event_map)
+                wait_for = self._collect_dependency_events(
+                    node.depends_on, event_map,
+                )
 
                 if isinstance(node, KernelDispatchNode):
-                    event = self._render_kernel_dispatch(node, wait_for)
-                    event_map[node_id] = event
-
+                    event_map[node_id] = self._render_kernel_dispatch(
+                        node, wait_for,
+                    )
                 elif isinstance(node, ReductionTreeNode):
-                    event = self._render_reduction_tree(node, wait_for)
-                    event_map[node_id] = event
-
+                    event_map[node_id] = self._render_reduction_tree(
+                        node, wait_for,
+                    )
                 elif isinstance(node, StreamingLoopNode):
-                    event = self._render_streaming_loop(node, wait_for)
-                    event_map[node_id] = event
-
+                    event_map[node_id] = self._render_streaming_loop(
+                        node, wait_for,
+                    )
                 elif isinstance(node, BarrierNode):
-                    event = self._render_barrier(wait_for)
-                    event_map[node_id] = event
-
-                else:  # RetrievalNode
+                    event_map[node_id] = self._render_barrier(wait_for)
+                else:
                     assert isinstance(node, RetrievalNode)
                     future = self._render_retrieval(node, wait_for, plan)
                     futures[node.event_name] = future
                     event_map[node_id] = future.event
         except OpenCLKernelError:
-            # Drain the queue so the device is not left in a dirty state
-            # before re-raising. finish() waits for all enqueued work.
             try:
                 self._queue.finish()
             except cl.RuntimeError:
-                pass  # queue drain is best-effort during error recovery
+                pass
             raise
 
         return futures
 
     # ------------------------------------------------------------------
-    # Barrier & retrieval (fully functional in Phase 2A)
+    # Barrier & retrieval
     # ------------------------------------------------------------------
 
     def _render_barrier(self, wait_for: list[cl.Event]) -> cl.Event:
-        """Render a BarrierNode as a marker event joining upstream events."""
         if not wait_for:
             marker = cl.UserEvent(self._context)
             marker.set_status(cl.command_execution_status.COMPLETE)
@@ -350,14 +384,21 @@ class OpenCLPlanRenderer:
         wait_for: list[cl.Event],
         plan: ExecutionPlan,
     ) -> OpenCLRetrievalFuture:
-        """Render a RetrievalNode: enqueue async D2H read, return future."""
         desc = plan.buffers[node.source_buffer]
-        padded_shape = desc.padded_shape
-        total_elements = 1
-        for d in padded_shape:
-            total_elements *= d
-        host_buffer = np.empty(total_elements, dtype=plan.precision.storage_dtype)
+        ps = desc.padded_shape
+        total_elements = int(np.prod(ps))
 
+        # Use the source buffer's precision-role dtype for the host array.
+        prole = desc.precision_role
+        match prole:
+            case "storage":
+                dtype = plan.precision.storage_dtype
+            case "state":
+                dtype = plan.precision.state_dtype
+            case _:  # "compute" or None
+                dtype = plan.precision.compute_dtype
+
+        host_buffer: NDArray[Any] = np.empty(total_elements, dtype=dtype)
         event = self._allocator.enqueue_read(
             node.source_buffer, host_buffer, wait_for=wait_for or None,
         )
@@ -366,11 +407,11 @@ class OpenCLPlanRenderer:
             event=event,
             host_buffer=host_buffer,
             logical_shape=node.logical_shape,
-            padded_shape=padded_shape,
+            padded_shape=ps,
         )
 
     # ------------------------------------------------------------------
-    # Kernel dispatch (Phase 2B fills in full logic)
+    # Kernel dispatch
     # ------------------------------------------------------------------
 
     def _render_kernel_dispatch(
@@ -378,12 +419,10 @@ class OpenCLPlanRenderer:
         node: KernelDispatchNode,
         wait_for: list[cl.Event],
     ) -> cl.Event:
-        """Dispatch a KernelDispatchNode via per-tile imperative enqueue."""
         binding = self._bindings[node.kernel_name]
         kernel = self._get_kernel(binding.get_kernel_name())
-
-        # Inject hardware-derived scalars that bindings may need
         scalar_params = self._enrich_scalar_params(node.scalar_params)
+        hw_simd = self._hardware.simd_width if self._hardware else 16
 
         tile_events: list[cl.Event] = []
         for tile_idx in range(node.tile_count):
@@ -396,7 +435,7 @@ class OpenCLPlanRenderer:
             global_size, local_size = binding.compute_grid(
                 tile_index=tile_idx,
                 scalar_params=scalar_params,
-                hardware_simd_width=self._hardware.simd_width if self._hardware else 16,
+                hardware_simd_width=hw_simd,
             )
             kernel.set_args(*args)
             event = cl.enqueue_nd_range_kernel(
@@ -410,29 +449,10 @@ class OpenCLPlanRenderer:
         return cl.enqueue_marker(self._queue, wait_for=tile_events)
 
     # ------------------------------------------------------------------
-    # Hardware scalar injection
+    # Reduction tree
     # ------------------------------------------------------------------
 
-    def _enrich_scalar_params(
-        self, scalar_params: dict[str, int | float],
-    ) -> dict[str, int | float]:
-        """Inject hardware-derived scalars that OpenCL bindings expect."""
-        enriched = dict(scalar_params)
-        simd = self._hardware.simd_width if self._hardware else 16
-        enriched.setdefault("work_group_size_0", min(simd * 8, 256))
-        enriched.setdefault("optimal_workgroup_size_1d_reduction", min(simd * 8, 256))
-        enriched.setdefault("simd_width", simd)
-        enriched.setdefault("element_size", 4)
-        # ADR-024: Include compute_dtype for COMPUTE_TYPE scalar marshalling
-        if hasattr(self, "_plan") and self._plan is not None:
-            enriched["_compute_dtype"] = self._plan.precision.compute_dtype
-        # Inject queue for bindings that need to perform buffer uploads
-        enriched["_opencl_queue"] = self._queue  # pyright: ignore[reportArgumentType]
-        return enriched
-
-    # ------------------------------------------------------------------
-    # Reduction tree (Phase 2B fills in full logic)
-    # ------------------------------------------------------------------
+    _SENTINEL_ABSENT_PARTIAL = 0xFFFF_FFFF
 
     def _render_reduction_tree(
         self,
@@ -443,262 +463,221 @@ class OpenCLPlanRenderer:
 
         ADR-026: Selects between storage-entry and compute-entry kernel
         variants based on the source buffer's precision_role.
-
-        Single-stage trees (num_stages == 1): dispatch existing all-to-one
-        aggregate kernel + clip_intermediate_grad (unchanged).
-
-        Multi-stage trees (num_stages > 1, ADR-019): dispatch
-        reduce_k_fan_in_and_clip at each stage — one dispatch per stage
-        with fused per-node summation and L2 clip.
         """
-        plan = node.reduction_plan
-        element_size = 4  # float32 default
+        assert self._plan is not None
+        rplan = node.reduction_plan
+        compute_elem_size = self._plan.precision.compute_dtype.itemsize
 
-        # ADR-026 §3: Determine if source buffer is compute-role
-        source_desc = self._plan.buffers[plan.source_buffer]
+        source_desc = self._plan.buffers[rplan.source_buffer]
         use_compute_entry = source_desc.precision_role == "compute"
 
-        if plan.num_stages > 1:
+        if rplan.num_stages > 1:
             return self._render_reduction_tree_multi_stage(
-                plan, wait_for, element_size, use_compute_entry
+                rplan, wait_for, compute_elem_size, use_compute_entry,
             )
         return self._render_reduction_tree_single_stage(
-            plan, wait_for, element_size, use_compute_entry
+            rplan, wait_for, compute_elem_size, use_compute_entry,
         )
 
     def _render_reduction_tree_single_stage(
         self,
-        plan: Any,
+        rplan: Any,
         wait_for: list[cl.Event],
-        element_size: int,
+        compute_elem_size: int,
         use_compute_entry: bool,
     ) -> cl.Event:
-        """Single-stage tree: existing all-to-one aggregate + clip path.
-
-        ADR-026: Selects compute-entry variant when use_compute_entry is True.
-        """
+        """Single-stage: all-to-one aggregate + optional clip."""
+        assert self._plan is not None
         hw_simd = self._hardware.simd_width if self._hardware else 16
+        N = rplan.num_partials
+        W = rplan.partial_width
 
-        # 1. Upload initial offset list to device
-        offset_array = np.array(plan.initial_offset_list, dtype=np.uint32)
-        offset_buf = self._allocator.allocate_internal(offset_array.nbytes)
-        upload_evt = cl.enqueue_copy(
-            self._queue, offset_buf, offset_array,
+        # 1. Upload offset list
+        ofs_arr = np.array(rplan.initial_offset_list, dtype=np.uint32)
+        ofs_buf = self._allocator.allocate_internal(ofs_arr.nbytes)
+        up_evt = cl.enqueue_copy(
+            self._queue, ofs_buf, ofs_arr,
             wait_for=wait_for or None, is_blocking=False,
         )
 
-        # 2. Allocate output buffer
-        intermed_size = plan.partial_width * element_size
-        ping = self._allocator.allocate_internal(intermed_size)
+        # 2. Intermediate output (COMPUTE_TYPE)
+        out_buf = self._allocator.allocate_internal(W * compute_elem_size)
+        source_buf = self._allocator.get_buffer(rplan.source_buffer)
 
-        # 3. Select kernel tier and dispatch (ADR-026: select variant)
-        current_N = plan.num_partials
-        if use_compute_entry:
-            # ADR-026: Compute-entry variant for compute-role source buffers
-            if current_N <= MAX_REG_AGG and self._register_reduce_from_compute_binding is not None:
-                binding = self._register_reduce_from_compute_binding
-            elif self._local_reduce_from_compute_binding is not None:
-                binding = self._local_reduce_from_compute_binding
-            else:
-                # Fallback: use storage-entry if compute-entry not registered
-                if current_N <= MAX_REG_AGG and self._register_reduce_binding is not None:
-                    binding = self._register_reduce_binding
-                elif self._local_reduce_binding is not None:
-                    binding = self._local_reduce_binding
-                else:
-                    raise RuntimeError("Reduction bindings not registered")
+        # 3. Tier selection (register vs local) + variant (storage vs compute)
+        if N <= MAX_REG_AGG:
+            binding = (
+                self._register_reduce_from_compute_binding
+                if use_compute_entry and self._register_reduce_from_compute_binding
+                else self._register_reduce_binding
+            )
+            if binding is None:
+                raise RuntimeError("Register-reduce binding not registered")
+            # Register-reduce: no local memory, no compute_type_size_bytes arg
+            args = binding.marshal_args_direct(
+                source_buf, ofs_buf, out_buf, N, W, 0,
+            )
         else:
-            # Storage-entry variant (existing behavior)
-            if current_N <= MAX_REG_AGG and self._register_reduce_binding is not None:
-                binding = self._register_reduce_binding
-            elif self._local_reduce_binding is not None:
-                binding = self._local_reduce_binding
-            else:
-                raise RuntimeError("Reduction bindings not registered")
+            binding = (
+                self._local_reduce_from_compute_binding
+                if use_compute_entry and self._local_reduce_from_compute_binding
+                else self._local_reduce_binding
+            )
+            if binding is None:
+                raise RuntimeError("Local-reduce binding not registered")
+            # Local-reduce: needs compute_type_size_bytes for local alloc
+            args = binding.marshal_args_direct(
+                source_buf, ofs_buf, out_buf, N, W, 0,
+                compute_type_size_bytes=compute_elem_size,
+            )
 
         kernel = self._get_kernel(binding.get_kernel_name())
-        args = binding.marshal_args_reduction(
-            source=self._allocator.get_buffer(plan.source_buffer),
-            offset_list=offset_buf,
-            dest=ping,
-            offset_count=current_N,
-            partial_width=plan.partial_width,
-            operation_type=0,  # sum
-        )
-        global_size, local_size = binding.compute_grid_reduction(
-            partial_width=plan.partial_width,
-            hardware_simd_width=hw_simd,
-        )
+        gs, ls = binding.compute_grid_direct(W, hw_simd)
         kernel.set_args(*args)
-        prev_event = cl.enqueue_nd_range_kernel(
-            self._queue, kernel, global_size, local_size,
-            wait_for=[upload_evt],
+        prev = cl.enqueue_nd_range_kernel(
+            self._queue, kernel, gs, ls, wait_for=[up_evt],
         )
 
-        # 4. Optional clip for "sum_and_clip"
-        if (plan.tree_variant == "sum_and_clip"
-                and plan.threshold_schedule
-                and plan.threshold_schedule[0] is not None
-                and self._clip_intermediate_binding is not None):
-            clip_binding = self._clip_intermediate_binding
-            clip_kernel = self._get_kernel(clip_binding.get_kernel_name())
-            clip_args = clip_binding.marshal_args_clip(
-                buffer=ping,
-                threshold=plan.threshold_schedule[0],
-                epsilon=1e-7,
-                param_count=plan.partial_width,
-                compute_dtype=self._plan.precision.compute_dtype if hasattr(self, "_plan") and self._plan else None,
+        # 4. Optional clip for "sum_and_clip" trees
+        if (
+            rplan.tree_variant == "sum_and_clip"
+            and rplan.threshold_schedule
+            and rplan.threshold_schedule[0] is not None
+            and self._clip_intermediate_binding is not None
+        ):
+            cb = self._clip_intermediate_binding
+            ck = self._get_kernel(cb.get_kernel_name())
+            c_args = cb.marshal_args_direct(
+                out_buf,
+                rplan.threshold_schedule[0],
+                1e-7,
+                W,
+                compute_type_size_bytes=compute_elem_size,
+                compute_dtype=self._plan.precision.compute_dtype,
             )
-            clip_global, clip_local = clip_binding.compute_grid_clip(
-                param_count=plan.partial_width,
-                hardware_simd_width=hw_simd,
-            )
-            clip_kernel.set_args(*clip_args)
-            prev_event = cl.enqueue_nd_range_kernel(
-                self._queue, clip_kernel, clip_global, clip_local,
-                wait_for=[prev_event],
+            c_gs, c_ls = cb.compute_grid_direct(W, hw_simd)
+            ck.set_args(*c_args)
+            prev = cl.enqueue_nd_range_kernel(
+                self._queue, ck, c_gs, c_ls, wait_for=[prev],
             )
 
-        # 5. Copy final result to destination buffer
-        dest_buf = self._allocator.get_buffer(plan.destination_buffer)
-        copy_size = plan.partial_width * element_size
-        copy_event = cl.enqueue_copy(
-            self._queue, dest_buf, ping,  # type: ignore[arg-type]
-            byte_count=copy_size,
-            wait_for=[prev_event],
+        # 5. Copy result to destination (cast needed: pyopencl stubs lack Buffer-to-Buffer typing)
+        dest_buf = self._allocator.get_buffer(rplan.destination_buffer)
+        return cl.enqueue_copy(
+            self._queue, cast(Any, dest_buf), cast(Any, out_buf),
+            byte_count=W * compute_elem_size,
+            wait_for=[prev], is_blocking=False,
         )
-        return copy_event
-
-    # Sentinel value matching SENTINEL_ABSENT_PARTIAL in kernels.cl.h
-    _SENTINEL_ABSENT_PARTIAL = 0xFFFF_FFFF
 
     def _render_reduction_tree_multi_stage(
         self,
-        plan: Any,
+        rplan: Any,
         wait_for: list[cl.Event],
-        element_size: int,
+        compute_elem_size: int,
         use_compute_entry: bool,
     ) -> cl.Event:
-        """Multi-stage tree (ADR-019): dispatch reduce_k_fan_in_and_clip per stage.
-
-        ADR-026 §3: Stage 0 uses storage-entry or compute-entry variant based
-        on the source buffer's precision_role. Stages ≥ 1 always use
-        compute-entry variant (prior stage output is COMPUTE_TYPE).
-        """
+        """Multi-stage (ADR-019): dispatch reduce_k_fan_in_and_clip per stage."""
+        assert self._plan is not None
         if self._k_fan_in_binding is None:
             raise RuntimeError(
-                "Multi-stage reduction tree requires K-fan-in binding "
-                "(ADR-019). Call set_reduction_bindings with k_fan_in=..."
+                "Multi-stage reduction requires K-fan-in binding (ADR-019)"
             )
 
-        K = plan.fan_in
-        current_N = plan.num_partials
-        source_buf = self._allocator.get_buffer(plan.source_buffer)
+        hw_simd = self._hardware.simd_width if self._hardware else 16
+        c_dtype = self._plan.precision.compute_dtype
+        K = rplan.fan_in
+        N = rplan.num_partials
+        W = rplan.partial_width
+        source = self._allocator.get_buffer(rplan.source_buffer)
 
-        # Build initial flat offset list padded to node_count * K with sentinels
-        node_count = math.ceil(current_N / K)
-        flat_offsets = list(plan.initial_offset_list)
-        pad_count = node_count * K - len(flat_offsets)
-        flat_offsets.extend([self._SENTINEL_ABSENT_PARTIAL] * pad_count)
-        offset_array = np.array(flat_offsets, dtype=np.uint32)
-        offset_buf = self._allocator.allocate_internal(offset_array.nbytes)
-        upload_evt = cl.enqueue_copy(
-            self._queue, offset_buf, offset_array,
+        # Pad initial offset list with sentinels to node_count × K
+        node_count = math.ceil(N / K)
+        flat = list(rplan.initial_offset_list)
+        flat.extend([self._SENTINEL_ABSENT_PARTIAL] * (node_count * K - len(flat)))
+        ofs_arr = np.array(flat, dtype=np.uint32)
+        ofs_buf = self._allocator.allocate_internal(ofs_arr.nbytes)
+        prev_evt = cl.enqueue_copy(
+            self._queue, ofs_buf, ofs_arr,
             wait_for=wait_for or None, is_blocking=False,
         )
 
-        # Allocate ping-pong intermediate buffers sized for max node output
-        max_output_elems = math.ceil(plan.num_partials / K) * plan.partial_width
-        ping = self._allocator.allocate_internal(max_output_elems * element_size)
-        pong = self._allocator.allocate_internal(max_output_elems * element_size)
+        # Ping-pong intermediate buffers
+        max_elems = math.ceil(N / K) * W
+        ping = self._allocator.allocate_internal(max_elems * compute_elem_size)
+        pong = self._allocator.allocate_internal(max_elems * compute_elem_size)
 
-        # ADR-026 §3: Select binding variant based on stage and source role
-        storage_binding = self._k_fan_in_binding
-        compute_binding = (
-            self._k_fan_in_from_compute_binding
-            if self._k_fan_in_from_compute_binding is not None
-            else storage_binding  # fallback if not registered
-        )
+        storage_k = self._k_fan_in_binding
+        compute_k = self._k_fan_in_from_compute_binding or storage_k
 
-        prev_events = [upload_evt]
+        events: list[cl.Event] = [prev_evt]
+        cur_N = N
 
-        for stage in range(plan.num_stages):
-            if current_N <= 1:
+        for stage in range(rplan.num_stages):
+            if cur_N <= 1:
                 break
 
-            node_count = math.ceil(current_N / K)
+            nc = math.ceil(cur_N / K)
 
-            # ADR-026 §3: Stage 0 uses variant based on source role;
-            # stages ≥ 1 always use compute-entry (prior output is COMPUTE_TYPE)
-            if stage == 0 and not use_compute_entry:
-                fan_in_binding = storage_binding
-            else:
-                fan_in_binding = compute_binding
-
-            fan_in_kernel = self._get_kernel(fan_in_binding.get_kernel_name())
-
-            # Determine clipping threshold for this stage
-            # Negative value bypasses clipping (diagnostic mode); must not default to 0.0
-            # which would clip all gradients to zero norm.
-            threshold = -1.0
-            if (plan.tree_variant == "sum_and_clip"
-                    and stage < len(plan.threshold_schedule)
-                    and plan.threshold_schedule[stage] is not None):
-                threshold = plan.threshold_schedule[stage]
-
-            args = fan_in_binding.marshal_args_fan_in(
-                source=source_buf,
-                offset_list=offset_buf,
-                dest=ping,
-                fan_in=K,
-                node_count=node_count,
-                partial_width=plan.partial_width,
-                clipping_threshold=threshold,
-                epsilon=1e-7,
-                compute_dtype=self._plan.precision.compute_dtype if hasattr(self, "_plan") and self._plan else None,
+            # ADR-026: stage 0 uses storage-entry iff source is storage-role;
+            # stages >= 1 always use compute-entry (prior output is COMPUTE_TYPE)
+            binding = (
+                storage_k if (stage == 0 and not use_compute_entry) else compute_k
             )
-            global_size, local_size = fan_in_binding.compute_grid_fan_in(
-                node_count=node_count,
-            )
-            fan_in_kernel.set_args(*args)
-            stage_event = cl.enqueue_nd_range_kernel(
-                self._queue, fan_in_kernel, global_size, local_size,
-                wait_for=prev_events,
-            )
-            prev_events = [stage_event]
 
-            # Prepare for next stage: source is the output ping
-            source_buf = ping
+            # Threshold: negative bypasses clipping (diagnostic mode)
+            thresh = -1.0
+            if (
+                rplan.tree_variant == "sum_and_clip"
+                and stage < len(rplan.threshold_schedule)
+                and rplan.threshold_schedule[stage] is not None
+            ):
+                thresh = rplan.threshold_schedule[stage]
+
+            kernel = self._get_kernel(binding.get_kernel_name())
+            args = binding.marshal_args_direct(
+                source, ofs_buf, ping,
+                K, nc, W, thresh, 1e-7,
+                compute_type_size_bytes=compute_elem_size,
+                compute_dtype=c_dtype,
+            )
+            gs, ls = binding.compute_grid_direct(nc, hw_simd)
+            kernel.set_args(*args)
+            evt = cl.enqueue_nd_range_kernel(
+                self._queue, kernel, gs, ls, wait_for=events,
+            )
+            events = [evt]
+
+            # Swap for next stage
+            source = ping
             ping, pong = pong, ping
+            cur_N = nc
 
             # Build contiguous offsets for next stage
-            current_N = node_count
-            if current_N > 1:
-                next_node_count = math.ceil(current_N / K)
-                next_flat_count = next_node_count * K
-                next_offsets = np.full(next_flat_count, self._SENTINEL_ABSENT_PARTIAL, dtype=np.uint32)
-                for i in range(current_N):
-                    next_offsets[i] = np.uint32(i * plan.partial_width)
-                new_offset_buf = self._allocator.allocate_internal(next_offsets.nbytes)
-                ofs_evt = cl.enqueue_copy(
-                    self._queue, new_offset_buf, next_offsets,
-                    wait_for=prev_events, is_blocking=False,
+            if cur_N > 1:
+                next_nc = math.ceil(cur_N / K)
+                next_ofs = np.full(
+                    next_nc * K, self._SENTINEL_ABSENT_PARTIAL, dtype=np.uint32,
                 )
-                offset_buf = new_offset_buf
-                prev_events = [ofs_evt]
+                for i in range(cur_N):
+                    next_ofs[i] = np.uint32(i * W)
+                new_buf = self._allocator.allocate_internal(next_ofs.nbytes)
+                ofs_evt = cl.enqueue_copy(
+                    self._queue, new_buf, next_ofs,
+                    wait_for=events, is_blocking=False,
+                )
+                ofs_buf = new_buf
+                events = [ofs_evt]
 
-        # Copy final result to destination buffer
-        dest_buf = self._allocator.get_buffer(plan.destination_buffer)
-        copy_size = plan.partial_width * element_size
-        copy_event = cl.enqueue_copy(
-            self._queue, dest_buf, source_buf,  # type: ignore[arg-type]
-            byte_count=copy_size,
-            wait_for=prev_events, is_blocking=False,
+        # Copy final result to destination (cast needed: pyopencl stubs lack Buffer-to-Buffer typing)
+        dest = self._allocator.get_buffer(rplan.destination_buffer)
+        return cl.enqueue_copy(
+            self._queue, cast(Any, dest), cast(Any, source),
+            byte_count=W * compute_elem_size,
+            wait_for=events, is_blocking=False,
         )
-        return copy_event
 
     # ------------------------------------------------------------------
-    # Streaming loop (Phase 2B fills in full logic)
+    # Streaming loop
     # ------------------------------------------------------------------
 
     def _render_streaming_loop(
@@ -706,33 +685,30 @@ class OpenCLPlanRenderer:
         node: StreamingLoopNode,
         wait_for: list[cl.Event],
     ) -> cl.Event:
-        """Render a streaming loop: per-chunk parametric dispatch."""
+        """Render a streaming loop: sequential per-chunk parametric dispatch."""
+        assert self._plan is not None
         splan = node.streaming_plan
-
-        # Allocate scratch buffers
-        scratch_bufs: dict[str, cl.Buffer] = {}
-        for spec in splan.scratch_buffers:
-            scratch_bufs[spec.logical_name] = self._allocator.allocate_internal(spec.size_bytes)
+        hw_simd = self._hardware.simd_width if self._hardware else 16
 
         chunk_events = wait_for
 
         for chunk_idx in range(splan.iteration.chunk_count):
-            # Compute per-chunk scalars from strides
-            chunk_scalars: dict[str, int | float] = dict(splan.constant_scalars)
+            # Compute per-chunk scalar overrides from strides
+            chunk_scalars: dict[str, Any] = dict(splan.constant_scalars)
             for stride in splan.parameter_strides:
-                chunk_scalars[stride.param_name] = stride.base + chunk_idx * stride.stride
+                chunk_scalars[stride.param_name] = (
+                    stride.base + chunk_idx * stride.stride
+                )
 
-            # Dispatch each body node in sequence
+            # Dispatch each body node sequentially within the chunk
             body_events = chunk_events
             for body_node_id in splan.body:
                 body_node = self._plan.nodes[body_node_id]
                 assert isinstance(body_node, KernelDispatchNode)
 
-                # Merge chunk-specific scalars over the body node's base scalars
-                merged_scalars = self._enrich_scalar_params(
-                    {**body_node.scalar_params, **chunk_scalars}
+                merged = self._enrich_scalar_params(
+                    {**body_node.scalar_params, **chunk_scalars},
                 )
-
                 binding = self._bindings[body_node.kernel_name]
                 kernel = self._get_kernel(binding.get_kernel_name())
 
@@ -741,31 +717,30 @@ class OpenCLPlanRenderer:
                     args = binding.marshal_args(
                         get_buffer=self._allocator.get_buffer,
                         buffer_bindings=body_node.buffer_bindings,
-                        scalar_params=merged_scalars,
+                        scalar_params=merged,
                         tile_index=tile_idx,
                     )
-                    global_size, local_size = binding.compute_grid(
+                    gs, ls = binding.compute_grid(
                         tile_index=tile_idx,
-                        scalar_params=merged_scalars,
-                        hardware_simd_width=self._hardware.simd_width if self._hardware else 16,
+                        scalar_params=merged,
+                        hardware_simd_width=hw_simd,
                     )
                     kernel.set_args(*args)
-                    event = cl.enqueue_nd_range_kernel(
-                        self._queue, kernel, global_size, local_size,
+                    evt = cl.enqueue_nd_range_kernel(
+                        self._queue, kernel, gs, ls,
                         wait_for=body_events or None,
                     )
-                    tile_events.append(event)
+                    tile_events.append(evt)
 
-                if len(tile_events) == 1:
-                    body_events = tile_events
-                else:
-                    body_events = [cl.enqueue_marker(self._queue, wait_for=tile_events)]
+                body_events = (
+                    tile_events if len(tile_events) == 1
+                    else [cl.enqueue_marker(self._queue, wait_for=tile_events)]
+                )
 
             chunk_events = body_events
 
         if chunk_events:
             return chunk_events[0]
-        # Fallback: return a completed user event
         marker = cl.UserEvent(self._context)
         marker.set_status(cl.command_execution_status.COMPLETE)
         return marker
@@ -775,7 +750,6 @@ class OpenCLPlanRenderer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    @staticmethod
     def _collect_dependency_events(
         depends_on: frozenset[str],
         event_map: dict[str, cl.Event],
@@ -783,24 +757,23 @@ class OpenCLPlanRenderer:
         """Collect cl.Events for all dependency node IDs.
 
         Raises OpenCLKernelError if any dependency event completed with
-        an error status, preventing cascading dispatches against a
-        failed event chain.
+        an error status.
         """
         events: list[cl.Event] = []
         for dep_id in depends_on:
-            if dep_id in event_map:
-                evt = event_map[dep_id]
-                try:
-                    status = evt.command_execution_status
-                except Exception:
-                    status = 0  # treat query failure as non-error
-                if status < 0:
-                    raise OpenCLKernelError(
-                        f"Upstream node '{dep_id}' completed with "
-                        f"error status {status}. Aborting downstream "
-                        f"dispatch to prevent cascading failures.",
-                        node_id=dep_id,
-                        event_status=status,
-                    )
-                events.append(evt)
+            evt = event_map.get(dep_id)
+            if evt is None:
+                continue
+            try:
+                status = evt.command_execution_status
+            except Exception:
+                status = 0
+            if status < 0:
+                raise OpenCLKernelError(
+                    f"Upstream node '{dep_id}' completed with error "
+                    f"status {status}.",
+                    node_id=dep_id,
+                    event_status=status,
+                )
+            events.append(evt)
         return events

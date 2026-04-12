@@ -1,16 +1,40 @@
 // phase_2_learn_D_backprop.cl.c
+//
+// Learn-phase streaming shared-layer backpropagation kernel implementations:
+//   Nodes 17, 18, 19.
+// Reference specification: kernels.cl.h (ADR-013 designation).
 
 #ifdef __OPENCL_VERSION__
 #else
 #include "kernels.cl.h"
 #endif
 
-// --- Implementation: backprop_shared_weights_chunk (Node 17) ---
-// Strategy: A "work-group per gradient" reduction kernel designed for the "True
-// Streaming" backpropagation model. Each work-group is assigned to compute one
-// scalar gradient value for a single shared weight (dL/dW_ij). Threads within
-// the group collaborate to reduce (sum) the contributions from all samples
-// in the assigned batch chunk.
+// ===========================================================================
+// Node 17 — backprop_shared_weights_chunk
+// ===========================================================================
+// Strategy: "Work-group per gradient component" reduction for the shared
+// weight matrix.  Each work-group computes a single scalar dL/dW_{i,j}
+// (the partial gradient for one shared weight) by collaboratively reducing
+// contributions from all samples in the assigned batch chunk via local
+// memory.
+//
+// The SIMD-major (SoA) write pattern matches the persistent shared weight
+// layout consumed by Node 4's forward pass and updated by Node 24's Adam
+// update.  This ensures flat-index correspondence between gradient and
+// parameter buffers through the layout-agnostic reduction pipeline.
+//
+// Dispatch geometry:
+//   global = (padded_input_count * batch_reduction_wg_size,
+//             padded_hidden_count)
+//   local  = (batch_reduction_wg_size, 1)
+//
+// get_group_id(0)  → input dimension index (i)
+// get_group_id(1)  → hidden dimension index (j)
+// get_local_id(0)  → batch reduction lane
+//
+// The tree reduction requires get_local_size(0) to be a power of two.
+// This is guaranteed by the Orchestration tier's dispatch selection.
+
 __kernel void backprop_shared_weights_chunk(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_input,
@@ -18,7 +42,7 @@ __kernel void backprop_shared_weights_chunk(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_mask,
     uint                         src_scalar_FLAG_use_explicit_hidden_mask,
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_summed_grad_hidden_activations,
-    __global const uint          *src_buffer_GLOBAL_sample_mask,
+    __global const uint         *src_buffer_GLOBAL_sample_mask,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major,
     uint                         src_scalar_NATURAL_batch_chunk_offset,
     uint                         src_scalar_NATURAL_batch_chunk_count,
@@ -31,101 +55,149 @@ __kernel void backprop_shared_weights_chunk(
     uint                         src_scalar_NATURAL_padded_hidden_count,
     uint                         src_scalar_NATURAL_final_grad_hidden_activations_total_count) {
 
-    // --- 1. Work-Group to Gradient Component Mapping ---
-    // The 2D work-group ID maps to a coordinate in the shared weight matrix (input_dim, hidden_dim).
-    const uint i_idx = get_group_id(0); // Index along the input dimension.
-    const uint j_idx = get_group_id(1); // Index along the hidden dimension.
-    // Threads within the group collaborate on the reduction over the batch chunk.
-    const uint lid   = get_local_id(0);
+    // Axiom 1.4 — interface completeness.  These parameters exist for the
+    // host's Calculability Proofs and Validation Preconditions; the kernel
+    // iterates via batch_chunk_offset/count and indexes via padded dimensions.
+    (void)src_scalar_NATURAL_total_batch_count;
+    (void)src_scalar_NATURAL_num_batch_chunks;
+    (void)src_scalar_NATURAL_final_grad_hidden_activations_total_count;
+
+    // --- 1. Work-Group → Gradient Component Coordinate --------------------
+    const uint i_idx = get_group_id(0);   // input dimension index
+    const uint j_idx = get_group_id(1);   // hidden dimension index
+    const uint lid   = get_local_id(0);   // batch reduction lane
     const uint lsize = get_local_size(0);
 
-    // Boundary check for the gradient component this work-group is assigned.
-    if (i_idx >= src_scalar_NATURAL_padded_input_count || j_idx >= src_scalar_NATURAL_padded_hidden_count) {
+    if (i_idx >= src_scalar_NATURAL_padded_input_count ||
+        j_idx >= src_scalar_NATURAL_padded_hidden_count) {
         return;
     }
 
-    // --- Padding Zero-Establishment (CONTRACT.md) ---
-    // The kernel is the sole guarantor of zeros at padding positions. If this
-    // work-group's (i,j) coordinate is in the padding region, write zero and exit.
-    const int is_padding = (i_idx >= src_scalar_NATURAL_input_count) || (j_idx >= src_scalar_NATURAL_hidden_count);
-    if (is_padding) {
+    // --- 2. SIMD-Major Write Address Computation --------------------------
+    // The destination uses SoA layout: (batch_chunk, h_block, padded_input,
+    // SIMD_lane), matching the persistent weight buffer's SIMD-major layout.
+    // Long casts guard against overflow for large tensor dimensions.
+    const uint hb   = j_idx / SIMD_WIDTH;
+    const uint lane = j_idx % SIMD_WIDTH;
+    const long chunk_base_offset =
+        (long)src_scalar_NATURAL_batch_chunk_index
+        * src_scalar_NATURAL_padded_input_count
+        * src_scalar_NATURAL_padded_hidden_count;
+    const long grad_w_out_idx =
+          chunk_base_offset
+        + (long)hb * src_scalar_NATURAL_padded_input_count * SIMD_WIDTH
+        + (long)i_idx * SIMD_WIDTH
+        + lane;
+
+    // --- 3. Padding Zero-Establishment (early exit) -----------------------
+    // Initialization Contract: NONE — the kernel is the sole guarantor that
+    // padding positions carry zero.  Downstream L2 norms (Node 19) read
+    // the full padded extent; incorrect padding would corrupt the norm.
+    if (i_idx >= src_scalar_NATURAL_input_count ||
+        j_idx >= src_scalar_NATURAL_hidden_count) {
         if (lid == 0) {
-            const uint hb   = j_idx / SIMD_WIDTH;
-            const uint lane = j_idx % SIMD_WIDTH;
-            const long chunk_base_offset = (long)src_scalar_NATURAL_batch_chunk_index * src_scalar_NATURAL_padded_input_count * src_scalar_NATURAL_padded_hidden_count;
-            const long grad_w_out_idx    = chunk_base_offset + (long)hb * src_scalar_NATURAL_padded_input_count * SIMD_WIDTH + (long)i_idx * SIMD_WIDTH + lane;
-            store_storage(dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major, grad_w_out_idx, COMPUTE_ZERO);
+            store_storage(
+                dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major,
+                grad_w_out_idx, COMPUTE_ZERO);
         }
         return;
     }
 
-    // --- 2. Parallel Reduction over the Batch Chunk ---
-    COMPUTE_TYPE p_grad_sw = COMPUTE_ZERO; // This thread's partial sum.
+    // --- 4. Parallel Reduction over Batch Chunk ---------------------------
+    // Each thread accumulates dL/dW_{i,j} contributions from a strided
+    // slice of the batch chunk.  The chain rule decomposes as:
+    //   dL/dW_{i,j} = Σ_b [ dL/dA_j × dA_j/dZ_j × dZ_j/dW_{i,j} ]
+    //               = Σ_b [ grad_h[j] × relu_mask[j] × input[i] ]
+    COMPUTE_TYPE p_grad_sw = COMPUTE_ZERO;
 
-    // Each thread calculates the gradient contribution from a strided slice of samples in the chunk.
-    for (uint b_local = lid; b_local < src_scalar_NATURAL_batch_chunk_count; b_local += lsize) {
+    for (uint b_local = lid;
+         b_local < src_scalar_NATURAL_batch_chunk_count;
+         b_local += lsize) {
+
         const uint b_global = src_scalar_NATURAL_batch_chunk_offset + b_local;
 
-        // Skip computation for any padded samples within the chunk.
         if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, b_global)) {
             continue;
         }
 
-        // --- Apply the Chain Rule: dL/dW_ij = (dL/dA_j) * (dA_j/dZ_j) * (dZ_j/dW_ij) ---
-        const long         hidden_offset = (long)b_global * src_scalar_NATURAL_padded_hidden_count + j_idx;
-        const COMPUTE_TYPE grad_h        = src_buffer_GLOBAL_summed_grad_hidden_activations[hidden_offset]; // (dL/dA_j)
-        const COMPUTE_TYPE hidden_val    = load_storage(src_buffer_GLOBAL_hidden_activations, hidden_offset);
+        const long hidden_offset =
+            (long)b_global * src_scalar_NATURAL_padded_hidden_count + j_idx;
 
-        // Derivative of ReLU activation: (dA_j/dZ_j)
-        // When FLAG=1, the mask buffer contains the compute-precision derivative truth.
-        // When FLAG=0, derive the mask from stored activations (mask = activation > 0).
-        const COMPUTE_TYPE d_activation = src_scalar_FLAG_use_explicit_hidden_mask ? load_storage(src_buffer_GLOBAL_hidden_mask, hidden_offset) : select((COMPUTE_TYPE)0.0f, (COMPUTE_TYPE)1.0f, hidden_val > COMPUTE_ZERO);
-        const COMPUTE_TYPE dL_dZ_j      = grad_h * d_activation;
+        // dL/dA_j — upstream gradient from the reduction engine (Node 16).
+        // Compute-role buffer: read directly (no widening conversion).
+        const COMPUTE_TYPE grad_h =
+            src_buffer_GLOBAL_summed_grad_hidden_activations[hidden_offset];
 
-        // Final term: (dZ_j/dW_ij), which is simply the corresponding input value.
-        const COMPUTE_TYPE input_val = load_storage(src_buffer_GLOBAL_input, (long)b_global * src_scalar_NATURAL_padded_input_count + i_idx);
-        p_grad_sw += dL_dZ_j * input_val;
+        // dA_j/dZ_j — ReLU derivative.
+        // Mask source: explicit buffer (FLAG=1) preserves compute-precision
+        // derivative truth; derived (FLAG=0) recomputes from stored
+        // activation.  When FLAG=1, the hidden_activations read is elided —
+        // the mask provides the derivative directly, saving one global
+        // memory load per sample.
+        COMPUTE_TYPE d_activation;
+        if (src_scalar_FLAG_use_explicit_hidden_mask) {
+            d_activation = load_storage(src_buffer_GLOBAL_hidden_mask,
+                                        hidden_offset);
+        } else {
+            const COMPUTE_TYPE hidden_val = load_storage(
+                src_buffer_GLOBAL_hidden_activations, hidden_offset);
+            d_activation =
+                (hidden_val > COMPUTE_ZERO) ? COMPUTE_ONE : COMPUTE_ZERO;
+        }
+
+        // dZ_j/dW_{i,j} = input[i] for the affine transform Z = W*x + b.
+        const COMPUTE_TYPE input_val = load_storage(
+            src_buffer_GLOBAL_input,
+            (long)b_global * src_scalar_NATURAL_padded_input_count + i_idx);
+
+        p_grad_sw += grad_h * d_activation * input_val;
     }
 
-    // --- 3. Intra-Workgroup Reduction & Final Write ---
-    // Perform a standard parallel reduction on the partial sums using local memory.
+    // --- 5. Intra-Workgroup Tree Reduction & Write ------------------------
     update_buffer_LOCAL_reduction_tile[lid] = p_grad_sw;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
         if (lid < stride) {
-            update_buffer_LOCAL_reduction_tile[lid] += update_buffer_LOCAL_reduction_tile[lid + stride];
+            update_buffer_LOCAL_reduction_tile[lid] +=
+                update_buffer_LOCAL_reduction_tile[lid + stride];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // The leader thread writes the final, reduced partial gradient for this chunk
-    // to its unique slot in the collection buffer, fulfilling the placement contract.
-    // WHY: The write uses SIMD-major (SoA) layout — matching the forward_pass kernel's
-    // weight buffer layout (h_block, padded_input, SIMD_lane). This ensures flat-index
-    // correspondence between gradient and parameter buffers, so Adam update pairs
-    // grad[k] with param[k] correctly.
     if (lid == 0) {
-        const uint hb   = j_idx / SIMD_WIDTH;
-        const uint lane = j_idx % SIMD_WIDTH;
-        const long chunk_base_offset = (long)src_scalar_NATURAL_batch_chunk_index * src_scalar_NATURAL_padded_input_count * src_scalar_NATURAL_padded_hidden_count;
-        const long grad_w_out_idx    = chunk_base_offset + (long)hb * src_scalar_NATURAL_padded_input_count * SIMD_WIDTH + (long)i_idx * SIMD_WIDTH + lane;
-        store_storage(dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major, grad_w_out_idx, update_buffer_LOCAL_reduction_tile[0]);
+        store_storage(
+            dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major,
+            grad_w_out_idx, update_buffer_LOCAL_reduction_tile[0]);
     }
 }
 
-// --- Implementation: backprop_shared_biases_chunk (Node 18) ---
-// Strategy: A highly efficient "work-group per gradient" reduction kernel optimized
-// for a 1D output. Each work-group is assigned to compute the partial gradient for a
-// single shared bias term (dL/dB_j). This 1D dispatch is simpler and more efficient
-// than a 2D model. Threads within the group collaborate to reduce the contributions
-// from all samples in their assigned batch chunk.
+// ===========================================================================
+// Node 18 — backprop_shared_biases_chunk
+// ===========================================================================
+// Strategy: "Work-group per gradient component" reduction for the shared
+// bias vector.  Each work-group computes a single scalar dL/dB_j by
+// collaboratively reducing contributions from all samples in the assigned
+// batch chunk via local memory.  The 1D dispatch is simpler and more
+// efficient than a 2D model because the bias gradient does not depend on
+// the input dimension.
+//
+// Dispatch geometry:
+//   global = (padded_hidden_count * batch_reduction_wg_size)
+//   local  = (batch_reduction_wg_size)
+//
+// get_group_id(0)  → hidden dimension index (j)
+// get_local_id(0)  → batch reduction lane
+//
+// The tree reduction requires get_local_size(0) to be a power of two.
+// This is guaranteed by the Orchestration tier's dispatch selection.
+
 __kernel void backprop_shared_biases_chunk(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_activations,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_mask,
     uint                         src_scalar_FLAG_use_explicit_hidden_mask,
     __global const COMPUTE_TYPE *src_buffer_GLOBAL_summed_grad_hidden_activations,
-    __global const uint          *src_buffer_GLOBAL_sample_mask,
+    __global const uint         *src_buffer_GLOBAL_sample_mask,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_biases_shared,
     uint                         src_scalar_NATURAL_batch_chunk_offset,
     uint                         src_scalar_NATURAL_batch_chunk_count,
@@ -136,83 +208,129 @@ __kernel void backprop_shared_biases_chunk(
     uint                         src_scalar_NATURAL_padded_hidden_count,
     uint                         src_scalar_NATURAL_final_grad_hidden_activations_total_count) {
 
-    // --- 1. Work-Group to Gradient Component Mapping ---
-    // The 1D work-group ID maps to an index in the shared bias vector.
-    const uint j_idx = get_group_id(0);
-    // Threads within the group collaborate on the reduction over the batch chunk.
-    const uint lid   = get_local_id(0);
+    // Axiom 1.4 — interface completeness.  These parameters exist for the
+    // host's Calculability Proofs and Validation Preconditions; the kernel
+    // iterates via batch_chunk_offset/count and indexes via padded dimensions.
+    (void)src_scalar_NATURAL_total_batch_count;
+    (void)src_scalar_NATURAL_num_batch_chunks;
+    (void)src_scalar_NATURAL_final_grad_hidden_activations_total_count;
+
+    // --- 1. Work-Group → Gradient Component Coordinate --------------------
+    const uint j_idx = get_group_id(0);   // hidden dimension index
+    const uint lid   = get_local_id(0);   // batch reduction lane
     const uint lsize = get_local_size(0);
 
-    // Boundary check for the gradient component this work-group is assigned.
     if (j_idx >= src_scalar_NATURAL_padded_hidden_count) {
         return;
     }
 
-    // --- Padding Zero-Establishment (CONTRACT.md) ---
-    // The kernel is the sole guarantor of zeros at padding positions.
-    // For indices >= hidden_count, write zero and exit early.
+    // --- 2. Write Address Computation -------------------------------------
+    // Linear layout: (batch_chunk, padded_hidden).
+    const long chunk_base_offset =
+        (long)src_scalar_NATURAL_batch_chunk_index
+        * src_scalar_NATURAL_padded_hidden_count;
+    const long grad_b_out_idx = chunk_base_offset + j_idx;
+
+    // --- 3. Padding Zero-Establishment (early exit) -----------------------
+    // Initialization Contract: NONE — the kernel is the sole guarantor that
+    // padding positions carry zero.  Downstream L2 norms (Node 19) read
+    // the full padded extent; incorrect padding would corrupt the norm.
     if (j_idx >= src_scalar_NATURAL_hidden_count) {
         if (lid == 0) {
-            const long chunk_base_offset = (long)src_scalar_NATURAL_batch_chunk_index * src_scalar_NATURAL_padded_hidden_count;
-            store_storage(dest_buffer_GLOBAL_partial_grad_biases_shared, chunk_base_offset + j_idx, COMPUTE_ZERO);
+            store_storage(dest_buffer_GLOBAL_partial_grad_biases_shared,
+                          grad_b_out_idx, COMPUTE_ZERO);
         }
         return;
     }
 
-    // --- 2. Parallel Reduction over the Batch Chunk ---
-    COMPUTE_TYPE p_grad_sb = COMPUTE_ZERO; // This thread's partial sum.
+    // --- 4. Parallel Reduction over Batch Chunk ---------------------------
+    // Each thread accumulates dL/dB_j contributions from a strided slice
+    // of the batch chunk.  The chain rule decomposes as:
+    //   dL/dB_j = Σ_b [ dL/dA_j × dA_j/dZ_j × dZ_j/dB_j ]
+    //           = Σ_b [ grad_h[j] × relu_mask[j] × 1 ]
+    // (dZ_j/dB_j = 1 for the affine transform Z = W*x + b.)
+    COMPUTE_TYPE p_grad_sb = COMPUTE_ZERO;
 
-    // Each thread calculates the gradient contribution from a strided slice of samples in the chunk.
-    for (uint b_local = lid; b_local < src_scalar_NATURAL_batch_chunk_count; b_local += lsize) {
+    for (uint b_local = lid;
+         b_local < src_scalar_NATURAL_batch_chunk_count;
+         b_local += lsize) {
+
         const uint b_global = src_scalar_NATURAL_batch_chunk_offset + b_local;
 
-        // Skip computation for any padded samples within the chunk.
         if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, b_global)) {
             continue;
         }
 
-        // --- Apply the Chain Rule: dL/dB_j = (dL/dA_j) * (dA_j/dZ_j) * (dZ_j/dB_j) ---
-        // For biases, dZ_j/dB_j = 1, so the gradient is simply dL/dZ_j.
-        const long         hidden_offset = (long)b_global * src_scalar_NATURAL_padded_hidden_count + j_idx;
-        const COMPUTE_TYPE grad_h        = src_buffer_GLOBAL_summed_grad_hidden_activations[hidden_offset]; // (dL/dA_j)
-        const COMPUTE_TYPE hidden_val    = load_storage(src_buffer_GLOBAL_hidden_activations, hidden_offset);
+        const long hidden_offset =
+            (long)b_global * src_scalar_NATURAL_padded_hidden_count + j_idx;
 
-        // Derivative of ReLU activation: (dA_j/dZ_j)
-        // When FLAG=1, the mask buffer contains the compute-precision derivative truth.
-        // When FLAG=0, derive the mask from stored activations (mask = activation > 0).
-        const COMPUTE_TYPE d_activation = src_scalar_FLAG_use_explicit_hidden_mask ? load_storage(src_buffer_GLOBAL_hidden_mask, hidden_offset) : select((COMPUTE_TYPE)0.0f, (COMPUTE_TYPE)1.0f, hidden_val > COMPUTE_ZERO);
+        // dL/dA_j — upstream gradient from the reduction engine (Node 16).
+        // Compute-role buffer: read directly (no widening conversion).
+        const COMPUTE_TYPE grad_h =
+            src_buffer_GLOBAL_summed_grad_hidden_activations[hidden_offset];
 
-        // Sum the contributions to the gradient, dL/dB_j. This calculation is simpler
-        // than for weights as it does not require reading from the main input buffer.
+        // dA_j/dZ_j — ReLU derivative.
+        // Same elision strategy as Node 17: when FLAG=1, the explicit mask
+        // buffer provides the derivative directly and the hidden_activations
+        // read is skipped, saving one global memory load per sample.
+        COMPUTE_TYPE d_activation;
+        if (src_scalar_FLAG_use_explicit_hidden_mask) {
+            d_activation = load_storage(src_buffer_GLOBAL_hidden_mask,
+                                        hidden_offset);
+        } else {
+            const COMPUTE_TYPE hidden_val = load_storage(
+                src_buffer_GLOBAL_hidden_activations, hidden_offset);
+            d_activation =
+                (hidden_val > COMPUTE_ZERO) ? COMPUTE_ONE : COMPUTE_ZERO;
+        }
+
         p_grad_sb += grad_h * d_activation;
     }
 
-    // --- 3. Intra-Workgroup Reduction & Final Write ---
-    // Perform a standard parallel reduction on the partial sums using local memory.
+    // --- 5. Intra-Workgroup Tree Reduction & Write ------------------------
     update_buffer_LOCAL_reduction_tile[lid] = p_grad_sb;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
         if (lid < stride) {
-            update_buffer_LOCAL_reduction_tile[lid] += update_buffer_LOCAL_reduction_tile[lid + stride];
+            update_buffer_LOCAL_reduction_tile[lid] +=
+                update_buffer_LOCAL_reduction_tile[lid + stride];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // The leader thread writes the final, reduced partial gradient for this chunk
-    // to its unique slot in the collection buffer, fulfilling the placement contract.
     if (lid == 0) {
-        const long chunk_base_offset = (long)src_scalar_NATURAL_batch_chunk_index * src_scalar_NATURAL_padded_hidden_count;
-        const long grad_b_out_idx    = chunk_base_offset + j_idx;
-        store_storage(dest_buffer_GLOBAL_partial_grad_biases_shared, grad_b_out_idx, update_buffer_LOCAL_reduction_tile[0]);
+        store_storage(dest_buffer_GLOBAL_partial_grad_biases_shared,
+                      grad_b_out_idx, update_buffer_LOCAL_reduction_tile[0]);
     }
 }
 
-// --- Implementation: clip_shared_gradients_chunk (Node 19) ---
-// Strategy: A streamable utility that acts as a stabilization gateway. It operates on
-// the raw output chunks from the shared backpropagation kernels (Nodes 17 & 18).
-// Using a "virtual vector" abstraction, it computes a single L2 norm across both
-// weight and bias gradients and then writes the conditionally-scaled results to a
-// destination address explicitly provided by the host.
+// ===========================================================================
+// Node 19 — clip_shared_gradients_chunk
+// ===========================================================================
+// Strategy: Two-pass virtual-vector algorithm for the streaming shared-layer
+// path.  A single work-group processes one batch chunk's complete shared
+// gradient set — weight and bias gradients treated as one contiguous
+// "virtual vector."
+//
+//   Pass 1: Parallel sum-of-squares reduction over the virtual vector,
+//           yielding the joint L2 norm.
+//   Pass 2: Conditional uniform scaling and placement write to the
+//           host-specified destination offsets in the collection buffers.
+//
+// This kernel fulfills the same stabilization role as Node 11 for the
+// module path, but operates within the "True Streaming" backpropagation
+// model where gradients are clipped immediately per batch chunk.
+//
+// Dispatch geometry:
+//   global = (work_group_size)         [one work-group per chunk]
+//   local  = (work_group_size)
+//
+// The host provides explicit write offsets, making this kernel a "dumb"
+// numerical primitive that writes to host-specified memory locations.
+//
+// The tree reduction requires get_local_size(0) to be a power of two.
+// This is guaranteed by the Orchestration tier's dispatch selection.
+
 __kernel void clip_shared_gradients_chunk(
     __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_grad_weights_shared_simd_major,
@@ -227,68 +345,100 @@ __kernel void clip_shared_gradients_chunk(
     uint                         dest_scalar_NATURAL_biases_write_offset,
     uint                         src_scalar_NATURAL_num_batch_chunks) {
 
-    // --- 1. Setup ---
+    // Axiom 1.4 — interface completeness.  This parameter exists for the
+    // host's Validation Preconditions (write offset bounds checking); the
+    // kernel's iteration is driven by the parameter counts.
+    (void)src_scalar_NATURAL_num_batch_chunks;
+
     const uint lid   = get_local_id(0);
     const uint lsize = get_local_size(0);
-    // The total number of elements in the logically concatenated "virtual vector".
-    const uint total_elements = src_scalar_NATURAL_weights_parameter_count + src_scalar_NATURAL_biases_parameter_count;
 
-    // --- 2. Pass 1: Calculate Sum of Squares for L2 Norm ---
+    // --- 1. Virtual-Vector Geometry ---------------------------------------
+    // The two gradient buffers form a "virtual vector" whose total element
+    // count drives the strided iteration in both passes.  The segment
+    // boundary maps a linear index to the correct physical buffer.
+    const uint total_elements =
+        src_scalar_NATURAL_weights_parameter_count
+        + src_scalar_NATURAL_biases_parameter_count;
+
+    // --- 2. Pass 1: Sum-of-Squares (Joint L2 Norm) -----------------------
+    // Each thread accumulates a partial sum-of-squares from a strided slice
+    // of the virtual vector.  The conditional chain maps a linear index `i`
+    // to the correct physical buffer segment.
     COMPUTE_TYPE local_sq_sum = COMPUTE_ZERO;
-    // Each thread calculates a partial sum of squares from a strided slice of the virtual vector.
+
     for (uint i = lid; i < total_elements; i += lsize) {
         COMPUTE_TYPE val;
-        // This conditional logic maps the linear index `i` to the correct physical buffer.
         if (i < src_scalar_NATURAL_weights_parameter_count) {
-            val = load_storage(src_buffer_GLOBAL_partial_grad_weights_shared_simd_major, i);
+            val = load_storage(
+                src_buffer_GLOBAL_partial_grad_weights_shared_simd_major, i);
         } else {
-            val = load_storage(src_buffer_GLOBAL_partial_grad_biases_shared, i - src_scalar_NATURAL_weights_parameter_count);
+            val = load_storage(
+                src_buffer_GLOBAL_partial_grad_biases_shared,
+                i - src_scalar_NATURAL_weights_parameter_count);
         }
         local_sq_sum += val * val;
     }
 
-    // Perform a standard parallel reduction on the partial sums using local memory.
+    // Work-group tree reduction to obtain the total sum-of-squares.
     update_buffer_LOCAL_reduction_tile[lid] = local_sq_sum;
     barrier(CLK_LOCAL_MEM_FENCE);
 
     for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
         if (lid < stride) {
-            update_buffer_LOCAL_reduction_tile[lid] += update_buffer_LOCAL_reduction_tile[lid + stride];
+            update_buffer_LOCAL_reduction_tile[lid] +=
+                update_buffer_LOCAL_reduction_tile[lid + stride];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // --- 3. Determine Scaling Factor and Broadcast ---
-    // The leader thread computes the final factor and broadcasts it via local memory.
+    // --- 3. Scale Factor Computation & Broadcast --------------------------
+    // Thread 0 derives the scaling factor from the joint norm and the
+    // clipping threshold, then broadcasts it to all threads via local
+    // memory.  The reuse of slot 0 is safe: the last barrier of the
+    // reduction loop guarantees all threads have completed their reads
+    // before thread 0 overwrites the value.
     if (lid == 0) {
-        const COMPUTE_TYPE total_sum_sq = update_buffer_LOCAL_reduction_tile[0];
-        const COMPUTE_TYPE norm         = MATH_FN sqrt(total_sum_sq);
+        const COMPUTE_TYPE norm =
+            MATH_SQRT(update_buffer_LOCAL_reduction_tile[0]);
 
-        // Diagnostic bypass: negative threshold skips clipping (scale = 1.0)
         COMPUTE_TYPE scale_factor = COMPUTE_ONE;
-        if (src_scalar_REAL_clipping_threshold_t_pre >= COMPUTE_ZERO && norm > src_scalar_REAL_clipping_threshold_t_pre) {
-            scale_factor = src_scalar_REAL_clipping_threshold_t_pre / (norm + src_scalar_REAL_epsilon);
+        if (src_scalar_REAL_clipping_threshold_t_pre >= COMPUTE_ZERO &&
+            norm > src_scalar_REAL_clipping_threshold_t_pre) {
+            scale_factor = src_scalar_REAL_clipping_threshold_t_pre
+                         / (norm + src_scalar_REAL_epsilon);
         }
         update_buffer_LOCAL_reduction_tile[0] = scale_factor;
     }
 
-    // Synchronize to ensure all threads see the computed scale_factor.
+    // Synchronize to ensure all threads read thread 0's computed factor.
     barrier(CLK_LOCAL_MEM_FENCE);
     const COMPUTE_TYPE scale_factor = update_buffer_LOCAL_reduction_tile[0];
 
-    // --- 4. Pass 2: Conditional Scaling and Placement Write ---
-    // Each thread applies the single, broadcasted scale_factor to its slice of the virtual vector,
-    // writing the result to the host-specified destination offset.
+    // --- 4. Pass 2: Conditional Scaling & Placement Write -----------------
+    // Each thread re-reads its strided slice of the virtual vector, applies
+    // the single broadcasted scale factor, and writes to the host-specified
+    // destination offset in the collection buffer.  The host provides the
+    // exact base offset; the kernel adds the element's relative index.
+    // Uniform scaling maps zero inputs to zero outputs (Padding
+    // Zero-Preservation invariant).
     for (uint i = lid; i < total_elements; i += lsize) {
         if (i < src_scalar_NATURAL_weights_parameter_count) {
-            const COMPUTE_TYPE val = load_storage(src_buffer_GLOBAL_partial_grad_weights_shared_simd_major, i);
-            // This write operation is the fulfillment of the placement contract. The host provides the
-            // exact base offset, and this kernel simply adds the element's relative index.
-            store_storage(dest_buffer_GLOBAL_clipped_partial_grad_weights_shared_simd_major, dest_scalar_NATURAL_weights_write_offset + i, val * scale_factor);
+            const COMPUTE_TYPE val = load_storage(
+                src_buffer_GLOBAL_partial_grad_weights_shared_simd_major, i);
+            store_storage(
+                dest_buffer_GLOBAL_clipped_partial_grad_weights_shared_simd_major,
+                dest_scalar_NATURAL_weights_write_offset + i,
+                val * scale_factor);
         } else {
-            const uint         relative_idx = i - src_scalar_NATURAL_weights_parameter_count;
-            const COMPUTE_TYPE val          = load_storage(src_buffer_GLOBAL_partial_grad_biases_shared, relative_idx);
-            store_storage(dest_buffer_GLOBAL_clipped_partial_grad_biases_shared, dest_scalar_NATURAL_biases_write_offset + relative_idx, val * scale_factor);
+            const uint relative_idx =
+                i - src_scalar_NATURAL_weights_parameter_count;
+            const COMPUTE_TYPE val = load_storage(
+                src_buffer_GLOBAL_partial_grad_biases_shared, relative_idx);
+            store_storage(
+                dest_buffer_GLOBAL_clipped_partial_grad_biases_shared,
+                dest_scalar_NATURAL_biases_write_offset + relative_idx,
+                val * scale_factor);
         }
     }
 }

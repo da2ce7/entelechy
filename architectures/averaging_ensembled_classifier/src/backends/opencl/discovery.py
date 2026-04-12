@@ -16,22 +16,32 @@ def discover_hardware(device: cl.Device) -> HardwareProfile:
     constraints — this is the Orchestration-tier derivation that the Policy
     tier consumes as an abstract budget.
     """
-    simd_width: int = int(cast(Any, device.get_info(cl.device_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE)))
+    simd_width: int = int(
+        cast(Any, device.get_info(cl.device_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE))
+    )
 
-    cache_line_bytes: int = int(cast(Any, device.get_info(cl.device_info.GLOBAL_MEM_CACHELINE_SIZE)))
+    cache_line_bytes: int = int(
+        cast(Any, device.get_info(cl.device_info.GLOBAL_MEM_CACHELINE_SIZE))
+    )
     if cache_line_bytes == 0:
         cache_line_bytes = 64  # Conservative fallback
 
-    max_work_group_size: int = int(cast(Any, device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)))
-    local_mem_size: int = int(cast(Any, device.get_info(cl.device_info.LOCAL_MEM_SIZE)))
-    global_mem_bytes: int = int(cast(Any, device.get_info(cl.device_info.GLOBAL_MEM_SIZE)))
+    max_work_group_size: int = int(
+        cast(Any, device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE))
+    )
+    local_mem_size: int = int(
+        cast(Any, device.get_info(cl.device_info.LOCAL_MEM_SIZE))
+    )
+    global_mem_bytes: int = int(
+        cast(Any, device.get_info(cl.device_info.GLOBAL_MEM_SIZE))
+    )
 
-    # max_reduce_fan_in: the maximum number of partials a single workgroup
-    # can reduce using local memory ping-pong. Constrained by both work-group
-    # size and local memory (2 * K * element_size for ping-pong).
+    # max_reduce_fan_in: the maximum number of partials a single work-group
+    # can reduce.  Reduction kernels allocate a single flat local tile of
+    # get_local_size(0) × sizeof(element) — NOT a ping-pong pair.
     # Use float32 (4 bytes) as the conservative element size.
     element_size = 4
-    max_fan_in_from_local = local_mem_size // (2 * element_size)
+    max_fan_in_from_local = local_mem_size // element_size
     max_reduce_fan_in = min(max_work_group_size, max_fan_in_from_local)
 
     return HardwareProfile(
