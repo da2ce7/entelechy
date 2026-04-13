@@ -85,7 +85,7 @@ Following the established precedent of Node 11's `src_scalar_FLAG_use_per_item_n
 **Node 4 (Producer):**
 ```c
 __global STORAGE_TYPE *dest_buffer_GLOBAL_hidden_mask,  // may be stub
-uint dest_scalar_FLAG_produce_hidden_mask,               // 0 or 1
+uint out_scalar_FLAG_produce_hidden_mask,               // 0 or 1
 ```
 
 When `FLAG = 0`, the kernel skips mask writes. The host binds a single-element stub buffer.
@@ -99,7 +99,7 @@ When `FLAG = 0`, the kernel skips mask writes. The host binds a single-element s
  *        - Precision Role: "storage"
  *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
  *        - Validation Preconditions: [1] This buffer is written ONLY IF
- *          dest_scalar_FLAG_produce_hidden_mask == 1. [2] If the flag is 1,
+ *          out_scalar_FLAG_produce_hidden_mask == 1. [2] If the flag is 1,
  *          the Host MUST provide a buffer matching the Calculability Proof.
  *          [3] If the flag is 0, the Host MAY provide a minimal 1-element stub
  *          buffer; the kernel SHALL NOT write to it.
@@ -515,7 +515,7 @@ Both abstractions are backend-neutral by construction — they use only integer 
 |------|-------|-------------|
 | 1 | `precision_config.py` | ✅ Add `MaskStrategy` dataclass; add `mask_strategy` property to `PrecisionConfig` |
 | 2 | `__init__.py` | ✅ Export `MaskStrategy` |
-| 3 | `kernels.cl.h` | ✅ Add `dest_buffer_GLOBAL_hidden_mask` (with stub validation), `dest_scalar_FLAG_produce_hidden_mask` to Node 4 |
+| 3 | `kernels.cl.h` | ✅ Add `dest_buffer_GLOBAL_hidden_mask` (with stub validation), `out_scalar_FLAG_produce_hidden_mask` to Node 4 |
 | 4 | `kernels.cl.h` | ✅ Add `src_buffer_GLOBAL_hidden_mask` (with stub validation), `src_scalar_FLAG_use_explicit_hidden_mask` to Nodes 5, 17, 18 |
 | 5 | `phase_1_act.cl.c` | ✅ Implement FLAG-conditional mask production (Node 4) and consumption with sparsity behavior (Node 5) |
 | 6 | `phase_2_learn_D_backprop.cl.c` | ✅ Implement FLAG-conditional mask consumption (Nodes 17, 18) |

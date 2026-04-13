@@ -416,7 +416,7 @@ def build_act_plan(
         {
             "src_scalar_NATURAL_batch_chunk_offset": 0,
             "src_scalar_NATURAL_batch_chunk_count": batch_size,
-            "dest_scalar_FLAG_produce_hidden_mask": flag_explicit,
+            "out_scalar_FLAG_produce_hidden_mask": flag_explicit,
             "src_scalar_NATURAL_total_batch_count": batch_size,
             "src_scalar_NATURAL_input_count": model_spec.input_dim,
             "src_scalar_NATURAL_padded_input_count": model_spec.padded_input_dim,
@@ -1099,7 +1099,7 @@ def build_learn_plan(
         {
             "src_scalar_NATURAL_batch_chunk_offset": 0,
             "src_scalar_NATURAL_batch_chunk_count": batch_size,
-            "dest_scalar_FLAG_produce_hidden_mask": flag_explicit,
+            "out_scalar_FLAG_produce_hidden_mask": flag_explicit,
             "src_scalar_NATURAL_total_batch_count": batch_size,
             "src_scalar_NATURAL_input_count": model_spec.input_dim,
             "src_scalar_NATURAL_padded_input_count": model_spec.padded_input_dim,
@@ -1635,8 +1635,8 @@ def build_learn_plan(
             "src_scalar_REAL_epsilon": model_spec.precision.compute_epsilon,
             "src_scalar_NATURAL_weights_parameter_count": shared_w_param_count,
             "src_scalar_NATURAL_biases_parameter_count": shared_b_param_count,
-            "dest_scalar_NATURAL_weights_write_offset": 0,
-            "dest_scalar_NATURAL_biases_write_offset": 0,
+            "out_scalar_NATURAL_weights_write_offset": 0,
+            "out_scalar_NATURAL_biases_write_offset": 0,
             "src_scalar_NATURAL_num_batch_chunks": batch_size,
         },
         tile_count=1,
@@ -1669,12 +1669,12 @@ def build_learn_plan(
                 "src_scalar_NATURAL_batch_chunk_offset", base=0, stride=1
             ),
             ParameterStride(
-                "dest_scalar_NATURAL_weights_write_offset",
+                "out_scalar_NATURAL_weights_write_offset",
                 base=0,
                 stride=shared_w_param_count,
             ),
             ParameterStride(
-                "dest_scalar_NATURAL_biases_write_offset",
+                "out_scalar_NATURAL_biases_write_offset",
                 base=0,
                 stride=shared_b_param_count,
             ),

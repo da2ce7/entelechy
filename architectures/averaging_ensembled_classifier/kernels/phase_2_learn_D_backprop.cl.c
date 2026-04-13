@@ -329,8 +329,8 @@ __kernel void clip_shared_gradients_chunk(
     COMPUTE_TYPE                 src_scalar_REAL_epsilon,
     uint                         src_scalar_NATURAL_weights_parameter_count,
     uint                         src_scalar_NATURAL_biases_parameter_count,
-    uint                         dest_scalar_NATURAL_weights_write_offset,
-    uint                         dest_scalar_NATURAL_biases_write_offset,
+    uint                         out_scalar_NATURAL_weights_write_offset,
+    uint                         out_scalar_NATURAL_biases_write_offset,
     uint                         src_scalar_NATURAL_num_batch_chunks) {
 
     // Axiom 1.4 — interface completeness.  This parameter exists for the
@@ -416,7 +416,7 @@ __kernel void clip_shared_gradients_chunk(
                 src_buffer_GLOBAL_partial_grad_weights_shared_simd_major, i);
             store_storage(
                 dest_buffer_GLOBAL_clipped_partial_grad_weights_shared_simd_major,
-                dest_scalar_NATURAL_weights_write_offset + i,
+                out_scalar_NATURAL_weights_write_offset + i,
                 val * scale_factor);
         } else {
             const uint relative_idx =
@@ -425,7 +425,7 @@ __kernel void clip_shared_gradients_chunk(
                 src_buffer_GLOBAL_partial_grad_biases_shared, relative_idx);
             store_storage(
                 dest_buffer_GLOBAL_clipped_partial_grad_biases_shared,
-                dest_scalar_NATURAL_biases_write_offset + relative_idx,
+                out_scalar_NATURAL_biases_write_offset + relative_idx,
                 val * scale_factor);
         }
     }

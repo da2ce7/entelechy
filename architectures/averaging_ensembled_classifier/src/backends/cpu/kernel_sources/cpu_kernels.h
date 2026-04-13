@@ -84,7 +84,7 @@ typedef struct {                                                               \
     const STATE_T*   src_buffer_GLOBAL_CONST_biases_shared;                    \
     STORAGE_T*       dest_buffer_GLOBAL_hidden_activations;                    \
     STORAGE_T*       dest_buffer_GLOBAL_hidden_mask;                           \
-    uint             dest_scalar_FLAG_produce_hidden_mask;                     \
+    uint             out_scalar_FLAG_produce_hidden_mask;                     \
     uint             src_scalar_NATURAL_batch_chunk_offset;                    \
     uint             src_scalar_NATURAL_batch_chunk_count;                     \
     uint             src_scalar_NATURAL_total_batch_count;                     \
@@ -353,8 +353,8 @@ typedef struct {                                                               \
     COMPUTE_T        src_scalar_REAL_epsilon;                                  \
     uint             src_scalar_NATURAL_weights_parameter_count;               \
     uint             src_scalar_NATURAL_biases_parameter_count;                \
-    uint             dest_scalar_NATURAL_weights_write_offset;                 \
-    uint             dest_scalar_NATURAL_biases_write_offset;                  \
+    uint             out_scalar_NATURAL_weights_write_offset;                 \
+    uint             out_scalar_NATURAL_biases_write_offset;                  \
     uint             src_scalar_NATURAL_num_batch_chunks;                      \
 } ClipSharedGradsArgs_##SUFFIX;                                                \
                                                                                \

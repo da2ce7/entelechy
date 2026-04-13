@@ -32,7 +32,7 @@ __kernel void forward_pass(
     __global const STATE_TYPE   *src_buffer_GLOBAL_CONST_biases_shared,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_hidden_activations,
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_hidden_mask,
-    uint                         dest_scalar_FLAG_produce_hidden_mask,
+    uint                         out_scalar_FLAG_produce_hidden_mask,
     uint                         src_scalar_NATURAL_batch_chunk_offset,
     uint                         src_scalar_NATURAL_batch_chunk_count,
     uint                         src_scalar_NATURAL_total_batch_count,
@@ -65,7 +65,7 @@ __kernel void forward_pass(
     if (!load_sample_mask(src_buffer_GLOBAL_sample_mask, effective_bid)) {
         store_storage(dest_buffer_GLOBAL_hidden_activations, hidden_idx,
                       COMPUTE_ZERO);
-        if (dest_scalar_FLAG_produce_hidden_mask) {
+        if (out_scalar_FLAG_produce_hidden_mask) {
             store_storage(dest_buffer_GLOBAL_hidden_mask, hidden_idx,
                           COMPUTE_ZERO);
         }
@@ -128,7 +128,7 @@ __kernel void forward_pass(
 
     // When enabled, the compute-precision derivative truth is captured
     // before any storage narrowing (see CONCEPT.md §2, mask strategy).
-    if (dest_scalar_FLAG_produce_hidden_mask) {
+    if (out_scalar_FLAG_produce_hidden_mask) {
         const COMPUTE_TYPE mask_val =
             (activation > COMPUTE_ZERO) ? COMPUTE_ONE : COMPUTE_ZERO;
         store_storage(dest_buffer_GLOBAL_hidden_mask, hidden_idx, mask_val);

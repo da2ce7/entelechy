@@ -79,7 +79,7 @@ class ForwardPassBinding(KernelBinding):
             buf("src_buffer_GLOBAL_CONST_biases_shared"),
             buf("dest_buffer_GLOBAL_hidden_activations"),
             buf("dest_buffer_GLOBAL_hidden_mask"),
-            u32("dest_scalar_FLAG_produce_hidden_mask"),
+            u32("out_scalar_FLAG_produce_hidden_mask"),
             u32("src_scalar_NATURAL_batch_chunk_offset"),
             u32("src_scalar_NATURAL_batch_chunk_count"),
             u32("src_scalar_NATURAL_total_batch_count"),

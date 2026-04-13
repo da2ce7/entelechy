@@ -47,6 +47,7 @@ Every buffer and scalar parameter begins with a **flow prefix** that declares th
 | :----- | :-------- | :-------------- |
 | `src_` | **Read-only input.** The kernel reads this parameter but never modifies it. | Provide a valid, fully-populated buffer or scalar. |
 | `dest_` | **Write-only output.** The kernel writes to this parameter. It does not read prior contents unless its `Initialization Contract` prescribes host-provided initial values. | Provide a buffer of the declared size; the kernel is the sole producer. |
+| `out_` | **Output-disposition input.** (Scalars only.) The kernel reads this scalar to configure a write operation on a `dest_` buffer. The kernel never writes to it. Applicable to scalars only. | Provide a valid value consistent with the corresponding `dest_` buffer's Placement, Initialization, or Conditional Buffer Contract. |
 | `update_` | **Read-write mutation.** The kernel reads existing contents and modifies them in-place. Used for `LOCAL` scratch memory and stateful parameter updates (e.g., optimizer moment vectors). | Provide a buffer with valid prior contents (for `GLOBAL_`) or a correctly-sized allocation (for `LOCAL_`). |
 | `sync_` | **Atomic synchronization.** The kernel uses atomic operations for cross-work-group coordination. Implies `update_` semantics with additional atomicity guarantees. | Initialize before dispatch (typically to zero). |
 
@@ -77,9 +78,11 @@ A scalar identifier shall be constructed as:
 
 `[Flow] :: "scalar" :: [NumberType] :: [ContextAndUsage]`
 
-- **`[Flow]`**: `src_` \| `dest_`
+- **`[Flow]`**: `src_` \| `dest_` \| `out_`
 - **`[NumberType]`**: A mandatory prefix defining the abstract numerical domain (§2.4).
 - **`[ContextAndUsage]`**: A canonical identifier defined exclusively in **Article 8: Canonical Lexicon**.
+
+> **Note on `out_` Flow.** The `out_` flow prefix is reserved for scalars that configure a `dest_` buffer's write geometry, activation predicate, or placement. Parameters with `out_` flow SHOULD carry `Validation Preconditions` identifying the associated `dest_` buffer and the cross-parameter constraint (e.g., `out_scalar_NATURAL_write_offset + element_count <= buffer_extent`).
 
 ### 2.4. Scalar `[NumberType]` Taxonomy
 
@@ -510,12 +513,12 @@ __kernel void illustrative_kernel_name(
     /**
      * @param dest_buffer_GLOBAL_partial_results The collection buffer
      *        for this unit's partial output.
-     *        - Tensor Shape: (dest_scalar_NATURAL_total_chunks,
+     *        - Tensor Shape: (out_scalar_NATURAL_total_chunks,
      *          RESULT_ELEMENTS_PER_CHUNK)
      *        - Padding Contract: {Type: NONE}
      *        - Initialization Contract: {Type: ZERO_REQUIRED}
      *        - Precision Role: "storage"
-     *        - Calculability Proof: [dest_scalar_NATURAL_total_chunks,
+     *        - Calculability Proof: [out_scalar_NATURAL_total_chunks,
      *          Compile-time constant: RESULT_ELEMENTS_PER_CHUNK]
      *        - Validation Preconditions: Host shall zero-initialize
      *          prior to dispatch.
@@ -549,8 +552,8 @@ __kernel void illustrative_kernel_name(
     uint src_scalar_NATURAL_item_count,
     uint src_scalar_NATURAL_total_item_count,
     float src_scalar_REAL_processing_threshold,
-    uint dest_scalar_NATURAL_output_chunk_index,
-    uint dest_scalar_NATURAL_total_chunks
+    uint out_scalar_NATURAL_output_chunk_index,
+    uint out_scalar_NATURAL_total_chunks
 );
 ```
 
@@ -665,8 +668,7 @@ Terms are defined in singular form. Plural forms are implicitly valid when combi
 | `intermediate_` | A buffer at a transitional reduction stage — past `partial_` (raw/clipped) but before `summed_` (fully reduced). |
 | `final_` | A fully processed, normalized result ready for consumption by a final state-modifying kernel (e.g., optimizer). |
 | `in_` | Pertaining to a source buffer. |
-| `out_` | Pertaining to a destination buffer (marks buffer affinity). |
-| `write_` | Pertaining to a computed write position within a destination buffer. Distinct from `out_` in that `write_` qualifies an address *offset* calculated by the host for placement within a collection buffer. |
+| `write_` | Pertaining to a computed write position within a destination buffer. Qualifies an address *offset* calculated by the host for placement within a collection buffer. |
 
 #### 4.2. Suffixes
 

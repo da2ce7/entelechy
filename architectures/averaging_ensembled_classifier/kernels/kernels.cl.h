@@ -32,15 +32,25 @@
 // Adherence to this contract ensures strict separation of concerns and
 // bidirectional implementation independence.
 
-// Check for OpenCL environment (target: OpenCL 1.2 without atomics)
+// =====================================================================
+// OpenCL Environment Detection
+// =====================================================================
+
 #ifdef __OPENCL_VERSION__
-// Require OpenCL 1.2 or later
+
 #if __OPENCL_VERSION__ < 120
 #error "OpenCL 1.2 or newer is required. Please use a compatible device/driver."
 #endif
 
-// --- Mandatory Build-Time Symbols (CONTRACT.md Article 6, amended by ADR-020 §3.6) ---
+// =====================================================================
+// 1. Mandatory Build-Time Symbol Validation
+//    (CONTRACT.md Article 6, amended by ADR-020 §3.6, ADR-025 §4)
+//
+//    All symbols must be provided by the host build system via -D flags.
+//    Missing symbols produce immediate compilation failure.
+// =====================================================================
 
+// --- Precision-Role Type Symbols ---
 #ifndef STORAGE_TYPE
 #error "System Contract Violation: STORAGE_TYPE must be defined by the host build system."
 #endif
@@ -49,6 +59,17 @@
 #endif
 #ifndef STATE_TYPE
 #error "System Contract Violation: STATE_TYPE must be defined by the host build system."
+#endif
+
+// --- Storage-Role Type Flags ---
+#if !defined(STORAGE_TYPE_IS_FP8)
+#error "System Contract Violation: STORAGE_TYPE_IS_FP8 must be defined by the build system."
+#endif
+#if !defined(STORAGE_TYPE_IS_E4M3)
+#error "System Contract Violation: STORAGE_TYPE_IS_E4M3 must be defined by the build system."
+#endif
+#if !defined(STORAGE_TYPE_IS_E5M2)
+#error "System Contract Violation: STORAGE_TYPE_IS_E5M2 must be defined by the build system."
 #endif
 #ifndef STORAGE_TYPE_IS_HALF
 #error "System Contract Violation: STORAGE_TYPE_IS_HALF must be defined by the host build system."
@@ -59,6 +80,8 @@
 #ifndef STORAGE_TYPE_IS_DOUBLE
 #error "System Contract Violation: STORAGE_TYPE_IS_DOUBLE must be defined by the host build system."
 #endif
+
+// --- Compute-Role Type Flags ---
 #ifndef COMPUTE_TYPE_IS_HALF
 #error "System Contract Violation: COMPUTE_TYPE_IS_HALF must be defined by the host build system."
 #endif
@@ -68,6 +91,8 @@
 #ifndef COMPUTE_TYPE_IS_DOUBLE
 #error "System Contract Violation: COMPUTE_TYPE_IS_DOUBLE must be defined by the host build system."
 #endif
+
+// --- State-Role Type Flags ---
 #ifndef STATE_TYPE_IS_HALF
 #error "System Contract Violation: STATE_TYPE_IS_HALF must be defined by the host build system."
 #endif
@@ -77,6 +102,8 @@
 #ifndef STATE_TYPE_IS_DOUBLE
 #error "System Contract Violation: STATE_TYPE_IS_DOUBLE must be defined by the host build system."
 #endif
+
+// --- Hardware Profile & Tuning Symbols ---
 #ifndef SIMD_WIDTH
 #error "System Contract Violation: SIMD_WIDTH must be defined by the host build system."
 #endif
@@ -87,7 +114,57 @@
 #error "System Contract Violation: NUMERICAL_STABILITY_EPSILON must be defined by the host build system."
 #endif
 
-// Enable FP16 extension if using half precision in storage or compute roles.
+// =====================================================================
+// 2. Compile-Time Invariant Enforcement (CONTRACT.md Article 6.4)
+//
+//    These guards provide defense-in-depth against build-system
+//    misconfigurations, complementing PrecisionConfig.__post_init__
+//    runtime validation.
+// =====================================================================
+
+// --- FP8 Format Mutual Exclusivity (CONTRACT.md Article 6.3) ---
+#if STORAGE_TYPE_IS_E4M3 && STORAGE_TYPE_IS_E5M2
+#error "System Contract Violation: E4M3 and E5M2 are mutually exclusive."
+#endif
+#if STORAGE_TYPE_IS_FP8 && !STORAGE_TYPE_IS_E4M3 && !STORAGE_TYPE_IS_E5M2
+#error "System Contract Violation: STORAGE_TYPE_IS_FP8 requires exactly one of E4M3 or E5M2."
+#endif
+#if !STORAGE_TYPE_IS_FP8 && (STORAGE_TYPE_IS_E4M3 || STORAGE_TYPE_IS_E5M2)
+#error "System Contract Violation: E4M3/E5M2 flags require STORAGE_TYPE_IS_FP8=1."
+#endif
+
+// --- Precision Role Exactly-One Selection ---
+#if (STORAGE_TYPE_IS_FP8 + STORAGE_TYPE_IS_HALF + STORAGE_TYPE_IS_FLOAT + STORAGE_TYPE_IS_DOUBLE) != 1
+#error "System Contract Violation: Exactly one STORAGE_TYPE_IS_* flag must be set."
+#endif
+#if (COMPUTE_TYPE_IS_HALF + COMPUTE_TYPE_IS_FLOAT + COMPUTE_TYPE_IS_DOUBLE) != 1
+#error "System Contract Violation: Exactly one COMPUTE_TYPE_IS_* flag must be set."
+#endif
+#if (STATE_TYPE_IS_HALF + STATE_TYPE_IS_FLOAT + STATE_TYPE_IS_DOUBLE) != 1
+#error "System Contract Violation: Exactly one STATE_TYPE_IS_* flag must be set."
+#endif
+
+// --- PrecisionConfig Invariant: storage.itemsize <= compute.itemsize ---
+#if STORAGE_TYPE_IS_DOUBLE && !COMPUTE_TYPE_IS_DOUBLE
+#error "System Contract Violation: storage=double requires compute=double (storage <= compute)"
+#endif
+#if STORAGE_TYPE_IS_FLOAT && COMPUTE_TYPE_IS_HALF
+#error "System Contract Violation: storage=float requires compute >= float (storage <= compute)"
+#endif
+
+// --- PrecisionConfig Invariant: storage.itemsize <= state.itemsize ---
+#if STORAGE_TYPE_IS_DOUBLE && !STATE_TYPE_IS_DOUBLE
+#error "System Contract Violation: storage=double requires state=double (storage <= state)"
+#endif
+#if STORAGE_TYPE_IS_FLOAT && STATE_TYPE_IS_HALF
+#error "System Contract Violation: storage=float requires state >= float (storage <= state)"
+#endif
+
+// =====================================================================
+// 3. Extension Enablement
+// =====================================================================
+
+// Enable FP16 extension if any precision role uses half.
 #if STORAGE_TYPE_IS_HALF
 #if !defined(cl_khr_fp16)
 #error "FP16 extension (cl_khr_fp16) required for half precision storage but not supported by device"
@@ -107,15 +184,19 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #endif
 
-// Enable FP64 extension if using double precision in compute or state roles.
-#if COMPUTE_TYPE_IS_DOUBLE || STATE_TYPE_IS_DOUBLE
+// Enable FP64 extension if any precision role uses double.
+#if STORAGE_TYPE_IS_DOUBLE || COMPUTE_TYPE_IS_DOUBLE || STATE_TYPE_IS_DOUBLE
 #if !defined(cl_khr_fp64)
 #error "FP64 extension (cl_khr_fp64) required for double precision but not supported by device"
 #endif
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 #endif
 
-// Compute-role zero literal
+// =====================================================================
+// 4. Compile-Time Constants
+// =====================================================================
+
+// --- Compute-Role Literal Constants ---
 #if COMPUTE_TYPE_IS_DOUBLE
 #define COMPUTE_ZERO 0.0
 #define COMPUTE_ONE  1.0
@@ -144,80 +225,34 @@
 #define COMPUTE_FP_MAX FLT_MAX
 #endif
 
+// --- Kernel Work-Group Attribute ---
 // KERNEL_ATTR provides a work-group size hint for backends that choose to
 // apply it. This header specifies interfaces only; actual application of
 // the attribute is a backend rendering-tier concern (OpenCL may apply it,
 // Vulkan uses specialization constants, CPU backend has no work-groups).
 #define KERNEL_ATTR __attribute__((work_group_size_hint(SIMD_WIDTH, 1, 1)))
 
-// --- Precision Boundary Abstractions (ADR-020 §4.4, ADR-023 §1, ADR-025 §6) ---
-// These are the sole mechanism for crossing precision role boundaries.
-// When STORAGE_TYPE == COMPUTE_TYPE, these compile to identity casts
-// that any OpenCL compiler eliminates. No #ifdef on type equality is
-// used anywhere in the kernel sources.
+// =====================================================================
+// 5. Precision Boundary Abstractions
+//    (ADR-020 §4.4, ADR-023 §1, ADR-025 §6, ADR-027)
+//
+//    These functions are the sole mechanism for crossing precision role
+//    boundaries. When STORAGE_TYPE == COMPUTE_TYPE, all conversions
+//    compile to identity casts that any OpenCL compiler eliminates.
+//    No #ifdef on type equality is used anywhere in the kernel sources.
+// =====================================================================
 
-// --- FP8 Storage Support (ADR-025 §4, §6) ---
-// FP8 flags are mandatory build-time symbols provided by build_compiler_flags().
-// Consistent with the project's strict contract philosophy: explicit failures
-// over silent defaults.
-#if !defined(STORAGE_TYPE_IS_FP8)
-#error "System Contract Violation: STORAGE_TYPE_IS_FP8 must be defined by the build system."
-#endif
-#if !defined(STORAGE_TYPE_IS_E4M3)
-#error "System Contract Violation: STORAGE_TYPE_IS_E4M3 must be defined by the build system."
-#endif
-#if !defined(STORAGE_TYPE_IS_E5M2)
-#error "System Contract Violation: STORAGE_TYPE_IS_E5M2 must be defined by the build system."
-#endif
-
-// --- FP8 Format Mutual Exclusivity Checks (CONTRACT.md Article 6) ---
-#if STORAGE_TYPE_IS_E4M3 && STORAGE_TYPE_IS_E5M2
-#error "System Contract Violation: E4M3 and E5M2 are mutually exclusive."
-#endif
-#if STORAGE_TYPE_IS_FP8 && !STORAGE_TYPE_IS_E4M3 && !STORAGE_TYPE_IS_E5M2
-#error "System Contract Violation: STORAGE_TYPE_IS_FP8 requires exactly one of E4M3 or E5M2."
-#endif
-#if !STORAGE_TYPE_IS_FP8 && (STORAGE_TYPE_IS_E4M3 || STORAGE_TYPE_IS_E5M2)
-#error "System Contract Violation: E4M3/E5M2 flags require STORAGE_TYPE_IS_FP8=1."
-#endif
-
-// --- Precision Role Exactly-One Selection (CONTRACT.md Article 6) ---
-// Each precision role must have exactly one type flag set.
-#if (STORAGE_TYPE_IS_FP8 + STORAGE_TYPE_IS_HALF + STORAGE_TYPE_IS_FLOAT + STORAGE_TYPE_IS_DOUBLE) != 1
-#error "System Contract Violation: Exactly one STORAGE_TYPE_IS_* flag must be set."
-#endif
-#if (COMPUTE_TYPE_IS_HALF + COMPUTE_TYPE_IS_FLOAT + COMPUTE_TYPE_IS_DOUBLE) != 1
-#error "System Contract Violation: Exactly one COMPUTE_TYPE_IS_* flag must be set."
-#endif
-#if (STATE_TYPE_IS_HALF + STATE_TYPE_IS_FLOAT + STATE_TYPE_IS_DOUBLE) != 1
-#error "System Contract Violation: Exactly one STATE_TYPE_IS_* flag must be set."
-#endif
-
-// --- PrecisionConfig Invariant: storage.itemsize <= compute.itemsize ---
-#if STORAGE_TYPE_IS_DOUBLE && !COMPUTE_TYPE_IS_DOUBLE
-#error "System Contract Violation: storage=double requires compute=double (storage <= compute)"
-#endif
-#if STORAGE_TYPE_IS_FLOAT && COMPUTE_TYPE_IS_HALF
-#error "System Contract Violation: storage=float requires compute >= float (storage <= compute)"
-#endif
-
-// --- PrecisionConfig Invariant: storage.itemsize <= state.itemsize ---
-#if STORAGE_TYPE_IS_DOUBLE && !STATE_TYPE_IS_DOUBLE
-#error "System Contract Violation: storage=double requires state=double (storage <= state)"
-#endif
-#if STORAGE_TYPE_IS_FLOAT && STATE_TYPE_IS_HALF
-#error "System Contract Violation: storage=float requires state >= float (storage <= state)"
-#endif
-
-// --- FP8 Conversion Tables (ADR-025 §6.1) ---
-// Software emulation path for FP8 storage.
-// Tables store FP32 values; FP16 compute narrows via (half) cast, FP64 widens.
+// --- 5a. FP8 Software Codec (ADR-025 §4, §6) ---
+//
+// Software emulation path for FP8 storage. Tables store FP32 values;
+// FP16 compute narrows via (half) cast, FP64 widens.
 // Generated by: python scripts/generate_fp8_lut.py --backend opencl
+
 #if STORAGE_TYPE_IS_FP8
 #include "fp8_lut.gen.h"
 
-// --- FP8 Load (storage → compute) ---
-// Returns COMPUTE_TYPE (half, float, or double)
+// FP8 Load (storage → compute)
+// Returns COMPUTE_TYPE (half, float, or double).
 // LUT stores float values. FP8→float is lossless (all 256 FP8 values
 // are exactly representable in float). FP16 compute narrows; FP64 widens.
 static inline COMPUTE_TYPE load_storage_fp8(__global const uchar *buf, size_t idx) {
@@ -228,15 +263,15 @@ static inline COMPUTE_TYPE load_storage_fp8(__global const uchar *buf, size_t id
 #endif
 
 #if COMPUTE_TYPE_IS_HALF
-    return (half)f32_val;    // Narrow to FP16 compute
+    return (half)f32_val;
 #elif COMPUTE_TYPE_IS_DOUBLE
-    return (double)f32_val;  // Widen to FP64 compute (lossless)
+    return (double)f32_val;
 #else
-    return f32_val;          // FP32 compute
+    return f32_val;
 #endif
 }
 
-// --- FP8 Store (compute → storage) ---
+// FP8 Store (compute → storage)
 // Accepts COMPUTE_TYPE, converts to FP8.
 //
 // NaN handling: NaN input maps to zero for both E4M3 and E5M2.
@@ -246,27 +281,27 @@ static inline COMPUTE_TYPE load_storage_fp8(__global const uchar *buf, size_t id
 // ml_dtypes.float8_e4m3fn behavior and the CPU backend (cpu_fp8.h).
 static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TYPE val) {
 #if COMPUTE_TYPE_IS_DOUBLE
-    // NaN check BEFORE clamp: fmin/fmax(NaN, x) == x per IEEE 754 minNum/maxNum,
-    // so NaN would be silently converted to ±FLT_MAX by the clamp below.
+    // NaN check BEFORE clamp: fmin/fmax(NaN, x) == x per IEEE 754
+    // minNum/maxNum, so NaN would be silently converted to ±FLT_MAX
+    // by the clamp below.
     double dval = (double)val;
     if (isnan(dval)) {
         buf[idx] = 0x00;
         return;
     }
-    // Defense-in-depth: clamp before double→float narrowing to prevent UB
+    // Defense-in-depth: clamp to FLT_MAX range before double→float narrowing
+    // to prevent infinity from reaching the FP8 encoder.
     dval = fmin(fmax(dval, -(double)FLT_MAX), (double)FLT_MAX);
     float fval = (float)dval;
 #else
     // Narrow to float for bit manipulation (FP8 fits in float exactly)
     float fval = (float)val;
-    // NaN → zero (see rationale above)
     if (isnan(fval)) {
         buf[idx] = 0x00;
         return;
     }
 #endif
 
-    // Handle sign
     uint sign = (fval < 0.0f) ? 1 : 0;
     fval = fabs(fval);
 
@@ -286,27 +321,25 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
 
     // Extract FP32 exponent and mantissa via bit cast
     uint fbits = as_uint(fval);
-    int exp32 = ((fbits >> 23) & 0xFF) - 127;  // Unbiased exponent
-    uint mant32 = fbits & 0x7FFFFF;            // 23-bit mantissa
+    int exp32 = ((fbits >> 23) & 0xFF) - 127;
+    uint mant32 = fbits & 0x7FFFFF;
 
     // Compute FP8 exponent
     int exp8 = exp32 + 7;  // E4M3 bias = 7
 
     // Handle subnormals
     // NOTE: Subnormal rounding omits shifted-out bits from sticky calculation.
-    // Max error: 1 ULP of FP8 subnormal (2^-9). Below quantization floor; no fix required.
+    // Max error: 1 ULP of FP8 subnormal (2^-9). Below quantization floor.
     if (exp8 <= 0) {
         int shift = 1 - exp8;
         if (shift >= 24) {
-            buf[idx] = sign ? 0x80 : 0x00;  // Underflow to zero
+            buf[idx] = sign ? 0x80 : 0x00;
             return;
         }
         mant32 = (mant32 | 0x800000) >> shift;
         exp8 = 0;
     } else if (exp8 > 15) {
         // Defense-in-depth: unreachable for well-formed floats.
-        // exp8 > 15 overflows the 4-bit exponent field; saturate.
-        // (exp8 == 15 is valid: values 256–448.)
         buf[idx] = sign ? 0xFE : 0x7E;
         return;
     }
@@ -358,11 +391,11 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
 
     // Handle subnormals
     // NOTE: Subnormal rounding omits shifted-out bits from sticky calculation.
-    // Max error: 1 ULP of FP8 E5M2 subnormal (2^-16). Below quantization floor; no fix required.
+    // Max error: 1 ULP of FP8 E5M2 subnormal (2^-16). Below quantization floor.
     if (exp8 <= 0) {
         int shift = 1 - exp8;
         if (shift >= 24) {
-            buf[idx] = sign ? 0x80 : 0x00;  // Underflow to zero
+            buf[idx] = sign ? 0x80 : 0x00;
             return;
         }
         mant32 = (mant32 | 0x800000) >> shift;
@@ -395,12 +428,15 @@ static inline void store_storage_fp8(__global uchar *buf, size_t idx, COMPUTE_TY
 
 #endif // STORAGE_TYPE_IS_FP8
 
+// --- 5b. Storage-Role Load/Store ---
+
 static inline COMPUTE_TYPE load_storage(
     __global const STORAGE_TYPE *buf, size_t idx)
 {
 #if STORAGE_TYPE_IS_FP8
     return load_storage_fp8((__global const uchar *)buf, idx);
 #elif STORAGE_TYPE_IS_HALF
+    // Explicit cast for self-documentation; STORAGE_TYPE is half here.
     return (COMPUTE_TYPE)vload_half(idx, (__global const half *)buf);
 #else
     return (COMPUTE_TYPE)buf[idx];
@@ -415,12 +451,15 @@ static inline void store_storage(
 #elif STORAGE_TYPE_IS_HALF
     // vstore_half accepts float/double and performs round-to-nearest-even
     // narrowing internally; no explicit (half) pre-cast is needed.
+    // Explicit cast for self-documentation; STORAGE_TYPE is half here.
     vstore_half(val, idx, (__global half *)buf);
 #else
     buf[idx] = (STORAGE_TYPE)val;
 #endif
 }
 
+// --- 5c. State-Role Load/Store ---
+//
 // FP64 Precision Boundary Notes (ADR-024 §3.2):
 // When STATE_TYPE = double and COMPUTE_TYPE = float:
 //   load_state: double → float narrowing (precision loss accepted;
@@ -440,7 +479,7 @@ static inline void store_storage(
 //   load_storage() uses vload_half() for half-precision storage, while
 //   load_state() uses plain array access. This asymmetry is intentional:
 //   vload_half() was historically required because some OpenCL 1.x
-//   implementations supported half storage but not half arithmetic—
+//   implementations supported half storage but not half arithmetic —
 //   vload_half() returns float without requiring full cl_khr_fp16 support.
 //   With cl_khr_fp16 active (required when any role type is half), plain
 //   access works identically for state buffers. Both approaches are correct.
@@ -465,7 +504,7 @@ static inline void store_state_update(
     buf[idx] = (STATE_TYPE)val;
 }
 
-// --- Sample Mask Bitmask Access (ADR-031) ---
+// --- 5d. Sample Mask Bitmask Access (ADR-031) ---
 // Packed uint bitmask with 32 samples per word, LSB-first.
 // Compiles to 3 integer ALU operations.
 static inline uint load_sample_mask(
@@ -474,14 +513,15 @@ static inline uint load_sample_mask(
     return (mask_words[sample_index >> 5u] >> (sample_index & 31u)) & 1u;
 }
 
-// === Accumulation Precision Type (ADR-027) ===
+// --- 5e. Accumulation Precision Type System (ADR-027) ---
 //
-// Stateful-update kernels perform EMA accumulation in ACCUM_TYPE, defined as
-// max(COMPUTE_TYPE, STATE_TYPE). This preserves full state precision when
-// STATE_TYPE > COMPUTE_TYPE, preventing erosion over unbounded training steps.
+// Stateful-update kernels perform EMA accumulation in ACCUM_TYPE, defined
+// as max(COMPUTE_TYPE, STATE_TYPE). This preserves full state precision
+// when STATE_TYPE > COMPUTE_TYPE, preventing erosion over unbounded
+// training steps.
 //
-// When STATE_TYPE <= COMPUTE_TYPE, ACCUM_TYPE == COMPUTE_TYPE and all casts
-// are identity operations eliminated by the compiler.
+// When STATE_TYPE <= COMPUTE_TYPE, ACCUM_TYPE == COMPUTE_TYPE and all
+// casts are identity operations eliminated by the compiler.
 //
 // ACCUM_TYPE coverage matrix (S=STATE, C=COMPUTE):
 //   S=double, C=double → else branch:  ACCUM=double (COMPUTE) ✓
@@ -514,7 +554,7 @@ static inline uint load_sample_mask(
     #define ACCUM_ZERO COMPUTE_ZERO
 #endif
 
-// --- State-Precision Accumulation Abstractions ---
+// --- 5f. Accumulation-Precision Abstractions ---
 
 // Load state value at accumulation precision (preserves full STATE_TYPE bits)
 static inline ACCUM_TYPE load_state_for_accum(
@@ -534,30 +574,38 @@ static inline ACCUM_TYPE load_state_for_accum(
 static inline void store_state_from_accum(
     __global STATE_TYPE *buf, size_t idx, ACCUM_TYPE val)
 {
-    // Narrows to STATE_TYPE when ACCUM_TYPE > STATE_TYPE (acceptable:
-    // state role defines the fidelity contract for persistent values).
     buf[idx] = (STATE_TYPE)val;
 }
 
 // Widen compute-role value to accumulation precision (for EMA inputs)
 static inline ACCUM_TYPE widen_to_accum(COMPUTE_TYPE val)
 {
-    return (ACCUM_TYPE)val;  // Widening or identity
+    return (ACCUM_TYPE)val;
 }
 
 // Narrow accumulation result to compute precision (for bias-corrected values)
 static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
 {
-    return (COMPUTE_TYPE)val;  // Narrowing or identity
+    return (COMPUTE_TYPE)val;
 }
 
-// --- End Precision Boundary Abstractions ---------------------------------
+// =====================================================================
+// End of OpenCL-Specific Infrastructure
+// =====================================================================
 
-#else
-// Host/C++ mode stub definitions
-#include <float.h> // For FLT_MAX
-#include <math.h>  // For fmax, sqrt, etc.
-#include <stdio.h> // For printf in debug stubs
+#else // !__OPENCL_VERSION__
+
+// =====================================================================
+// Host / C++ Mode Stub Definitions
+//
+// Provides minimal type shims and function stubs so that header
+// parsing, IDE tooling, and host-mode unit tests can process this
+// file without an OpenCL compiler.
+// =====================================================================
+
+#include <float.h>
+#include <math.h>
+#include <stdio.h>
 
 #ifndef __kernel
 #define __kernel
@@ -575,6 +623,8 @@ static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
 #define uint unsigned int
 #endif
 #define KERNEL_ATTR
+
+// --- Precision-Role Type Defaults ---
 #ifndef STORAGE_TYPE
 #define STORAGE_TYPE float
 #endif
@@ -584,6 +634,8 @@ static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
 #ifndef STATE_TYPE
 #define STATE_TYPE float
 #endif
+
+// --- Storage-Role Type Flags ---
 #ifndef STORAGE_TYPE_IS_HALF
 #define STORAGE_TYPE_IS_HALF 0
 #endif
@@ -592,24 +644,6 @@ static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
 #endif
 #ifndef STORAGE_TYPE_IS_DOUBLE
 #define STORAGE_TYPE_IS_DOUBLE 0
-#endif
-#ifndef COMPUTE_TYPE_IS_HALF
-#define COMPUTE_TYPE_IS_HALF 0
-#endif
-#ifndef COMPUTE_TYPE_IS_FLOAT
-#define COMPUTE_TYPE_IS_FLOAT 1
-#endif
-#ifndef COMPUTE_TYPE_IS_DOUBLE
-#define COMPUTE_TYPE_IS_DOUBLE 0
-#endif
-#ifndef STATE_TYPE_IS_HALF
-#define STATE_TYPE_IS_HALF 0
-#endif
-#ifndef STATE_TYPE_IS_FLOAT
-#define STATE_TYPE_IS_FLOAT 1
-#endif
-#ifndef STATE_TYPE_IS_DOUBLE
-#define STATE_TYPE_IS_DOUBLE 0
 #endif
 #ifndef STORAGE_TYPE_IS_FP8
 #define STORAGE_TYPE_IS_FP8 0
@@ -620,12 +654,37 @@ static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
 #ifndef STORAGE_TYPE_IS_E5M2
 #define STORAGE_TYPE_IS_E5M2 0
 #endif
+
 // Host-mode FP8 guard: FP8 storage requires the full OpenCL backend's
 // LUT-based decode and algorithmic encode paths. Host-mode stubs do not
 // support FP8.
 #if STORAGE_TYPE_IS_FP8
 #error "FP8 storage is not supported in host-mode stubs. Use the CPU backend."
 #endif
+
+// --- Compute-Role Type Flags ---
+#ifndef COMPUTE_TYPE_IS_HALF
+#define COMPUTE_TYPE_IS_HALF 0
+#endif
+#ifndef COMPUTE_TYPE_IS_FLOAT
+#define COMPUTE_TYPE_IS_FLOAT 1
+#endif
+#ifndef COMPUTE_TYPE_IS_DOUBLE
+#define COMPUTE_TYPE_IS_DOUBLE 0
+#endif
+
+// --- State-Role Type Flags ---
+#ifndef STATE_TYPE_IS_HALF
+#define STATE_TYPE_IS_HALF 0
+#endif
+#ifndef STATE_TYPE_IS_FLOAT
+#define STATE_TYPE_IS_FLOAT 1
+#endif
+#ifndef STATE_TYPE_IS_DOUBLE
+#define STATE_TYPE_IS_DOUBLE 0
+#endif
+
+// --- Compute-Role Constants ---
 #ifndef COMPUTE_ZERO
 #define COMPUTE_ZERO 0.0f
 #endif
@@ -635,6 +694,8 @@ static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
 #ifndef COMPUTE_FP_MAX
 #define COMPUTE_FP_MAX FLT_MAX
 #endif
+
+// --- Hardware Profile Defaults ---
 #ifndef SIMD_WIDTH
 #define SIMD_WIDTH 1
 #endif
@@ -644,6 +705,8 @@ static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
 #ifndef NUMERICAL_STABILITY_EPSILON
 #define NUMERICAL_STABILITY_EPSILON 1
 #endif
+
+// --- OpenCL Built-in Stubs ---
 #define CLK_LOCAL_MEM_FENCE 0x01
 #define CLK_GLOBAL_MEM_FENCE 0x02
 #ifndef max
@@ -652,6 +715,7 @@ static inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val)
 #ifndef min
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #endif
+
 inline int          get_global_id(int dim) { return 0; }
 inline int          get_local_id(int dim) { return 0; }
 inline int          get_group_id(int dim) { return 0; }
@@ -663,20 +727,21 @@ inline COMPUTE_TYPE clamp(COMPUTE_TYPE val, COMPUTE_TYPE min_val, COMPUTE_TYPE m
 inline COMPUTE_TYPE select(COMPUTE_TYPE a, COMPUTE_TYPE b, int c) { return (c) ? b : a; }
 // OpenCL pown: use powf to avoid conflict with C23 pown declaration
 #define pown(base, exp) ((COMPUTE_TYPE)powf((float)(base), (float)(exp)))
-// Host-mode precision boundary stubs (identity operations)
+
+// --- Precision Boundary Stubs (identity operations) ---
 inline COMPUTE_TYPE load_storage(const STORAGE_TYPE *buf, size_t idx) { return (COMPUTE_TYPE)buf[idx]; }
 inline void store_storage(STORAGE_TYPE *buf, size_t idx, COMPUTE_TYPE val) { buf[idx] = (STORAGE_TYPE)val; }
 inline COMPUTE_TYPE load_state(const STATE_TYPE *buf, size_t idx) { return (COMPUTE_TYPE)buf[idx]; }
 inline void store_state(STATE_TYPE *buf, size_t idx, COMPUTE_TYPE val) { buf[idx] = (STATE_TYPE)val; }
-// Semantically distinct from store_state(): marks an in-place optimizer
-// state mutation. Currently identical; exists for future extensibility.
 inline void store_state_update(STATE_TYPE *buf, size_t idx, COMPUTE_TYPE val) { buf[idx] = (STATE_TYPE)val; }
-// ADR-031: Sample mask bitmask access — host-mode stub
+
+// --- Sample Mask Stub (ADR-031) ---
 inline unsigned int load_sample_mask(const unsigned int *mask_words, unsigned int sample_index) {
     return (mask_words[sample_index >> 5u] >> (sample_index & 31u)) & 1u;
 }
-// Host-mode accumulation-precision stubs (ADR-027)
-// In host mode, STATE_TYPE == COMPUTE_TYPE == float, so ACCUM_TYPE = COMPUTE_TYPE
+
+// --- Accumulation-Precision Stubs (ADR-027) ---
+// In host mode, STATE_TYPE == COMPUTE_TYPE == float, so ACCUM_TYPE = COMPUTE_TYPE.
 #ifndef ACCUM_TYPE
 #define ACCUM_TYPE COMPUTE_TYPE
 #endif
@@ -689,11 +754,19 @@ inline unsigned int load_sample_mask(const unsigned int *mask_words, unsigned in
 #ifndef ACCUM_ZERO
 #define ACCUM_ZERO 0.0f
 #endif
-inline ACCUM_TYPE load_state_for_accum(const STATE_TYPE *buf, size_t idx) { return (ACCUM_TYPE)buf[idx]; }
-inline void store_state_from_accum(STATE_TYPE *buf, size_t idx, ACCUM_TYPE val) { buf[idx] = (STATE_TYPE)val; }
-inline ACCUM_TYPE widen_to_accum(COMPUTE_TYPE val) { return (ACCUM_TYPE)val; }
+
+inline ACCUM_TYPE   load_state_for_accum(const STATE_TYPE *buf, size_t idx) { return (ACCUM_TYPE)buf[idx]; }
+inline void         store_state_from_accum(STATE_TYPE *buf, size_t idx, ACCUM_TYPE val) { buf[idx] = (STATE_TYPE)val; }
+inline ACCUM_TYPE   widen_to_accum(COMPUTE_TYPE val) { return (ACCUM_TYPE)val; }
 inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val) { return (COMPUTE_TYPE)val; }
+
 #endif // __OPENCL_VERSION__
+
+// =====================================================================
+// Common Constants, Flags & Math Macros
+//
+// Shared between OpenCL and host-mode compilation.
+// =====================================================================
 
 // --- Kernel-Internal Constants ---
 // Bank-conflict avoidance: +1 element per row stride in local memory.
@@ -706,7 +779,7 @@ inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val) { return (COMPUTE_TYPE)val
 #define LOCAL_MEM_BANK_PADDING 1
 #endif
 
-// --- Host-configurable Flags and Enums ---
+// --- Host-Configurable Flags and Enums ---
 #define PROBLEM_TYPE_CCE 0 // Selects Softmax/Cross-Entropy Loss math path
 #define PROBLEM_TYPE_BCE 1 // Selects Sigmoid/Binary Cross-Entropy math path
 #define AGG_MODE_SUM 0     // Selects summation for aggregation
@@ -735,7 +808,22 @@ inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val) { return (COMPUTE_TYPE)val
 #define MATH_SQRT sqrt
 #endif
 
-// --- Phase 4: Shared Layer Forward Pass ---
+// #####################################################################
+// #####################################################################
+// ##                                                                 ##
+// ##                     KERNEL DECLARATIONS                         ##
+// ##                                                                 ##
+// #####################################################################
+// #####################################################################
+
+// =====================================================================
+// Act Phase Kernels (Nodes 4–7)
+//
+// Forward pass computation: shared-layer activations, module-layer
+// logit rendering, probability & loss calculation (CCE/BCE).
+// =====================================================================
+
+// --- Node 4: Shared Layer Forward Pass --------------------------------
 
 /**
  * @brief (Node 4) Computes hidden activations for a slice of the input batch.
@@ -743,7 +831,7 @@ inline COMPUTE_TYPE narrow_from_accum(ACCUM_TYPE val) { return (COMPUTE_TYPE)val
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Streamable"
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs loaded via load_storage(); state-role inputs loaded via load_state(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Hidden mask production is controlled by `dest_scalar_FLAG_produce_hidden_mask`. When 1: the ReLU derivative mask capturing compute-precision truth is written to `dest_buffer_GLOBAL_hidden_mask`. When 0: mask writes are skipped; the Host MAY pass a minimal stub buffer. This FLAG enables policy-tier control over mask lifecycle based on the precision configuration. Padding Zero Propagation (Emergent): Hidden-dimension padding positions (indices >= padded_hidden_count's logical extent) in dest_buffer_GLOBAL_hidden_activations and dest_buffer_GLOBAL_hidden_mask carry zero when all three conditions hold: (a) input-dimension padding in src_buffer_GLOBAL_input is zero, (b) hidden-dimension padding in weights is zero, (c) hidden-dimension padding in biases is zero. This is a mathematical consequence of the affine transform (W*x + b) and ReLU(0) = 0, not an active zeroing step. The kernel is not required to distinguish padding from logical positions — it receives only padded dimensions (padded_input_count, padded_hidden_count). Implementations MAY skip computation at padding indices as a performance optimization; both approaches satisfy Padding Zero-Propagation. The host initialization and optimizer (Node 24) are the co-guarantors of the three preconditions."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs loaded via load_storage(); state-role inputs loaded via load_state(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Sample Masking (ADR-031): When load_sample_mask(sample_mask, sample) == 0, the sample is invalid/padding; the kernel writes zero to all hidden activation outputs for that sample (and to the corresponding hidden mask positions when out_scalar_FLAG_produce_hidden_mask == 1) and skips further computation. This is a correctness requirement — not merely a performance optimization. A masked sample's input data may contain arbitrary values; without the mask check, the affine transform W × x + b produces non-zero activations whose downstream consequences include: (a) non-zero ReLU mask values propagating to Nodes 17 and 18, and (b) non-zero hidden activation values propagating to Node 8's weight gradient path. Downstream consumers cite this invariant explicitly: Nodes 17 and 18 rely on 'relu_derivative = 0 from Node 4's activation zeroing' as one of two independent guarantees that masked samples contribute zero to shared-layer gradients; Node 8's weight gradient path relies on hidden_activations = 0 to annihilate the non-zero loss derivative at masked samples. Hidden mask production is controlled by `out_scalar_FLAG_produce_hidden_mask`. When 1: the ReLU derivative mask capturing compute-precision truth is written to `dest_buffer_GLOBAL_hidden_mask`. When 0: mask writes are skipped; the Host MAY pass a minimal stub buffer. This FLAG enables policy-tier control over mask lifecycle based on the precision configuration. Padding Zero Propagation (Emergent): Hidden-dimension padding positions (indices >= padded_hidden_count's logical extent) in dest_buffer_GLOBAL_hidden_activations and dest_buffer_GLOBAL_hidden_mask carry zero when all three conditions hold: (a) input-dimension padding in src_buffer_GLOBAL_input is zero, (b) hidden-dimension padding in weights is zero, (c) hidden-dimension padding in biases is zero. This is a mathematical consequence of the affine transform (W*x + b) and ReLU(0) = 0, not an active zeroing step. The kernel is not required to distinguish padding from logical positions — it receives only padded dimensions (padded_input_count, padded_hidden_count). Implementations MAY skip computation at padding indices as a performance optimization; both approaches satisfy Padding Zero-Propagation. The host initialization and optimizer (Node 24) are the co-guarantors of the three preconditions."
  */
 __kernel void forward_pass(
     /**
@@ -819,22 +907,22 @@ __kernel void forward_pass(
     __global STORAGE_TYPE *dest_buffer_GLOBAL_hidden_activations,
 
     /**
-     * @param dest_buffer_GLOBAL_hidden_mask [CONDITIONAL on dest_scalar_FLAG_produce_hidden_mask] Derivative mask from ReLU operation (1 if activation > 0, else 0).
+     * @param dest_buffer_GLOBAL_hidden_mask [CONDITIONAL on out_scalar_FLAG_produce_hidden_mask] Derivative mask from ReLU operation (1 if activation > 0, else 0).
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "Padded to alignment"}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_padded_hidden_count]
-     *        - Validation Preconditions: [1] This buffer is written to ONLY IF `dest_scalar_FLAG_produce_hidden_mask` == 1. [2] If the flag is set, the write slice must be within bounds, as proven
+     *        - Validation Preconditions: [1] This buffer is written to ONLY IF `out_scalar_FLAG_produce_hidden_mask` == 1. [2] If the flag is set, the write slice must be within bounds, as proven
      * by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <= src_scalar_NATURAL_total_batch_count. [3] If the flag is set, Host shall allocate exactly
      * [src_scalar_NATURAL_total_batch_count * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes. [4] If the flag is not set, the Host MAY pass a minimal stub buffer.
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_hidden_mask,
 
     /**
-     * @param dest_scalar_FLAG_produce_hidden_mask A flag controlling mask production.
+     * @param out_scalar_FLAG_produce_hidden_mask A flag controlling mask production.
      *        - Validation Preconditions: Must be 0 or 1. If 1, the ReLU derivative mask is written to `dest_buffer_GLOBAL_hidden_mask`. If 0, mask writes are skipped.
      */
-    uint dest_scalar_FLAG_produce_hidden_mask,
+    uint out_scalar_FLAG_produce_hidden_mask,
 
     uint src_scalar_NATURAL_batch_chunk_offset,
     uint src_scalar_NATURAL_batch_chunk_count,
@@ -843,7 +931,7 @@ __kernel void forward_pass(
     uint src_scalar_NATURAL_padded_input_count,
     uint src_scalar_NATURAL_padded_hidden_count);
 
-// --- Phase 5-7: Module Layer Forward Pass & Loss ---
+// --- Node 5: Module Layer Logit Rendering -----------------------------
 
 /**
  * @brief (Node 5) Renders a contiguous slice of the monolithic logits buffer.
@@ -950,11 +1038,13 @@ __kernel void render_logits_chunk(
     uint src_scalar_NATURAL_padded_total_output_class_count,
     uint src_scalar_NATURAL_total_modules_count);
 
+// --- Node 6: CCE Probability & Loss ----------------------------------
+
 /**
  * @brief (Node 6) Fused kernel to compute probabilities and final CCE loss for a tile.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "The implementation is a fused, indivisible unit for numerically stable Softmax calculation. Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; partial_probs narrowed via store_storage(); final_loss written directly in COMPUTE_TYPE (no narrowing). All arithmetic exclusively in COMPUTE_TYPE. Loss Write Predicate: The kernel writes to dest_buffer_GLOBAL_final_loss[module][sample] only when the target class index for the sample falls within the current tile's class chunk range [class_chunk_offset, class_chunk_offset + classes_per_chunk). All other tiles skip the loss write, relying on the ZERO_REQUIRED initialization."
+ *        - Behavioral Invariants: "The implementation is a fused, indivisible unit for numerically stable Softmax calculation. Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; partial_probs narrowed via store_storage(); final_loss written directly in COMPUTE_TYPE (no narrowing). All arithmetic exclusively in COMPUTE_TYPE. Sample Masking (ADR-031): When load_sample_mask(sample_mask, sample) == 0, the sample is invalid/padding; the kernel writes zero to all probability and loss outputs for that sample and skips further computation. This ensures the diagnostic loss aggregation (Node 14) reflects only valid samples. Loss Write Predicate: The kernel writes to dest_buffer_GLOBAL_final_loss[module][sample] only when the target class index for the sample falls within the current tile's class chunk range [class_chunk_offset, class_chunk_offset + classes_per_chunk). All other tiles skip the loss write, relying on the ZERO_REQUIRED initialization."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Partial Renderer for probabilities output. Conditional Writer for loss (predicate: target class index ∈ [class_chunk_offset, class_chunk_offset + classes_per_chunk))."
  *        - Kernel Bifurcation: "CONCEPT.md Principle 3(B) — separate kernel required due to incompatible type signatures,
@@ -1042,11 +1132,13 @@ __kernel void compute_probs_loss_cce_chunk(
      */
     uint src_scalar_NATURAL_total_tile_count);
 
+// --- Node 7: BCE Probability & Loss ----------------------------------
+
 /**
  * @brief (Node 7) Computes probabilities and PARTIAL BCE loss for a tile.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "The implementation shall employ a numerically stable Sigmoid computation (two-branch form: for positive logits, σ(x) = 1/(1+exp(-x)); for negative logits, σ(x) = exp(x)/(1+exp(x))) to prevent exp() overflow. BCE loss shall use a numerically stable formulation that avoids log(0) (e.g., max(x,0) - x*y + log(1+exp(-|x|))). Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; partial_probs narrowed via store_storage(); partial_loss written in COMPUTE_TYPE. All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Behavioral Invariants: "The implementation shall employ a numerically stable Sigmoid computation (two-branch form: for positive logits, σ(x) = 1/(1+exp(-x)); for negative logits, σ(x) = exp(x)/(1+exp(x))) to prevent exp() overflow. BCE loss shall use a numerically stable formulation that avoids log(0) (e.g., max(x,0) - x*y + log(1+exp(-|x|))). Precision Boundary Conversion: storage-role and state-role inputs widened to COMPUTE_TYPE upon load; partial_probs narrowed via store_storage(); partial_loss written in COMPUTE_TYPE. All arithmetic exclusively in COMPUTE_TYPE. Sample Masking (ADR-031): When load_sample_mask(sample_mask, sample) == 0, the sample is invalid/padding; the kernel writes zero to all probability and loss outputs for that sample and skips further computation. This ensures the diagnostic loss aggregation (Node 14) reflects only valid samples."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Dual Partial Renderer. Uses flat_tile_index for both probability and loss outputs."
  *        - Kernel Bifurcation: "CONCEPT.md Principle 3(B) — separate kernel required due to incompatible type signatures,
@@ -1135,13 +1227,20 @@ __kernel void compute_probs_loss_bce_chunk(
      */
     uint src_scalar_NATURAL_total_tile_count);
 
-// --- Phase 8-10: Parallel Gradient Computation ---
+// =====================================================================
+// Learn Phase I: Gradient Generation & Clipping (Nodes 8–11)
+//
+// Parallel gradient computation for module parameters, hidden-layer
+// error, and temperature parameters, followed by per-tile clipping.
+// =====================================================================
+
+// --- Node 8: Module Parameter Gradients -------------------------------
 
 /**
  * @brief (Node 8) Computes partial module param gradients (Weights, Biases) for a tile and batch chunk.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. Padding Zero-Preservation: The kernel writes computed gradients only within its assigned class chunk range [class_offset, class_offset + classes_per_chunk) for each (module, hidden) position within its tile and batch chunk. Positions outside this range — including other tiles' class ranges and class-dimension padding — are never written; the ZERO_REQUIRED initialization of the destination buffer is the primary guarantor of zeros at these positions. For hidden-dimension padding (h >= hidden_count) within the class chunk range, the computation produces zero because upstream hidden activations at padding indices are zero (Zero-Propagation Theorem precondition (b): weight padding is zero, precondition (c): bias padding is zero, therefore hidden activation padding is zero, therefore 0 × (prob - target) = 0). The kernel is not required to special-case these positions — the zero output is a mathematical consequence of the upstream invariant chain. Implementations MAY skip computation at padding indices as a performance optimization; both approaches satisfy Padding Zero-Preservation."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. Padding Zero-Preservation: The kernel writes computed gradients only within its assigned class chunk range [class_offset, class_offset + classes_per_chunk) for each (module, hidden) position within its tile and batch chunk. Positions outside this range — including other tiles' class ranges and class-dimension padding — are never written; the ZERO_REQUIRED initialization of the destination buffer is the primary guarantor of zeros at these positions. For hidden-dimension padding (h >= hidden_count) within the class chunk range, the computation produces zero because upstream hidden activations at padding indices are zero (Zero-Propagation Theorem precondition (b): weight padding is zero, precondition (c): bias padding is zero, therefore hidden activation padding is zero, therefore 0 × (prob - target) = 0). The kernel is not required to special-case these positions — the zero output is a mathematical consequence of the upstream invariant chain. Implementations MAY skip computation at padding indices as a performance optimization; both approaches satisfy Padding Zero-Preservation. Sample Masking (ADR-031): When load_sample_mask(sample_mask, sample) == 0, the sample is invalid/padding; the kernel skips the entire gradient contribution for that sample. This is a correctness requirement for bias gradients — not merely a performance optimization. Upstream invariants (Nodes 6/7) write zero probabilities for masked samples, but the loss derivative d_loss/d_logit remains non-zero when the target signal is non-zero (CCE: (prob − 1)/τ = −1/τ at the true class; BCE: prob − target = −target for non-zero targets). Without the mask check, bias gradients accumulate these spurious contributions directly (grad_bias[c] += d_loss/d_logit[sample][c]). Weight gradients are independently protected by the upstream hidden_activations = 0 invariant (Node 4's sample masking guarantees zero hidden activations for masked samples, so d_loss/d_logit × 0 = 0), but the unified per-sample skip is the sole guarantor of correct bias gradients."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Dual Partial Renderer. Uses (flat_tile_index, batch_chunk_index) composite placement for both weight and bias gradient outputs. Per Principle §3 Inter-Dispatch Reduction Delegation, each dispatch writes to a unique slot; batch-chunk summation is delegated to a ReductionTreeNode inserted before Node 11."
  */
@@ -1274,12 +1373,14 @@ __kernel void calculate_module_param_grads_chunk(
      */
     uint src_scalar_NATURAL_total_tile_count);
 
+// --- Node 9: Hidden Layer Error Backpropagation -----------------------
+
 /**
  * @brief (Node 9) Computes the partial upstream gradient for the hidden layer (Grad_H) for a tile.
  * @kernel_contract
  *        - Holistic Constraints: "This kernel processes the complete batch dimension in a single dispatch. Batch-chunking parameters (batch_chunk_offset, batch_chunk_count) are intentionally absent because the downstream Item Synchronization Point (Node 13) requires a monolithic collection buffer."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened upon load; storage-role output narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Padding Zero-Establishment: For the padded_hidden_count dimension, the kernel SHALL write zero for all positions at indices >= hidden_count. The kernel is the sole guarantor of zeros at padding positions (Initialization Contract: NONE). This guarantees that downstream L2 norm computations (Node 11) over the full padded extent are mathematically equivalent to norms over the logical extent."
- *        - Idempotency: "Associatively Non-Idempotent"
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened upon load; storage-role output narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Padding Zero-Establishment: For the padded_hidden_count dimension, the kernel SHALL write zero for all positions at indices >= hidden_count. The kernel is the sole guarantor of zeros at padding positions (Initialization Contract: NONE). This guarantees that downstream L2 norm computations (Node 11) over the full padded extent are mathematically equivalent to norms over the logical extent. Sample Masking (ADR-031): When load_sample_mask(sample_mask, sample) == 0, the sample is invalid/padding; the kernel writes zero to all gradient outputs for that sample and skips further computation. This is a correctness requirement — not merely a performance optimization. Upstream invariants (Nodes 6/7) write zero probabilities for masked samples, but the loss derivative d_loss/d_logit remains non-zero when the target signal is non-zero (CCE: −1/τ at the true class; BCE: −target for non-zero targets). Without the mask check, Grad_H[sample][h] = Σ_c (d_loss/d_logit[sample][c] × W[h][c]) produces non-zero gradients because module weights are non-zero learnable parameters. These spurious gradients would propagate through Nodes 11 → 13 → 16 into summed_grad_h. Downstream consumers (Nodes 17, 18) cite this masking as an upstream invariant ('summed_grad_h = 0 from Node 9's masking') — one of two independent guarantees protecting shared-layer gradient correctness."
+ *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Partial Renderer for a monolithic intermediate buffer."
  */
 __kernel void backprop_error_to_hidden_chunk(
@@ -1374,12 +1475,14 @@ __kernel void backprop_error_to_hidden_chunk(
      */
     uint src_scalar_NATURAL_total_tile_count);
 
+// --- Node 10: Temperature Gradients -----------------------------------
+
 /**
  * @brief (Node 10) Computes partial temperature gradients for a tile.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened upon load; partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE."
- *        - Idempotency: "Associatively Non-Idempotent"
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened upon load; partial gradient outputs narrowed via store_storage(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. Sample Masking (ADR-031): When load_sample_mask(sample_mask, sample) == 0, the sample is invalid/padding; the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Upstream invariants (zeroed logits from Node 5, uniform probabilities from Node 6/7) guarantee zero temperature gradient contribution for masked samples regardless of whether the early exit is applied."
+ *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Partial Renderer for temperature gradients."
  */
 __kernel void calculate_chunk_temp_gradients(
@@ -1477,7 +1580,7 @@ __kernel void calculate_chunk_temp_gradients(
      */
     uint src_scalar_NATURAL_total_tile_count);
 
-// --- Phase 11: Gradient Clipping ---
+// --- Node 11: Partial Gradient Clipping -------------------------------
 
 /**
  * @brief (Node 11) [Utility Kernel] Computes the total L2 Norm for a single item's partial gradients and conditionally scales them. Supports both a single batch-wide clipping norm and per-item norms.
@@ -1503,7 +1606,7 @@ __kernel void clip_partial_gradients(
     __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
 
     /**
-     * @param src_buffer_GLOBAL_partial_grad_weights_module Source buffer from Node 8.
+     * @param src_buffer_GLOBAL_partial_grad_weights_module Source buffer: output of Node 8's collection buffer (after batch-chunk reduction when `num_batch_chunks > 1` and, when `storage_dtype != compute_dtype`, a `narrow_to_storage` Precision Bridge; direct from Node 8 otherwise).
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {
      *            dim[0] ("total_tile_count"): {Type: NONE},
@@ -1518,7 +1621,7 @@ __kernel void clip_partial_gradients(
     __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_grad_weights_module,
 
     /**
-     * @param src_buffer_GLOBAL_partial_grad_biases_module Source buffer from Node 8.
+     * @param src_buffer_GLOBAL_partial_grad_biases_module Source buffer: output of Node 8's collection buffer (after batch-chunk reduction when `num_batch_chunks > 1` and, when `storage_dtype != compute_dtype`, a `narrow_to_storage` Precision Bridge; direct from Node 8 otherwise).
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {Type: SIMD, Formula: "SIMD_WIDTH alignment via padded_total_output_class_count"}
      *        - Precision Role: "storage"
@@ -1629,7 +1732,6 @@ __kernel void clip_partial_gradients(
      */
     COMPUTE_TYPE src_scalar_REAL_epsilon,
 
-    // --- Dimension and Placement Parameters ---
     uint src_scalar_NATURAL_flat_tile_index,
     uint src_scalar_NATURAL_num_class_chunks,
     uint src_scalar_NATURAL_classes_per_chunk,
@@ -1643,7 +1745,16 @@ __kernel void clip_partial_gradients(
      */
     uint src_scalar_NATURAL_total_tile_count);
 
-// --- Phase 13: Data Layout Transformation & Permutation ---
+// =====================================================================
+// Learn Phase II: Aggregation, Reduction & Specialized Processing
+//                 (Nodes 13, 14–15, 16, 20)
+//
+// Gradient gather/permutation (Item Synchronization Point), the
+// Recursive Clip-Aggregation Engine, and the specialized Grad_H
+// reduction.
+// =====================================================================
+
+// --- Node 13: Gradient Gather & Permutation (Item Synchronization) ----
 
 /**
  * @brief (Node 13) Specialized Kernel: Gathers scattered partial gradients into a single, reduction-ready buffer.
@@ -1652,7 +1763,7 @@ __kernel void clip_partial_gradients(
  * SoA layout."
  *        - Behavioral Invariants: "The gather operation performs an implicit reduction (summation) over the `class_chunk` dimension. Precision Boundary Conversion: storage-role inputs widened via load_storage(); storage-role outputs narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Padding Zero-Preservation: The kernel writes only to destination positions corresponding to tiles within the logical (module, batch, hidden) domain. For the module dimension: positions at indices >= total_modules_count within the padded_total_modules_count stride are never written; the ZERO_REQUIRED initialization of the destination buffer is the primary guarantor of zeros at these positions. For the hidden dimension: the input's zero-valued padding positions (indices >= hidden_count, established by Node 9 and preserved by Node 11) are read, summed across class chunks (sum of zeros = zero), and stored via store_storage() — preserving zero at the corresponding output positions."
  *        - Synchronization Model: "Global Barrier. This kernel cannot execute until all its clipped partial inputs from Node 11 are fully rendered."
- *        - Idempotency: "Associatively Non-Idempotent"
+ *        - Idempotency: "Strictly Idempotent"
  */
 __kernel void gather_and_permute_grad_hidden_activations(
     /**
@@ -1692,7 +1803,20 @@ __kernel void gather_and_permute_grad_hidden_activations(
     uint src_scalar_NATURAL_num_class_chunks,
     uint src_scalar_NATURAL_total_tile_count);
 
-// --- Phase 14, 15 & 20: Aggregation Engine ---
+// --- Recursive Clip-Aggregation Engine (Nodes 14, 15, 20) ------------
+//
+// This section contains all kernels composing the host-orchestrated
+// log_K(N) reduction tree. The engine is not a monolithic kernel but
+// an emergent property of composing these single-purpose primitives.
+//
+// Each kernel exists in two precision variants (ADR-026):
+//   Storage-entry: reads STORAGE_TYPE partials via load_storage()
+//   Compute-entry: reads COMPUTE_TYPE intermediates directly
+//
+// The Orchestration tier selects the variant based on the source
+// buffer's precision_role from its BufferDescriptor.
+
+// --- Single-Stage Reduction: Register Reduce (Storage-Entry, Tier 1) --
 
 /**
  * @brief (Node 14, 15a & 20a) Tier 1 (N is small): Reduces scattered partial results using registers and an indirection list.
@@ -1738,6 +1862,56 @@ __kernel void aggregate_register_reduce(
     uint src_scalar_NATURAL_partial_offset_list_count,
     uint src_scalar_NATURAL_partial_width,
     uint src_scalar_FLAG_operation_type);
+
+// --- Single-Stage Reduction: Register Reduce (Compute-Entry, Tier 1) --
+
+/**
+ * @brief (Node 14, 15a & 20a) Compute-entry variant of aggregate_register_reduce.
+ *        Identical algorithm reading COMPUTE_TYPE intermediates directly.
+ * @kernel_contract
+ *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a COMPUTE_TYPE collection buffer, located via an explicit offset list.
+ * When used as a stage in a multi-stage reduction tree, operation_type MUST be AGG_MODE_SUM; AGG_MODE_AVERAGE is valid only as a single-stage terminal reduction, as partial-count division
+ * at interior stages produces silently incorrect results."
+ *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag. All buffers are compute-role; no precision boundary conversion is required. Reduction accumulation in COMPUTE_TYPE; compute-role output written directly. All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Idempotency: "Associatively Non-Idempotent"
+ *        - Synchronization Model: "Reduction Engine Stage"
+ *        - Precision Variant: "Compute-entry variant of aggregate_register_reduce. Used for interior stages of multi-stage reduction trees (where the source is a prior stage's COMPUTE_TYPE output) and for leaf stages whose source collection is natively COMPUTE_TYPE."
+ */
+__kernel void aggregate_register_reduce_from_compute(
+    /**
+     * @param src_buffer_GLOBAL_partial_collection The memory pool containing COMPUTE_TYPE intermediate results.
+     *        - Tensor Shape: Undefined.
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof: N/A.
+     *        - Validation Preconditions: Host must provide a valid buffer that encompasses all memory regions referenced by the combination of `src_buffer_GLOBAL_CONST_partial_offset_list` and `src_scalar_NATURAL_partial_width`.
+     */
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_partial_collection,
+
+    /**
+     * @param src_buffer_GLOBAL_CONST_partial_offset_list The indirection table. Each element is an offset into `src_buffer_GLOBAL_partial_collection`.
+     *        - Tensor Shape: (src_scalar_NATURAL_partial_offset_list_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_partial_offset_list_count]
+     *        - Validation Preconditions: Host must provide a buffer containing exactly `src_scalar_NATURAL_partial_offset_list_count` uints.
+     */
+    __global const uint *src_buffer_GLOBAL_CONST_partial_offset_list,
+
+    /**
+     * @param dest_buffer_GLOBAL_partial The destination buffer for the single, reduced partial result.
+     *        - Tensor Shape: (src_scalar_NATURAL_partial_width)
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof: [src_scalar_NATURAL_partial_width]
+     *        - Validation Preconditions: Host must allocate exactly [src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)] bytes.
+     */
+    __global COMPUTE_TYPE *dest_buffer_GLOBAL_partial,
+
+    uint src_scalar_NATURAL_partial_offset_list_count,
+    uint src_scalar_NATURAL_partial_width,
+    uint src_scalar_FLAG_operation_type);
+
+// --- Single-Stage Reduction: Local Reduce (Storage-Entry, Tier 2) -----
 
 /**
  * @brief (Node 14, 15a & 20a) Tier 2 (N is large): Reduces scattered partial results using local memory and an indirection list.
@@ -1797,53 +1971,7 @@ __kernel void aggregate_local_reduce(
     uint src_scalar_NATURAL_partial_width,
     uint src_scalar_FLAG_operation_type);
 
-// --- ADR-026: Precision-Typed Reduction Kernel Variants (Compute-Entry) ---
-
-/**
- * @brief (Node 14, 15a & 20a) Compute-entry variant of aggregate_register_reduce.
- *        Identical algorithm reading COMPUTE_TYPE intermediates directly.
- * @kernel_contract
- *        - Holistic Constraints: "This kernel operates on scattered (non-contiguous) input partials from a COMPUTE_TYPE collection buffer, located via an explicit offset list.
- * When used as a stage in a multi-stage reduction tree, operation_type MUST be AGG_MODE_SUM; AGG_MODE_AVERAGE is valid only as a single-stage terminal reduction, as partial-count division
- * at interior stages produces silently incorrect results."
- *        - Behavioral Invariants: "The reduction policy (SUM/AVERAGE) is controlled by the `operation_type` flag. All buffers are compute-role; no precision boundary conversion is required. Reduction accumulation in COMPUTE_TYPE; compute-role output written directly. All arithmetic exclusively in COMPUTE_TYPE."
- *        - Idempotency: "Associatively Non-Idempotent"
- *        - Synchronization Model: "Reduction Engine Stage"
- *        - Precision Variant: "Compute-entry variant of aggregate_register_reduce. Used for interior stages of multi-stage reduction trees (where the source is a prior stage's COMPUTE_TYPE output) and for leaf stages whose source collection is natively COMPUTE_TYPE."
- */
-__kernel void aggregate_register_reduce_from_compute(
-    /**
-     * @param src_buffer_GLOBAL_partial_collection The memory pool containing COMPUTE_TYPE intermediate results.
-     *        - Tensor Shape: Undefined.
-     *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "compute"
-     *        - Calculability Proof: N/A.
-     *        - Validation Preconditions: Host must provide a valid buffer that encompasses all memory regions referenced by the combination of `src_buffer_GLOBAL_CONST_partial_offset_list` and `src_scalar_NATURAL_partial_width`.
-     */
-    __global const COMPUTE_TYPE *src_buffer_GLOBAL_partial_collection,
-
-    /**
-     * @param src_buffer_GLOBAL_CONST_partial_offset_list The indirection table. Each element is an offset into `src_buffer_GLOBAL_partial_collection`.
-     *        - Tensor Shape: (src_scalar_NATURAL_partial_offset_list_count)
-     *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_partial_offset_list_count]
-     *        - Validation Preconditions: Host must provide a buffer containing exactly `src_scalar_NATURAL_partial_offset_list_count` uints.
-     */
-    __global const uint *src_buffer_GLOBAL_CONST_partial_offset_list,
-
-    /**
-     * @param dest_buffer_GLOBAL_partial The destination buffer for the single, reduced partial result.
-     *        - Tensor Shape: (src_scalar_NATURAL_partial_width)
-     *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "compute"
-     *        - Calculability Proof: [src_scalar_NATURAL_partial_width]
-     *        - Validation Preconditions: Host must allocate exactly [src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)] bytes.
-     */
-    __global COMPUTE_TYPE *dest_buffer_GLOBAL_partial,
-
-    uint src_scalar_NATURAL_partial_offset_list_count,
-    uint src_scalar_NATURAL_partial_width,
-    uint src_scalar_FLAG_operation_type);
+// --- Single-Stage Reduction: Local Reduce (Compute-Entry, Tier 2) -----
 
 /**
  * @brief (Node 14, 15a & 20a) Compute-entry variant of aggregate_local_reduce.
@@ -1902,6 +2030,8 @@ __kernel void aggregate_local_reduce_from_compute(
     uint src_scalar_NATURAL_partial_width,
     uint src_scalar_FLAG_operation_type);
 
+// --- Single-Stage Clip: clip_intermediate_grad ------------------------
+
 /**
  * @brief (Node 15b, 20b) [Utility Kernel] Applies partial-group-wise clipping to a single, contiguous, intermediate gradient buffer.
  * @kernel_contract
@@ -1955,7 +2085,306 @@ __kernel void clip_intermediate_grad(
      */
     uint src_scalar_NATURAL_parameter_count);
 
-// --- Phase 16: Specialized Grad_H Reduction ---
+// --- Multi-Stage K-Fan-In Reduction Primitive (ADR-019) ---------------
+//
+// Sentinel value indicating an absent partial in the tail node of a
+// K-fan-in reduction stage. When num_partials is not divisible by K,
+// the final node's offset list is padded with this sentinel.
+#define SENTINEL_ABSENT_PARTIAL 0xFFFFFFFFu
+
+// --- Multi-Stage Reduction: K-Fan-In (Storage-Entry) ------------------
+
+/**
+ * @brief (Node 14, 15a, 20a — multi-stage) Reduces groups of K scattered
+ *        partials into independent output nodes with optional per-node L2 clip.
+ * @kernel_contract
+ *        - Holistic Constraints: "Each work-group processes one reduction node.
+ *          The kernel reads K partials per node from the source buffer via an
+ *          offset list, sums them, optionally clips the result per-node, and
+ *          writes one output vector of partial_width elements. Supports absent
+ *          partials via sentinel offset 0xFFFFFFFF for the tail node."
+ *        - Behavioral Invariants: "When clipping_threshold >= 0, per-node L2
+ *          clip is applied: scale = threshold / (norm + epsilon). When
+ *          clipping_threshold < 0, clip is bypassed (diagnostic mode).
+ *          Zero threshold clips to zero norm (zeroes all gradients).
+ *          Epsilon prevents division by zero. Precision Boundary Conversion: storage-role partials widened via load_storage(); compute-role outputs written directly; LOCAL scratch uses COMPUTE_TYPE. All arithmetic exclusively in COMPUTE_TYPE."
+ *        - Idempotency: "Associatively Non-Idempotent"
+ *        - Synchronization Model: "Reduction Engine Stage"
+ */
+__kernel void reduce_k_fan_in_and_clip(
+    /**
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel L2 norm reduction.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
+     *        - Precision Role: "compute" (LOCAL scratch)
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Used for tree-structured parallel reduction to compute the per-node
+     *          L2 norm (sum of squares) over partial_width elements. Each thread
+     *          accumulates partial sums of squares for its assigned elements of
+     *          the summed K-partial vector, then the work-group reduces to a
+     *          single scalar for the conditional scaling decision. One work-group
+     *          per reduction node."
+     */
+    __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
+
+    /**
+     * @param src_buffer_GLOBAL_partial_collection The memory pool containing all
+     *        partial results referenced by the offset list.
+     *        - Tensor Shape: Undefined.
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "storage"
+     *        - Calculability Proof: N/A.
+     *        - Validation Preconditions: Host must provide a valid buffer that
+     *          encompasses all memory regions referenced by the combination of
+     *          `src_buffer_GLOBAL_CONST_offset_list_flat` and
+     *          `src_scalar_NATURAL_partial_width`.
+     */
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_collection,
+
+    /**
+     * @param src_buffer_GLOBAL_CONST_offset_list_flat Flat offset list with K
+     *        consecutive entries per node. Sentinel SENTINEL_ABSENT_PARTIAL
+     *        (0xFFFFFFFF) indicates an absent partial in the tail node.
+     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_fan_in]
+     *        - Validation Preconditions: Host must provide a buffer containing exactly
+     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in` uint entries.
+     */
+    __global const uint *src_buffer_GLOBAL_CONST_offset_list_flat,
+
+    /**
+     * @param dest_buffer_GLOBAL_stage_partial Contiguous output buffer. Node n writes
+     *        at `[n * partial_width, (n+1) * partial_width)`.
+     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width)
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_partial_width]
+     *        - Validation Preconditions: Host must allocate exactly
+     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)` bytes.
+     */
+    __global COMPUTE_TYPE *dest_buffer_GLOBAL_stage_partial,
+
+    /**
+     * @param src_scalar_NATURAL_fan_in Number of partials to reduce per node.
+     *        - Validation Preconditions: Must be >= 2.
+     */
+    uint src_scalar_NATURAL_fan_in,
+
+    /**
+     * @param src_scalar_NATURAL_node_count Number of independent reduction nodes.
+     *        - Validation Preconditions: Must be >= 1.
+     */
+    uint src_scalar_NATURAL_node_count,
+
+    /**
+     * @param src_scalar_NATURAL_partial_width Number of elements per partial vector.
+     *        - Validation Preconditions: Must be >= 1.
+     */
+    uint src_scalar_NATURAL_partial_width,
+
+    /**
+     * @param src_scalar_REAL_clipping_threshold_t_j The clipping threshold for this stage j.
+     *        Value < 0 disables clip (diagnostic mode). Value 0 clips to zero norm.
+     *        - Validation Preconditions: Negative values bypass clipping; non-negative values enable it.
+     */
+    COMPUTE_TYPE src_scalar_REAL_clipping_threshold_t_j,
+
+    /**
+     * @param src_scalar_REAL_epsilon Small constant to prevent division by zero.
+     *        - Validation Preconditions: Must be a small, positive real number.
+     */
+    COMPUTE_TYPE src_scalar_REAL_epsilon);
+
+// --- Multi-Stage Reduction: K-Fan-In (Compute-Entry) ------------------
+
+/**
+ * @brief (Node 14, 15a, 20a — interior stages and compute-role leaf stages)
+ *        Compute-entry variant of reduce_k_fan_in_and_clip. Identical algorithm,
+ *        but reads COMPUTE_TYPE intermediates rather than STORAGE_TYPE partials.
+ * @kernel_contract
+ *        - Holistic Constraints: "Each work-group processes one reduction node.
+ *          The kernel reads K partials per node from the source buffer via an
+ *          offset list, sums them, optionally clips the result per-node, and
+ *          writes one output vector of partial_width elements. Supports absent
+ *          partials via sentinel offset 0xFFFFFFFF for the tail node."
+ *        - Behavioral Invariants: "When clipping_threshold >= 0, per-node L2
+ *          clip is applied: scale = threshold / (norm + epsilon). When
+ *          clipping_threshold < 0, clip is bypassed (diagnostic mode).
+ *          Zero threshold clips to zero norm (zeroes all gradients).
+ *          Epsilon prevents division by zero. All buffers are compute-role;
+ *          no precision boundary conversion is required. Reduction accumulation
+ *          in COMPUTE_TYPE; compute-role output written directly. All arithmetic
+ *          exclusively in COMPUTE_TYPE."
+ *        - Idempotency: "Associatively Non-Idempotent"
+ *        - Synchronization Model: "Reduction Engine Stage"
+ *        - Precision Variant: "Compute-entry variant of reduce_k_fan_in_and_clip.
+ *          Used for interior stages of multi-stage reduction trees (where the
+ *          source is a prior stage's COMPUTE_TYPE output) and for leaf stages
+ *          whose source collection is natively COMPUTE_TYPE (e.g., BCE loss
+ *          partials from Node 7)."
+ */
+__kernel void reduce_k_fan_in_and_clip_from_compute(
+    /**
+     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel L2 norm reduction.
+     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
+     *        - Precision Role: "compute" (LOCAL scratch)
+     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
+     *          Identical access pattern to reduce_k_fan_in_and_clip; the only
+     *          difference is that source reads are COMPUTE_TYPE rather than
+     *          STORAGE_TYPE."
+     */
+    __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
+
+    /**
+     * @param src_buffer_GLOBAL_partial_collection The memory pool containing
+     *        COMPUTE_TYPE intermediate results from a prior reduction stage or
+     *        a natively compute-role partial collection.
+     *        - Tensor Shape: Undefined.
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof: N/A.
+     *        - Validation Preconditions: Host must provide a valid buffer that
+     *          encompasses all memory regions referenced by the combination of
+     *          `src_buffer_GLOBAL_CONST_offset_list_flat` and
+     *          `src_scalar_NATURAL_partial_width`.
+     */
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_partial_collection,
+
+    /**
+     * @param src_buffer_GLOBAL_CONST_offset_list_flat Flat offset list with K
+     *        consecutive entries per node. Sentinel SENTINEL_ABSENT_PARTIAL
+     *        (0xFFFFFFFF) indicates an absent partial in the tail node.
+     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in)
+     *        - Padding Contract: {Type: NONE}
+     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_fan_in]
+     *        - Validation Preconditions: Host must provide a buffer containing exactly
+     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in` uint entries.
+     */
+    __global const uint *src_buffer_GLOBAL_CONST_offset_list_flat,
+
+    /**
+     * @param dest_buffer_GLOBAL_stage_partial Contiguous output buffer. Node n writes
+     *        at `[n * partial_width, (n+1) * partial_width)`.
+     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width)
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_partial_width]
+     *        - Validation Preconditions: Host must allocate exactly
+     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)` bytes.
+     */
+    __global COMPUTE_TYPE *dest_buffer_GLOBAL_stage_partial,
+
+    /**
+     * @param src_scalar_NATURAL_fan_in Number of partials to reduce per node.
+     *        - Validation Preconditions: Must be >= 2.
+     */
+    uint src_scalar_NATURAL_fan_in,
+
+    /**
+     * @param src_scalar_NATURAL_node_count Number of independent reduction nodes.
+     *        - Validation Preconditions: Must be >= 1.
+     */
+    uint src_scalar_NATURAL_node_count,
+
+    /**
+     * @param src_scalar_NATURAL_partial_width Number of elements per partial vector.
+     *        - Validation Preconditions: Must be >= 1.
+     */
+    uint src_scalar_NATURAL_partial_width,
+
+    /**
+     * @param src_scalar_REAL_clipping_threshold_t_j The clipping threshold for this stage j.
+     *        Value < 0 disables clip (diagnostic mode). Value 0 clips to zero norm.
+     *        - Validation Preconditions: Negative values bypass clipping; non-negative values enable it.
+     */
+    COMPUTE_TYPE src_scalar_REAL_clipping_threshold_t_j,
+
+    /**
+     * @param src_scalar_REAL_epsilon Small constant to prevent division by zero.
+     *        - Validation Preconditions: Must be a small, positive real number.
+     */
+    COMPUTE_TYPE src_scalar_REAL_epsilon);
+
+// --- Precision Bridge Primitive ---------------------------------------
+//
+// Inserted by the Orchestration tier at inter-kernel DAG edges where a
+// compute-role producer feeds a storage-role consumer and no intermediate
+// kernel naturally performs the conversion (see CONCEPT.md §5, Inter-Kernel
+// Precision Boundary Resolution). The canonical use case is the batch-chunk
+// ReductionTreeNode output (compute-role) feeding Node 11 (storage-role
+// inputs). When storage_dtype == compute_dtype, the Orchestration tier
+// elides this dispatch entirely — the source buffer is bit-compatible.
+
+/**
+ * @brief [Utility Kernel] Element-wise precision narrowing from compute
+ *        role to storage role.
+ * @kernel_contract
+ *        - Holistic Constraints: "Generic, element-wise precision bridge.
+ *          Inserted by the Orchestration tier at DAG edges where a
+ *          compute-role producer feeds a storage-role consumer and no
+ *          intermediate kernel naturally performs the conversion. When
+ *          storage_dtype == compute_dtype, the Orchestration tier elides
+ *          this dispatch entirely — the source buffer is bit-compatible
+ *          with the consumer's expectation."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: reads
+ *          COMPUTE_TYPE input directly; narrows to storage precision via
+ *          store_storage(). When STORAGE_TYPE == COMPUTE_TYPE, the
+ *          operation is an identity copy eliminated by compiler
+ *          optimization (and the dispatch itself is elided at plan
+ *          construction). When STORAGE_TYPE is FP8, the output is
+ *          subject to the FP8 quantization floor and saturation
+ *          semantics of store_storage_fp8(). No arithmetic is performed
+ *          on the values — this is a pure format conversion.
+ *          Padding Zero Propagation (Emergent): Zero-valued positions
+ *          in the input map to zero-valued positions in the output
+ *          because store_storage(0) = 0 for all supported precision
+ *          formats — including FP8, where 0x00 represents zero in
+ *          both E4M3 and E5M2. The bridge is padding-agnostic; zero
+ *          propagation is a consequence of the identity property of
+ *          zero under format conversion."
+ *        - Idempotency: "Strictly Idempotent"
+ *        - Synchronization Model: "Utility"
+ */
+__kernel void narrow_to_storage(
+    /**
+     * @param src_buffer_GLOBAL_input The compute-role source buffer.
+     *        - Tensor Shape: (src_scalar_NATURAL_element_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof:
+     *          [src_scalar_NATURAL_element_count]
+     *        - Validation Preconditions: Host shall allocate exactly
+     *          [src_scalar_NATURAL_element_count *
+     *          sizeof(COMPUTE_TYPE)] bytes.
+     */
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_input,
+
+    /**
+     * @param dest_buffer_GLOBAL_output The storage-role destination
+     *        buffer.
+     *        - Tensor Shape: (src_scalar_NATURAL_element_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "storage"
+     *        - Calculability Proof:
+     *          [src_scalar_NATURAL_element_count]
+     *        - Validation Preconditions: Host shall allocate exactly
+     *          [src_scalar_NATURAL_element_count *
+     *          sizeof(STORAGE_TYPE)] bytes.
+     */
+    __global STORAGE_TYPE *dest_buffer_GLOBAL_output,
+
+    /**
+     * @param src_scalar_NATURAL_element_count Total number of elements
+     *        to convert.
+     *        - Calculability Proof: [Known by Host Orchestrator from
+     *          the source buffer's BufferDescriptor]
+     *        - Validation Preconditions: Must match the element count
+     *          of both src and dest buffers.
+     */
+    uint src_scalar_NATURAL_element_count);
+
+// --- Node 16: Specialized Grad_H Reduction ----------------------------
+
 /**
  * @brief (Node 16) Specialized Kernel: Reduces the permuted Grad_H buffer
  *        using a host-prescribed, multi-stage, numerically-stable reduction.
@@ -1991,7 +2420,16 @@ __kernel void clip_intermediate_grad(
  *
  *          When num_reduction_stages is 0, the kernel bypasses the Staged
  *          Reduction Phase entirely: pre-accumulation produces at most one
- *          value per row, and thread 0 writes it directly."
+ *          value per row, and thread 0 writes it directly.
+ *
+ *          Padding Zero Propagation (Emergent): Hidden-dimension padding
+ *          positions (indices h >= hidden_count within padded_hidden_count)
+ *          in the output buffer carry zero when the input buffer has zero
+ *          at the corresponding module-column positions for all modules.
+ *          This is a mathematical consequence of summing zeros across the
+ *          module reduction dimension. Preconditions: Node 13's Padding
+ *          Zero-Preservation ensures zero at padding positions in the
+ *          input SoA buffer."
  *        - Synchronization Model: "Specialized Reduction Kernel / Global
  *          Barrier"
  *        - Idempotency: "Associatively Non-Idempotent"
@@ -2127,7 +2565,15 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
     uint src_scalar_NATURAL_total_modules_count,
     uint src_scalar_NATURAL_padded_total_modules_count);
 
-// --- Phase 17-18: Streaming Shared Layer Backpropagation ---
+// =====================================================================
+// Learn Phase III: Streaming Shared-Layer Backpropagation (Nodes 17–19)
+//
+// True Streaming model: recompute inputs, compute partial gradients,
+// clip immediately, and feed clipped partials into the reduction
+// engine — all within a single parametric loop.
+// =====================================================================
+
+// --- Node 17: Shared Weight Gradients ---------------------------------
 
 /**
  * @brief (Node 17) Computes partial gradients for shared layer weights from a batch chunk.
@@ -2240,6 +2686,8 @@ __kernel void backprop_shared_weights_chunk(
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_final_grad_hidden_activations_total_count);
 
+// --- Node 18: Shared Bias Gradients -----------------------------------
+
 /**
  * @brief (Node 18) Computes partial gradients for shared layer biases from a batch chunk.
  * @kernel_contract
@@ -2332,6 +2780,8 @@ __kernel void backprop_shared_biases_chunk(
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_final_grad_hidden_activations_total_count);
 
+// --- Node 19: Shared Gradient Clipping --------------------------------
+
 /**
  * @brief (Node 19) [Utility Kernel] Computes the L2 Norm for a single SHARED GRADIENT
  * chunk, conditionally scales it, and writes the result to a destination memory address
@@ -2392,8 +2842,8 @@ __kernel void clip_shared_gradients_chunk(
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_weights_parameter_count]
      *        - Validation Preconditions: [1] The Host is responsible for providing a valid
-     *          `dest_scalar_NATURAL_weights_write_offset` such that the write operation
-     *          remains within the bounds of this collection buffer: (dest_scalar_NATURAL_weights_write_offset +
+     *          `out_scalar_NATURAL_weights_write_offset` such that the write operation
+     *          remains within the bounds of this collection buffer: (out_scalar_NATURAL_weights_write_offset +
      *          src_scalar_NATURAL_weights_parameter_count) <=
      *          (src_scalar_NATURAL_num_batch_chunks * src_scalar_NATURAL_weights_parameter_count).
      */
@@ -2407,29 +2857,50 @@ __kernel void clip_shared_gradients_chunk(
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_biases_parameter_count]
      *        - Validation Preconditions: [1] The Host is responsible for providing a valid
-     *          `dest_scalar_NATURAL_biases_write_offset` such that the write operation
-     *          remains within the bounds of this collection buffer: (dest_scalar_NATURAL_biases_write_offset +
+     *          `out_scalar_NATURAL_biases_write_offset` such that the write operation
+     *          remains within the bounds of this collection buffer: (out_scalar_NATURAL_biases_write_offset +
      *          src_scalar_NATURAL_biases_parameter_count) <=
      *          (src_scalar_NATURAL_num_batch_chunks * src_scalar_NATURAL_biases_parameter_count).
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_clipped_partial_grad_biases_shared,
 
+    /**
+     * @param src_scalar_REAL_clipping_threshold_t_pre The maximum
+     *        permissible L2 norm for this streaming chunk's shared
+     *        gradient vector.
+     *        - Validation Preconditions: Must be a positive real number.
+     */
     COMPUTE_TYPE src_scalar_REAL_clipping_threshold_t_pre,
+
+    /**
+     * @param src_scalar_REAL_epsilon A small constant to prevent
+     *        division by zero during norm calculation.
+     *        - Validation Preconditions: Must be a small, positive real
+     *          number (e.g., 1e-6).
+     */
     COMPUTE_TYPE src_scalar_REAL_epsilon,
+
     uint        src_scalar_NATURAL_weights_parameter_count,
     uint        src_scalar_NATURAL_biases_parameter_count,
-    uint        dest_scalar_NATURAL_weights_write_offset,
-    uint        dest_scalar_NATURAL_biases_write_offset,
+    uint        out_scalar_NATURAL_weights_write_offset,
+    uint        out_scalar_NATURAL_biases_write_offset,
     uint        src_scalar_NATURAL_num_batch_chunks);
 
-// --- Phase 21-25: Finalization & Updates ---
+// =====================================================================
+// Learn Phase IV–V: Finalization & Parameter Updates (Nodes 21, 24–25)
+//
+// Gradient normalization, Adam optimizer update, and temperature
+// clamping. Executes after the Batch Synchronization Point.
+// =====================================================================
+
+// --- Node 21: Gradient Normalization ----------------------------------
 
 /**
  * @brief (Node 21) [Utility Kernel] Normalizes a buffer of summed gradients by dividing each element by the effective batch size.
  * @kernel_contract
  *        - Holistic Constraints: "This kernel is a generic, element-wise scaling utility designed to operate on any parameter group's summed gradient buffer."
  *        - Behavioral Invariants: "Performs element-wise division: `output[i] = input[i] / (effective_batch_size + epsilon)`. An epsilon term MUST be used to prevent division by zero if the
- * effective_batch_size is 0. All buffers are compute-role; no precision boundary conversion is required."
+ * effective_batch_size is 0. All buffers are compute-role; no precision boundary conversion is required. Padding Zero Propagation (Emergent): Positions in the output buffer corresponding to padding indices carry zero when the input buffer has zero at those positions. The operation output[i] = input[i] / divisor maps zero to zero for all finite positive divisors. Preconditions: the input buffer's zeros at padding positions are guaranteed by the upstream reduction chain (Nodes 11, 15/20) which preserves the zero invariant established by Nodes 8, 9, 17, and 18."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Finalizer Utility / Batch-wide Normalizer. Executes after the reduction engine and before the optimizer update."
  */
@@ -2474,6 +2945,8 @@ __kernel void normalize_gradients(
      *        - Validation Preconditions: Must match the element count of the src/dest buffers.
      */
     uint src_scalar_NATURAL_parameter_count);
+
+// --- Node 24: Adam Optimizer Update -----------------------------------
 
 /**
  * @brief (Node 24) Applies Adam optimizer update to an entire parameter group. Single dispatch.
@@ -2537,6 +3010,8 @@ __kernel void adam_update(
     uint        src_scalar_NATURAL_parameter_count,
     uint        src_scalar_NATURAL_total_parameter_count);
 
+// --- Node 25: Temperature Clamping ------------------------------------
+
 /**
  * @brief (Node 25) Clamps temperature parameters within a [min, max] range.
  * @kernel_contract
@@ -2562,219 +3037,351 @@ __kernel void clamp_temperatures(
     uint        src_scalar_NATURAL_parameter_count,
     uint        src_scalar_NATURAL_total_parameter_count);
 
-// --- ADR-019: K-Fan-In Reduction Kernel Primitive ---
-// Sentinel value indicating an absent partial in the tail node of a
-// K-fan-in reduction stage.  When num_partials is not divisible by K,
-// the final node's offset list is padded with this sentinel.
-#define SENTINEL_ABSENT_PARTIAL 0xFFFFFFFFu
+// 
+// #####################################################################
+// ##                                                                 ##
+// ##            EXPERIMENTAL KERNEL DECLARATIONS                     ##
+// ##                                                                 ##
+// ##  These kernels are provided for experimentation with multi-     ##
+// ##  layer shared-layer stacks and branch-point gradient routing.   ##
+// ##  They are NOT yet referenced by the canonical DAG node          ##
+// ##  numbering, do not have assigned node IDs, and are not          ##
+// ##  covered by the existing Validation Scenarios. Integration      ##
+// ##  into the execution plan requires Policy-tier plan-             ##
+// ##  construction extensions and new ADR(s) formalizing the         ##
+// ##  multi-layer backpropagation topology.                          ##
+// ##                                                                 ##
+// #####################################################################
+// 
+
+// --- Transpose SIMD-Major Matrix-Vector (Structural Inverse of Node 4) ---
 
 /**
- * @brief (Node 14, 15a, 20a — multi-stage) Reduces groups of K scattered
- *        partials into independent output nodes with optional per-node L2 clip.
+ * @brief [EXPERIMENTAL] Computes input-dimension gradients via masked
+ *        transposed SIMD-major matrix-vector multiplication.
+ *        Structural inverse of Node 4 (forward_pass).
+ *
+ *        Computes:
+ *          dest[b][i] = Σ_h W_simd[h][i] × grad_h[b][h] × mask[b][h]
+ *
+ *        where the sum reduces over the hidden dimension and the output
+ *        spans the input dimension — the transpose of Node 4's
+ *        input→hidden forward multiply.
+ *
  * @kernel_contract
- *        - Holistic Constraints: "Each work-group processes one reduction node.
- *          The kernel reads K partials per node from the source buffer via an
- *          offset list, sums them, optionally clips the result per-node, and
- *          writes one output vector of partial_width elements. Supports absent
- *          partials via sentinel offset 0xFFFFFFFF for the tail node."
- *        - Behavioral Invariants: "When clipping_threshold >= 0, per-node L2
- *          clip is applied: scale = threshold / (norm + epsilon). When
- *          clipping_threshold < 0, clip is bypassed (diagnostic mode).
- *          Zero threshold clips to zero norm (zeroes all gradients).
- *          Epsilon prevents division by zero. Precision Boundary Conversion: storage-role partials widened via load_storage(); compute-role outputs written directly; LOCAL scratch uses COMPUTE_TYPE. All arithmetic exclusively in COMPUTE_TYPE."
- *        - Idempotency: "Associatively Non-Idempotent"
- *        - Synchronization Model: "Reduction Engine Stage"
+ *        - Holistic Constraints: "All constraints are defined by the
+ *          parameter commentary blocks."
+ *        - Idempotency: "Strictly Idempotent"
+ *        - Synchronization Model: "Streamable"
+ *        - Behavioral Invariants: "Precision Boundary Conversion:
+ *          state-role weights loaded via load_state(); storage-role
+ *          hidden_activations and hidden_mask loaded via load_storage();
+ *          compute-role upstream gradient consumed directly; storage-role
+ *          output narrowed via store_storage(). All arithmetic
+ *          exclusively in COMPUTE_TYPE.
+ *
+ *          ReLU derivative source controlled by
+ *          src_scalar_FLAG_use_explicit_hidden_mask (same pattern as
+ *          Nodes 5, 17, 18). When 0: mask derived from stored
+ *          activations (mask = load_storage(hidden_activations) > 0).
+ *          When 1: mask read from src_buffer_GLOBAL_hidden_mask. Host
+ *          MAY pass a minimal stub buffer when flag is 0.
+ *
+ *          Sample Masking (ADR-031): When load_sample_mask() returns 0
+ *          for a sample, all gradient outputs for that sample are set
+ *          to 0 and further computation is skipped.
+ *
+ *          Padding Zero-Establishment: For the padded_input_count
+ *          dimension, the kernel SHALL write zero for all positions at
+ *          indices >= input_count. The kernel is the sole guarantor of
+ *          zeros at padding positions (Initialization Contract: NONE).
+ *          Hidden-dimension padding contributes zero to the reduction
+ *          sum because upstream gradient padding positions are zero
+ *          (guaranteed by upstream Padding Zero Propagation) and weight
+ *          padding positions are zero (Zero-Propagation Theorem
+ *          state-role origin); implementations MAY skip computation at
+ *          hidden padding indices as a performance optimization."
+ *        - Kernel Bifurcation: "CONCEPT.md Principle 3(B) — structurally
+ *          incompatible with Node 4 (forward_pass). Node 4 reduces over
+ *          the input dimension to produce hidden activations and a ReLU
+ *          mask with bias addition; this kernel reduces over the hidden
+ *          dimension consuming a mask and an upstream gradient to produce
+ *          input-dimension gradients. The reduction axis swap,
+ *          opposite-direction data flow, and differing ancillary
+ *          operations (ReLU application + bias addition vs. mask-gated
+ *          transposed multiply without bias) prevent unification under
+ *          a single interface with a FLAG parameter."
  */
-__kernel void reduce_k_fan_in_and_clip(
+__kernel void transpose_matvec_masked_simd_major(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel L2 norm reduction.
-     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
+     * @param update_buffer_LOCAL_simd_tile Local memory for tiled
+     *        transposed matrix-vector multiplication.
+     *        - Allocation Formula: (SIMD_WIDTH + SIMD_WIDTH * SIMD_WIDTH)
+     *          * sizeof(COMPUTE_TYPE)
      *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
-     *          Used for tree-structured parallel reduction to compute the per-node
-     *          L2 norm (sum of squares) over partial_width elements. Each thread
-     *          accumulates partial sums of squares for its assigned elements of
-     *          the summed K-partial vector, then the work-group reduces to a
-     *          single scalar for the conditional scaling decision. One work-group
-     *          per reduction node."
+     *        - Internal Layout Note: "Partitioned into two contiguous
+     *          sub-arrays: tile_grad[SIMD_WIDTH] (broadcast tile for the
+     *          masked upstream gradient slice, holding grad_h[b][h] *
+     *          mask[b][h] for SIMD_WIDTH consecutive hidden indices) at
+     *          offset 0, followed by tile_weights[SIMD_WIDTH][SIMD_WIDTH]
+     *          (weight matrix tile loaded from the SIMD-major layout,
+     *          stride = SIMD_WIDTH) at offset SIMD_WIDTH. The weight tile
+     *          is accessed in transposed order relative to Node 4's
+     *          forward-pass access pattern: each thread reads across the
+     *          input dimension for a fixed hidden-SIMD-lane, accumulating
+     *          into an input-dimension output register."
      */
-    __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
+    __local COMPUTE_TYPE *update_buffer_LOCAL_simd_tile,
 
     /**
-     * @param src_buffer_GLOBAL_partial_collection The memory pool containing all
-     *        partial results referenced by the offset list.
-     *        - Tensor Shape: Undefined.
+     * @param src_buffer_GLOBAL_CONST_weights_shared_simd_major The
+     *        learnable shared weights in SIMD-friendly layout. Identical
+     *        buffer and layout as consumed by Node 4 (forward_pass).
+     *        - Tensor Shape: (src_scalar_NATURAL_padded_hidden_count
+     *          / SIMD_WIDTH, src_scalar_NATURAL_padded_input_count,
+     *          SIMD_WIDTH)
+     *        - Padding Contract: {
+     *            dim[0] ("hidden_count/SIMD_WIDTH" →
+     *              "padded_hidden_count/SIMD_WIDTH"):
+     *              {Type: SIMD, Formula: "SIMD_WIDTH-multiple alignment
+     *              on hidden_count ensures exact division"},
+     *            dim[1] ("input_count" → "padded_input_count"):
+     *              {Type: CACHE, Formula: "128-byte alignment"},
+     *            dim[2] ("SIMD_WIDTH"): {Type: NONE}
+     *          }
+     *        - Precision Role: "state"
+     *        - Calculability Proof:
+     *          [src_scalar_NATURAL_padded_hidden_count,
+     *          src_scalar_NATURAL_padded_input_count]
+     *        - Validation Preconditions: Host shall allocate exactly
+     *          [src_scalar_NATURAL_padded_hidden_count *
+     *          src_scalar_NATURAL_padded_input_count *
+     *          sizeof(STATE_TYPE)] bytes.
+     */
+    __global const STATE_TYPE
+        *src_buffer_GLOBAL_CONST_weights_shared_simd_major,
+
+    /**
+     * @param src_buffer_GLOBAL_grad_hidden_activations The upstream
+     *        gradient with respect to this layer's hidden activations.
+     *        May originate from Node 16 (single-layer), from
+     *        elementwise_add (branch-point combination), or from a
+     *        higher layer's transpose_matvec_masked_simd_major output
+     *        (multi-layer chain).
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count,
+     *          src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof:
+     *          [src_scalar_NATURAL_total_batch_count,
+     *          src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: [1] The batch access slice
+     *          must be within bounds, as proven by:
+     *          (src_scalar_NATURAL_batch_chunk_offset +
+     *          src_scalar_NATURAL_batch_chunk_count) <=
+     *          src_scalar_NATURAL_total_batch_count. [2] Host shall
+     *          allocate exactly
+     *          [src_scalar_NATURAL_total_batch_count *
+     *          src_scalar_NATURAL_padded_hidden_count *
+     *          sizeof(COMPUTE_TYPE)] bytes.
+     */
+    __global const COMPUTE_TYPE
+        *src_buffer_GLOBAL_grad_hidden_activations,
+
+    /**
+     * @param src_buffer_GLOBAL_hidden_activations The intermediate
+     *        activations from this layer's forward pass (Node 4 output).
+     *        Used for ReLU derivative recomputation when
+     *        src_scalar_FLAG_use_explicit_hidden_mask == 0.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count,
+     *          src_scalar_NATURAL_padded_hidden_count)
+     *        - Padding Contract: {Type: CACHE, Formula:
+     *          "Padded to alignment"}
      *        - Precision Role: "storage"
-     *        - Calculability Proof: N/A.
-     *        - Validation Preconditions: Host must provide a valid buffer that
-     *          encompasses all memory regions referenced by the combination of
-     *          `src_buffer_GLOBAL_CONST_offset_list_flat` and
-     *          `src_scalar_NATURAL_partial_width`.
+     *        - Calculability Proof:
+     *          [src_scalar_NATURAL_total_batch_count,
+     *          src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: [1] The batch access slice
+     *          must be within bounds, as proven by:
+     *          (src_scalar_NATURAL_batch_chunk_offset +
+     *          src_scalar_NATURAL_batch_chunk_count) <=
+     *          src_scalar_NATURAL_total_batch_count. [2] Host must
+     *          ensure this buffer was allocated to exactly
+     *          [src_scalar_NATURAL_total_batch_count *
+     *          src_scalar_NATURAL_padded_hidden_count *
+     *          sizeof(STORAGE_TYPE)] bytes.
      */
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_partial_collection,
+    __global const STORAGE_TYPE
+        *src_buffer_GLOBAL_hidden_activations,
 
     /**
-     * @param src_buffer_GLOBAL_CONST_offset_list_flat Flat offset list with K
-     *        consecutive entries per node. Sentinel SENTINEL_ABSENT_PARTIAL
-     *        (0xFFFFFFFF) indicates an absent partial in the tail node.
-     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in)
+     * @param src_buffer_GLOBAL_hidden_mask [CONDITIONAL on
+     *        src_scalar_FLAG_use_explicit_hidden_mask] The ReLU
+     *        derivative mask from Node 4.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count,
+     *          src_scalar_NATURAL_padded_hidden_count)
+     *        - Padding Contract: {Type: CACHE, Formula:
+     *          "Padded to alignment"}
+     *        - Precision Role: "storage"
+     *        - Calculability Proof:
+     *          [src_scalar_NATURAL_total_batch_count,
+     *          src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: [1] This buffer is read from
+     *          ONLY IF src_scalar_FLAG_use_explicit_hidden_mask == 1.
+     *          [2] If the flag is set, the batch access slice must be
+     *          within bounds, as proven by:
+     *          (src_scalar_NATURAL_batch_chunk_offset +
+     *          src_scalar_NATURAL_batch_chunk_count) <=
+     *          src_scalar_NATURAL_total_batch_count. [3] If the flag
+     *          is set, Host must ensure this buffer was allocated to
+     *          exactly [src_scalar_NATURAL_total_batch_count *
+     *          src_scalar_NATURAL_padded_hidden_count *
+     *          sizeof(STORAGE_TYPE)] bytes. [4] If the flag is not
+     *          set, the Host MAY pass a minimal stub buffer.
+     */
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_hidden_mask,
+
+    /**
+     * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer
+     *        encoding the validity (1) or padding (0) status of each
+     *        sample. Bit i of word j encodes sample (32*j + i),
+     *        LSB-first. Accessed via load_sample_mask() utility
+     *        (ADR-031).
+     *        - Tensor Shape:
+     *          (ceil(src_scalar_NATURAL_total_batch_count / 32))
      *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_fan_in]
-     *        - Validation Preconditions: Host must provide a buffer containing exactly
-     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in` uint entries.
+     *        - Precision Role: "exempt (integer bitmask)"
+     *        - Calculability Proof:
+     *          [src_scalar_NATURAL_total_batch_count]
+     *        - Validation Preconditions: [1] The batch access slice
+     *          must be within bounds, as proven by:
+     *          (src_scalar_NATURAL_batch_chunk_offset +
+     *          src_scalar_NATURAL_batch_chunk_count) <=
+     *          src_scalar_NATURAL_total_batch_count. [2] Host shall
+     *          allocate exactly
+     *          [ceil(src_scalar_NATURAL_total_batch_count / 32) *
+     *          sizeof(uint)] bytes.
      */
-    __global const uint *src_buffer_GLOBAL_CONST_offset_list_flat,
+    __global const uint *src_buffer_GLOBAL_sample_mask,
 
     /**
-     * @param dest_buffer_GLOBAL_stage_partial Contiguous output buffer. Node n writes
-     *        at `[n * partial_width, (n+1) * partial_width)`.
-     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width)
-     *        - Padding Contract: {Type: NONE}
-     *        - Precision Role: "compute"
-     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_partial_width]
-     *        - Validation Preconditions: Host must allocate exactly
-     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)` bytes.
+     * @param dest_buffer_GLOBAL_grad_input The output gradient with
+     *        respect to this layer's input. Each batch chunk writes to
+     *        its disjoint row-slice; the full buffer is valid for
+     *        downstream consumption only after all batch chunks
+     *        complete.
+     *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count,
+     *          src_scalar_NATURAL_padded_input_count)
+     *        - Padding Contract: {Type: CACHE, Formula:
+     *          "Pad row stride to 128-byte alignment"}
+     *        - Precision Role: "storage"
+     *        - Calculability Proof:
+     *          [src_scalar_NATURAL_total_batch_count,
+     *          src_scalar_NATURAL_padded_input_count]
+     *        - Validation Preconditions: [1] The write slice must be
+     *          within bounds, as proven by:
+     *          (src_scalar_NATURAL_batch_chunk_offset +
+     *          src_scalar_NATURAL_batch_chunk_count) <=
+     *          src_scalar_NATURAL_total_batch_count. [2] Host shall
+     *          allocate exactly
+     *          [src_scalar_NATURAL_total_batch_count *
+     *          src_scalar_NATURAL_padded_input_count *
+     *          sizeof(STORAGE_TYPE)] bytes.
      */
-    __global COMPUTE_TYPE *dest_buffer_GLOBAL_stage_partial,
+    __global STORAGE_TYPE *dest_buffer_GLOBAL_grad_input,
 
     /**
-     * @param src_scalar_NATURAL_fan_in Number of partials to reduce per node.
-     *        - Validation Preconditions: Must be >= 2.
+     * @param src_scalar_FLAG_use_explicit_hidden_mask A flag to select
+     *        the ReLU derivative source.
+     *        - Validation Preconditions: Must be 0 or 1. If 0, mask is
+     *          derived from stored activations
+     *          (mask = load_storage(hidden_activations) > 0). If 1,
+     *          mask is read from src_buffer_GLOBAL_hidden_mask.
      */
-    uint src_scalar_NATURAL_fan_in,
+    uint src_scalar_FLAG_use_explicit_hidden_mask,
 
-    /**
-     * @param src_scalar_NATURAL_node_count Number of independent reduction nodes.
-     *        - Validation Preconditions: Must be >= 1.
-     */
-    uint src_scalar_NATURAL_node_count,
+    uint src_scalar_NATURAL_batch_chunk_offset,
+    uint src_scalar_NATURAL_batch_chunk_count,
+    uint src_scalar_NATURAL_total_batch_count,
+    uint src_scalar_NATURAL_input_count,
+    uint src_scalar_NATURAL_padded_input_count,
+    uint src_scalar_NATURAL_hidden_count,
+    uint src_scalar_NATURAL_padded_hidden_count);
 
-    /**
-     * @param src_scalar_NATURAL_partial_width Number of elements per partial vector.
-     *        - Validation Preconditions: Must be >= 1.
-     */
-    uint src_scalar_NATURAL_partial_width,
-
-    /**
-     * @param src_scalar_REAL_clipping_threshold_t_j The clipping threshold for this stage j.
-     *        Value < 0 disables clip (diagnostic mode). Value 0 clips to zero norm.
-     *        - Validation Preconditions: Negative values bypass clipping; non-negative values enable it.
-     */
-    COMPUTE_TYPE src_scalar_REAL_clipping_threshold_t_j,
-
-    /**
-     * @param src_scalar_REAL_epsilon Small constant to prevent division by zero.
-     *        - Validation Preconditions: Must be a small, positive real number.
-     */
-    COMPUTE_TYPE src_scalar_REAL_epsilon);
+// --- Element-Wise Addition (Branch-Point Gradient Combination) --------
 
 /**
- * @brief (Node 14, 15a, 20a — interior stages and compute-role leaf stages)
- *        Compute-entry variant of reduce_k_fan_in_and_clip. Identical algorithm,
- *        but reads COMPUTE_TYPE intermediates rather than STORAGE_TYPE partials.
+ * @brief [EXPERIMENTAL] Element-wise addition of two compute-role
+ *        buffers. Combines gradient contributions at DAG branch points
+ *        where classifier heads and deeper layers converge.
+ *
+ *        Computes:
+ *          dest[i] = src_a[i] + src_b[i]  for i in [0, element_count)
+ *
  * @kernel_contract
- *        - Holistic Constraints: "Each work-group processes one reduction node.
- *          The kernel reads K partials per node from the source buffer via an
- *          offset list, sums them, optionally clips the result per-node, and
- *          writes one output vector of partial_width elements. Supports absent
- *          partials via sentinel offset 0xFFFFFFFF for the tail node."
- *        - Behavioral Invariants: "When clipping_threshold >= 0, per-node L2
- *          clip is applied: scale = threshold / (norm + epsilon). When
- *          clipping_threshold < 0, clip is bypassed (diagnostic mode).
- *          Zero threshold clips to zero norm (zeroes all gradients).
- *          Epsilon prevents division by zero. All buffers are compute-role;
- *          no precision boundary conversion is required. Reduction accumulation
- *          in COMPUTE_TYPE; compute-role output written directly. All arithmetic
- *          exclusively in COMPUTE_TYPE."
- *        - Idempotency: "Associatively Non-Idempotent"
- *        - Synchronization Model: "Reduction Engine Stage"
- *        - Precision Variant: "Compute-entry variant of reduce_k_fan_in_and_clip.
- *          Used for interior stages of multi-stage reduction trees (where the
- *          source is a prior stage's COMPUTE_TYPE output) and for leaf stages
- *          whose source collection is natively COMPUTE_TYPE (e.g., BCE loss
- *          partials from Node 7)."
+ *        - Holistic Constraints: "All constraints are defined by the
+ *          parameter commentary blocks."
+ *        - Idempotency: "Strictly Idempotent"
+ *        - Synchronization Model: "Utility"
+ *        - Behavioral Invariants: "All buffers are compute-role; no
+ *          precision boundary conversion is required. All arithmetic
+ *          exclusively in COMPUTE_TYPE.
+ *          Padding Zero Propagation (Emergent): When both input
+ *          buffers carry zero at a position, the output carries zero
+ *          at that position. This is a mathematical consequence of
+ *          0 + 0 = 0. Precondition: both input buffers must carry
+ *          zero at padding positions, guaranteed by their respective
+ *          upstream invariant chains."
  */
-__kernel void reduce_k_fan_in_and_clip_from_compute(
+__kernel void elementwise_add(
     /**
-     * @param update_buffer_LOCAL_reduction_tile Local memory for intra-work-group parallel L2 norm reduction.
-     *        - Allocation Formula: get_local_size(0) * sizeof(COMPUTE_TYPE)
-     *        - Precision Role: "compute" (LOCAL scratch)
-     *        - Internal Layout Note: "Flat 1D array indexed by local thread ID.
-     *          Identical access pattern to reduce_k_fan_in_and_clip; the only
-     *          difference is that source reads are COMPUTE_TYPE rather than
-     *          STORAGE_TYPE."
-     */
-    __local COMPUTE_TYPE *update_buffer_LOCAL_reduction_tile,
-
-    /**
-     * @param src_buffer_GLOBAL_partial_collection The memory pool containing
-     *        COMPUTE_TYPE intermediate results from a prior reduction stage or
-     *        a natively compute-role partial collection.
-     *        - Tensor Shape: Undefined.
+     * @param src_buffer_GLOBAL_input_a The first addend buffer.
+     *        - Tensor Shape: (src_scalar_NATURAL_element_count)
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "compute"
-     *        - Calculability Proof: N/A.
-     *        - Validation Preconditions: Host must provide a valid buffer that
-     *          encompasses all memory regions referenced by the combination of
-     *          `src_buffer_GLOBAL_CONST_offset_list_flat` and
-     *          `src_scalar_NATURAL_partial_width`.
+     *        - Calculability Proof:
+     *          [src_scalar_NATURAL_element_count]
+     *        - Validation Preconditions: Host shall allocate exactly
+     *          [src_scalar_NATURAL_element_count *
+     *          sizeof(COMPUTE_TYPE)] bytes.
      */
-    __global const COMPUTE_TYPE *src_buffer_GLOBAL_partial_collection,
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_input_a,
 
     /**
-     * @param src_buffer_GLOBAL_CONST_offset_list_flat Flat offset list with K
-     *        consecutive entries per node. Sentinel SENTINEL_ABSENT_PARTIAL
-     *        (0xFFFFFFFF) indicates an absent partial in the tail node.
-     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in)
-     *        - Padding Contract: {Type: NONE}
-     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_fan_in]
-     *        - Validation Preconditions: Host must provide a buffer containing exactly
-     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in` uint entries.
-     */
-    __global const uint *src_buffer_GLOBAL_CONST_offset_list_flat,
-
-    /**
-     * @param dest_buffer_GLOBAL_stage_partial Contiguous output buffer. Node n writes
-     *        at `[n * partial_width, (n+1) * partial_width)`.
-     *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width)
+     * @param src_buffer_GLOBAL_input_b The second addend buffer.
+     *        - Tensor Shape: (src_scalar_NATURAL_element_count)
      *        - Padding Contract: {Type: NONE}
      *        - Precision Role: "compute"
-     *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_partial_width]
-     *        - Validation Preconditions: Host must allocate exactly
-     *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)` bytes.
+     *        - Calculability Proof:
+     *          [src_scalar_NATURAL_element_count]
+     *        - Validation Preconditions: Host shall allocate exactly
+     *          [src_scalar_NATURAL_element_count *
+     *          sizeof(COMPUTE_TYPE)] bytes.
      */
-    __global COMPUTE_TYPE *dest_buffer_GLOBAL_stage_partial,
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_input_b,
 
     /**
-     * @param src_scalar_NATURAL_fan_in Number of partials to reduce per node.
-     *        - Validation Preconditions: Must be >= 2.
+     * @param dest_buffer_GLOBAL_output The element-wise sum.
+     *        - Tensor Shape: (src_scalar_NATURAL_element_count)
+     *        - Padding Contract: {Type: NONE}
+     *        - Precision Role: "compute"
+     *        - Calculability Proof:
+     *          [src_scalar_NATURAL_element_count]
+     *        - Validation Preconditions: Host shall allocate exactly
+     *          [src_scalar_NATURAL_element_count *
+     *          sizeof(COMPUTE_TYPE)] bytes.
      */
-    uint src_scalar_NATURAL_fan_in,
+    __global COMPUTE_TYPE *dest_buffer_GLOBAL_output,
 
     /**
-     * @param src_scalar_NATURAL_node_count Number of independent reduction nodes.
-     *        - Validation Preconditions: Must be >= 1.
+     * @param src_scalar_NATURAL_element_count Total number of elements
+     *        to process.
+     *        - Calculability Proof: [Known by Host Orchestrator from
+     *          the source buffers' BufferDescriptors — must be
+     *          identical across all three buffers]
+     *        - Validation Preconditions: Must match the element count
+     *          of all three buffers.
      */
-    uint src_scalar_NATURAL_node_count,
-
-    /**
-     * @param src_scalar_NATURAL_partial_width Number of elements per partial vector.
-     *        - Validation Preconditions: Must be >= 1.
-     */
-    uint src_scalar_NATURAL_partial_width,
-
-    /**
-     * @param src_scalar_REAL_clipping_threshold_t_j The clipping threshold for this stage j.
-     *        Value < 0 disables clip (diagnostic mode). Value 0 clips to zero norm.
-     *        - Validation Preconditions: Negative values bypass clipping; non-negative values enable it.
-     */
-    COMPUTE_TYPE src_scalar_REAL_clipping_threshold_t_j,
-
-    /**
-     * @param src_scalar_REAL_epsilon Small constant to prevent division by zero.
-     *        - Validation Preconditions: Must be a small, positive real number.
-     */
-    COMPUTE_TYPE src_scalar_REAL_epsilon);
+    uint src_scalar_NATURAL_element_count);
 
 #endif // KERNELS_CL_H

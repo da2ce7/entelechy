@@ -138,11 +138,11 @@ void PREC_FN(task_clip_shared_grads)(void* raw_args, uint task_index, uint threa
     for (uint i = 0; i < n_w; i++) {
         COMPUTE_T v = scalar_load_storage(a->src_buffer_GLOBAL_partial_grad_weights_shared_simd_major, i);
         scalar_store_storage(a->dest_buffer_GLOBAL_clipped_partial_grad_weights_shared_simd_major,
-            a->dest_scalar_NATURAL_weights_write_offset + i, v * scale);
+            a->out_scalar_NATURAL_weights_write_offset + i, v * scale);
     }
     for (uint i = 0; i < n_b; i++) {
         COMPUTE_T v = scalar_load_storage(a->src_buffer_GLOBAL_partial_grad_biases_shared, i);
         scalar_store_storage(a->dest_buffer_GLOBAL_clipped_partial_grad_biases_shared,
-            a->dest_scalar_NATURAL_biases_write_offset + i, v * scale);
+            a->out_scalar_NATURAL_biases_write_offset + i, v * scale);
     }
 }

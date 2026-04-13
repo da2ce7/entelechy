@@ -33,7 +33,7 @@ void PREC_FN(task_forward_pass)(void* raw_args, uint task_index, uint thread_id)
     /* Padded samples: zero out and return */
     if (!mask_val) {
         memset(hidden_row, 0, a->src_scalar_NATURAL_padded_hidden_count * PREC_SIZEOF_STORAGE);
-        if (a->dest_scalar_FLAG_produce_hidden_mask) {
+        if (a->out_scalar_FLAG_produce_hidden_mask) {
             memset(hidden_msk_row, 0, a->src_scalar_NATURAL_padded_hidden_count * PREC_SIZEOF_STORAGE);
         }
         return;
@@ -75,7 +75,7 @@ void PREC_FN(task_forward_pass)(void* raw_args, uint task_index, uint thread_id)
         simd_store_storage(&hidden_row[h_offset], activated);
 
         /* Hidden mask: 1.0 where pre-ReLU > 0 AND sample is valid */
-        if (a->dest_scalar_FLAG_produce_hidden_mask) {
+        if (a->out_scalar_FLAG_produce_hidden_mask) {
             simd_float relu_mask = simd_select(v_zero, v_mask, accum);
             simd_store_storage(&hidden_msk_row[h_offset], relu_mask);
         }

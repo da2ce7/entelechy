@@ -321,7 +321,7 @@ All flags match §6.0 definitions. ✓
 
 | Requirement                                 | Implementation                                                   |
 | :------------------------------------------ | :--------------------------------------------------------------- |
-| Forward pass produces mask when `explicit`  | Node 4: `dest_scalar_FLAG_produce_hidden_mask` ✓                 |
+| Forward pass produces mask when `explicit`  | Node 4: `out_scalar_FLAG_produce_hidden_mask` ✓                 |
 | Consuming kernels read mask when `explicit` | Nodes 5, 17, 18: `src_scalar_FLAG_use_explicit_hidden_mask` ✓    |
 | Stub buffer allowed when flag = 0           | All conditional buffers: "Host MAY pass a minimal stub buffer" ✓ |
 

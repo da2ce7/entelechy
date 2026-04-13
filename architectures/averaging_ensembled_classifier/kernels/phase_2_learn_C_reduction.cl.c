@@ -1,7 +1,8 @@
 // phase_2_learn_C_reduction.cl.c
 //
 // Learn-phase reduction and aggregation kernel implementations:
-//   Nodes 14, 15, 16, 20 — and the ADR-019 K-fan-in primitives.
+//   Nodes 14, 15, 16, 20 — the ADR-019 K-fan-in primitives,
+//   and the narrow_to_storage Precision Bridge.
 // Reference specification: kernels.cl.h (ADR-013 designation).
 
 #ifdef __OPENCL_VERSION__
@@ -317,135 +318,6 @@ __kernel void clip_intermediate_grad(
 }
 
 // ===========================================================================
-// Node 16 — stabilize_and_reduce_grad_hidden_activations
-// ===========================================================================
-// Strategy: Specialized "work-group per row" reduction engine.  Each
-// work-group reduces one row of the contiguous SoA buffer produced by the
-// upstream Item Synchronization Point (Node 13), applying a host-prescribed
-// stabilization schedule.
-//
-//   Phase 1 — Pre-accumulation: each thread serially accumulates
-//     ceil(total_modules_count / lsize) elements from its assigned row,
-//     then clips its scalar accumulator to the host-prescribed
-//     pre-accumulation threshold.
-//   Phase 2 — Staged reduction: upward-sweep binary tree in __local memory
-//     with per-stage clip thresholds from the host-prescribed schedule.
-//   Phase 3 — Final write: thread 0 writes the scalar result.
-//
-// Dispatch geometry:
-//   global = (total_batch_count * padded_hidden_count * work_group_size)
-//   local  = (work_group_size)
-//
-// get_group_id(0)  → row index (flattened batch × hidden).
-// get_local_id(0)  → reduction lane within the work-group.
-//
-// The upward-sweep binary tree starts at stride 1 (adjacent pairs) and
-// doubles each stage, leaving the final result in local[0].  This pattern
-// matches the host-prescribed stage count: stage 0 is the leaf (most
-// permissive threshold), stage num-1 is the root (tightest threshold).
-//
-// The tree reduction requires get_local_size(0) to be a power of two.
-// This is guaranteed by the Orchestration tier's dispatch selection.
-
-__kernel void stabilize_and_reduce_grad_hidden_activations(
-    __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
-    __global const STORAGE_TYPE *src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa,
-    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_summed_grad_hidden_activations,
-    __global const COMPUTE_TYPE *src_buffer_GLOBAL_CONST_clipping_threshold_per_stage,
-    uint                         src_scalar_NATURAL_num_reduction_stages,
-    COMPUTE_TYPE                 src_scalar_REAL_clipping_threshold_t_pre,
-    COMPUTE_TYPE                 src_scalar_REAL_epsilon,
-    uint                         src_scalar_NATURAL_total_batch_count,
-    uint                         src_scalar_NATURAL_padded_hidden_count,
-    uint                         src_scalar_NATURAL_total_modules_count,
-    uint                         src_scalar_NATURAL_padded_total_modules_count) {
-
-    // --- 0. Work-Group → Row Mapping --------------------------------------
-    const uint row_idx = get_group_id(0);
-    const uint lid     = get_local_id(0);
-    const uint lsize   = get_local_size(0);
-
-    const uint total_rows =
-        src_scalar_NATURAL_total_batch_count
-        * src_scalar_NATURAL_padded_hidden_count;
-    if (row_idx >= total_rows) {
-        return;
-    }
-
-    // --- 1. Phase 1: Pre-accumulation ------------------------------------
-    // Each thread accumulates ceil(total_modules_count / lsize) elements
-    // from its assigned row, then clips to the host-prescribed threshold.
-    // When total_modules_count <= lsize, each thread loads at most one
-    // element and the clip is effectively a no-op (the host sets t_pre
-    // high enough to avoid attenuation of single values).
-    COMPUTE_TYPE thread_accum = COMPUTE_ZERO;
-    const long   row_offset   =
-        (long)row_idx * src_scalar_NATURAL_padded_total_modules_count;
-
-    for (uint i = lid; i < src_scalar_NATURAL_total_modules_count;
-         i += lsize) {
-        thread_accum += load_storage(
-            src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa,
-            row_offset + i);
-    }
-
-    // Pre-accumulation clip (host-prescribed threshold).
-    // For a single scalar, the L2 norm equals the absolute value.
-    const COMPUTE_TYPE mag = fabs(thread_accum);
-    if (mag > src_scalar_REAL_clipping_threshold_t_pre) {
-        thread_accum *= src_scalar_REAL_clipping_threshold_t_pre
-                      / (mag + src_scalar_REAL_epsilon);
-    }
-
-    update_buffer_LOCAL_reduction_tile[lid] = thread_accum;
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    // --- 2. Phase 2: Staged Reduction with Interleaved Clipping ----------
-    // Upward-sweep binary tree: stride doubles each stage, merging
-    // adjacent pairs.  After each summation, the per-element result is
-    // clipped to the host-prescribed threshold for that stage.
-    //
-    // Stage indexing (per contract):
-    //   stage 0 → leaf (most permissive, farthest from root)
-    //   stage num-1 → root (tightest, = T_algorithmic)
-    //
-    // When num_reduction_stages == 0 (total_modules_count <= 1), this
-    // loop is bypassed entirely and thread 0 writes its pre-accumulation
-    // result directly.
-    for (uint s = 0; s < src_scalar_NATURAL_num_reduction_stages; ++s) {
-        const COMPUTE_TYPE threshold =
-            src_buffer_GLOBAL_CONST_clipping_threshold_per_stage[s];
-
-        const uint stride = 1u << s;
-        const uint pair   = stride << 1;
-
-        // Bitwise test: (lid & (pair - 1)) == 0 selects the "owning"
-        // thread of each pair.  Equivalent to lid % pair == 0 for
-        // power-of-two pair, but avoids integer division.
-        if ((lid & (pair - 1)) == 0 && lid + stride < lsize) {
-            COMPUTE_TYPE sum_val =
-                update_buffer_LOCAL_reduction_tile[lid]
-                + update_buffer_LOCAL_reduction_tile[lid + stride];
-
-            // Per-element scalar clip (L2 norm of a scalar = |scalar|).
-            const COMPUTE_TYPE norm_val = fabs(sum_val);
-            if (norm_val > threshold) {
-                sum_val *= threshold / (norm_val + src_scalar_REAL_epsilon);
-            }
-            update_buffer_LOCAL_reduction_tile[lid] = sum_val;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-
-    // --- 3. Phase 3: Final Write -----------------------------------------
-    // Thread 0 holds the fully reduced and stabilized scalar result.
-    if (lid == 0) {
-        dest_buffer_GLOBAL_summed_grad_hidden_activations[row_idx] =
-            update_buffer_LOCAL_reduction_tile[0];
-    }
-}
-
-// ===========================================================================
 // ADR-019: K-Fan-In Reduction Kernel Primitives
 // ===========================================================================
 
@@ -661,5 +533,182 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
                     scale_factor;
             }
         }
+    }
+}
+
+// ===========================================================================
+// Precision Bridge — narrow_to_storage
+// ===========================================================================
+// Strategy: Embarrassingly parallel element-wise format conversion.  Each
+// work-item converts exactly one element from COMPUTE_TYPE to STORAGE_TYPE
+// via store_storage().  No arithmetic is performed on the values — this is
+// a pure precision narrowing operation.
+//
+// When STORAGE_TYPE == COMPUTE_TYPE, the Orchestration tier elides this
+// dispatch entirely at plan-construction time (the source buffer is
+// bit-compatible with the consumer's expectation).  If dispatched anyway,
+// store_storage() compiles to an identity copy that the compiler eliminates.
+//
+// When STORAGE_TYPE is FP8, the output is subject to the FP8 quantization
+// floor and saturation semantics of store_storage_fp8(): values beyond the
+// format's max finite value saturate, values below the minimum subnormal
+// round to the nearest representable value (including zero), and NaN maps
+// to zero.
+//
+// Padding Zero Propagation (Emergent): store_storage(buf, idx, 0) == 0
+// for all supported precision formats — including FP8 where 0x00 represents
+// zero in both E4M3 and E5M2.  The bridge is padding-agnostic; zero
+// propagation is a consequence of the identity property of zero under
+// format conversion.
+//
+// Dispatch geometry:
+//   global = (element_count)   [or padded to backend work-group granularity]
+//   local  = backend-selected
+//
+// get_global_id(0) → element index.
+
+__kernel void narrow_to_storage(
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_input,
+    __global STORAGE_TYPE       *dest_buffer_GLOBAL_output,
+    uint                         src_scalar_NATURAL_element_count) {
+
+    const uint idx = get_global_id(0);
+
+    if (idx >= src_scalar_NATURAL_element_count) {
+        return;
+    }
+
+    // Pure format conversion: read COMPUTE_TYPE directly, narrow via
+    // store_storage().  No arithmetic on the value.
+    store_storage(dest_buffer_GLOBAL_output, idx,
+                  src_buffer_GLOBAL_input[idx]);
+}
+
+// ===========================================================================
+// Node 16 — stabilize_and_reduce_grad_hidden_activations
+// ===========================================================================
+// Strategy: Specialized "work-group per row" reduction engine.  Each
+// work-group reduces one row of the contiguous SoA buffer produced by the
+// upstream Item Synchronization Point (Node 13), applying a host-prescribed
+// stabilization schedule.
+//
+//   Phase 1 — Pre-accumulation: each thread serially accumulates
+//     ceil(total_modules_count / lsize) elements from its assigned row,
+//     then clips its scalar accumulator to the host-prescribed
+//     pre-accumulation threshold.
+//   Phase 2 — Staged reduction: upward-sweep binary tree in __local memory
+//     with per-stage clip thresholds from the host-prescribed schedule.
+//   Phase 3 — Final write: thread 0 writes the scalar result.
+//
+// Dispatch geometry:
+//   global = (total_batch_count * padded_hidden_count * work_group_size)
+//   local  = (work_group_size)
+//
+// get_group_id(0)  → row index (flattened batch × hidden).
+// get_local_id(0)  → reduction lane within the work-group.
+//
+// The upward-sweep binary tree starts at stride 1 (adjacent pairs) and
+// doubles each stage, leaving the final result in local[0].  This pattern
+// matches the host-prescribed stage count: stage 0 is the leaf (most
+// permissive threshold), stage num-1 is the root (tightest threshold).
+//
+// The tree reduction requires get_local_size(0) to be a power of two.
+// This is guaranteed by the Orchestration tier's dispatch selection.
+
+__kernel void stabilize_and_reduce_grad_hidden_activations(
+    __local COMPUTE_TYPE        *update_buffer_LOCAL_reduction_tile,
+    __global const STORAGE_TYPE *src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa,
+    __global COMPUTE_TYPE       *dest_buffer_GLOBAL_summed_grad_hidden_activations,
+    __global const COMPUTE_TYPE *src_buffer_GLOBAL_CONST_clipping_threshold_per_stage,
+    uint                         src_scalar_NATURAL_num_reduction_stages,
+    COMPUTE_TYPE                 src_scalar_REAL_clipping_threshold_t_pre,
+    COMPUTE_TYPE                 src_scalar_REAL_epsilon,
+    uint                         src_scalar_NATURAL_total_batch_count,
+    uint                         src_scalar_NATURAL_padded_hidden_count,
+    uint                         src_scalar_NATURAL_total_modules_count,
+    uint                         src_scalar_NATURAL_padded_total_modules_count) {
+
+    // --- 0. Work-Group → Row Mapping --------------------------------------
+    const uint row_idx = get_group_id(0);
+    const uint lid     = get_local_id(0);
+    const uint lsize   = get_local_size(0);
+
+    const uint total_rows =
+        src_scalar_NATURAL_total_batch_count
+        * src_scalar_NATURAL_padded_hidden_count;
+    if (row_idx >= total_rows) {
+        return;
+    }
+
+    // --- 1. Phase 1: Pre-accumulation ------------------------------------
+    // Each thread accumulates ceil(total_modules_count / lsize) elements
+    // from its assigned row, then clips to the host-prescribed threshold.
+    // When total_modules_count <= lsize, each thread loads at most one
+    // element and the clip is effectively a no-op (the host sets t_pre
+    // high enough to avoid attenuation of single values).
+    COMPUTE_TYPE thread_accum = COMPUTE_ZERO;
+    const long   row_offset   =
+        (long)row_idx * src_scalar_NATURAL_padded_total_modules_count;
+
+    for (uint i = lid; i < src_scalar_NATURAL_total_modules_count;
+         i += lsize) {
+        thread_accum += load_storage(
+            src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa,
+            row_offset + i);
+    }
+
+    // Pre-accumulation clip (host-prescribed threshold).
+    // For a single scalar, the L2 norm equals the absolute value.
+    const COMPUTE_TYPE mag = fabs(thread_accum);
+    if (mag > src_scalar_REAL_clipping_threshold_t_pre) {
+        thread_accum *= src_scalar_REAL_clipping_threshold_t_pre
+                      / (mag + src_scalar_REAL_epsilon);
+    }
+
+    update_buffer_LOCAL_reduction_tile[lid] = thread_accum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // --- 2. Phase 2: Staged Reduction with Interleaved Clipping ----------
+    // Upward-sweep binary tree: stride doubles each stage, merging
+    // adjacent pairs.  After each summation, the per-element result is
+    // clipped to the host-prescribed threshold for that stage.
+    //
+    // Stage indexing (per contract):
+    //   stage 0 → leaf (most permissive, farthest from root)
+    //   stage num-1 → root (tightest, = T_algorithmic)
+    //
+    // When num_reduction_stages == 0 (total_modules_count <= 1), this
+    // loop is bypassed entirely and thread 0 writes its pre-accumulation
+    // result directly.
+    for (uint s = 0; s < src_scalar_NATURAL_num_reduction_stages; ++s) {
+        const COMPUTE_TYPE threshold =
+            src_buffer_GLOBAL_CONST_clipping_threshold_per_stage[s];
+
+        const uint stride = 1u << s;
+        const uint pair   = stride << 1;
+
+        // Bitwise test: (lid & (pair - 1)) == 0 selects the "owning"
+        // thread of each pair.  Equivalent to lid % pair == 0 for
+        // power-of-two pair, but avoids integer division.
+        if ((lid & (pair - 1)) == 0 && lid + stride < lsize) {
+            COMPUTE_TYPE sum_val =
+                update_buffer_LOCAL_reduction_tile[lid]
+                + update_buffer_LOCAL_reduction_tile[lid + stride];
+
+            // Per-element scalar clip (L2 norm of a scalar = |scalar|).
+            const COMPUTE_TYPE norm_val = fabs(sum_val);
+            if (norm_val > threshold) {
+                sum_val *= threshold / (norm_val + src_scalar_REAL_epsilon);
+            }
+            update_buffer_LOCAL_reduction_tile[lid] = sum_val;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // --- 3. Phase 3: Final Write -----------------------------------------
+    // Thread 0 holds the fully reduced and stabilized scalar result.
+    if (lid == 0) {
+        dest_buffer_GLOBAL_summed_grad_hidden_activations[row_idx] =
+            update_buffer_LOCAL_reduction_tile[0];
     }
 }

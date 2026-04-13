@@ -279,7 +279,7 @@ class ClipSharedGradientsChunkBinding(KernelBinding):
             real("src_scalar_REAL_epsilon"),
             u32("src_scalar_NATURAL_weights_parameter_count"),
             u32("src_scalar_NATURAL_biases_parameter_count"),
-            u32("dest_scalar_NATURAL_weights_write_offset"),
-            u32("dest_scalar_NATURAL_biases_write_offset"),
+            u32("out_scalar_NATURAL_weights_write_offset"),
+            u32("out_scalar_NATURAL_biases_write_offset"),
             u32("src_scalar_NATURAL_num_batch_chunks"),
         ]
