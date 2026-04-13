@@ -415,6 +415,55 @@ class ClipIntermediateGradBinding(KernelBinding):
 
 
 # ---------------------------------------------------------------------------
+# Precision Bridge — narrow_to_storage
+# ---------------------------------------------------------------------------
+
+
+class NarrowToStorageBinding(KernelBinding):
+    """Binding for ``narrow_to_storage`` (Precision Bridge utility).
+
+    Dispatch geometry::
+
+        global = (element_count)
+        local  = backend-selected (None)
+
+    Embarrassingly parallel element-wise format conversion.  Each work-item
+    narrows one COMPUTE_TYPE element to STORAGE_TYPE via store_storage().
+    Elided entirely by the Orchestration tier when storage_dtype ==
+    compute_dtype — the source buffer is bit-compatible with the consumer.
+    """
+
+    def get_kernel_name(self) -> str:
+        return "narrow_to_storage"
+
+    def compute_grid(
+        self,
+        tile_index: int,
+        scalar_params: dict[str, Any],
+        hardware_simd_width: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+        _ = tile_index, hardware_simd_width
+        return (int(scalar_params["src_scalar_NATURAL_element_count"]),), None
+
+    def marshal_args(
+        self,
+        get_buffer: Callable[[BufferHandle], cl.Buffer],
+        buffer_bindings: dict[str, BufferHandle],
+        scalar_params: dict[str, Any],
+        tile_index: int,
+    ) -> list[Any]:
+        _ = tile_index
+        buf: Callable[[str], cl.Buffer] = lambda name: get_buffer(
+            buffer_bindings[name]
+        )
+        return [
+            buf("src_buffer_GLOBAL_input"),
+            buf("dest_buffer_GLOBAL_output"),
+            np.uint32(scalar_params["src_scalar_NATURAL_element_count"]),
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Node 16 — stabilize_and_reduce_grad_hidden_activations
 # ---------------------------------------------------------------------------
 
@@ -435,10 +484,10 @@ class StabilizeReduceGradHBinding(KernelBinding):
     Amplification).
 
     The Orchestration tier renders the threshold schedule via
-    ``render_node16_threshold_schedule()`` during argument marshaling,
+    ``render_node16_threshold_schedule()`` in ``prepare_dispatch()``,
     accounting for the GPU backend's workgroup-size-limited
     pre-accumulation.  The rendered schedule is uploaded to the per-stage
-    threshold buffer as a side effect of ``marshal_args``.
+    threshold buffer as a documented side effect of ``prepare_dispatch``.
 
     In addition to the canonical kernel parameters (keyed by their
     ``src_scalar_*`` / ``src_buffer_*`` contract names), ``scalar_params``
@@ -451,7 +500,6 @@ class StabilizeReduceGradHBinding(KernelBinding):
     * ``_compute_fp_format_max`` — COMPUTE_TYPE maximum finite value
     * ``_compute_type_size_bytes`` — sizeof(COMPUTE_TYPE)
     * ``_compute_dtype`` — numpy dtype for COMPUTE_TYPE scalars
-    * ``_opencl_queue`` — active ``cl.CommandQueue`` for schedule upload
 
     Parameters
     ----------
@@ -465,6 +513,61 @@ class StabilizeReduceGradHBinding(KernelBinding):
 
     def get_kernel_name(self) -> str:
         return "stabilize_and_reduce_grad_hidden_activations"
+
+    def prepare_dispatch(
+        self,
+        queue: cl.CommandQueue,
+        get_buffer: Callable[[BufferHandle], cl.Buffer],
+        buffer_bindings: dict[str, BufferHandle],
+        scalar_params: dict[str, Any],
+        tile_index: int,
+    ) -> dict[str, Any]:
+        """Render and upload the host-prescribed threshold schedule.
+
+        Side effect: enqueues a single H2D copy of the rendered schedule
+        into the ``_per_stage`` threshold buffer.  This is the sole
+        device write in the binding lifecycle for this kernel.
+
+        The rendered schedule depends on ``self._workgroup_size``, which
+        is a binding-instance property unknown to the Policy tier.  This
+        is the canonical use case for ``prepare_dispatch()``:
+        Orchestration-tier adaptation of Policy-tier parameters to the
+        backend's dispatch topology.
+        """
+        _ = tile_index  # Global Barrier — no tile placement.
+        total_modules = int(
+            scalar_params["src_scalar_NATURAL_total_modules_count"]
+        )
+        num_stages, t_pre, schedule = render_node16_threshold_schedule(
+            t_algorithmic=float(scalar_params["_policy_t_algorithmic"]),
+            lambda_=float(scalar_params["_policy_lambda"]),
+            compute_fp_format_max=float(
+                scalar_params["_compute_fp_format_max"]
+            ),
+            total_modules=total_modules,
+            workgroup_size=self._workgroup_size,
+            max_fan_in=int(scalar_params["_policy_max_k"]),
+        )
+
+        # Upload rendered schedule to device buffer.
+        if schedule:
+            compute_dtype: np.dtype[Any] = np.dtype(
+                scalar_params.get("_compute_dtype", np.float32)
+            )
+            schedule_np = np.array(schedule, dtype=compute_dtype)
+            schedule_buf = get_buffer(
+                buffer_bindings[
+                    "src_buffer_GLOBAL_CONST_clipping_threshold_per_stage"
+                ]
+            )
+            cl.enqueue_copy(queue, schedule_buf, schedule_np)
+
+        # Augment scalar_params with binding-computed values.
+        return {
+            **scalar_params,
+            "_prepared_num_reduction_stages": num_stages,
+            "_prepared_clipping_threshold_t_pre": t_pre,
+        }
 
     def compute_grid(
         self,
@@ -490,6 +593,7 @@ class StabilizeReduceGradHBinding(KernelBinding):
         scalar_params: dict[str, Any],
         tile_index: int,
     ) -> list[Any]:
+        """Pure argument translation — reads _prepared_* keys, no side effects."""
         _ = tile_index  # Global Barrier — no tile placement.
         buf: Callable[[str], cl.Buffer] = lambda name: get_buffer(
             buffer_bindings[name]
@@ -503,42 +607,9 @@ class StabilizeReduceGradHBinding(KernelBinding):
         compute_bytes = int(scalar_params["_compute_type_size_bytes"])
         local_bytes = self._workgroup_size * compute_bytes
 
-        # --- Threshold schedule rendering (Orchestration-tier concern) -----
-        # The Orchestration tier adapts the Policy tier's Quadratic Scaling
-        # Policy parameters to the GPU backend's dispatch topology,
-        # accounting for workgroup-size-limited pre-accumulation.
-        total_modules = int(
-            scalar_params["src_scalar_NATURAL_total_modules_count"]
-        )
-        num_stages, t_pre, schedule = render_node16_threshold_schedule(
-            t_algorithmic=float(scalar_params["_policy_t_algorithmic"]),
-            lambda_=float(scalar_params["_policy_lambda"]),
-            compute_fp_format_max=float(
-                scalar_params["_compute_fp_format_max"]
-            ),
-            total_modules=total_modules,
-            workgroup_size=self._workgroup_size,
-            max_fan_in=int(scalar_params["_policy_max_k"]),
-        )
-
-        # Upload the rendered schedule to the per-stage threshold buffer.
-        # This device write is a side effect of marshal_args, necessary
-        # because the schedule is computed at dispatch time from the
-        # Orchestration tier's rendered topology (workgroup_size is a
-        # binding-tier property unknown to the Policy tier).
-        schedule_buf = buf(
-            "src_buffer_GLOBAL_CONST_clipping_threshold_per_stage"
-        )
-        if schedule:
-            compute_dtype: np.dtype[Any] = np.dtype(
-                scalar_params.get("_compute_dtype", np.float32)
-            )
-            schedule_np = np.array(schedule, dtype=compute_dtype)
-            queue: cl.CommandQueue | None = scalar_params.get(
-                "_opencl_queue"
-            )
-            if queue is not None:
-                cl.enqueue_copy(queue, schedule_buf, schedule_np)
+        # Read binding-computed values from prepare_dispatch().
+        num_stages = int(scalar_params["_prepared_num_reduction_stages"])
+        t_pre = scalar_params["_prepared_clipping_threshold_t_pre"]
 
         return [
             cl.LocalMemory(local_bytes),
@@ -547,7 +618,7 @@ class StabilizeReduceGradHBinding(KernelBinding):
                 "_permuted_soa"
             ),
             buf("dest_buffer_GLOBAL_summed_grad_hidden_activations"),
-            schedule_buf,
+            buf("src_buffer_GLOBAL_CONST_clipping_threshold_per_stage"),
             np.uint32(num_stages),
             compute_scalar(t_pre, scalar_params),
             compute_scalar(

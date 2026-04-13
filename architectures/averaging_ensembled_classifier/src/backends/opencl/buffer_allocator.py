@@ -46,6 +46,11 @@ class OpenCLBufferAllocator:
             flags = self._flags_for_role(desc.role)
             buf = cl.Buffer(self._context, flags, size=desc.size_bytes)
             # Zero-fill: GPU memory may contain residue from prior allocations.
+            # TODO(performance): BufferDescriptor could carry an initialization_contract
+            # field (e.g., "ZERO_REQUIRED", "ZERO_REQUIRED_ADDITIVE", "NONE").  Only
+            # zero-fill when contract requires it — buffers with "NONE" (where the
+            # producing kernel guarantees all read positions are written) could skip
+            # this H2D bandwidth cost.  Current blanket zero-fill is safe but suboptimal.
             cl.enqueue_fill_buffer(
                 self._queue, buf, np.zeros(1, dtype=np.uint8), 0, desc.size_bytes,
             )

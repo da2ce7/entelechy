@@ -9,15 +9,13 @@ for plan-level dispatch.
 import abc
 from typing import Literal
 
-from .kernel_contracts import KernelContract
-from .kernel_contracts.phase_2_learn_A_production import (
-    compute_probs_loss_cce_contract,
-    compute_probs_loss_bce_contract,
-    calculate_module_param_grads_contract,
-)
-from .kernel_contracts.phase_2_learn_B_processing import (
-    backprop_error_to_hidden_contract,
-    calculate_chunk_temp_gradients_contract,
+from .kernel_contracts import (
+    KernelContract,
+    compute_probs_loss_cce_chunk,
+    compute_probs_loss_bce_chunk,
+    calculate_module_param_grads_chunk,
+    backprop_error_to_hidden_chunk,
+    calculate_chunk_temp_gradients,
 )
 
 
@@ -85,16 +83,16 @@ class PlanCceStrategy(PlanProblemTypeStrategy):
         return None  # integer-typed, no precision role
 
     def get_loss_contract(self) -> KernelContract:
-        return compute_probs_loss_cce_contract
+        return compute_probs_loss_cce_chunk
 
     def get_module_grad_contract(self) -> KernelContract:
-        return calculate_module_param_grads_contract
+        return calculate_module_param_grads_chunk
 
     def get_hidden_grad_contract(self) -> KernelContract:
-        return backprop_error_to_hidden_contract
+        return backprop_error_to_hidden_chunk
 
     def get_temp_grad_contract(self) -> KernelContract:
-        return calculate_chunk_temp_gradients_contract
+        return calculate_chunk_temp_gradients
 
 
 class PlanBceStrategy(PlanProblemTypeStrategy):
@@ -115,13 +113,13 @@ class PlanBceStrategy(PlanProblemTypeStrategy):
         return "storage"  # BCE targets are storage-role (ADR-021)
 
     def get_loss_contract(self) -> KernelContract:
-        return compute_probs_loss_bce_contract
+        return compute_probs_loss_bce_chunk
 
     def get_module_grad_contract(self) -> KernelContract:
-        return calculate_module_param_grads_contract
+        return calculate_module_param_grads_chunk
 
     def get_hidden_grad_contract(self) -> KernelContract:
-        return backprop_error_to_hidden_contract
+        return backprop_error_to_hidden_chunk
 
     def get_temp_grad_contract(self) -> KernelContract:
-        return calculate_chunk_temp_gradients_contract
+        return calculate_chunk_temp_gradients

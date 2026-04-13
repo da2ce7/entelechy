@@ -136,7 +136,7 @@ class BackpropErrorToHiddenChunkBinding(KernelBinding):
     tensor (Grad_H) by performing a serial dot product over its assigned
     class chunk.  This maps a matrix-vector multiply to embarrassingly
     parallel work-items.  Padding Zero-Establishment writes zeros for
-    ``h_idx >= hidden_count`` (Initialization Contract: NONE).
+    ``h_idx >= hidden_count`` (Initialization Contract: NOT_REQUIRED).
 
     The contract mandates no batch-chunking: the downstream Item
     Synchronization Point (Node 13) requires a monolithic collection buffer.

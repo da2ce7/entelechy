@@ -1,81 +1,77 @@
 # src/shared/kernel_contracts/__init__.py
 """Backend-neutral kernel contracts (ADR-007).
 
-Each contract is a frozen dataclass describing a kernel's interface
-independently of any backend.
+Re-exports all types and contract instances from the authoritative
+``kernels_cl_h.py`` header mirror.
 """
-from dataclasses import dataclass
-from typing import Literal, Optional
 
+# ── Core types ────────────────────────────────────────────────────────
+from .kernels_cl_h import (
+    Placement,
+    BufferParam,
+    ScalarParam,
+    Param,
+    KernelContract,
+)
 
-@dataclass(frozen=True)
-class PaddingContract:
-    """Padding specification (CONTRACT.md Article 3.1)."""
-    padding_type: Literal["CACHE", "BANK_CONFLICT_AVOIDANCE", "SIMD", "NONE"]
-    formula: str | None
+# ── Constants ─────────────────────────────────────────────────────────
+from .kernels_cl_h import (
+    PROBLEM_TYPE_CCE,
+    PROBLEM_TYPE_BCE,
+    AGG_MODE_SUM,
+    AGG_MODE_AVERAGE,
+    SENTINEL_ABSENT_PARTIAL,
+)
 
+# ── Contract instances — Act Phase (§2) ──────────────────────────────
+from .kernels_cl_h import (
+    forward_pass,
+    render_logits_chunk,
+    compute_probs_loss_cce_chunk,
+    compute_probs_loss_bce_chunk,
+)
 
-@dataclass(frozen=True)
-class BufferParamSpec:
-    """Specification for a single buffer parameter in a kernel contract."""
-    name: str
-    flow: Literal["src", "dest", "update", "sync"]
-    memory_scope: Literal["GLOBAL", "LOCAL", "GLOBAL_CONST", "DEVICE_CONST"]
-    tensor_shape: tuple[str, ...]
-    padding_contract: PaddingContract
-    calculability_proof: tuple[str, ...]
-    validation_preconditions: tuple[str, ...]
-    # None is reserved for integer-typed buffers (e.g. CCE/BCE targets).
-    precision_role: Optional[Literal["storage", "compute", "state"]]
+# ── Contract instances — Learn Phase I (§3) ──────────────────────────
+from .kernels_cl_h import (
+    calculate_module_param_grads_chunk,
+    backprop_error_to_hidden_chunk,
+    calculate_chunk_temp_gradients,
+    clip_partial_gradients,
+)
 
+# ── Contract instances — Learn Phase II (§4) ─────────────────────────
+from .kernels_cl_h import (
+    gather_and_permute_grad_hidden_activations,
+    aggregate_register_reduce,
+    aggregate_register_reduce_from_compute,
+    aggregate_local_reduce,
+    aggregate_local_reduce_from_compute,
+    clip_intermediate_grad,
+    reduce_k_fan_in_and_clip,
+    reduce_k_fan_in_and_clip_from_compute,
+    narrow_to_storage,
+    stabilize_and_reduce_grad_hidden_activations,
+)
 
-@dataclass(frozen=True)
-class ScalarParamSpec:
-    """Specification for a single scalar parameter in a kernel contract."""
-    name: str
-    flow: Literal["src", "dest"]
-    number_type: Literal["NATURAL", "INTEGER", "REAL", "FLAG"]
+# ── Contract instances — Learn Phase III (§5) ────────────────────────
+from .kernels_cl_h import (
+    backprop_shared_weights_chunk,
+    backprop_shared_biases_chunk,
+    clip_shared_gradients_chunk,
+)
 
+# ── Contract instances — Learn Phase IV–V (§6) ──────────────────────
+from .kernels_cl_h import (
+    normalize_gradients,
+    adam_update,
+    clamp_temperatures,
+)
 
-@dataclass(frozen=True)
-class LocalMemorySpec:
-    """Specification for a local memory requirement."""
-    name: str
-    size_expr: str
+# ── Contract instances — Experimental (§7) ───────────────────────────
+from .kernels_cl_h import (
+    transpose_matvec_masked_simd_major,
+    elementwise_add,
+)
 
-
-@dataclass(frozen=True)
-class PlacementContract:
-    """Placement strategy specification (CONTRACT.md Article 3.2)."""
-    strategy: str
-    key_domain: tuple[int, int] | None
-    context_params: dict[str, str]
-
-
-@dataclass(frozen=True)
-class KernelContractBlock:
-    """Kernel-level contract metadata (CONTRACT.md Article 4)."""
-    holistic_constraints: str
-    idempotency: Literal[
-        "Strictly Idempotent",
-        "Associatively Non-Idempotent",
-        "Fundamentally Non-Idempotent (Stateful)"
-    ]
-    synchronization_model: str | None
-    behavioral_invariants: tuple[str, ...] | None
-
-
-@dataclass(frozen=True)
-class KernelContract:
-    """Backend-neutral kernel interface contract (ADR-007).
-
-    Carries the complete interface specification for plan-construction-time
-    validation. Does not carry backend-specific dispatch details — those
-    belong in each backend's KernelBinding.
-    """
-    kernel_name: str
-    contract_block: KernelContractBlock
-    buffer_params: tuple[BufferParamSpec, ...]
-    scalar_params: tuple[ScalarParamSpec, ...]
-    local_memory: tuple[LocalMemorySpec, ...]
-    placement: PlacementContract | None
+# ── Registry ──────────────────────────────────────────────────────────
+from .kernels_cl_h import REGISTRY

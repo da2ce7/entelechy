@@ -4,7 +4,7 @@ import pytest
 
 from src.shared.buffer_lifecycle import BufferDescriptor, BufferHandle, BufferRole
 from src.shared.hardware_profile import HardwareProfile
-from src.shared.kernel_contracts.phase_1_act import forward_pass_contract
+from src.shared.kernel_contracts import forward_pass
 from src.shared.plan_types import (
     BarrierNode,
     ExecutionPlan,
@@ -36,7 +36,7 @@ class TestNodeConstruction:
         h, _ = _buf(0, "b")
         node = KernelDispatchNode(
             node_id="n1", depends_on=frozenset(), kernel_name="test",
-            contract=forward_pass_contract, buffer_bindings={"b": h},
+            contract=forward_pass, buffer_bindings={"b": h},
             scalar_params={"x": 1}, tile_count=1, local_work_size=None,
             placement_strategy=None,
         )
@@ -73,7 +73,7 @@ class TestExecutionPlanValidation:
         h, bd = _buf(0, "out", BufferRole.BATCH_OUTPUT)
         n1 = KernelDispatchNode(
             node_id="a", depends_on=frozenset(), kernel_name="k",
-            contract=forward_pass_contract, buffer_bindings={"out": h},
+            contract=forward_pass, buffer_bindings={"out": h},
             scalar_params={}, tile_count=1, local_work_size=None,
             placement_strategy=None,
         )
@@ -90,7 +90,7 @@ class TestExecutionPlanValidation:
         h, bd = _buf(0, "out")
         n1 = KernelDispatchNode(
             node_id="a", depends_on=frozenset({"nonexistent"}),
-            kernel_name="k", contract=forward_pass_contract,
+            kernel_name="k", contract=forward_pass,
             buffer_bindings={"out": h}, scalar_params={}, tile_count=1,
             local_work_size=None, placement_strategy=None,
         )
@@ -115,7 +115,7 @@ class TestExecutionPlanValidation:
         h_missing = BufferHandle(99)
         n1 = KernelDispatchNode(
             node_id="a", depends_on=frozenset(), kernel_name="k",
-            contract=forward_pass_contract,
+            contract=forward_pass,
             buffer_bindings={"out": h_missing}, scalar_params={},
             tile_count=1, local_work_size=None, placement_strategy=None,
         )

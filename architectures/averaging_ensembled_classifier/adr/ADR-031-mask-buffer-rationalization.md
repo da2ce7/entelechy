@@ -294,7 +294,7 @@ This compiles to 3 integer ALU operations. No cache miss penalty — the same wo
  *        padding (0) status of each sample in the batch.
  *        - Tensor Shape: ((src_scalar_NATURAL_total_batch_count + 31) / 32)
  *          expressed as uint words, each encoding 32 samples LSB-first.
- *        - Padding Contract: {Type: NONE, Formula: "Bits beyond
+ *        - Padding Contract: {Type: UNPADDED, Formula: "Bits beyond
  *          total_batch_count are zero-padded by the host."}
  *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
  *        - Validation Preconditions: Host shall allocate exactly

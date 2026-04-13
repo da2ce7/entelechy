@@ -82,7 +82,7 @@ __kernel void backprop_shared_weights_chunk(
         + lane;
 
     // --- 3. Padding Zero-Establishment (early exit) -----------------------
-    // Initialization Contract: NONE — the kernel is the sole guarantor that
+    // Initialization Contract: NOT_REQUIRED — the kernel is the sole guarantor that
     // padding positions carry zero.  Downstream L2 norms (Node 19) read
     // the full padded extent; incorrect padding would corrupt the norm.
     if (i_idx >= src_scalar_NATURAL_input_count ||
@@ -220,7 +220,7 @@ __kernel void backprop_shared_biases_chunk(
     const long grad_b_out_idx = j_idx;
 
     // --- 3. Padding Zero-Establishment (early exit) -----------------------
-    // Initialization Contract: NONE — the kernel is the sole guarantor that
+    // Initialization Contract: NOT_REQUIRED — the kernel is the sole guarantor that
     // padding positions carry zero.  Downstream L2 norms (Node 19) read
     // the full padded extent; incorrect padding would corrupt the norm.
     if (j_idx >= src_scalar_NATURAL_hidden_count) {

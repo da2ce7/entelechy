@@ -27,29 +27,21 @@ import numpy as np
 
 from .buffer_lifecycle import BufferDescriptor, BufferHandle, BufferRole
 from .hardware_profile import HardwareProfile
-from .kernel_contracts import KernelContract
+from .kernel_contracts import (
+    KernelContract,
+    forward_pass,
+    render_logits_chunk,
+    clip_partial_gradients,
+    gather_and_permute_grad_hidden_activations,
+    stabilize_and_reduce_grad_hidden_activations,
+    backprop_shared_biases_chunk,
+    backprop_shared_weights_chunk,
+    clip_shared_gradients_chunk,
+    adam_update,
+    clamp_temperatures,
+    normalize_gradients,
+)
 from .optimizer_config import OptimizerConfig
-from .kernel_contracts.phase_1_act import (
-    forward_pass_contract,
-    render_logits_chunk_contract,
-)
-from .kernel_contracts.phase_2_learn_B_processing import (
-    clip_partial_gradients_contract,
-)
-from .kernel_contracts.phase_2_learn_C_reduction import (
-    gather_and_permute_grad_h_contract,
-    stabilize_reduce_grad_h_contract,
-)
-from .kernel_contracts.phase_2_learn_D_backprop import (
-    backprop_shared_biases_contract,
-    backprop_shared_weights_contract,
-    clip_shared_gradients_contract,
-)
-from .kernel_contracts.phase_3_update import (
-    adam_update_contract,
-    clamp_temperatures_contract,
-    normalize_gradients_contract,
-)
 from .model_spec import ModelSpec
 from .plan_types import (
     BarrierNode,
@@ -220,7 +212,7 @@ def _dispatch(
     return KernelDispatchNode(
         node_id=node_id,
         depends_on=depends_on,
-        kernel_name=contract.kernel_name,
+        kernel_name=contract.name,
         contract=contract,
         buffer_bindings=buffer_bindings,
         scalar_params=scalar_params,
@@ -372,7 +364,7 @@ def build_act_plan(
         BufferRole.BATCH_INTERMEDIATE,
         "storage",
     )
-    _bce_loss = "cce" not in strategy.get_loss_contract().kernel_name
+    _bce_loss = "cce" not in strategy.get_loss_contract().name
     _loss_shape = (
         (tile_count, modules_per_chunk, batch_size)
         if _bce_loss
@@ -404,7 +396,7 @@ def build_act_plan(
     n4 = _dispatch(
         "forward_pass",
         frozenset(),
-        forward_pass_contract,
+        forward_pass,
         {
             "src_buffer_GLOBAL_input": b_input_data,
             "src_buffer_GLOBAL_sample_mask": b_sample_mask,
@@ -439,7 +431,7 @@ def build_act_plan(
     n5 = _dispatch(
         "render_logits_chunk",
         frozenset({"forward_pass"}),
-        render_logits_chunk_contract,
+        render_logits_chunk,
         {
             "src_buffer_GLOBAL_hidden_activations": b_hidden,
             "src_buffer_GLOBAL_hidden_mask": b_hidden_mask,
@@ -479,7 +471,7 @@ def build_act_plan(
     #   node_id = exact kernel name from the strategy's contract
     # ------------------------------------------------------------------
     loss_contract = strategy.get_loss_contract()
-    loss_node_id = loss_contract.kernel_name  # "compute_probs_loss_cce_chunk" or "…bce…"
+    loss_node_id = loss_contract.name  # "compute_probs_loss_cce_chunk" or "…bce…"
     loss_buf_key = (
         "dest_buffer_GLOBAL_final_loss"
         if "cce" in loss_node_id
@@ -842,7 +834,7 @@ def build_learn_plan(
         BufferRole.BATCH_INTERMEDIATE,
         "storage",
     )
-    _bce_loss = "cce" not in strategy.get_loss_contract().kernel_name
+    _bce_loss = "cce" not in strategy.get_loss_contract().name
     _loss_shape = (
         (tile_count, modules_per_chunk, batch_size)
         if _bce_loss
@@ -1087,7 +1079,7 @@ def build_learn_plan(
     n4 = _dispatch(
         "forward_pass",
         frozenset(),
-        forward_pass_contract,
+        forward_pass,
         {
             "src_buffer_GLOBAL_input": b_input_data,
             "src_buffer_GLOBAL_sample_mask": b_sample_mask,
@@ -1122,7 +1114,7 @@ def build_learn_plan(
     n5 = _dispatch(
         "render_logits_chunk",
         frozenset({"forward_pass"}),
-        render_logits_chunk_contract,
+        render_logits_chunk,
         {
             "src_buffer_GLOBAL_hidden_activations": b_hidden,
             "src_buffer_GLOBAL_hidden_mask": b_hidden_mask,
@@ -1162,7 +1154,7 @@ def build_learn_plan(
     #   node_id = exact kernel name from the strategy's contract
     # ------------------------------------------------------------------
     loss_contract = strategy.get_loss_contract()
-    loss_node_id = loss_contract.kernel_name
+    loss_node_id = loss_contract.name
     loss_buf_key = (
         "dest_buffer_GLOBAL_final_loss"
         if "cce" in loss_node_id
@@ -1341,7 +1333,7 @@ def build_learn_plan(
             "backprop_error_to_hidden_chunk",
             "calculate_chunk_temp_gradients",
         }),
-        clip_partial_gradients_contract,
+        clip_partial_gradients,
         {
             "src_buffer_GLOBAL_partial_grad_weights_module": b_partial_grad_weights_module,
             "src_buffer_GLOBAL_partial_grad_biases_module": b_partial_grad_biases_module,
@@ -1394,7 +1386,7 @@ def build_learn_plan(
     n13 = _dispatch(
         "gather_and_permute_grad_hidden_activations",
         phase_i_done,
-        gather_and_permute_grad_h_contract,
+        gather_and_permute_grad_hidden_activations,
         {
             "src_buffer_GLOBAL_clipped_partial_grad_hidden_activations_aos": b_clipped_grad_hidden,
             "dest_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa": b_permuted_grad_h,
@@ -1447,7 +1439,7 @@ def build_learn_plan(
     n16 = _dispatch(
         "stabilize_and_reduce_grad_hidden_activations",
         frozenset({"item_sync_barrier"}),
-        stabilize_reduce_grad_h_contract,
+        stabilize_and_reduce_grad_hidden_activations,
         {
             "src_buffer_GLOBAL_clipped_grad_hidden_activations_permuted_soa": b_permuted_grad_h,
             "dest_buffer_GLOBAL_summed_grad_hidden_activations": b_summed_grad_h,
@@ -1550,7 +1542,7 @@ def build_learn_plan(
     n17 = _dispatch(
         "backprop_shared_weights_chunk",
         phase_ii_done,
-        backprop_shared_weights_contract,
+        backprop_shared_weights_chunk,
         {
             "src_buffer_GLOBAL_input": b_input_data,
             "src_buffer_GLOBAL_hidden_activations": b_hidden,
@@ -1587,7 +1579,7 @@ def build_learn_plan(
     n18 = _dispatch(
         "backprop_shared_biases_chunk",
         phase_ii_done,
-        backprop_shared_biases_contract,
+        backprop_shared_biases_chunk,
         {
             "src_buffer_GLOBAL_hidden_activations": b_hidden,
             "src_buffer_GLOBAL_hidden_mask": b_hidden_mask,
@@ -1623,7 +1615,7 @@ def build_learn_plan(
             "backprop_shared_weights_chunk",
             "backprop_shared_biases_chunk",
         }),
-        clip_shared_gradients_contract,
+        clip_shared_gradients_chunk,
         {
             "src_buffer_GLOBAL_partial_grad_weights_shared_simd_major": b_partial_grad_sw,
             "src_buffer_GLOBAL_partial_grad_biases_shared": b_partial_grad_sb,
@@ -1753,7 +1745,7 @@ def build_learn_plan(
     n21_mod = _dispatch(
         "normalize_gradients__module_weights",
         norm_deps,
-        normalize_gradients_contract,
+        normalize_gradients,
         {
             "src_buffer_GLOBAL_summed_grad": b_summed_grad_mod,
             "dest_buffer_GLOBAL_final_grad": b_final_grad_mod,
@@ -1773,7 +1765,7 @@ def build_learn_plan(
     n21_mod_b = _dispatch(
         "normalize_gradients__module_biases",
         norm_deps,
-        normalize_gradients_contract,
+        normalize_gradients,
         {
             "src_buffer_GLOBAL_summed_grad": b_summed_grad_mod_biases,
             "dest_buffer_GLOBAL_final_grad": b_final_grad_mod_biases,
@@ -1793,7 +1785,7 @@ def build_learn_plan(
     n21_temps = _dispatch(
         "normalize_gradients__temps",
         norm_deps,
-        normalize_gradients_contract,
+        normalize_gradients,
         {
             "src_buffer_GLOBAL_summed_grad": b_summed_grad_temps,
             "dest_buffer_GLOBAL_final_grad": b_final_grad_temps,
@@ -1813,7 +1805,7 @@ def build_learn_plan(
     n21_shared = _dispatch(
         "normalize_gradients__shared_weights",
         norm_deps,
-        normalize_gradients_contract,
+        normalize_gradients,
         {
             "src_buffer_GLOBAL_summed_grad": b_summed_grad_shared,
             "dest_buffer_GLOBAL_final_grad": b_final_grad_shared,
@@ -1833,7 +1825,7 @@ def build_learn_plan(
     n21_shared_b = _dispatch(
         "normalize_gradients__shared_biases",
         norm_deps,
-        normalize_gradients_contract,
+        normalize_gradients,
         {
             "src_buffer_GLOBAL_summed_grad": b_summed_grad_shared_biases,
             "dest_buffer_GLOBAL_final_grad": b_final_grad_shared_biases,
@@ -1889,7 +1881,7 @@ def build_learn_plan(
     n24_shared = _dispatch(
         "adam_update__shared_weights",
         update_deps,
-        adam_update_contract,
+        adam_update,
         {
             "src_buffer_GLOBAL_final_grad": b_final_grad_shared,
             "update_buffer_GLOBAL_parameters": b_shared_weights,
@@ -1915,7 +1907,7 @@ def build_learn_plan(
     n24_shared_b = _dispatch(
         "adam_update__shared_biases",
         update_deps,
-        adam_update_contract,
+        adam_update,
         {
             "src_buffer_GLOBAL_final_grad": b_final_grad_shared_biases,
             "update_buffer_GLOBAL_parameters": b_biases_shared,
@@ -1946,7 +1938,7 @@ def build_learn_plan(
     n24_module = _dispatch(
         "adam_update__module_weights",
         update_deps,
-        adam_update_contract,
+        adam_update,
         {
             "src_buffer_GLOBAL_final_grad": b_final_grad_mod,
             "update_buffer_GLOBAL_parameters": b_module_weights,
@@ -1973,7 +1965,7 @@ def build_learn_plan(
     n24_module_b = _dispatch(
         "adam_update__module_biases",
         update_deps,
-        adam_update_contract,
+        adam_update,
         {
             "src_buffer_GLOBAL_final_grad": b_final_grad_mod_biases,
             "update_buffer_GLOBAL_parameters": b_module_biases,
@@ -1999,7 +1991,7 @@ def build_learn_plan(
     n24_temps = _dispatch(
         "adam_update__temps",
         update_deps,
-        adam_update_contract,
+        adam_update,
         {
             "src_buffer_GLOBAL_final_grad": b_final_grad_temps,
             "update_buffer_GLOBAL_parameters": b_temperatures,
@@ -2027,7 +2019,7 @@ def build_learn_plan(
     n25 = _dispatch(
         "clamp_temperatures",
         frozenset({"adam_update__temps"}),
-        clamp_temperatures_contract,
+        clamp_temperatures,
         {
             "update_buffer_GLOBAL_temps": b_temperatures,
         },

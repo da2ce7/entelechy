@@ -2,7 +2,7 @@
 
 ## Diagnosis
 
-The root cause is that a single invariant name — **"Padding Zero-Fill"** — conflates two jurisdictionally distinct obligations. It is used identically on Node 8 (where `ZERO_REQUIRED_ADDITIVE` makes the host the primary guarantor) and Node 9 (where `Initialization Contract: NONE` makes the kernel the *sole* guarantor). This violates the architecture's own principle of jurisdictional separation.
+The root cause is that a single invariant name — **"Padding Zero-Fill"** — conflates two jurisdictionally distinct obligations. It is used identically on Node 8 (where `ZERO_REQUIRED_ADDITIVE` makes the host the primary guarantor) and Node 9 (where `Initialization Contract: NOT_REQUIRED` makes the kernel the *sole* guarantor). This violates the architecture's own principle of jurisdictional separation.
 
 The ambiguity is further compounded by CONCEPT §3.6, which describes a system-level *emergent property* (the zero-propagation chain) in the same language as a per-kernel *obligation*, making it unclear whether any given kernel can rely on upstream zeros or must establish them independently.
 
@@ -28,14 +28,14 @@ The current single invariant is retired. In its place, the `Behavioral Invariant
 
 | Invariant | Meaning | Applies When |
 |:---|:---|:---|
-| **`Padding Zero-Establishment`** | The kernel SHALL actively write zero to all positions at indices ≥ the logical extent, within its write footprint. The kernel is the **sole guarantor** that these positions contain zero. | The destination buffer's `Initialization Contract` is `NONE`, **and** downstream consumers read the full padded extent. |
+| **`Padding Zero-Establishment`** | The kernel SHALL actively write zero to all positions at indices ≥ the logical extent, within its write footprint. The kernel is the **sole guarantor** that these positions contain zero. | The destination buffer's `Initialization Contract` is `NOT_REQUIRED`, **and** downstream consumers read the full padded extent. |
 | **`Padding Zero-Preservation`** | The kernel SHALL NOT write non-zero values to positions at indices ≥ the logical extent. The host initialization is the **primary guarantor**; the kernel's obligation is non-corruption. | The destination buffer's `Initialization Contract` is `ZERO_REQUIRED` or `ZERO_REQUIRED_ADDITIVE`. |
 
 A third case requires no kernel invariant at all:
 
 | Pattern | Meaning | Applies When |
 |:---|:---|:---|
-| **No padding obligation** | The kernel makes no claims about padding positions. Downstream consumers are contractually bounded by the logical extent and SHALL NOT access padding. | The destination buffer's `Initialization Contract` is `NONE`, **and** downstream consumers declare bounded access in their own Validation Preconditions. |
+| **No padding obligation** | The kernel makes no claims about padding positions. Downstream consumers are contractually bounded by the logical extent and SHALL NOT access padding. | The destination buffer's `Initialization Contract` is `NOT_REQUIRED`, **and** downstream consumers declare bounded access in their own Validation Preconditions. |
 
 This is the existing Node 5 logits pattern, already correctly expressed: *"Padding positions beyond `total_output_class_count`... are architecturally unwritten. Downstream consumers... are contractually bounded by `total_output_class_count` and DO NOT access padding."*
 

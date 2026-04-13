@@ -61,7 +61,7 @@ class BackpropSharedWeightsChunkBinding(KernelBinding):
 
     Padding Zero-Establishment: the kernel writes zero for SIMD-major
     positions corresponding to logical indices ``i >= input_count`` or
-    ``h >= hidden_count`` (Initialization Contract: NONE).
+    ``h >= hidden_count`` (Initialization Contract: NOT_REQUIRED).
     """
 
     def get_kernel_name(self) -> str:
@@ -148,7 +148,7 @@ class BackpropSharedBiasesChunkBinding(KernelBinding):
     ``src_buffer_GLOBAL_hidden_mask`` when the flag is 0.
 
     Padding Zero-Establishment: the kernel writes zero for positions at
-    indices ``>= hidden_count`` (Initialization Contract: NONE).
+    indices ``>= hidden_count`` (Initialization Contract: NOT_REQUIRED).
     """
 
     def get_kernel_name(self) -> str:

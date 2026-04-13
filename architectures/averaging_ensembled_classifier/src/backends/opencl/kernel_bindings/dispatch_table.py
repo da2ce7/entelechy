@@ -44,6 +44,7 @@ from .binding_phase_2_learn_C import (
     AggregateRegisterReduceBinding,
     AggregateRegisterReduceFromComputeBinding,
     ClipIntermediateGradBinding,
+    NarrowToStorageBinding,
     ReduceKFanInAndClipBinding,
     ReduceKFanInAndClipFromComputeBinding,
     StabilizeReduceGradHBinding,
@@ -99,6 +100,7 @@ def build_dispatch_table() -> dict[str, KernelBinding]:
         "clip_intermediate_grad": ClipIntermediateGradBinding(),
         "reduce_k_fan_in_and_clip": ReduceKFanInAndClipBinding(),
         "reduce_k_fan_in_and_clip_from_compute": ReduceKFanInAndClipFromComputeBinding(),
+        "narrow_to_storage": NarrowToStorageBinding(),
         "stabilize_and_reduce_grad_hidden_activations": StabilizeReduceGradHBinding(),
         # -- Streaming shared-layer backprop (Nodes 17–19) -----------------
         "backprop_shared_weights_chunk": BackpropSharedWeightsChunkBinding(),

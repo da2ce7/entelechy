@@ -10,7 +10,8 @@ from numpy.typing import NDArray
 import pyopencl as cl
 
 from ...shared.hardware_profile import HardwareProfile
-from ...shared.buffer_lifecycle import BufferRole
+from ...shared.buffer_lifecycle import BufferDescriptor, BufferRole
+from ...shared.precision_config import PrecisionConfig
 from ...shared.plan_types import (
     BarrierNode,
     ExecutionPlan,
@@ -127,8 +128,6 @@ class OpenCLPlanRenderer:
             enriched.setdefault("_compute_type_size_bytes", 4)
             enriched.setdefault("_compute_dtype", np.float32)
 
-        # Queue for bindings that upload data at marshal time (Node 16)
-        enriched.setdefault("_opencl_queue", self._queue)
         return enriched
 
     # ------------------------------------------------------------------
@@ -137,15 +136,18 @@ class OpenCLPlanRenderer:
 
     @staticmethod
     def _persistent_key(
-        desc: Any, precision: Any,
+        desc: BufferDescriptor, precision: PrecisionConfig,
     ) -> tuple[str, tuple[int, ...], str]:
         """Identity key for a MODEL_STATE buffer across plan generations."""
-        role_dtypes = {
-            "storage": precision.storage_dtype,
-            "compute": precision.compute_dtype,
-            "state": precision.state_dtype,
-        }
-        dtype = role_dtypes.get(desc.precision_role, np.dtype(np.float32))
+        if desc.precision_role is not None:
+            role_dtypes: dict[str, np.dtype[Any]] = {
+                "storage": precision.storage_dtype,
+                "compute": precision.compute_dtype,
+                "state": precision.state_dtype,
+            }
+            dtype = role_dtypes[desc.precision_role]
+        else:
+            dtype = np.dtype(np.float32)
         return (desc.logical_name, desc.padded_shape, dtype.str)
 
     # ------------------------------------------------------------------
@@ -298,16 +300,24 @@ class OpenCLPlanRenderer:
 
         # 3. Re-inject persistent buffers under the new plan's handles
         newly_needed: set[str] = set()
+        current_keys: set[tuple[str, tuple[int, ...], str]] = set()
         for desc in plan.buffers.values():
             if desc.role != BufferRole.MODEL_STATE:
                 continue
             key = self._persistent_key(desc, plan.precision)
+            current_keys.add(key)
             if key in self._persistent_model_state:
                 self._allocator.inject_buffer(
                     desc.handle, self._persistent_model_state[key], desc,
                 )
             else:
                 newly_needed.add(desc.logical_name)
+
+        # 3b. Purge stale MODEL_STATE buffers no longer needed by this plan
+        # (e.g., from config changes: different padded_shape, precision, etc.)
+        for key in list(self._persistent_model_state):
+            if key not in current_keys:
+                self._persistent_model_state.pop(key).release()
 
         # 4. Allocate remaining buffers (skips pre-injected handles)
         self._allocator.allocate_plan_buffers(plan.buffers)
@@ -354,11 +364,17 @@ class OpenCLPlanRenderer:
                 elif isinstance(node, BarrierNode):
                     event_map[node_id] = self._render_barrier(wait_for)
                 else:
-                    assert isinstance(node, RetrievalNode)
+                    # Exhaustive: only RetrievalNode remains in PlanNode union
+                    assert isinstance(node, RetrievalNode), (
+                        f"Unknown plan node type '{type(node).__name__}' "
+                        f"for node '{node_id}'"
+                    )
                     future = self._render_retrieval(node, wait_for, plan)
                     futures[node.event_name] = future
                     event_map[node_id] = future.event
-        except OpenCLKernelError:
+        except Exception:
+            # Flush the command queue on any exception to prevent stale commands
+            # from affecting subsequent operations.
             try:
                 self._queue.finish()
             except cl.RuntimeError:
@@ -426,15 +442,26 @@ class OpenCLPlanRenderer:
 
         tile_events: list[cl.Event] = []
         for tile_idx in range(node.tile_count):
-            args = binding.marshal_args(
+            # Two-phase binding protocol: prepare_dispatch may augment
+            # scalar_params with binding-computed values (_prepared_* keys)
+            # and perform device-side resource preparation (e.g., schedule
+            # uploads).  marshal_args is purely functional.
+            prepared_params = binding.prepare_dispatch(
+                queue=self._queue,
                 get_buffer=self._allocator.get_buffer,
                 buffer_bindings=node.buffer_bindings,
                 scalar_params=scalar_params,
                 tile_index=tile_idx,
             )
+            args = binding.marshal_args(
+                get_buffer=self._allocator.get_buffer,
+                buffer_bindings=node.buffer_bindings,
+                scalar_params=prepared_params,
+                tile_index=tile_idx,
+            )
             global_size, local_size = binding.compute_grid(
                 tile_index=tile_idx,
-                scalar_params=scalar_params,
+                scalar_params=prepared_params,
                 hardware_simd_width=hw_simd,
             )
             kernel.set_args(*args)
@@ -491,6 +518,8 @@ class OpenCLPlanRenderer:
         hw_simd = self._hardware.simd_width if self._hardware else 16
         N = rplan.num_partials
         W = rplan.partial_width
+        # Operation type: 0=SUM (default), future-proofed for plan extensibility
+        op_type: int = getattr(rplan, 'operation_type', 0)
 
         # 1. Upload offset list
         ofs_arr = np.array(rplan.initial_offset_list, dtype=np.uint32)
@@ -505,29 +534,42 @@ class OpenCLPlanRenderer:
         source_buf = self._allocator.get_buffer(rplan.source_buffer)
 
         # 3. Tier selection (register vs local) + variant (storage vs compute)
+        # ADR-026: If source buffer is compute-role, we MUST use compute-entry
+        # variant.  Falling back to storage-entry would reinterpret compute-
+        # precision data as storage-precision — silent corruption.
         if N <= MAX_REG_AGG:
-            binding = (
-                self._register_reduce_from_compute_binding
-                if use_compute_entry and self._register_reduce_from_compute_binding
-                else self._register_reduce_binding
-            )
+            if use_compute_entry:
+                if self._register_reduce_from_compute_binding is None:
+                    raise RuntimeError(
+                        "Compute-entry register-reduce binding required for "
+                        "compute-role source buffers, but not registered via "
+                        "set_reduction_bindings()"
+                    )
+                binding = self._register_reduce_from_compute_binding
+            else:
+                binding = self._register_reduce_binding
             if binding is None:
                 raise RuntimeError("Register-reduce binding not registered")
             # Register-reduce: no local memory, no compute_type_size_bytes arg
             args = binding.marshal_args_direct(
-                source_buf, ofs_buf, out_buf, N, W, 0,
+                source_buf, ofs_buf, out_buf, N, W, op_type,
             )
         else:
-            binding = (
-                self._local_reduce_from_compute_binding
-                if use_compute_entry and self._local_reduce_from_compute_binding
-                else self._local_reduce_binding
-            )
+            if use_compute_entry:
+                if self._local_reduce_from_compute_binding is None:
+                    raise RuntimeError(
+                        "Compute-entry local-reduce binding required for "
+                        "compute-role source buffers, but not registered via "
+                        "set_reduction_bindings()"
+                    )
+                binding = self._local_reduce_from_compute_binding
+            else:
+                binding = self._local_reduce_binding
             if binding is None:
                 raise RuntimeError("Local-reduce binding not registered")
             # Local-reduce: needs compute_type_size_bytes for local alloc
             args = binding.marshal_args_direct(
-                source_buf, ofs_buf, out_buf, N, W, 0,
+                source_buf, ofs_buf, out_buf, N, W, op_type,
                 compute_type_size_bytes=compute_elem_size,
             )
 
@@ -607,7 +649,16 @@ class OpenCLPlanRenderer:
         pong = self._allocator.allocate_internal(max_elems * compute_elem_size)
 
         storage_k = self._k_fan_in_binding
-        compute_k = self._k_fan_in_from_compute_binding or storage_k
+        # ADR-026: Stages >=1 always read COMPUTE_TYPE intermediates, so compute-
+        # entry variant is required.  Silently falling back to storage-entry would
+        # reinterpret compute-precision data as storage-precision — fail-fast.
+        if self._k_fan_in_from_compute_binding is None:
+            raise RuntimeError(
+                "Multi-stage reduction requires compute-entry K-fan-in binding "
+                "(ADR-019, ADR-026) for interior stages, but not registered via "
+                "set_reduction_bindings()"
+            )
+        compute_k = self._k_fan_in_from_compute_binding
 
         events: list[cl.Event] = [prev_evt]
         cur_N = N
@@ -704,7 +755,11 @@ class OpenCLPlanRenderer:
             body_events = chunk_events
             for body_node_id in splan.body:
                 body_node = self._plan.nodes[body_node_id]
-                assert isinstance(body_node, KernelDispatchNode)
+                if not isinstance(body_node, KernelDispatchNode):
+                    raise TypeError(
+                        f"StreamingLoopNode body node '{body_node_id}' is "
+                        f"{type(body_node).__name__}, expected KernelDispatchNode"
+                    )
 
                 merged = self._enrich_scalar_params(
                     {**body_node.scalar_params, **chunk_scalars},
@@ -714,15 +769,23 @@ class OpenCLPlanRenderer:
 
                 tile_events: list[cl.Event] = []
                 for tile_idx in range(body_node.tile_count):
-                    args = binding.marshal_args(
+                    # Two-phase binding protocol (see _render_kernel_dispatch).
+                    prepared_params = binding.prepare_dispatch(
+                        queue=self._queue,
                         get_buffer=self._allocator.get_buffer,
                         buffer_bindings=body_node.buffer_bindings,
                         scalar_params=merged,
                         tile_index=tile_idx,
                     )
+                    args = binding.marshal_args(
+                        get_buffer=self._allocator.get_buffer,
+                        buffer_bindings=body_node.buffer_bindings,
+                        scalar_params=prepared_params,
+                        tile_index=tile_idx,
+                    )
                     gs, ls = binding.compute_grid(
                         tile_index=tile_idx,
-                        scalar_params=merged,
+                        scalar_params=prepared_params,
                         hardware_simd_width=hw_simd,
                     )
                     kernel.set_args(*args)

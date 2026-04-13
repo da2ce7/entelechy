@@ -86,9 +86,13 @@ def _dtype_to_cl_type(dtype: np.dtype[Any]) -> str:
 
 
 def _epsilon_literal(epsilon: float, is_half: int, is_double: int) -> str:
-    """Format epsilon as an appropriate C literal for the target precision."""
+    """Format epsilon as an appropriate C literal for the target precision.
+
+    Uses standard suffixes: 'h' for half (cl_khr_fp16), 'f' for float,
+    none for double.
+    """
     if is_half:
-        return str(epsilon)
+        return f"{epsilon}h"
     if is_double:
         return str(epsilon)
     return f"{epsilon}f"

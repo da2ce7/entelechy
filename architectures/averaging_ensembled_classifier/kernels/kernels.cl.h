@@ -863,7 +863,7 @@ __kernel void forward_pass(
      * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
      *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
      *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: [1] The access slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
@@ -877,7 +877,7 @@ __kernel void forward_pass(
      *        - Padding Contract: {
      *            dim[0] ("hidden_count/SIMD_WIDTH" → "padded_hidden_count/SIMD_WIDTH"): {Type: SIMD, Formula: "SIMD_WIDTH-multiple alignment on hidden_count ensures exact division"},
      *            dim[1] ("input_count" → "padded_input_count"): {Type: CACHE, Formula: "128-byte alignment"},
-     *            dim[2] ("SIMD_WIDTH"): {Type: NONE}
+     *            dim[2] ("SIMD_WIDTH"): {Type: UNPADDED}
      *          }
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_input_count]
@@ -977,7 +977,7 @@ __kernel void render_logits_chunk(
      * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
      *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
      *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: [1] The batch access slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
@@ -989,7 +989,7 @@ __kernel void render_logits_chunk(
      * @param src_buffer_GLOBAL_CONST_weights_module The learnable weights for all classifier modules.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {
-     *            dim[0] ("total_modules_count"): {Type: NONE},
+     *            dim[0] ("total_modules_count"): {Type: UNPADDED},
      *            dim[1] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
      *            dim[2] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
      *          }
@@ -1066,7 +1066,7 @@ __kernel void compute_probs_loss_cce_chunk(
     /**
      * @param src_buffer_GLOBAL_CONST_temps The learnable temperature parameters for logit scaling.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count]
      *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_modules_count * sizeof(STATE_TYPE)] bytes for this buffer. [2] All values must be strictly positive and finite (guaranteed by host initialization and Node 25 post-update enforcement).
@@ -1076,7 +1076,7 @@ __kernel void compute_probs_loss_cce_chunk(
     /**
      * @param src_buffer_GLOBAL_targets The ground truth labels (class indices).
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: [1] Values must be in [0, total_output_class_count - 1]. [2] Host shall allocate exactly [src_scalar_NATURAL_total_batch_count * sizeof(int)] bytes for this
      * buffer.
@@ -1087,7 +1087,7 @@ __kernel void compute_probs_loss_cce_chunk(
      * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
      *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
      *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes for this buffer.
@@ -1097,7 +1097,7 @@ __kernel void compute_probs_loss_cce_chunk(
     /**
      * @param dest_buffer_GLOBAL_partial_probs The collection buffer for this tile's computed probabilities.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk]
      *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
@@ -1109,7 +1109,7 @@ __kernel void compute_probs_loss_cce_chunk(
     /**
      * @param dest_buffer_GLOBAL_final_loss The monolithic buffer for final loss values.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Initialization Contract: {Type: ZERO_REQUIRED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_total_batch_count]
@@ -1160,7 +1160,7 @@ __kernel void compute_probs_loss_bce_chunk(
     /**
      * @param src_buffer_GLOBAL_CONST_temps The learnable temperature parameters for logit scaling.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count]
      *        - Validation Preconditions: [1] The tile access must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] Host shall allocate exactly
@@ -1182,7 +1182,7 @@ __kernel void compute_probs_loss_bce_chunk(
      * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
      *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
      *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes for this buffer.
@@ -1192,7 +1192,7 @@ __kernel void compute_probs_loss_bce_chunk(
     /**
      * @param dest_buffer_GLOBAL_partial_probs The collection buffer for this tile's computed probabilities.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk]
      *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
@@ -1204,7 +1204,7 @@ __kernel void compute_probs_loss_bce_chunk(
     /**
      * @param dest_buffer_GLOBAL_partial_loss The collection buffer for this tile's computed partial loss.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count]
      *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
@@ -1270,7 +1270,7 @@ __kernel void calculate_module_param_grads_chunk(
     /**
      * @param src_buffer_GLOBAL_partial_probs The collection of partial probabilities from Node 6 or 7.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk]
      *        - Validation Preconditions: [1] The requested tile must be within the total number of tiles, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2]
@@ -1294,7 +1294,7 @@ __kernel void calculate_module_param_grads_chunk(
      * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
      *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
      *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: [1] The batch access slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
@@ -1305,7 +1305,7 @@ __kernel void calculate_module_param_grads_chunk(
     /**
      * @param src_buffer_GLOBAL_CONST_temps The learnable temperature parameters for logit scaling.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count]
      *        - Validation Preconditions: [1] The tile access must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] Host shall allocate exactly
@@ -1317,9 +1317,9 @@ __kernel void calculate_module_param_grads_chunk(
      * @param dest_buffer_GLOBAL_partial_grad_weights_module The collection buffer for this (tile, batch_chunk) pair's computed weight gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {
-     *            dim[0] ("total_tile_count"): {Type: NONE},
-     *            dim[1] ("num_batch_chunks"): {Type: NONE},
-     *            dim[2] ("modules_per_chunk"): {Type: NONE},
+     *            dim[0] ("total_tile_count"): {Type: UNPADDED},
+     *            dim[1] ("num_batch_chunks"): {Type: UNPADDED},
+     *            dim[2] ("modules_per_chunk"): {Type: UNPADDED},
      *            dim[3] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
      *            dim[4] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
      *          }
@@ -1337,9 +1337,9 @@ __kernel void calculate_module_param_grads_chunk(
      * @param dest_buffer_GLOBAL_partial_grad_biases_module The collection buffer for this (tile, batch_chunk) pair's computed bias gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {
-     *            dim[0] ("total_tile_count"): {Type: NONE},
-     *            dim[1] ("num_batch_chunks"): {Type: NONE},
-     *            dim[2] ("modules_per_chunk"): {Type: NONE},
+     *            dim[0] ("total_tile_count"): {Type: UNPADDED},
+     *            dim[1] ("num_batch_chunks"): {Type: UNPADDED},
+     *            dim[2] ("modules_per_chunk"): {Type: UNPADDED},
      *            dim[3] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
      *          }
      *        - Initialization Contract: {Type: ZERO_REQUIRED}
@@ -1379,7 +1379,7 @@ __kernel void calculate_module_param_grads_chunk(
  * @brief (Node 9) Computes the partial upstream gradient for the hidden layer (Grad_H) for a tile.
  * @kernel_contract
  *        - Holistic Constraints: "This kernel processes the complete batch dimension in a single dispatch. Batch-chunking parameters (batch_chunk_offset, batch_chunk_count) are intentionally absent because the downstream Item Synchronization Point (Node 13) requires a monolithic collection buffer."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened upon load; storage-role output narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Padding Zero-Establishment: For the padded_hidden_count dimension, the kernel SHALL write zero for all positions at indices >= hidden_count. The kernel is the sole guarantor of zeros at padding positions (Initialization Contract: NONE). This guarantees that downstream L2 norm computations (Node 11) over the full padded extent are mathematically equivalent to norms over the logical extent. Sample Masking (ADR-031): When load_sample_mask(sample_mask, sample) == 0, the sample is invalid/padding; the kernel writes zero to all gradient outputs for that sample and skips further computation. This is a correctness requirement — not merely a performance optimization. Upstream invariants (Nodes 6/7) write zero probabilities for masked samples, but the loss derivative d_loss/d_logit remains non-zero when the target signal is non-zero (CCE: −1/τ at the true class; BCE: −target for non-zero targets). Without the mask check, Grad_H[sample][h] = Σ_c (d_loss/d_logit[sample][c] × W[h][c]) produces non-zero gradients because module weights are non-zero learnable parameters. These spurious gradients would propagate through Nodes 11 → 13 → 16 into summed_grad_h. Downstream consumers (Nodes 17, 18) cite this masking as an upstream invariant ('summed_grad_h = 0 from Node 9's masking') — one of two independent guarantees protecting shared-layer gradient correctness."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role and state-role inputs widened upon load; storage-role output narrowed via store_storage(). All arithmetic exclusively in COMPUTE_TYPE. Padding Zero-Establishment: For the padded_hidden_count dimension, the kernel SHALL write zero for all positions at indices >= hidden_count. The kernel is the sole guarantor of zeros at padding positions (Initialization Contract: NOT_REQUIRED). This guarantees that downstream L2 norm computations (Node 11) over the full padded extent are mathematically equivalent to norms over the logical extent. Sample Masking (ADR-031): When load_sample_mask(sample_mask, sample) == 0, the sample is invalid/padding; the kernel writes zero to all gradient outputs for that sample and skips further computation. This is a correctness requirement — not merely a performance optimization. Upstream invariants (Nodes 6/7) write zero probabilities for masked samples, but the loss derivative d_loss/d_logit remains non-zero when the target signal is non-zero (CCE: −1/τ at the true class; BCE: −target for non-zero targets). Without the mask check, Grad_H[sample][h] = Σ_c (d_loss/d_logit[sample][c] × W[h][c]) produces non-zero gradients because module weights are non-zero learnable parameters. These spurious gradients would propagate through Nodes 11 → 13 → 16 into summed_grad_h. Downstream consumers (Nodes 17, 18) cite this masking as an upstream invariant ('summed_grad_h = 0 from Node 9's masking') — one of two independent guarantees protecting shared-layer gradient correctness."
  *        - Idempotency: "Strictly Idempotent"
  *        - Synchronization Model: "Partial Renderer for a monolithic intermediate buffer."
  */
@@ -1387,7 +1387,7 @@ __kernel void backprop_error_to_hidden_chunk(
     /**
      * @param src_buffer_GLOBAL_partial_probs The collection of partial probabilities from Node 6 or 7.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk]
      *        - Validation Preconditions: [1] The requested tile must be within the total number of tiles, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2]
@@ -1411,7 +1411,7 @@ __kernel void backprop_error_to_hidden_chunk(
      * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
      *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
      *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes for this buffer.
@@ -1422,7 +1422,7 @@ __kernel void backprop_error_to_hidden_chunk(
      * @param src_buffer_GLOBAL_CONST_weights_module The learnable weights for all classifier modules.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {
-     *            dim[0] ("total_modules_count"): {Type: NONE},
+     *            dim[0] ("total_modules_count"): {Type: UNPADDED},
      *            dim[1] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
      *            dim[2] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
      *          }
@@ -1436,7 +1436,7 @@ __kernel void backprop_error_to_hidden_chunk(
     /**
      * @param src_buffer_GLOBAL_CONST_temps The learnable temperature parameters for logit scaling.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count]
      *        - Validation Preconditions: [1] The tile access must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] Host shall allocate exactly
@@ -1511,7 +1511,7 @@ __kernel void calculate_chunk_temp_gradients(
     /**
      * @param src_buffer_GLOBAL_partial_probs The collection of partial probabilities from Node 6 or 7.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_total_batch_count, src_scalar_NATURAL_classes_per_chunk]
      *        - Validation Preconditions: [1] The requested tile must be within the total number of tiles, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2]
@@ -1535,7 +1535,7 @@ __kernel void calculate_chunk_temp_gradients(
      * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
      *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
      *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: Host shall allocate exactly [ceil(src_scalar_NATURAL_total_batch_count / 32) * sizeof(uint)] bytes for this buffer.
@@ -1545,7 +1545,7 @@ __kernel void calculate_chunk_temp_gradients(
     /**
      * @param src_buffer_GLOBAL_CONST_temps The learnable temperature parameters for logit scaling.
      *        - Tensor Shape: (src_scalar_NATURAL_total_modules_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_modules_count]
      *        - Validation Preconditions: [1] The tile access must be valid, as proven by: src_scalar_NATURAL_flat_tile_index < src_scalar_NATURAL_total_tile_count. [2] Host shall allocate exactly
@@ -1556,7 +1556,7 @@ __kernel void calculate_chunk_temp_gradients(
     /**
      * @param dest_buffer_GLOBAL_partial_grad_temps The collection buffer for this tile's computed temperature gradients.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk]
      *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
@@ -1609,8 +1609,8 @@ __kernel void clip_partial_gradients(
      * @param src_buffer_GLOBAL_partial_grad_weights_module Source buffer: output of Node 8's collection buffer (after batch-chunk reduction when `num_batch_chunks > 1` and, when `storage_dtype != compute_dtype`, a `narrow_to_storage` Precision Bridge; direct from Node 8 otherwise).
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk, src_scalar_NATURAL_padded_hidden_count, src_scalar_NATURAL_padded_total_output_class_count)
      *        - Padding Contract: {
-     *            dim[0] ("total_tile_count"): {Type: NONE},
-     *            dim[1] ("modules_per_chunk"): {Type: NONE},
+     *            dim[0] ("total_tile_count"): {Type: UNPADDED},
+     *            dim[1] ("modules_per_chunk"): {Type: UNPADDED},
      *            dim[2] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
      *            dim[3] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
      *          }
@@ -1633,7 +1633,7 @@ __kernel void clip_partial_gradients(
     /**
      * @param src_buffer_GLOBAL_partial_grad_temps Source buffer from Node 10.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk]
      *        - Validation Preconditions: [1] The `flat_tile_index` must be within bounds. [2] Host must allocate buffer with size consistent with the Calculability Proof.
@@ -1653,7 +1653,7 @@ __kernel void clip_partial_gradients(
     /**
      * @param src_buffer_GLOBAL_CONST_clipping_threshold_per_item [CONDITIONAL on src_scalar_FLAG_use_per_item_norm] A buffer containing a distinct clipping threshold for each item.
      *        - Tensor Shape: (src_scalar_NATURAL_total_tile_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count]
      *        - Validation Preconditions: [1] This buffer is read from ONLY IF `src_scalar_FLAG_use_per_item_norm` == 1. [2] If the flag is set, the Host MUST provide a valid buffer of size
@@ -1665,8 +1665,8 @@ __kernel void clip_partial_gradients(
      * @param dest_buffer_GLOBAL_clipped_partial_grad_weights_module Output for clipped weight gradients.
      *        - Tensor Shape: Identical to its `src_` counterpart.
      *        - Padding Contract: {
-     *            dim[0] ("total_tile_count"): {Type: NONE},
-     *            dim[1] ("modules_per_chunk"): {Type: NONE},
+     *            dim[0] ("total_tile_count"): {Type: UNPADDED},
+     *            dim[1] ("modules_per_chunk"): {Type: UNPADDED},
      *            dim[2] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
      *            dim[3] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
      *          }
@@ -1691,7 +1691,7 @@ __kernel void clip_partial_gradients(
     /**
      * @param dest_buffer_GLOBAL_clipped_partial_grad_temps Output for clipped temperature gradients.
      *        - Tensor Shape: Identical to its `src_` counterpart.
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_total_tile_count, src_scalar_NATURAL_modules_per_chunk]
      *        - Placement Contract: grid_mod_cls(src_scalar_NATURAL_flat_tile_index)
@@ -1832,7 +1832,7 @@ __kernel void aggregate_register_reduce(
     /**
      * @param src_buffer_GLOBAL_partial_collection The memory pool containing all partial results for this stage.
      *        - Tensor Shape: Undefined.
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: N/A.
      *        - Validation Preconditions: Host must provide a valid buffer that encompasses all memory regions referenced by the combination of `src_buffer_GLOBAL_CONST_partial_offset_list` and
@@ -1843,7 +1843,7 @@ __kernel void aggregate_register_reduce(
     /**
      * @param src_buffer_GLOBAL_CONST_partial_offset_list The indirection table. Each element is an offset into `src_buffer_GLOBAL_partial_collection`.
      *        - Tensor Shape: (src_scalar_NATURAL_partial_offset_list_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Calculability Proof: [src_scalar_NATURAL_partial_offset_list_count]
      *        - Validation Preconditions: Host must provide a buffer containing exactly `src_scalar_NATURAL_partial_offset_list_count` uints.
      */
@@ -1852,7 +1852,7 @@ __kernel void aggregate_register_reduce(
     /**
      * @param dest_buffer_GLOBAL_partial The destination buffer for the single, reduced partial result.
      *        - Tensor Shape: (src_scalar_NATURAL_partial_width)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_partial_width]
      *        - Validation Preconditions: Host must allocate exactly [src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)] bytes.
@@ -1881,7 +1881,7 @@ __kernel void aggregate_register_reduce_from_compute(
     /**
      * @param src_buffer_GLOBAL_partial_collection The memory pool containing COMPUTE_TYPE intermediate results.
      *        - Tensor Shape: Undefined.
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: N/A.
      *        - Validation Preconditions: Host must provide a valid buffer that encompasses all memory regions referenced by the combination of `src_buffer_GLOBAL_CONST_partial_offset_list` and `src_scalar_NATURAL_partial_width`.
@@ -1891,7 +1891,7 @@ __kernel void aggregate_register_reduce_from_compute(
     /**
      * @param src_buffer_GLOBAL_CONST_partial_offset_list The indirection table. Each element is an offset into `src_buffer_GLOBAL_partial_collection`.
      *        - Tensor Shape: (src_scalar_NATURAL_partial_offset_list_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Calculability Proof: [src_scalar_NATURAL_partial_offset_list_count]
      *        - Validation Preconditions: Host must provide a buffer containing exactly `src_scalar_NATURAL_partial_offset_list_count` uints.
      */
@@ -1900,7 +1900,7 @@ __kernel void aggregate_register_reduce_from_compute(
     /**
      * @param dest_buffer_GLOBAL_partial The destination buffer for the single, reduced partial result.
      *        - Tensor Shape: (src_scalar_NATURAL_partial_width)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_partial_width]
      *        - Validation Preconditions: Host must allocate exactly [src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)] bytes.
@@ -1940,7 +1940,7 @@ __kernel void aggregate_local_reduce(
     /**
      * @param src_buffer_GLOBAL_partial_collection The memory pool containing all partial results for this stage.
      *        - Tensor Shape: Undefined.
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: N/A.
      *        - Validation Preconditions: Host must provide a valid buffer that encompasses all memory regions referenced by the combination of `src_buffer_GLOBAL_CONST_partial_offset_list` and
@@ -1951,7 +1951,7 @@ __kernel void aggregate_local_reduce(
     /**
      * @param src_buffer_GLOBAL_CONST_partial_offset_list The indirection table. Each element is an offset into `src_buffer_GLOBAL_partial_collection`.
      *        - Tensor Shape: (src_scalar_NATURAL_partial_offset_list_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Calculability Proof: [src_scalar_NATURAL_partial_offset_list_count]
      *        - Validation Preconditions: Host must provide a buffer containing exactly `src_scalar_NATURAL_partial_offset_list_count` uints.
      */
@@ -1960,7 +1960,7 @@ __kernel void aggregate_local_reduce(
     /**
      * @param dest_buffer_GLOBAL_partial The destination buffer for the single, reduced partial result.
      *        - Tensor Shape: (src_scalar_NATURAL_partial_width)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_partial_width]
      *        - Validation Preconditions: Host must allocate exactly [src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)] bytes.
@@ -2000,7 +2000,7 @@ __kernel void aggregate_local_reduce_from_compute(
     /**
      * @param src_buffer_GLOBAL_partial_collection The memory pool containing COMPUTE_TYPE intermediate results.
      *        - Tensor Shape: Undefined.
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: N/A.
      *        - Validation Preconditions: Host must provide a valid buffer that encompasses all memory regions referenced by the combination of `src_buffer_GLOBAL_CONST_partial_offset_list` and `src_scalar_NATURAL_partial_width`.
@@ -2010,7 +2010,7 @@ __kernel void aggregate_local_reduce_from_compute(
     /**
      * @param src_buffer_GLOBAL_CONST_partial_offset_list The indirection table. Each element is an offset into `src_buffer_GLOBAL_partial_collection`.
      *        - Tensor Shape: (src_scalar_NATURAL_partial_offset_list_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Calculability Proof: [src_scalar_NATURAL_partial_offset_list_count]
      *        - Validation Preconditions: Host must provide a buffer containing exactly `src_scalar_NATURAL_partial_offset_list_count` uints.
      */
@@ -2019,7 +2019,7 @@ __kernel void aggregate_local_reduce_from_compute(
     /**
      * @param dest_buffer_GLOBAL_partial The destination buffer for the single, reduced partial result.
      *        - Tensor Shape: (src_scalar_NATURAL_partial_width)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_partial_width]
      *        - Validation Preconditions: Host must allocate exactly [src_scalar_NATURAL_partial_width * sizeof(COMPUTE_TYPE)] bytes.
@@ -2058,7 +2058,7 @@ __kernel void clip_intermediate_grad(
     /**
      * @param update_buffer_GLOBAL_intermediate_grad The buffer to be clipped in-place. This is typically the output of a preceding `aggregate_*` kernel.
      *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]
      *        - Validation Preconditions: Host must provide a valid buffer containing exactly `src_scalar_NATURAL_parameter_count` elements.
@@ -2130,7 +2130,7 @@ __kernel void reduce_k_fan_in_and_clip(
      * @param src_buffer_GLOBAL_partial_collection The memory pool containing all
      *        partial results referenced by the offset list.
      *        - Tensor Shape: Undefined.
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: N/A.
      *        - Validation Preconditions: Host must provide a valid buffer that
@@ -2145,7 +2145,7 @@ __kernel void reduce_k_fan_in_and_clip(
      *        consecutive entries per node. Sentinel SENTINEL_ABSENT_PARTIAL
      *        (0xFFFFFFFF) indicates an absent partial in the tail node.
      *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_fan_in]
      *        - Validation Preconditions: Host must provide a buffer containing exactly
      *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in` uint entries.
@@ -2156,7 +2156,7 @@ __kernel void reduce_k_fan_in_and_clip(
      * @param dest_buffer_GLOBAL_stage_partial Contiguous output buffer. Node n writes
      *        at `[n * partial_width, (n+1) * partial_width)`.
      *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_partial_width]
      *        - Validation Preconditions: Host must allocate exactly
@@ -2240,7 +2240,7 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
      *        COMPUTE_TYPE intermediate results from a prior reduction stage or
      *        a natively compute-role partial collection.
      *        - Tensor Shape: Undefined.
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: N/A.
      *        - Validation Preconditions: Host must provide a valid buffer that
@@ -2255,7 +2255,7 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
      *        consecutive entries per node. Sentinel SENTINEL_ABSENT_PARTIAL
      *        (0xFFFFFFFF) indicates an absent partial in the tail node.
      *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_fan_in]
      *        - Validation Preconditions: Host must provide a buffer containing exactly
      *          `src_scalar_NATURAL_node_count * src_scalar_NATURAL_fan_in` uint entries.
@@ -2266,7 +2266,7 @@ __kernel void reduce_k_fan_in_and_clip_from_compute(
      * @param dest_buffer_GLOBAL_stage_partial Contiguous output buffer. Node n writes
      *        at `[n * partial_width, (n+1) * partial_width)`.
      *        - Tensor Shape: (src_scalar_NATURAL_node_count * src_scalar_NATURAL_partial_width)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_node_count, src_scalar_NATURAL_partial_width]
      *        - Validation Preconditions: Host must allocate exactly
@@ -2349,7 +2349,7 @@ __kernel void narrow_to_storage(
     /**
      * @param src_buffer_GLOBAL_input The compute-role source buffer.
      *        - Tensor Shape: (src_scalar_NATURAL_element_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof:
      *          [src_scalar_NATURAL_element_count]
@@ -2363,7 +2363,7 @@ __kernel void narrow_to_storage(
      * @param dest_buffer_GLOBAL_output The storage-role destination
      *        buffer.
      *        - Tensor Shape: (src_scalar_NATURAL_element_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof:
      *          [src_scalar_NATURAL_element_count]
@@ -2493,7 +2493,7 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
      *        destination for the final, summed hidden layer gradient vector.
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count *
      *          src_scalar_NATURAL_padded_hidden_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count,
      *          src_scalar_NATURAL_padded_hidden_count]
@@ -2516,7 +2516,7 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
      *        pre-computed by the Orchestration tier.
      *        - Tensor Shape:
      *          (src_scalar_NATURAL_num_reduction_stages)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof:
      *          [src_scalar_NATURAL_num_reduction_stages]
@@ -2579,7 +2579,7 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
  * @brief (Node 17) Computes partial gradients for shared layer weights from a batch chunk.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Integer-typed sample_mask accessed via load_sample_mask(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sample-Level Early Exit: When load_sample_mask() returns 0 for a sample, the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Both upstream invariants (summed_grad_h = 0 from Node 9's masking, relu_derivative = 0 from Node 4's activation zeroing) independently guarantee zero contribution for masked samples regardless of whether the early exit is applied. SIMD-Major Write Pattern: The kernel writes gradient elements at flat indices corresponding to the SIMD-major (SoA) layout (padded_hidden_count/SIMD_WIDTH, padded_input_count, SIMD_WIDTH), matching the persistent shared weight parameter layout consumed by Node 4 and updated by Node 24. This ensures flat-index correspondence between the gradient and parameter buffers through the layout-agnostic reduction pipeline. Padding Zero-Establishment: For SIMD-major positions corresponding to logical indices input_count <= i < padded_input_count or hidden_count <= h < padded_hidden_count, the kernel SHALL write zero. The kernel is the sole guarantor of zeros at padding positions (Initialization Contract: NONE). This guarantees that downstream L2 norm computations (Node 19) over the full padded extent are mathematically equivalent to norms over the logical extent."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Integer-typed sample_mask accessed via load_sample_mask(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sample-Level Early Exit: When load_sample_mask() returns 0 for a sample, the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Both upstream invariants (summed_grad_h = 0 from Node 9's masking, relu_derivative = 0 from Node 4's activation zeroing) independently guarantee zero contribution for masked samples regardless of whether the early exit is applied. SIMD-Major Write Pattern: The kernel writes gradient elements at flat indices corresponding to the SIMD-major (SoA) layout (padded_hidden_count/SIMD_WIDTH, padded_input_count, SIMD_WIDTH), matching the persistent shared weight parameter layout consumed by Node 4 and updated by Node 24. This ensures flat-index correspondence between the gradient and parameter buffers through the layout-agnostic reduction pipeline. Padding Zero-Establishment: For SIMD-major positions corresponding to logical indices input_count <= i < padded_input_count or hidden_count <= h < padded_hidden_count, the kernel SHALL write zero. The kernel is the sole guarantor of zeros at padding positions (Initialization Contract: NOT_REQUIRED). This guarantees that downstream L2 norm computations (Node 19) over the full padded extent are mathematically equivalent to norms over the logical extent."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Streamable. Designed for the 'True Streaming' backpropagation model."
  */
@@ -2641,7 +2641,7 @@ __kernel void backprop_shared_weights_chunk(
     /**
      * @param src_buffer_GLOBAL_summed_grad_hidden_activations The final, consolidated upstream gradient from Node 16.
      *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_activations_total_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_final_grad_hidden_activations_total_count]
      *        - Validation Preconditions: The logical shape assumed by this kernel must match the physical size of the provided buffer, as proven by: (src_scalar_NATURAL_total_batch_count *
@@ -2653,7 +2653,7 @@ __kernel void backprop_shared_weights_chunk(
      * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
      *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
      *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: [1] The batch access slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
@@ -2666,10 +2666,10 @@ __kernel void backprop_shared_weights_chunk(
      *        Consumed by Node 19 within the same streaming loop iteration.
      *        - Tensor Shape: (1, src_scalar_NATURAL_padded_hidden_count / SIMD_WIDTH, src_scalar_NATURAL_padded_input_count, SIMD_WIDTH)
      *        - Padding Contract: {
-     *            dim[0] ("1"): {Type: NONE},
+     *            dim[0] ("1"): {Type: UNPADDED},
      *            dim[1] ("hidden_count/SIMD_WIDTH" → "padded_hidden_count/SIMD_WIDTH"): {Type: SIMD, Formula: "SIMD_WIDTH-multiple alignment on hidden_count ensures exact division"},
      *            dim[2] ("input_count" → "padded_input_count"): {Type: CACHE, Formula: "128-byte alignment"},
-     *            dim[3] ("SIMD_WIDTH"): {Type: NONE}
+     *            dim[3] ("SIMD_WIDTH"): {Type: UNPADDED}
      *          }
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_padded_hidden_count / SIMD_WIDTH, src_scalar_NATURAL_padded_input_count, SIMD_WIDTH]
@@ -2692,7 +2692,7 @@ __kernel void backprop_shared_weights_chunk(
  * @brief (Node 18) Computes partial gradients for shared layer biases from a batch chunk.
  * @kernel_contract
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
- *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Integer-typed sample_mask accessed via load_sample_mask(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sample-Level Early Exit: When load_sample_mask() returns 0 for a sample, the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Both upstream invariants (summed_grad_h = 0 from Node 9's masking, relu_derivative = 0 from Node 4's activation zeroing) independently guarantee zero contribution for masked samples regardless of whether the early exit is applied. Padding Zero-Establishment: For the padded_hidden_count dimension, the kernel SHALL write zero for all positions at indices >= hidden_count. The kernel is the sole guarantor of zeros at padding positions (Initialization Contract: NONE). This guarantees that downstream L2 norm computations (Node 19) over the full padded extent are mathematically equivalent to norms over the logical extent."
+ *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Integer-typed sample_mask accessed via load_sample_mask(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sample-Level Early Exit: When load_sample_mask() returns 0 for a sample, the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Both upstream invariants (summed_grad_h = 0 from Node 9's masking, relu_derivative = 0 from Node 4's activation zeroing) independently guarantee zero contribution for masked samples regardless of whether the early exit is applied. Padding Zero-Establishment: For the padded_hidden_count dimension, the kernel SHALL write zero for all positions at indices >= hidden_count. The kernel is the sole guarantor of zeros at padding positions (Initialization Contract: NOT_REQUIRED). This guarantees that downstream L2 norm computations (Node 19) over the full padded extent are mathematically equivalent to norms over the logical extent."
  *        - Idempotency: "Associatively Non-Idempotent"
  *        - Synchronization Model: "Streamable. Designed for the 'True Streaming' backpropagation model."
  */
@@ -2742,7 +2742,7 @@ __kernel void backprop_shared_biases_chunk(
     /**
      * @param src_buffer_GLOBAL_summed_grad_hidden_activations The final, consolidated upstream gradient from Node 16.
      *        - Tensor Shape: (src_scalar_NATURAL_final_grad_hidden_activations_total_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_final_grad_hidden_activations_total_count]
      *        - Validation Preconditions: The logical shape assumed by this kernel must match the physical size of the provided buffer, as proven by: (src_scalar_NATURAL_total_batch_count *
@@ -2754,7 +2754,7 @@ __kernel void backprop_shared_biases_chunk(
      * @param src_buffer_GLOBAL_sample_mask A packed bitmask buffer encoding the validity (1) or padding (0) status of each sample.
      *        Bit i of word j encodes sample (32*j + i), LSB-first. Accessed via load_sample_mask() utility (ADR-031).
      *        - Tensor Shape: (ceil(src_scalar_NATURAL_total_batch_count / 32))
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof: [src_scalar_NATURAL_total_batch_count]
      *        - Validation Preconditions: [1] The batch access slice must be within bounds, as proven by: (src_scalar_NATURAL_batch_chunk_offset + src_scalar_NATURAL_batch_chunk_count) <=
@@ -2814,7 +2814,7 @@ __kernel void clip_shared_gradients_chunk(
      * @param src_buffer_GLOBAL_partial_grad_weights_shared_simd_major The partial weight gradients for a single
      *        data chunk, produced by Node 17.
      *        - Tensor Shape: (src_scalar_NATURAL_weights_parameter_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_weights_parameter_count]
      *        - Validation Preconditions: Host shall ensure this buffer is a contiguous memory
@@ -2826,7 +2826,7 @@ __kernel void clip_shared_gradients_chunk(
      * @param src_buffer_GLOBAL_partial_grad_biases_shared The partial bias gradients for a single
      *        data chunk, produced by Node 18.
      *        - Tensor Shape: (src_scalar_NATURAL_biases_parameter_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_biases_parameter_count]
      *        - Validation Preconditions: Host shall ensure this buffer is a contiguous memory
@@ -2838,7 +2838,7 @@ __kernel void clip_shared_gradients_chunk(
      * @param dest_buffer_GLOBAL_clipped_partial_grad_weights_shared_simd_major The COLLECTION buffer for all clipped
      *        partial weight gradients, ready for consumption by an aggregate_* kernel (Node 20).
      *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_weights_parameter_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_weights_parameter_count]
      *        - Validation Preconditions: [1] The Host is responsible for providing a valid
@@ -2853,7 +2853,7 @@ __kernel void clip_shared_gradients_chunk(
      * @param dest_buffer_GLOBAL_clipped_partial_grad_biases_shared The COLLECTION buffer for all clipped
      *        partial bias gradients, ready for consumption by an aggregate_* kernel (Node 20).
      *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_biases_parameter_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_biases_parameter_count]
      *        - Validation Preconditions: [1] The Host is responsible for providing a valid
@@ -2908,7 +2908,7 @@ __kernel void normalize_gradients(
     /**
      * @param src_buffer_GLOBAL_summed_grad The buffer of aggregated, batch-wide gradients from the reduction engine.
      *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]
      *        - Validation Preconditions: Host shall ensure this buffer contains the complete, summed gradients for a parameter group before dispatch.
@@ -2918,7 +2918,7 @@ __kernel void normalize_gradients(
     /**
      * @param dest_buffer_GLOBAL_final_grad The output buffer containing the normalized, average gradients ready for the optimizer.
      *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]
      *        - Validation Preconditions: Host shall allocate a buffer with a size and layout identical to `src_buffer_GLOBAL_summed_grad`.
@@ -2960,7 +2960,7 @@ __kernel void adam_update(
     /**
      * @param src_buffer_GLOBAL_final_grad The buffer containing the final, normalized, batch-averaged gradients from Node 21.
      *        - Tensor Shape: (src_scalar_NATURAL_parameter_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [src_scalar_NATURAL_parameter_count]
      *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_parameter_count * sizeof(COMPUTE_TYPE)] bytes for this buffer.
@@ -2970,7 +2970,7 @@ __kernel void adam_update(
     /**
      * @param update_buffer_GLOBAL_parameters The parameter buffer to be updated in-place (e.g., weights, biases).
      *        - Tensor Shape: (src_scalar_NATURAL_total_parameter_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_parameter_count]
      *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_parameter_count * sizeof(STATE_TYPE)] bytes. [2] The physical memory layout must be identical to
@@ -2981,7 +2981,7 @@ __kernel void adam_update(
     /**
      * @param update_buffer_GLOBAL_m1 The first moment vector buffer to be updated in-place.
      *        - Tensor Shape: (src_scalar_NATURAL_total_parameter_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_parameter_count]
      *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_parameter_count * sizeof(STATE_TYPE)] bytes. [2] The physical memory layout must be identical to other
@@ -2992,7 +2992,7 @@ __kernel void adam_update(
     /**
      * @param update_buffer_GLOBAL_m2 The second moment vector buffer to be updated in-place.
      *        - Tensor Shape: (src_scalar_NATURAL_total_parameter_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_parameter_count]
      *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_parameter_count * sizeof(STATE_TYPE)] bytes. [2] The physical memory layout must be identical to other
@@ -3024,7 +3024,7 @@ __kernel void clamp_temperatures(
     /**
      * @param update_buffer_GLOBAL_temps The temperature parameter buffer to be clamped in-place.
      *        - Tensor Shape: (src_scalar_NATURAL_total_parameter_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "state"
      *        - Calculability Proof: [src_scalar_NATURAL_total_parameter_count]
      *        - Validation Preconditions: [1] Host shall allocate exactly [src_scalar_NATURAL_total_parameter_count * sizeof(STATE_TYPE)] bytes for this buffer. [2] (src_scalar_NATURAL_parameter_offset + src_scalar_NATURAL_parameter_count) <= src_scalar_NATURAL_total_parameter_count.
@@ -3094,7 +3094,7 @@ __kernel void clamp_temperatures(
  *          Padding Zero-Establishment: For the padded_input_count
  *          dimension, the kernel SHALL write zero for all positions at
  *          indices >= input_count. The kernel is the sole guarantor of
- *          zeros at padding positions (Initialization Contract: NONE).
+ *          zeros at padding positions (Initialization Contract: NOT_REQUIRED).
  *          Hidden-dimension padding contributes zero to the reduction
  *          sum because upstream gradient padding positions are zero
  *          (guaranteed by upstream Padding Zero Propagation) and weight
@@ -3147,7 +3147,7 @@ __kernel void transpose_matvec_masked_simd_major(
      *              on hidden_count ensures exact division"},
      *            dim[1] ("input_count" → "padded_input_count"):
      *              {Type: CACHE, Formula: "128-byte alignment"},
-     *            dim[2] ("SIMD_WIDTH"): {Type: NONE}
+     *            dim[2] ("SIMD_WIDTH"): {Type: UNPADDED}
      *          }
      *        - Precision Role: "state"
      *        - Calculability Proof:
@@ -3170,7 +3170,7 @@ __kernel void transpose_matvec_masked_simd_major(
      *        (multi-layer chain).
      *        - Tensor Shape: (src_scalar_NATURAL_total_batch_count,
      *          src_scalar_NATURAL_padded_hidden_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof:
      *          [src_scalar_NATURAL_total_batch_count,
@@ -3249,7 +3249,7 @@ __kernel void transpose_matvec_masked_simd_major(
      *        (ADR-031).
      *        - Tensor Shape:
      *          (ceil(src_scalar_NATURAL_total_batch_count / 32))
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "exempt (integer bitmask)"
      *        - Calculability Proof:
      *          [src_scalar_NATURAL_total_batch_count]
@@ -3337,7 +3337,7 @@ __kernel void elementwise_add(
     /**
      * @param src_buffer_GLOBAL_input_a The first addend buffer.
      *        - Tensor Shape: (src_scalar_NATURAL_element_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof:
      *          [src_scalar_NATURAL_element_count]
@@ -3350,7 +3350,7 @@ __kernel void elementwise_add(
     /**
      * @param src_buffer_GLOBAL_input_b The second addend buffer.
      *        - Tensor Shape: (src_scalar_NATURAL_element_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof:
      *          [src_scalar_NATURAL_element_count]
@@ -3363,7 +3363,7 @@ __kernel void elementwise_add(
     /**
      * @param dest_buffer_GLOBAL_output The element-wise sum.
      *        - Tensor Shape: (src_scalar_NATURAL_element_count)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof:
      *          [src_scalar_NATURAL_element_count]

@@ -1,90 +1,77 @@
 # tests/tier1/test_kernel_contracts.py
 """Contract field completeness and validation."""
-import importlib
-
 import pytest
 
-from src.shared.kernel_contracts import KernelContract
+from src.shared.kernel_contracts import KernelContract, BufferParam, ScalarParam, REGISTRY
 
 
-PHASE_MODULES = [
-    "src.shared.kernel_contracts.phase_1_act",
-    "src.shared.kernel_contracts.phase_2_learn_A_production",
-    "src.shared.kernel_contracts.phase_2_learn_B_processing",
-    "src.shared.kernel_contracts.phase_2_learn_C_reduction",
-    "src.shared.kernel_contracts.phase_2_learn_D_backprop",
-    "src.shared.kernel_contracts.phase_3_update",
-]
+ALL_CONTRACTS: list[tuple[str, KernelContract]] = list(REGISTRY.items())
+CANONICAL_STRATEGIES = {
+    "grid_mod_cls",
+    "grid_mod_cls_batch",
+    "linear_batch",
+    "linear_generic",
+}
 
 
-def _collect_contracts() -> list[tuple[str, str, KernelContract]]:
-    """Collect all KernelContract instances from per-phase modules."""
-    contracts: list[tuple[str, str, KernelContract]] = []
-    for mod_name in PHASE_MODULES:
-        mod = importlib.import_module(mod_name)
-        for attr_name in dir(mod):
-            obj = getattr(mod, attr_name)
-            if isinstance(obj, KernelContract):
-                contracts.append((mod_name, attr_name, obj))
-    return contracts
+class TestRegistryPopulated:
+    def test_registry_nonempty(self):
+        assert len(REGISTRY) > 0
 
-
-ALL_CONTRACTS = _collect_contracts()
-CANONICAL_STRATEGIES = {"grid_mod_cls", "linear_batch", "linear_generic"}
-
-
-class TestAllContractsPopulated:
-    def test_at_least_one_per_phase(self):
-        for mod_name in PHASE_MODULES:
-            phase_contracts = [c for m, _, c in ALL_CONTRACTS if m == mod_name]
-            assert len(phase_contracts) >= 1, f"No contracts in {mod_name}"
+    def test_registry_keys_match_names(self):
+        for key, contract in REGISTRY.items():
+            assert key == contract.name
 
 
 class TestContractFields:
     @pytest.mark.parametrize(
-        "mod,name,contract",
+        "name,contract",
         ALL_CONTRACTS,
-        ids=[f"{n}" for _, n, _ in ALL_CONTRACTS],
+        ids=[n for n, _ in ALL_CONTRACTS],
     )
-    def test_has_buffer_params(self, mod: str, name: str, contract: KernelContract) -> None:
-        assert len(contract.buffer_params) > 0, f"{name} has no buffer_params"
+    def test_has_buffers(self, name: str, contract: KernelContract) -> None:
+        assert len(contract.buffers) > 0, f"{name} has no buffer params"
 
     @pytest.mark.parametrize(
-        "mod,name,contract",
+        "name,contract",
         ALL_CONTRACTS,
-        ids=[f"{n}" for _, n, _ in ALL_CONTRACTS],
+        ids=[n for n, _ in ALL_CONTRACTS],
     )
-    def test_kernel_name_nonempty(self, mod: str, name: str, contract: KernelContract) -> None:
-        assert contract.kernel_name
+    def test_name_nonempty(self, name: str, contract: KernelContract) -> None:
+        assert contract.name
 
     @pytest.mark.parametrize(
-        "mod,name,contract",
+        "name,contract",
         ALL_CONTRACTS,
-        ids=[f"{n}" for _, n, _ in ALL_CONTRACTS],
+        ids=[n for n, _ in ALL_CONTRACTS],
     )
-    def test_placement_strategy_canonical(self, mod: str, name: str, contract: KernelContract) -> None:
-        if contract.placement is not None:
-            assert contract.placement.strategy in CANONICAL_STRATEGIES, (
-                f"{name} has non-canonical placement {contract.placement.strategy}"
-            )
+    def test_idempotency_valid(self, name: str, contract: KernelContract) -> None:
+        assert contract.idempotency in {
+            "Strictly Idempotent",
+            "Associatively Non-Idempotent",
+            "Fundamentally Non-Idempotent (Stateful)",
+        }
 
-
-class TestCalculabilityProofClosure:
     @pytest.mark.parametrize(
-        "mod,name,contract",
+        "name,contract",
         ALL_CONTRACTS,
-        ids=[f"{n}" for _, n, _ in ALL_CONTRACTS],
+        ids=[n for n, _ in ALL_CONTRACTS],
     )
-    def test_proof_references_exist(self, mod: str, name: str, contract: KernelContract) -> None:
-        """All parameter names in calculability_proof exist within the contract."""
-        all_param_names: set[str] = set()
-        for bp in contract.buffer_params:
-            all_param_names.add(bp.name)
-        for sp in contract.scalar_params:
-            all_param_names.add(sp.name)
-        for bp in contract.buffer_params:
-            for ref in bp.calculability_proof:
-                assert ref in all_param_names, (
-                    f"{name}: calculability_proof ref {ref!r} not found "
-                    f"in param names {all_param_names}"
+    def test_placement_strategy_canonical(self, name: str, contract: KernelContract) -> None:
+        for buf in contract.buffers:
+            if buf.placement is not None:
+                assert buf.placement.strategy in CANONICAL_STRATEGIES, (
+                    f"{name}.{buf.name} has non-canonical placement "
+                    f"{buf.placement.strategy}"
                 )
+
+    @pytest.mark.parametrize(
+        "name,contract",
+        ALL_CONTRACTS,
+        ids=[n for n, _ in ALL_CONTRACTS],
+    )
+    def test_params_are_typed(self, name: str, contract: KernelContract) -> None:
+        for p in contract.params:
+            assert isinstance(p, (BufferParam, ScalarParam)), (
+                f"{name}: param {p!r} is not BufferParam or ScalarParam"
+            )

@@ -127,7 +127,7 @@ The following keys are recognized for global-scope buffer parameters:
 | **`Padding Contract`** | Mandatory | The padding strategy applied to the buffer's dimensions (§3.3). |
 | **`Precision Role`** | Mandatory (FP buffers) | The precision-role dtype governing this buffer's element type and allocation size (§3.2.1). Integer-typed buffers (`int`, `uint`, `atomic_uint`) are exempt. |
 | **`Calculability Proof`** | Mandatory | A constructive expression deriving the buffer's dimensions from interface parameters, satisfying Axiom 1.4. |
-| **`Initialization Contract`** | `dest_` only | Pre-initialization requirements (§3.4). Omission is equivalent to `{Type: NONE}`. |
+| **`Initialization Contract`** | `dest_` only | Pre-initialization requirements (§3.4). Omission is equivalent to `{Type: NOT_REQUIRED}`. |
 | **`Placement Contract`** | `dest_` only | The placement strategy for Partial Renderers (§3.5). |
 | **`Validation Preconditions`** | Recommended | Conditions the host must satisfy before dispatch. |
 | **`Performance Notes`** | Optional | Non-binding optimization hints. |
@@ -157,7 +157,7 @@ The `Padding Contract` field (global-scope buffers only) specifies the padding s
 | :--------- | :--------- |
 | `CACHE` | Padding to align data to a hardware cache line boundary. |
 | `SIMD` | Padding to align a dimension to the natural SIMD vector width. |
-| `NONE` | No independent padding strategy is applied to this buffer. When `padded_*` dimension parameters appear in the `Tensor Shape`, the padding is fully determined by those parameter values; no additional buffer-specific padding calculation is required. |
+| `UNPADDED` | No padding strategy is applied to this dimension or buffer. The dimension's physical extent equals its logical extent. When `padded_*` dimension parameters appear in the `Tensor Shape`, the padding is fully determined by those parameter values; no additional buffer-specific padding calculation is required. |
 
 #### 3.3.2. Single-Dimension Format
 
@@ -173,7 +173,7 @@ When a buffer has multiple independently padded dimensions, the `Padding Contrac
 
 ```
 - Padding Contract: {
-    dim[0] ("total_modules_count"): {Type: NONE},
+    dim[0] ("total_modules_count"): {Type: UNPADDED},
     dim[1] ("hidden_count" → "padded_hidden_count"): {Type: CACHE, Formula: "128-byte alignment"},
     dim[2] ("total_output_class_count" → "padded_total_output_class_count"): {Type: SIMD, Formula: "SIMD_WIDTH alignment"}
   }
@@ -189,13 +189,13 @@ The `Initialization Contract` field (global-scope `dest_` buffers only) declares
 | :--------- | :--------- |
 | `ZERO_REQUIRED` | Host must zero-fill the entire buffer before any kernel dispatch writes to it. The producing kernel uses partial-write or scatter-write patterns that leave positions unwritten; downstream consumers read the full buffer extent. |
 | `ZERO_REQUIRED_ADDITIVE` | Host must zero-fill the buffer before the *first* dispatch of a streaming series. The producing kernel adds to existing values on each dispatch; downstream consumers read only after the complete series. |
-| `NONE` | No initialization required. The producing kernel(s) guarantee that all positions read by downstream consumers are written before consumption. |
+| `NOT_REQUIRED` | No initialization required. The producing kernel(s) guarantee that all positions read by downstream consumers are written before consumption. |
 
-**Default.** When a `dest_` buffer's commentary block omits the `Initialization Contract` field, the contract is implicitly `{Type: NONE}`.
+**Default.** When a `dest_` buffer's commentary block omits the `Initialization Contract` field, the contract is implicitly `{Type: NOT_REQUIRED}`.
 
 **Applicability.** This field is not applicable to `src_` flow parameters (produced by prior pipeline stages), `update_` flow parameters (whose prior contents are meaningful), or `sync_` flow parameters (which carry their own initialization requirements in `Validation Preconditions`).
 
-> **Guidance — Sparse-Write Partial Renderers.** When a Partial Renderer writes to a destination buffer whose allocated extent per tile is wider than the tile's logical write footprint (e.g., when the buffer is deliberately over-allocated to enable contiguous downstream access), `{Type: NONE}` is inappropriate unless the kernel actively fills all unwritten positions. Use `{Type: ZERO_REQUIRED}` with `Padding Zero-Preservation` to delegate unwritten-position responsibility to the host. See Node 8's class-chunk amplification pattern for the canonical example.
+> **Guidance — Sparse-Write Partial Renderers.** When a Partial Renderer writes to a destination buffer whose allocated extent per tile is wider than the tile's logical write footprint (e.g., when the buffer is deliberately over-allocated to enable contiguous downstream access), `{Type: NOT_REQUIRED}` is inappropriate unless the kernel actively fills all unwritten positions. Use `{Type: ZERO_REQUIRED}` with `Padding Zero-Preservation` to delegate unwritten-position responsibility to the host. See Node 8's class-chunk amplification pattern for the canonical example.
 
 ### 3.5. Partial Renderer Contract
 
@@ -269,7 +269,7 @@ The following named invariants are recognized in the `Behavioral Invariants` key
 | :-------- | :------------ | :--------- |
 | `Precision Boundary Conversion` | Kernels accessing buffers whose `precision_role` is `"storage"` or `"state"`. | The kernel shall: (1) widen all non-compute-role inputs to `COMPUTE_TYPE` upon load, (2) perform all **transformative** arithmetic exclusively in `COMPUTE_TYPE`, and (3) narrow results from `COMPUTE_TYPE` to the destination buffer's role type upon store. When all role types are equal, all conversions are identity operations eliminated by the compiler. Kernels accessing only `"compute"`-role and integer buffers do not require this invariant. |
 | `State-Precision Accumulation` | Stateful-update kernels performing **accumulative** operations on state-role buffers (EMA updates, running statistics). | Accumulative arithmetic shall use `ACCUM_TYPE = max(COMPUTE_TYPE, STATE_TYPE)`. When `STATE_TYPE > COMPUTE_TYPE`: (1) load state values at full `STATE_TYPE` precision, (2) widen compute-role inputs to `STATE_TYPE`, (3) perform accumulative arithmetic in `STATE_TYPE`, (4) store results at `STATE_TYPE`. When `STATE_TYPE ≤ COMPUTE_TYPE`, this invariant is equivalent to `Precision Boundary Conversion`. Applies **only** to mathematically accumulative operations — transformative operations within the same kernel (e.g., bias correction, final parameter update) use `COMPUTE_TYPE`. |
-| `Padding Zero-Establishment` | Kernels whose destination buffer has `Initialization Contract: NONE` and whose downstream consumers read the full padded extent. | The kernel SHALL actively write zero to all positions at indices ≥ the logical extent within its write footprint. The kernel is the **sole guarantor** of zeros at these positions. |
+| `Padding Zero-Establishment` | Kernels whose destination buffer has `Initialization Contract: NOT_REQUIRED` and whose downstream consumers read the full padded extent. | The kernel SHALL actively write zero to all positions at indices ≥ the logical extent within its write footprint. The kernel is the **sole guarantor** of zeros at these positions. |
 | `Padding Zero-Preservation` | Kernels whose destination buffer has `Initialization Contract: ZERO_REQUIRED` or `ZERO_REQUIRED_ADDITIVE`. | The kernel SHALL NOT write non-zero values to positions at indices ≥ the logical extent. The host initialization is the **primary guarantor**; the kernel's obligation is non-corruption. |
 | `Padding Zero Propagation (Emergent)` | Kernels where zero padding is a mathematical consequence of upstream invariants, not an active zeroing step. | When declared, its preconditions must be stated explicitly. The kernel is not required to distinguish padding from logical positions — the output carries zero at padding positions by mathematical necessity. |
 
@@ -503,7 +503,7 @@ __kernel void illustrative_kernel_name(
     /**
      * @param src_buffer_DEVICE_CONST_lookup_table A read-only device-constant resource.
      *        - Tensor Shape: (LUT_CAPACITY)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Precision Role: "compute"
      *        - Calculability Proof: [Compile-time constant: LUT_CAPACITY]
      *        - Validation Preconditions: None.
@@ -515,7 +515,7 @@ __kernel void illustrative_kernel_name(
      *        for this unit's partial output.
      *        - Tensor Shape: (out_scalar_NATURAL_total_chunks,
      *          RESULT_ELEMENTS_PER_CHUNK)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Initialization Contract: {Type: ZERO_REQUIRED}
      *        - Precision Role: "storage"
      *        - Calculability Proof: [out_scalar_NATURAL_total_chunks,
@@ -542,7 +542,7 @@ __kernel void illustrative_kernel_name(
      * @param sync_buffer_GLOBAL_atomic_counter A global resource for
      *        cross-group atomic synchronization.
      *        - Tensor Shape: (1)
-     *        - Padding Contract: {Type: NONE}
+     *        - Padding Contract: {Type: UNPADDED}
      *        - Calculability Proof: [Implicit size: atomic_uint]
      *        - Validation Preconditions: Host shall initialize to 0.
      */

@@ -2,9 +2,9 @@
 """PlanProblemTypeStrategy → KernelContract delegation."""
 
 from src.shared.kernel_contracts import KernelContract
-from src.shared.kernel_contracts.phase_2_learn_A_production import (
-    compute_probs_loss_bce_contract,
-    compute_probs_loss_cce_contract,
+from src.shared.kernel_contracts import (
+    compute_probs_loss_bce_chunk,
+    compute_probs_loss_cce_chunk,
 )
 from src.shared.problem_type_strategy import (
     PlanBceStrategy,
@@ -15,7 +15,7 @@ from src.shared.problem_type_strategy import (
 class TestCceStrategy:
     def test_loss_contract_is_cce(self):
         s = PlanCceStrategy()
-        assert s.get_loss_contract() is compute_probs_loss_cce_contract
+        assert s.get_loss_contract() is compute_probs_loss_cce_chunk
 
     def test_required_buffer_name(self):
         assert PlanCceStrategy().required_targets_buffer_name == "targets_cce"
@@ -31,7 +31,7 @@ class TestCceStrategy:
 class TestBceStrategy:
     def test_loss_contract_is_bce(self):
         s = PlanBceStrategy()
-        assert s.get_loss_contract() is compute_probs_loss_bce_contract
+        assert s.get_loss_contract() is compute_probs_loss_bce_chunk
 
     def test_required_buffer_name(self):
         assert PlanBceStrategy().required_targets_buffer_name == "targets_bce"
@@ -45,4 +45,4 @@ class TestNoOpenclImports:
         # .kernel_contracts which is pure shared layer.
         s = PlanCceStrategy()
         c = s.get_loss_contract()
-        assert c.kernel_name  # valid contract, no backend
+        assert c.name  # valid contract, no backend
