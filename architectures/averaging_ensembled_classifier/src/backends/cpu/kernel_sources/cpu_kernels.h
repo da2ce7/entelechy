@@ -321,9 +321,7 @@ typedef struct {                                                               \
     STORAGE_T*       dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major; \
     uint             src_scalar_NATURAL_batch_chunk_offset;                    \
     uint             src_scalar_NATURAL_batch_chunk_count;                     \
-    uint             src_scalar_NATURAL_batch_chunk_index;                     \
     uint             src_scalar_NATURAL_total_batch_count;                     \
-    uint             src_scalar_NATURAL_num_batch_chunks;                      \
     uint             src_scalar_NATURAL_input_count;                           \
     uint             src_scalar_NATURAL_padded_input_count;                    \
     uint             src_scalar_NATURAL_hidden_count;                          \
@@ -340,9 +338,7 @@ typedef struct {                                                               \
     STORAGE_T*       dest_buffer_GLOBAL_partial_grad_biases_shared;            \
     uint             src_scalar_NATURAL_batch_chunk_offset;                    \
     uint             src_scalar_NATURAL_batch_chunk_count;                     \
-    uint             src_scalar_NATURAL_batch_chunk_index;                     \
     uint             src_scalar_NATURAL_total_batch_count;                     \
-    uint             src_scalar_NATURAL_num_batch_chunks;                      \
     uint             src_scalar_NATURAL_hidden_count;                          \
     uint             src_scalar_NATURAL_padded_hidden_count;                   \
     uint             src_scalar_NATURAL_final_grad_hidden_activations_total_count; \

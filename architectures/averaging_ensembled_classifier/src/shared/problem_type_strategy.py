@@ -7,6 +7,7 @@ for plan-level dispatch.
 """
 
 import abc
+from typing import Literal
 
 from .kernel_contracts import KernelContract
 from .kernel_contracts.phase_2_learn_A_production import (
@@ -54,6 +55,17 @@ class PlanProblemTypeStrategy(abc.ABC):
         """0 for CCE, 1 for BCE — matches the FLAG field in kernel structs."""
         ...
 
+    @abc.abstractmethod
+    def get_targets_element_size(self, storage_dtype_size: int) -> int:
+        """Return element size for targets buffer (4 for CCE int, storage_dtype_size for BCE)."""
+        ...
+
+    @abc.abstractmethod
+    def get_targets_precision_role(self) -> Literal["storage", "compute", "state"] | None:
+        """Return precision role for targets buffer (None for CCE int, 'storage' for BCE)."""
+        ...
+        ...
+
 
 class PlanCceStrategy(PlanProblemTypeStrategy):
     """CCE plan strategy — single-label classification."""
@@ -65,6 +77,12 @@ class PlanCceStrategy(PlanProblemTypeStrategy):
     @property
     def required_targets_buffer_name(self) -> str:
         return "targets_cce"
+
+    def get_targets_element_size(self, storage_dtype_size: int) -> int:
+        return 4  # int32 class indices
+
+    def get_targets_precision_role(self) -> Literal["storage", "compute", "state"] | None:
+        return None  # integer-typed, no precision role
 
     def get_loss_contract(self) -> KernelContract:
         return compute_probs_loss_cce_contract
@@ -89,6 +107,12 @@ class PlanBceStrategy(PlanProblemTypeStrategy):
     @property
     def required_targets_buffer_name(self) -> str:
         return "targets_bce"
+
+    def get_targets_element_size(self, storage_dtype_size: int) -> int:
+        return storage_dtype_size  # multi-hot floats in storage precision
+
+    def get_targets_precision_role(self) -> Literal["storage", "compute", "state"] | None:
+        return "storage"  # BCE targets are storage-role (ADR-021)
 
     def get_loss_contract(self) -> KernelContract:
         return compute_probs_loss_bce_contract

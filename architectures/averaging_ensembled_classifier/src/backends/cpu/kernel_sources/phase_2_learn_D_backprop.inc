@@ -25,17 +25,16 @@ void PREC_FN(task_backprop_shared_weights)(void* raw_args, uint task_index, uint
     if (i_idx >= a->src_scalar_NATURAL_padded_input_count || j_idx >= a->src_scalar_NATURAL_padded_hidden_count)
         return;
 
+    /* SIMD-major layout: [h_block][input][SIMD_WIDTH] */
+    const uint hb   = j_idx / SIMD_WIDTH;
+    const uint lane = j_idx % SIMD_WIDTH;
+    const size_t out_idx = (size_t)hb * a->src_scalar_NATURAL_padded_input_count * SIMD_WIDTH
+                         + (size_t)i_idx * SIMD_WIDTH + lane;
+
     /* Padding Zero-Establishment (CONTRACT.md): The kernel is the sole
      * guarantor of zeros at padding positions. */
     const bool is_padding = (i_idx >= a->src_scalar_NATURAL_input_count) || (j_idx >= a->src_scalar_NATURAL_hidden_count);
     if (is_padding) {
-        const size_t chunk_base = (size_t)a->src_scalar_NATURAL_batch_chunk_index
-            * a->src_scalar_NATURAL_padded_input_count * a->src_scalar_NATURAL_padded_hidden_count;
-        const uint hb   = j_idx / SIMD_WIDTH;
-        const uint lane = j_idx % SIMD_WIDTH;
-        const size_t out_idx = chunk_base
-            + (size_t)hb * a->src_scalar_NATURAL_padded_input_count * SIMD_WIDTH
-            + (size_t)i_idx * SIMD_WIDTH + lane;
         scalar_store_storage(a->dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major, out_idx, (COMPUTE_T)0.0);
         return;
     }
@@ -64,15 +63,6 @@ void PREC_FN(task_backprop_shared_weights)(void* raw_args, uint task_index, uint
         grad_sw += dL_dZ * input_val;
     }
 
-    const size_t chunk_base = (size_t)a->src_scalar_NATURAL_batch_chunk_index
-        * a->src_scalar_NATURAL_padded_input_count * a->src_scalar_NATURAL_padded_hidden_count;
-    /* SIMD-major layout: [h_block][input][SIMD_WIDTH] matches
-     * forward_pass weight addressing so Adam updates the correct element. */
-    const uint hb   = j_idx / SIMD_WIDTH;
-    const uint lane  = j_idx % SIMD_WIDTH;
-    const size_t out_idx = chunk_base
-        + (size_t)hb * a->src_scalar_NATURAL_padded_input_count * SIMD_WIDTH
-        + (size_t)i_idx * SIMD_WIDTH + lane;
     scalar_store_storage(a->dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major, out_idx, grad_sw);
 }
 
@@ -90,8 +80,7 @@ void PREC_FN(task_backprop_shared_biases)(void* raw_args, uint task_index, uint 
     /* Padding Zero-Establishment (CONTRACT.md): The kernel is the sole
      * guarantor of zeros at padding positions. */
     if (j_idx >= a->src_scalar_NATURAL_hidden_count) {
-        const size_t chunk_base = (size_t)a->src_scalar_NATURAL_batch_chunk_index * a->src_scalar_NATURAL_padded_hidden_count;
-        scalar_store_storage(a->dest_buffer_GLOBAL_partial_grad_biases_shared, chunk_base + j_idx, (COMPUTE_T)0.0);
+        scalar_store_storage(a->dest_buffer_GLOBAL_partial_grad_biases_shared, j_idx, (COMPUTE_T)0.0);
         return;
     }
 
@@ -115,8 +104,7 @@ void PREC_FN(task_backprop_shared_biases)(void* raw_args, uint task_index, uint 
         grad_sb += grad_h * d_act;
     }
 
-    const size_t chunk_base = (size_t)a->src_scalar_NATURAL_batch_chunk_index * a->src_scalar_NATURAL_padded_hidden_count;
-    scalar_store_storage(a->dest_buffer_GLOBAL_partial_grad_biases_shared, chunk_base + j_idx, grad_sb);
+    scalar_store_storage(a->dest_buffer_GLOBAL_partial_grad_biases_shared, j_idx, grad_sb);
 }
 
 /* ================================================================

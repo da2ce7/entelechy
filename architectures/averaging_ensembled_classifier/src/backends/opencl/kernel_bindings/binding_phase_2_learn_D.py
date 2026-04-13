@@ -86,7 +86,7 @@ class BackpropSharedWeightsChunkBinding(KernelBinding):
         scalar_params: dict[str, int | float],
         tile_index: int,
     ) -> list[Any]:
-        _ = tile_index  # Partial Renderer — batch_chunk_index is the placement key.
+        _ = tile_index  # Streamable — writes to single-slot scratch buffer.
         buf: Callable[[str], cl.Buffer] = lambda name: get_buffer(buffer_bindings[name])
         u32: Callable[[str], np.uint32] = lambda key: np.uint32(scalar_params[key])
 
@@ -107,9 +107,7 @@ class BackpropSharedWeightsChunkBinding(KernelBinding):
             buf("dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major"),
             u32("src_scalar_NATURAL_batch_chunk_offset"),
             u32("src_scalar_NATURAL_batch_chunk_count"),
-            u32("src_scalar_NATURAL_batch_chunk_index"),
             u32("src_scalar_NATURAL_total_batch_count"),
-            u32("src_scalar_NATURAL_num_batch_chunks"),
             u32("src_scalar_NATURAL_input_count"),
             u32("src_scalar_NATURAL_padded_input_count"),
             u32("src_scalar_NATURAL_hidden_count"),
@@ -174,7 +172,7 @@ class BackpropSharedBiasesChunkBinding(KernelBinding):
         scalar_params: dict[str, int | float],
         tile_index: int,
     ) -> list[Any]:
-        _ = tile_index  # Partial Renderer — batch_chunk_index is the placement key.
+        _ = tile_index  # Streamable — writes to single-slot scratch buffer.
         buf: Callable[[str], cl.Buffer] = lambda name: get_buffer(buffer_bindings[name])
         u32: Callable[[str], np.uint32] = lambda key: np.uint32(scalar_params[key])
 
@@ -194,9 +192,7 @@ class BackpropSharedBiasesChunkBinding(KernelBinding):
             buf("dest_buffer_GLOBAL_partial_grad_biases_shared"),
             u32("src_scalar_NATURAL_batch_chunk_offset"),
             u32("src_scalar_NATURAL_batch_chunk_count"),
-            u32("src_scalar_NATURAL_batch_chunk_index"),
             u32("src_scalar_NATURAL_total_batch_count"),
-            u32("src_scalar_NATURAL_num_batch_chunks"),
             u32("src_scalar_NATURAL_hidden_count"),
             u32("src_scalar_NATURAL_padded_hidden_count"),
             u32("src_scalar_NATURAL_final_grad_hidden_activations_total_count"),

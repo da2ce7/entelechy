@@ -2135,7 +2135,7 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Integer-typed sample_mask accessed via load_sample_mask(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sample-Level Early Exit: When load_sample_mask() returns 0 for a sample, the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Both upstream invariants (summed_grad_h = 0 from Node 9's masking, relu_derivative = 0 from Node 4's activation zeroing) independently guarantee zero contribution for masked samples regardless of whether the early exit is applied. SIMD-Major Write Pattern: The kernel writes gradient elements at flat indices corresponding to the SIMD-major (SoA) layout (padded_hidden_count/SIMD_WIDTH, padded_input_count, SIMD_WIDTH), matching the persistent shared weight parameter layout consumed by Node 4 and updated by Node 24. This ensures flat-index correspondence between the gradient and parameter buffers through the layout-agnostic reduction pipeline. Padding Zero-Establishment: For SIMD-major positions corresponding to logical indices input_count <= i < padded_input_count or hidden_count <= h < padded_hidden_count, the kernel SHALL write zero. The kernel is the sole guarantor of zeros at padding positions (Initialization Contract: NONE). This guarantees that downstream L2 norm computations (Node 19) over the full padded extent are mathematically equivalent to norms over the logical extent."
  *        - Idempotency: "Associatively Non-Idempotent"
- *        - Synchronization Model: "Partial Renderer. Designed for the 'True Streaming' backpropagation model."
+ *        - Synchronization Model: "Streamable. Designed for the 'True Streaming' backpropagation model."
  */
 __kernel void backprop_shared_weights_chunk(
     /**
@@ -2216,27 +2216,24 @@ __kernel void backprop_shared_weights_chunk(
     __global const uint *src_buffer_GLOBAL_sample_mask,
 
     /**
-     * @param dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major The collection buffer for this chunk's computed weight gradients in SIMD-major layout.
-     *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_hidden_count / SIMD_WIDTH, src_scalar_NATURAL_padded_input_count, SIMD_WIDTH)
+     * @param dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major Single-slot scratch buffer for this chunk's computed weight gradients in SIMD-major layout.
+     *        Consumed by Node 19 within the same streaming loop iteration.
+     *        - Tensor Shape: (1, src_scalar_NATURAL_padded_hidden_count / SIMD_WIDTH, src_scalar_NATURAL_padded_input_count, SIMD_WIDTH)
      *        - Padding Contract: {
-     *            dim[0] ("num_batch_chunks"): {Type: NONE},
+     *            dim[0] ("1"): {Type: NONE},
      *            dim[1] ("hidden_count/SIMD_WIDTH" → "padded_hidden_count/SIMD_WIDTH"): {Type: SIMD, Formula: "SIMD_WIDTH-multiple alignment on hidden_count ensures exact division"},
      *            dim[2] ("input_count" → "padded_input_count"): {Type: CACHE, Formula: "128-byte alignment"},
      *            dim[3] ("SIMD_WIDTH"): {Type: NONE}
      *          }
      *        - Precision Role: "storage"
-     *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_hidden_count / SIMD_WIDTH, src_scalar_NATURAL_padded_input_count, SIMD_WIDTH]
-     *        - Placement Contract: linear_batch(src_scalar_NATURAL_batch_chunk_index)
-     *        - Validation Preconditions: [1] The write chunk index must be valid, as proven by: src_scalar_NATURAL_batch_chunk_index < src_scalar_NATURAL_num_batch_chunks. [2] Host shall
-     * allocate exactly [src_scalar_NATURAL_num_batch_chunks * src_scalar_NATURAL_padded_input_count * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes.
+     *        - Calculability Proof: [src_scalar_NATURAL_padded_hidden_count / SIMD_WIDTH, src_scalar_NATURAL_padded_input_count, SIMD_WIDTH]
+     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_padded_input_count * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes.
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major,
 
     uint src_scalar_NATURAL_batch_chunk_offset,
     uint src_scalar_NATURAL_batch_chunk_count,
-    uint src_scalar_NATURAL_batch_chunk_index,
     uint src_scalar_NATURAL_total_batch_count,
-    uint src_scalar_NATURAL_num_batch_chunks,
     uint src_scalar_NATURAL_input_count,
     uint src_scalar_NATURAL_padded_input_count,
     uint src_scalar_NATURAL_hidden_count,
@@ -2249,7 +2246,7 @@ __kernel void backprop_shared_weights_chunk(
  *        - Holistic Constraints: "All constraints are defined by the parameter commentary blocks."
  *        - Behavioral Invariants: "Precision Boundary Conversion: storage-role inputs widened via load_storage(); compute-role gradient consumed directly; partial gradient outputs narrowed via store_storage(). Integer-typed sample_mask accessed via load_sample_mask(). Intra-workgroup reduction in LOCAL COMPUTE_TYPE scratch. All arithmetic exclusively in COMPUTE_TYPE. ReLU derivative source is controlled by `src_scalar_FLAG_use_explicit_hidden_mask`. When 0: mask is derived internally from stored activations (mask = load_storage(hidden_activations) > 0). When 1: mask is read from `src_buffer_GLOBAL_hidden_mask`. The Host MAY pass a minimal stub buffer when the flag is 0. Sample-Level Early Exit: When load_sample_mask() returns 0 for a sample, the kernel skips the entire contribution for that sample. This is a performance optimization — not a correctness requirement. Both upstream invariants (summed_grad_h = 0 from Node 9's masking, relu_derivative = 0 from Node 4's activation zeroing) independently guarantee zero contribution for masked samples regardless of whether the early exit is applied. Padding Zero-Establishment: For the padded_hidden_count dimension, the kernel SHALL write zero for all positions at indices >= hidden_count. The kernel is the sole guarantor of zeros at padding positions (Initialization Contract: NONE). This guarantees that downstream L2 norm computations (Node 19) over the full padded extent are mathematically equivalent to norms over the logical extent."
  *        - Idempotency: "Associatively Non-Idempotent"
- *        - Synchronization Model: "Partial Renderer. Designed for the 'True Streaming' backpropagation model."
+ *        - Synchronization Model: "Streamable. Designed for the 'True Streaming' backpropagation model."
  */
 __kernel void backprop_shared_biases_chunk(
     /**
@@ -2318,22 +2315,19 @@ __kernel void backprop_shared_biases_chunk(
     __global const uint *src_buffer_GLOBAL_sample_mask,
 
     /**
-     * @param dest_buffer_GLOBAL_partial_grad_biases_shared The collection buffer for this chunk's computed bias gradients.
-     *        - Tensor Shape: (src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_hidden_count)
+     * @param dest_buffer_GLOBAL_partial_grad_biases_shared Single-slot scratch buffer for this chunk's computed bias gradients.
+     *        Consumed by Node 19 within the same streaming loop iteration.
+     *        - Tensor Shape: (1, src_scalar_NATURAL_padded_hidden_count)
      *        - Padding Contract: {Type: CACHE, Formula: "128-byte alignment via padded_hidden_count"}
      *        - Precision Role: "storage"
-     *        - Calculability Proof: [src_scalar_NATURAL_num_batch_chunks, src_scalar_NATURAL_padded_hidden_count]
-     *        - Placement Contract: linear_batch(src_scalar_NATURAL_batch_chunk_index)
-     *        - Validation Preconditions: [1] The write chunk index must be valid, as proven by: src_scalar_NATURAL_batch_chunk_index < src_scalar_NATURAL_num_batch_chunks. [2] Host shall
-     * allocate exactly [src_scalar_NATURAL_num_batch_chunks * src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes.
+     *        - Calculability Proof: [src_scalar_NATURAL_padded_hidden_count]
+     *        - Validation Preconditions: Host shall allocate exactly [src_scalar_NATURAL_padded_hidden_count * sizeof(STORAGE_TYPE)] bytes.
      */
     __global STORAGE_TYPE *dest_buffer_GLOBAL_partial_grad_biases_shared,
 
     uint src_scalar_NATURAL_batch_chunk_offset,
     uint src_scalar_NATURAL_batch_chunk_count,
-    uint src_scalar_NATURAL_batch_chunk_index,
     uint src_scalar_NATURAL_total_batch_count,
-    uint src_scalar_NATURAL_num_batch_chunks,
     uint src_scalar_NATURAL_hidden_count,
     uint src_scalar_NATURAL_padded_hidden_count,
     uint src_scalar_NATURAL_final_grad_hidden_activations_total_count);

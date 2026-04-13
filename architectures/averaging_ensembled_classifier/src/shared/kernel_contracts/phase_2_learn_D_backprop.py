@@ -10,7 +10,7 @@ backprop_shared_weights_contract = KernelContract(
     contract_block=KernelContractBlock(
         holistic_constraints="All constraints are defined by the parameter commentary blocks.",
         idempotency="Associatively Non-Idempotent",
-        synchronization_model="Partial Renderer. True Streaming backpropagation model.",
+        synchronization_model="Streamable. Writes to single-slot scratch buffer consumed by Node 19 within same iteration.",
         behavioral_invariants=None,
     ),
     buffer_params=(
@@ -56,10 +56,10 @@ backprop_shared_weights_contract = KernelContract(
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major", flow="dest", memory_scope="GLOBAL",
-            tensor_shape=("num_batch_chunks", "padded_input_count", "padded_hidden_count"),
+            tensor_shape=("padded_hidden_count / SIMD_WIDTH", "padded_input_count", "SIMD_WIDTH"),
             padding_contract=PaddingContract("NONE", None),
-            calculability_proof=("num_batch_chunks", "padded_input_count", "padded_hidden_count"),
-            validation_preconditions=("chunk write index valid",),
+            calculability_proof=("padded_hidden_count", "padded_input_count"),
+            validation_preconditions=("single-slot scratch buffer",),
             precision_role="storage",
         ),
     ),
@@ -67,9 +67,7 @@ backprop_shared_weights_contract = KernelContract(
         ScalarParamSpec("FLAG_use_explicit_hidden_mask", "src", "FLAG"),
         ScalarParamSpec("batch_chunk_offset", "src", "NATURAL"),
         ScalarParamSpec("batch_chunk_count", "src", "NATURAL"),
-        ScalarParamSpec("batch_chunk_index", "src", "NATURAL"),
         ScalarParamSpec("total_batch_count", "src", "NATURAL"),
-        ScalarParamSpec("num_batch_chunks", "src", "NATURAL"),
         ScalarParamSpec("input_count", "src", "NATURAL"),
         ScalarParamSpec("padded_input_count", "src", "NATURAL"),
         ScalarParamSpec("hidden_count", "src", "NATURAL"),
@@ -79,7 +77,7 @@ backprop_shared_weights_contract = KernelContract(
     local_memory=(
         LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
     ),
-    placement=PlacementContract(strategy="linear_batch", key_domain=None, context_params={}),
+    placement=None,  # Writes to single-slot scratch, not a collection buffer
 )
 
 backprop_shared_biases_contract = KernelContract(
@@ -87,7 +85,7 @@ backprop_shared_biases_contract = KernelContract(
     contract_block=KernelContractBlock(
         holistic_constraints="All constraints are defined by the parameter commentary blocks.",
         idempotency="Associatively Non-Idempotent",
-        synchronization_model="Partial Renderer. True Streaming backpropagation model.",
+        synchronization_model="Streamable. Writes to single-slot scratch buffer consumed by Node 19 within same iteration.",
         behavioral_invariants=None,
     ),
     buffer_params=(
@@ -125,10 +123,10 @@ backprop_shared_biases_contract = KernelContract(
         ),
         BufferParamSpec(
             name="dest_buffer_GLOBAL_partial_grad_biases_shared", flow="dest", memory_scope="GLOBAL",
-            tensor_shape=("num_batch_chunks", "padded_hidden_count"),
+            tensor_shape=("padded_hidden_count",),
             padding_contract=PaddingContract("NONE", None),
-            calculability_proof=("num_batch_chunks", "padded_hidden_count"),
-            validation_preconditions=("chunk write index valid",),
+            calculability_proof=("padded_hidden_count",),
+            validation_preconditions=("single-slot scratch buffer",),
             precision_role="storage",
         ),
     ),
@@ -136,9 +134,7 @@ backprop_shared_biases_contract = KernelContract(
         ScalarParamSpec("FLAG_use_explicit_hidden_mask", "src", "FLAG"),
         ScalarParamSpec("batch_chunk_offset", "src", "NATURAL"),
         ScalarParamSpec("batch_chunk_count", "src", "NATURAL"),
-        ScalarParamSpec("batch_chunk_index", "src", "NATURAL"),
         ScalarParamSpec("total_batch_count", "src", "NATURAL"),
-        ScalarParamSpec("num_batch_chunks", "src", "NATURAL"),
         ScalarParamSpec("hidden_count", "src", "NATURAL"),
         ScalarParamSpec("padded_hidden_count", "src", "NATURAL"),
         ScalarParamSpec("final_grad_hidden_activations_total_count", "src", "NATURAL"),
@@ -146,7 +142,7 @@ backprop_shared_biases_contract = KernelContract(
     local_memory=(
         LocalMemorySpec("reduction_tile", "get_local_size(0) * sizeof(COMPUTE_TYPE)"),
     ),
-    placement=PlacementContract(strategy="linear_batch", key_domain=None, context_params={}),
+    placement=None,  # Writes to single-slot scratch, not a collection buffer
 )
 
 clip_shared_gradients_contract = KernelContract(

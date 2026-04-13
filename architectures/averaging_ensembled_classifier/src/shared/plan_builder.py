@@ -324,9 +324,9 @@ def build_act_plan(
     b_targets = alloc.allocate(
         strategy.required_targets_buffer_name,
         (batch_size, model_spec.padded_class_dim),
-        4,
+        strategy.get_targets_element_size(elem_storage),
         BufferRole.BATCH_INPUT,
-        "compute",
+        strategy.get_targets_precision_role(),
     )
 
     # Mask strategy flags (ADR-031)
@@ -598,8 +598,18 @@ def build_learn_plan(
     activation_lifecycle: Literal["cache", "recompute"] = "recompute",
     optimizer: OptimizerConfig | None = None,
     adam_step: int = 1,
+    effective_batch_size: int | None = None,
 ) -> ExecutionPlan:
-    """Construct a Learn-phase (gradient production → update) plan."""
+    """Construct a Learn-phase (gradient production → update) plan.
+
+    Args:
+        effective_batch_size: Number of valid (unmasked) samples in the batch.
+            Used for gradient normalization (Node 21). If None, defaults to
+            batch_size (assumes full batch with no masked samples). When the
+            batch contains padding samples excluded by the sample_mask, this
+            should be the popcount of valid samples to ensure correct gradient
+            averaging.
+    """
     alloc = _BufferAllocator()
     elem_storage = model_spec.precision.storage_dtype.itemsize
     elem_compute = model_spec.precision.compute_dtype.itemsize
@@ -607,6 +617,12 @@ def build_learn_plan(
     tiling = _make_tiling(model_spec)
     tile_count = tiling.total_tiles
     nodes: dict[str, PlanNode] = {}
+
+    # Effective batch size for gradient normalization (Node 21)
+    # Defaults to batch_size if not specified (full batch assumption)
+    _effective_batch = (
+        effective_batch_size if effective_batch_size is not None else batch_size
+    )
 
     modules_per_chunk = (
         (model_spec.num_modules + tiling.num_module_chunks - 1)
@@ -778,9 +794,9 @@ def build_learn_plan(
     b_targets = alloc.allocate(
         strategy.required_targets_buffer_name,
         (batch_size, model_spec.padded_class_dim),
-        4,
+        strategy.get_targets_element_size(elem_storage),
         BufferRole.BATCH_INPUT,
-        "compute",
+        strategy.get_targets_precision_role(),
     )
 
     # Mask strategy flags (ADR-031)
@@ -970,20 +986,22 @@ def build_learn_plan(
     )
 
     # Phase III intermediates
+    # Scratch buffers for streaming loop body (single-chunk sized, reused per iteration)
     b_partial_grad_sw = alloc.allocate(
-        "partial_grad_weights_shared_simd_major",
-        (batch_size, model_spec.padded_input_dim, model_spec.padded_hidden_dim),
+        "partial_grad_weights_shared_simd_major_scratch",
+        (1, model_spec.padded_input_dim, model_spec.padded_hidden_dim),
         elem_storage,
         BufferRole.BATCH_INTERMEDIATE,
         "storage",
     )
     b_partial_grad_sb = alloc.allocate(
-        "partial_grad_biases_shared",
-        (batch_size, model_spec.padded_hidden_dim),
+        "partial_grad_biases_shared_scratch",
+        (1, model_spec.padded_hidden_dim),
         elem_storage,
         BufferRole.BATCH_INTERMEDIATE,
         "storage",
     )
+    # Collection buffers for clipped gradients (Node 19 writes at strided offsets)
     b_clipped_grad_sw = alloc.allocate(
         "clipped_partial_grad_weights_shared_simd_major",
         (batch_size, shared_w_param_count),
@@ -1520,8 +1538,6 @@ def build_learn_plan(
 
     phase_ii_done = frozenset({
         "stabilize_and_reduce_grad_hidden_activations",
-        "reduce_module_weights_grad",
-        "reduce_temps_grad",
     })
 
     # =================================================================
@@ -1547,9 +1563,7 @@ def build_learn_plan(
             "src_scalar_NATURAL_batch_chunk_offset": 0,
             "src_scalar_NATURAL_batch_chunk_count": 1,
             "src_scalar_FLAG_use_explicit_hidden_mask": flag_explicit,
-            "src_scalar_NATURAL_batch_chunk_index": 0,
             "src_scalar_NATURAL_total_batch_count": batch_size,
-            "src_scalar_NATURAL_num_batch_chunks": batch_size,
             "src_scalar_NATURAL_input_count": model_spec.input_dim,
             "src_scalar_NATURAL_padded_input_count": model_spec.padded_input_dim,
             "src_scalar_NATURAL_hidden_count": model_spec.hidden_dim,
@@ -1557,7 +1571,7 @@ def build_learn_plan(
             "src_scalar_NATURAL_final_grad_hidden_activations_total_count": grad_h_total,
         },
         tile_count=1,
-        placement_strategy="linear_batch",
+        placement_strategy=None,  # Writes to single-slot scratch buffer
     )
     nodes[n17.node_id] = n17
     alloc.set_producer(b_partial_grad_sw, n17.node_id)
@@ -1585,15 +1599,13 @@ def build_learn_plan(
             "src_scalar_NATURAL_batch_chunk_offset": 0,
             "src_scalar_NATURAL_batch_chunk_count": 1,
             "src_scalar_FLAG_use_explicit_hidden_mask": flag_explicit,
-            "src_scalar_NATURAL_batch_chunk_index": 0,
             "src_scalar_NATURAL_total_batch_count": batch_size,
-            "src_scalar_NATURAL_num_batch_chunks": batch_size,
             "src_scalar_NATURAL_hidden_count": model_spec.hidden_dim,
             "src_scalar_NATURAL_padded_hidden_count": model_spec.padded_hidden_dim,
             "src_scalar_NATURAL_final_grad_hidden_activations_total_count": grad_h_total,
         },
         tile_count=1,
-        placement_strategy="linear_batch",
+        placement_strategy=None,  # Writes to single-slot scratch buffer
     )
     nodes[n18.node_id] = n18
     alloc.set_producer(b_partial_grad_sb, n18.node_id)
@@ -1637,6 +1649,10 @@ def build_learn_plan(
     alloc.add_consumer(b_partial_grad_sb, n19.node_id)
 
     # Streaming loop wrapping Phase III
+    # Note: batch_chunk_index is NOT strided — Nodes 17/18 always write to
+    # scratch buffer slot 0. The batch_chunk_offset stride selects which
+    # samples to READ; the write_offset strides select where Node 19 WRITES
+    # clipped results in the collection buffers.
     streaming_bp = StreamingLoopPlan(
         iteration=IterationDimension(
             total_extent=batch_size,
@@ -1653,9 +1669,6 @@ def build_learn_plan(
                 "src_scalar_NATURAL_batch_chunk_offset", base=0, stride=1
             ),
             ParameterStride(
-                "src_scalar_NATURAL_batch_chunk_index", base=0, stride=1
-            ),
-            ParameterStride(
                 "dest_scalar_NATURAL_weights_write_offset",
                 base=0,
                 stride=shared_w_param_count,
@@ -1666,7 +1679,7 @@ def build_learn_plan(
                 stride=shared_b_param_count,
             ),
         ),
-        scratch_buffers=(),
+        scratch_buffers=(),  # scratch buffers already allocated at plan level
         constant_scalars={},
     )
     n_stream_bp = StreamingLoopNode(
@@ -1746,7 +1759,7 @@ def build_learn_plan(
             "dest_buffer_GLOBAL_final_grad": b_final_grad_mod,
         },
         {
-            "src_scalar_REAL_effective_batch_size": float(batch_size),
+            "src_scalar_REAL_effective_batch_size": float(_effective_batch),
             "src_scalar_REAL_epsilon": model_spec.precision.compute_epsilon,
             "src_scalar_NATURAL_parameter_count": epp_mod_w,
         },
@@ -1766,7 +1779,7 @@ def build_learn_plan(
             "dest_buffer_GLOBAL_final_grad": b_final_grad_mod_biases,
         },
         {
-            "src_scalar_REAL_effective_batch_size": float(batch_size),
+            "src_scalar_REAL_effective_batch_size": float(_effective_batch),
             "src_scalar_REAL_epsilon": model_spec.precision.compute_epsilon,
             "src_scalar_NATURAL_parameter_count": epp_mod_b,
         },
@@ -1786,7 +1799,7 @@ def build_learn_plan(
             "dest_buffer_GLOBAL_final_grad": b_final_grad_temps,
         },
         {
-            "src_scalar_REAL_effective_batch_size": float(batch_size),
+            "src_scalar_REAL_effective_batch_size": float(_effective_batch),
             "src_scalar_REAL_epsilon": model_spec.precision.compute_epsilon,
             "src_scalar_NATURAL_parameter_count": epp_temps,
         },
@@ -1806,7 +1819,7 @@ def build_learn_plan(
             "dest_buffer_GLOBAL_final_grad": b_final_grad_shared,
         },
         {
-            "src_scalar_REAL_effective_batch_size": float(batch_size),
+            "src_scalar_REAL_effective_batch_size": float(_effective_batch),
             "src_scalar_REAL_epsilon": model_spec.precision.compute_epsilon,
             "src_scalar_NATURAL_parameter_count": shared_w_param_count,
         },
@@ -1826,7 +1839,7 @@ def build_learn_plan(
             "dest_buffer_GLOBAL_final_grad": b_final_grad_shared_biases,
         },
         {
-            "src_scalar_REAL_effective_batch_size": float(batch_size),
+            "src_scalar_REAL_effective_batch_size": float(_effective_batch),
             "src_scalar_REAL_epsilon": model_spec.precision.compute_epsilon,
             "src_scalar_NATURAL_parameter_count": shared_b_param_count,
         },

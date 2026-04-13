@@ -46,9 +46,7 @@ __kernel void backprop_shared_weights_chunk(
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major,
     uint                         src_scalar_NATURAL_batch_chunk_offset,
     uint                         src_scalar_NATURAL_batch_chunk_count,
-    uint                         src_scalar_NATURAL_batch_chunk_index,
     uint                         src_scalar_NATURAL_total_batch_count,
-    uint                         src_scalar_NATURAL_num_batch_chunks,
     uint                         src_scalar_NATURAL_input_count,
     uint                         src_scalar_NATURAL_padded_input_count,
     uint                         src_scalar_NATURAL_hidden_count,
@@ -59,7 +57,6 @@ __kernel void backprop_shared_weights_chunk(
     // host's Calculability Proofs and Validation Preconditions; the kernel
     // iterates via batch_chunk_offset/count and indexes via padded dimensions.
     (void)src_scalar_NATURAL_total_batch_count;
-    (void)src_scalar_NATURAL_num_batch_chunks;
     (void)src_scalar_NATURAL_final_grad_hidden_activations_total_count;
 
     // --- 1. Work-Group → Gradient Component Coordinate --------------------
@@ -74,18 +71,13 @@ __kernel void backprop_shared_weights_chunk(
     }
 
     // --- 2. SIMD-Major Write Address Computation --------------------------
-    // The destination uses SoA layout: (batch_chunk, h_block, padded_input,
-    // SIMD_lane), matching the persistent weight buffer's SIMD-major layout.
-    // Long casts guard against overflow for large tensor dimensions.
+    // The destination is a single-slot scratch buffer consumed by Node 19
+    // within the same streaming loop iteration. No chunk offset needed.
+    // Layout: (h_block, padded_input, SIMD_WIDTH).
     const uint hb   = j_idx / SIMD_WIDTH;
     const uint lane = j_idx % SIMD_WIDTH;
-    const long chunk_base_offset =
-        (long)src_scalar_NATURAL_batch_chunk_index
-        * src_scalar_NATURAL_padded_input_count
-        * src_scalar_NATURAL_padded_hidden_count;
     const long grad_w_out_idx =
-          chunk_base_offset
-        + (long)hb * src_scalar_NATURAL_padded_input_count * SIMD_WIDTH
+          (long)hb * src_scalar_NATURAL_padded_input_count * SIMD_WIDTH
         + (long)i_idx * SIMD_WIDTH
         + lane;
 
@@ -201,9 +193,7 @@ __kernel void backprop_shared_biases_chunk(
     __global STORAGE_TYPE       *dest_buffer_GLOBAL_partial_grad_biases_shared,
     uint                         src_scalar_NATURAL_batch_chunk_offset,
     uint                         src_scalar_NATURAL_batch_chunk_count,
-    uint                         src_scalar_NATURAL_batch_chunk_index,
     uint                         src_scalar_NATURAL_total_batch_count,
-    uint                         src_scalar_NATURAL_num_batch_chunks,
     uint                         src_scalar_NATURAL_hidden_count,
     uint                         src_scalar_NATURAL_padded_hidden_count,
     uint                         src_scalar_NATURAL_final_grad_hidden_activations_total_count) {
@@ -212,7 +202,6 @@ __kernel void backprop_shared_biases_chunk(
     // host's Calculability Proofs and Validation Preconditions; the kernel
     // iterates via batch_chunk_offset/count and indexes via padded dimensions.
     (void)src_scalar_NATURAL_total_batch_count;
-    (void)src_scalar_NATURAL_num_batch_chunks;
     (void)src_scalar_NATURAL_final_grad_hidden_activations_total_count;
 
     // --- 1. Work-Group → Gradient Component Coordinate --------------------
@@ -225,11 +214,10 @@ __kernel void backprop_shared_biases_chunk(
     }
 
     // --- 2. Write Address Computation -------------------------------------
-    // Linear layout: (batch_chunk, padded_hidden).
-    const long chunk_base_offset =
-        (long)src_scalar_NATURAL_batch_chunk_index
-        * src_scalar_NATURAL_padded_hidden_count;
-    const long grad_b_out_idx = chunk_base_offset + j_idx;
+    // The destination is a single-slot scratch buffer consumed by Node 19
+    // within the same streaming loop iteration. No chunk offset needed.
+    // Linear layout: (padded_hidden).
+    const long grad_b_out_idx = j_idx;
 
     // --- 3. Padding Zero-Establishment (early exit) -----------------------
     // Initialization Contract: NONE — the kernel is the sole guarantor that

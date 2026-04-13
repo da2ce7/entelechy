@@ -558,7 +558,7 @@ The two host-visible synchronization events are represented as `RetrievalNode`s:
 
 #### **The Placement Contract**
 
-All kernels designated as "Partial Renderers" must accept a unique `flat_tile_index` integer parameter from the host. This index is used to calculate the write offset within their designated output buffer, ensuring each partial result is placed in its correct, discrete slot. This contract applies to kernels: **(6), (7), (8), (9), (10), (11), (17), (18)**.
+All kernels designated as "Partial Renderers" must accept a unique `flat_tile_index` integer parameter from the host. This index is used to calculate the write offset within their designated output buffer, ensuring each partial result is placed in its correct, discrete slot. This contract applies to kernels: **(6), (7), (8), (9), (10), (11)**.
 
 ---
 
@@ -636,11 +636,11 @@ All kernels designated as "Partial Renderers" must accept a unique `flat_tile_in
     3. **Architectural Coherence:** It resolves the logical conflict of applying a scatter-gather primitive to a pre-gathered, contiguous buffer.
     4. **Pattern Consistency:** It receives host-prescribed thresholds in the same manner as the generic reduction engine (Nodes 14/15/20), eliminating the former jurisdictional exception where this kernel computed its own policy schedule.
 - **(17) `backprop_shared_weights_chunk`**: Computes partial gradients for shared weights.
-  - **Contract:** Consumes `Input_i`, a slice of the `Summed_Grad_H`, and a **chunk** of recomputed `hidden_i`. Adheres to the Placement Contract.
-  - **Lifecycle Note:** The `PARTIAL_Grad_SW_i` buffer produced by this kernel **must** be processed by **Node (19)** before being aggregated by Node (20).
+  - **Contract:** Consumes `Input_i`, a slice of the `Summed_Grad_H`, and a **chunk** of recomputed `hidden_i`. Writes to a single-slot scratch buffer consumed by Node (19) within the same streaming loop iteration.
+  - **Lifecycle Note:** The `PARTIAL_Grad_SW_i` buffer produced by this kernel **must** be consumed by **Node (19)** within the same streaming loop iteration before the next iteration overwrites it.
 - **(18) `backprop_shared_biases_chunk`**: Computes partial gradients for shared biases.
-  - **Contract:** Consumes a slice of the `Summed_Grad_H` and a **chunk** of recomputed `hidden_i`. Adheres to the Placement Contract.
-  - **Lifecycle Note:** The `PARTIAL_Grad_SB_i` buffer produced by this kernel **must** be processed by **Node (19)** before being aggregated by Node (20).
+  - **Contract:** Consumes a slice of the `Summed_Grad_H` and a **chunk** of recomputed `hidden_i`. Writes to a single-slot scratch buffer consumed by Node (19) within the same streaming loop iteration.
+  - **Lifecycle Note:** The `PARTIAL_Grad_SB_i` buffer produced by this kernel **must** be consumed by **Node (19)** within the same streaming loop iteration before the next iteration overwrites it.
 - **(19) `clip_shared_gradients_chunk`**: Applies gradient clipping to the partial gradients from the **streamed shared path**.
   - **Contract:** Invoked inside the host's streaming loop for each _chunk_ of shared layer backpropagation (`Nodes 17, 18`). It calculates the L2 norm of the `Grad_SW` and `Grad_SB` vectors for that chunk and applies scaling. Its interface is simple and accepts only the two relevant gradient buffers. This is a mandatory stability primitive for the streaming data path.
 
