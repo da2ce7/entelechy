@@ -6,7 +6,7 @@ from src.shared.hardware_profile import HardwareProfile
 from src.shared.model_spec import ModelSpec
 from src.shared.optimizer_config import OptimizerConfig
 from src.shared.plan_builder import build_learn_plan
-from src.shared.problem_type_strategy import PlanCceStrategy
+from architectures.averaging_ensembled_classifier.src.shared.problem_type_spec import PlanCceStrategy
 from src.shared.stabilization_policy import StabilizationPolicy
 
 

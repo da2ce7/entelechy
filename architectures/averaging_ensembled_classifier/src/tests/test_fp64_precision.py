@@ -17,7 +17,7 @@ from src.shared.model_spec import ModelSpec
 from src.shared.precision_config import PrecisionConfig
 from src.shared.stabilization_policy import StabilizationPolicy
 from src.shared.plan_builder import build_act_plan
-from src.shared.problem_type_strategy import PlanCceStrategy
+from architectures.averaging_ensembled_classifier.src.shared.problem_type_spec import PlanCceStrategy
 
 from .conftest import IRIS, FP64_PRECISION_CONFIGS, FP64_MODEL_SPEC_FACTORIES, ALL_PRECISION_CONFIGS, ALL_MODEL_SPEC_FACTORIES
 

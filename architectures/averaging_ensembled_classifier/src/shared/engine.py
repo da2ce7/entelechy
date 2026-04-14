@@ -22,7 +22,7 @@ from .optimizer_config import OptimizerConfig
 from .plan_builder import build_act_plan, build_learn_plan
 from .plan_renderer import PlanRenderer
 from .precision_config import PrecisionConfig
-from .problem_type_strategy import PlanCceStrategy, PlanProblemTypeStrategy
+from .problem_type_spec import PlanCceStrategy, PlanProblemTypeStrategy
 from .retrieval_future import RetrievalFuture
 from .stabilization_policy import StabilizationPolicy
 from .ticket import WorkTicket

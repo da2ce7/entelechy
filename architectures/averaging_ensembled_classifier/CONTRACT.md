@@ -730,7 +730,9 @@ Terms are defined in singular form. Plural forms are implicitly valid when combi
 | `clipping_threshold` | Data Role | The maximum permissible L2 norm for gradient clipping. |
 | `policy_t_algorithmic` | Hyperparameter | Time-dependent policy threshold from the adaptive gradient clipping schedule. |
 | `policy_lambda` | Hyperparameter | Scaling coefficient for the gradient clipping policy. |
-| `policy_max_k` | Hyperparameter | Maximum fan-in *K* for staged reduction policy selection. |
+| `policy_max_k` | Hyperparameter | **Retired.** Superseded by the `min(max_reduce_fan_in, policy_reduce_fan_in)` formulation. The former term conflated the hardware ceiling and the policy choice into a single opaque "maximum." |
+| `max_reduce_fan_in` | Hardware Profile | The maximum fan-in the target device can efficiently sustain per reduction stage. Upper bound on the realized Reduction Batch Size (`K_hw`). |
+| `policy_reduce_fan_in` | Hyperparameter | The user-configured fan-in governing stabilization granularity (`K_policy`). Lower values produce more intermediate clip stages and finer-grained gradient direction preservation. When unspecified, defaults to `max_reduce_fan_in`, making the hardware ceiling binding. |
 
 #### 5.6. Reduction Engine Topology
 
@@ -739,6 +741,7 @@ Terms are defined in singular form. Plural forms are implicitly valid when combi
 | `fan_in` | Topology | The number of input partials consumed by a single reduction node (the *K* in K-fan-in). |
 | `node` | Topology | An independent unit of work in the reduction tree; each node aggregates *K* partials into one output. |
 | `stage` | Topology | A level in the multi-stage reduction tree. Stage 0 is the leaf layer; higher stages consume prior stage outputs. |
+| `pre_accumulation_count` | Topology | The number of input elements each thread serially accumulates before the staged tree reduction begins. Equals `⌈total_elements / workgroup_size⌉` when `total_elements > workgroup_size`; 1 or 0 otherwise. Denoted `L_pre` in CONCEPT.md §3.4. |
 
 ### 6.0 Canonical Flag Identifiers
 

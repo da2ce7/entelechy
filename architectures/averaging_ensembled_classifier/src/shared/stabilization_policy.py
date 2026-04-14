@@ -1,319 +1,375 @@
-# stabilization_policy.py
+# src/shared/stabilization_policy.py
+"""Gradient stabilization policy (CONCEPT.md §3.3–3.4).
 
+Implements the Quadratic Scaling Policy and orthogonal numerical safety
+enforcement for the log_K(N) reduction engine.
+
+Two-step threshold formula (per stage)
+──────────────────────────────────────
+::
+
+    1. policy_threshold  = T_algorithmic + λ · j²
+    2. final_threshold   = min(policy_threshold, compute_fp_format_max / K)
+
+where *j* is the stage index (0 = root, higher values = earlier/leaf
+stages) and *K* is the uniform reduction fan-in.
+
+K resolution (CONCEPT.md §2)
+─────────────────────────────
+::
+
+    K = min(K_hw, K_policy)
+
+When ``policy_reduce_fan_in`` is ``None`` (the default), K_hw is
+binding.  K is further capped at ``num_partials`` and clamped to ≥ 2
+for any actual reduction.
+
+Node 16 specialisation
+──────────────────────
+The Grad_H reduction kernel (Node 16) uses a work-group-per-row
+strategy with optional pre-accumulation.  ``render_node16_schedule``
+produces a backend-adapted schedule accounting for the dispatch
+topology (CONCEPT.md §3.4, §11 item 4).
+
+Authoritative sources
+─────────────────────
+CONCEPT.md §2    — Reduction Batch Size resolution
+CONCEPT.md §3.3  — Quadratic Scaling Policy
+CONCEPT.md §3.4  — Orthogonal numerical safety enforcement
+CONCEPT.md §11   — Node 16 schedule rendering
 """
-This module constitutes the sole and authoritative host-side implementation of
-the System's Dynamic Gradient Stabilization Strategy.
 
-Jurisdictional Mandate:
-This module's jurisdiction is to translate the high-level stabilization policy
-(defined by user intent and hardware constraints) into the low-level, primitive
-scalar values required by the device-side kernel contracts. It is the definitive,
-verifiable bridge between the host's strategic orchestration and the device's
-tactical execution.
-
-Architectural Role:
-This module provides the `StabilizationPolicy` object, a formal architectural
-entity. This object is the host-side computational engine that implements the
-stabilization logic specified for Nodes 15, 16, and 20 in the Architectural
-Concept and Kernel Contracts. Its existence enables the separation of concerns,
-ensuring the Host Orchestrator is decoupled from the nuanced mathematics of
-stabilization.
-
-Adherence to the interfaces provided herein is mandatory for any host-side
-logic that governs gradient reduction.
-"""
+from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Tuple
+
+__all__ = [
+    "Node16Schedule",
+    "ReductionTopology",
+    "StabilizationPolicy",
+]
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Result types
+# ═════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class ReductionTopology:
+    """Uniform reduction tree geometry returned by
+    :meth:`StabilizationPolicy.plan_reduction_tree`.
+
+    Parameters
+    ----------
+    fan_in:
+        K — partials consumed per output node per stage.
+        1 when ``num_stages == 0`` (Identity tier bypass).
+    num_stages:
+        ⌈log_K(N)⌉.  0 signals the Identity tier
+        (single partial, no reduction dispatch).
+    """
+
+    fan_in: int
+    num_stages: int
+
+
+@dataclass(frozen=True)
+class Node16Schedule:
+    """Rendered threshold schedule for the specialised Grad_H
+    reduction kernel (Node 16).
+
+    Produced by :meth:`StabilizationPolicy.render_node16_schedule`.
+
+    Parameters
+    ----------
+    num_stages:
+        Number of staged reduction rounds after pre-accumulation.
+        0 when post-accumulation intermediates ≤ 1.
+    pre_accumulation_threshold:
+        Clip threshold for each thread's serial pre-accumulation
+        result.  ``compute_fp_format_max`` when no pre-accumulation
+        occurs (total_modules ≤ workgroup_size).
+    stage_thresholds:
+        Per-stage clip thresholds.  Index 0 = first clip after
+        pre-accumulation (leaf); last index = final clip (root).
+        Length equals ``num_stages``.  Empty when
+        ``num_stages == 0``.
+    """
+
+    num_stages: int
+    pre_accumulation_threshold: float
+    stage_thresholds: tuple[float, ...]
+
+
+# ═════════════════════════════════════════════════════════════════════
+# StabilizationPolicy
+# ═════════════════════════════════════════════════════════════════════
 
 
 @dataclass(frozen=True)
 class StabilizationPolicy:
+    """Immutable gradient stabilization policy.
+
+    Encodes the user's algorithmic intent (``t_algorithmic``, ``λ``)
+    and the hardware's arithmetic ceiling (``compute_fp_format_max``)
+    into a unified configuration that produces per-stage clipping
+    thresholds for the reduction engine.
+
+    Parameters
+    ----------
+    t_algorithmic:
+        Target L2 norm at the root of the reduction tree (j = 0).
+        The Quadratic Scaling Policy's anchor point.  When 0,
+        every stage clips to zero — effectively suppressing all
+        gradients.
+    lambda_:
+        Funnel curvature coefficient.  Larger values produce more
+        permissive early-stage (leaf) thresholds.  When 0, the
+        policy degrades to a fixed ceiling at ``t_algorithmic``
+        for all stages (CONCEPT.md §3.3).
+    compute_fp_format_max:
+        Maximum finite value of the compute-precision format
+        (``PrecisionConfig.compute_fp_format_max``).  Source of
+        the orthogonal safety ceiling ``cfm / K`` that prevents
+        summation-induced overflow.
+    policy_reduce_fan_in:
+        K_policy — user-configured stabilisation granularity
+        (CONCEPT.md §2).  Lower values produce more intermediate
+        clip stages and finer-grained gradient direction
+        preservation.  ``None`` (default) makes the hardware
+        ceiling K_hw binding.
     """
-    An immutable policy object that embodies the contract between user intent
-    and hardware reality for gradient stabilization.
 
-    Contractual Role:
-    This class serves as an immutable configuration manifest and a provider of
-    pure, stateless calculation methods. It is instantiated by the Host
-    Orchestrator with the high-level policy parameters and provides the
-    necessary functions to compute the exact, primitive values required for
-    kernel dispatch, thereby fulfilling the system's stabilization contract.
-    """
-
-    # --- Algorithmic & System Parameters ---
-
-    # WHY: This parameter represents the user's declared algorithmic objective.
-    # It is the final, target L2 norm to which the fully aggregated gradient
-    # at the root of the reduction tree (j=0) must adhere.
     t_algorithmic: float
-
-    # WHY: This parameter governs the curvature of the stabilization policy
-    # funnel. It dictates the rate at which clipping thresholds are relaxed
-    # for earlier, more granular stages of the reduction tree.
     lambda_: float
-
-    # WHY: This parameter represents a non-negotiable physical system boundary.
-    # The maximum representable value of the compute precision format. Governs
-    # overflow safety during reduction tree summation. Under the three-role model,
-    # the safety ceiling is bounded by arithmetic precision, not storage precision.
-    # At FP64 compute precision, the safety ceiling (~1.8e+308 / K_j) makes
-    # overflow a non-practical concern for any realistic fan-in K. The
-    # stabilization machinery remains active (it costs nothing when not
-    # triggered) but will never fire under FP64 compute.
     compute_fp_format_max: float
+    policy_reduce_fan_in: int | None = None
 
-    # WHY: This parameter is a mandatory system-level safeguard. It establishes
-    # a floor for all computed thresholds, preventing signal annihilation that
-    # could occur if the policy (e.g., a very small t_algorithmic) otherwise
-    # produced a pathologically small threshold.
-    min_threshold: float = 1.0
+    def __post_init__(self) -> None:
+        if self.t_algorithmic < 0:
+            raise ValueError(
+                f"t_algorithmic must be ≥ 0, got {self.t_algorithmic}"
+            )
+        if self.lambda_ < 0:
+            raise ValueError(
+                f"lambda_ must be ≥ 0, got {self.lambda_}"
+            )
+        if self.compute_fp_format_max <= 0:
+            raise ValueError(
+                f"compute_fp_format_max must be > 0, "
+                f"got {self.compute_fp_format_max}"
+            )
+        if (
+            self.policy_reduce_fan_in is not None
+            and self.policy_reduce_fan_in < 2
+        ):
+            raise ValueError(
+                f"policy_reduce_fan_in must be ≥ 2 or None, "
+                f"got {self.policy_reduce_fan_in}"
+            )
 
-    # =========================================================================
-    # === API for Specialized Reduction Kernels (Consumed by Node 16)       ===
-    # =========================================================================
+    # ── K resolution (CONCEPT.md §2) ─────────────────────────────
 
-    def get_specialized_reduction_policy_k(self, user_policy_k: int, hardware_max_fan_in: int) -> int:
+    def resolve_fan_in(self, hardware_max_fan_in: int) -> int:
+        """Resolve the Reduction Batch Size K.
+
+        ``K = min(K_hw, K_policy)``, clamped to ≥ 2.  When
+        ``policy_reduce_fan_in`` is ``None``, ``K = K_hw``.
+
+        This method does **not** cap K at ``num_partials`` — that
+        is the caller's responsibility (handled by
+        :meth:`plan_reduction_tree`).
         """
-        Function: Pre-flight Contract Synthesizer for Specialized Reducers.
+        k_policy = (
+            self.policy_reduce_fan_in
+            if self.policy_reduce_fan_in is not None
+            else hardware_max_fan_in
+        )
+        return max(2, min(hardware_max_fan_in, k_policy))
 
-        Architectural Mandate:
-        The kernel contract for `stabilize_and_reduce_grad_hidden_activations`
-        (Node 16) mandates that the host shall provide a single, pre-sanitized
-        integer, `src_scalar_NATURAL_policy_max_k`. This method is the sole,
-        authoritative implementation of the synthesis required to produce that
-        value.
+    # ── Tree planning ─────────────────────────────────────────────
 
-        It resolves three distinct constraints into a single, primitive integer
-        that the device kernel can accept with absolute trust:
-          A. User Intent: The user's desired K for a specific policy.
-          B. Hardware Reality: The physical work-group limits of the device.
-          C. Mathematical Safety: The absolute fan-in limit required to
-             prevent signal annihilation.
+    def plan_reduction_tree(
+        self,
+        num_partials: int,
+        hardware_max_fan_in: int,
+    ) -> ReductionTopology:
+        """Plan a uniform log_K(N) reduction tree.
+
+        Returns the fan-in K and stage count for *num_partials*
+        input partials.
+
+        When ``num_partials ≤ 1``, returns the Identity tier
+        (``fan_in=1``, ``num_stages=0``): no reduction dispatch,
+        the backend references the single partial directly.
+
+        K is ``min(resolve_fan_in(hardware_max_fan_in), num_partials)``
+        — never exceeding the number of partials available.
         """
-        # Constraint C: Mathematical Safety.
-        # WHY: This calculates the absolute maximum fan-in (K) permitted by the
-        # system's fundamental `min_threshold`. It guarantees that the hardware
-        # safety ceiling (`fp_format_max / K`) can never fall below this
-        # non-negotiable floor, thus preventing signal annihilation.
-        math_safety_k_limit = self.compute_fp_format_max / self.min_threshold if self.min_threshold > 0 else float("inf")
+        if num_partials <= 1:
+            return ReductionTopology(fan_in=1, num_stages=0)
 
-        # Synthesis and Finalization.
-        # WHY: The final value is contractually obligated to be the most
-        # restrictive (minimum) of the three constraints. This safely encodes
-        # all high-level policy into a primitive value suitable for dispatch.
-        final_k = min(user_policy_k, hardware_max_fan_in, math_safety_k_limit)
+        k = min(self.resolve_fan_in(hardware_max_fan_in), num_partials)
+        k = max(2, k)  # defense-in-depth; resolve_fan_in guarantees ≥ 2
+        num_stages = math.ceil(math.log(num_partials) / math.log(k))
+        return ReductionTopology(fan_in=k, num_stages=num_stages)
 
-        # WHY: A fan-in of less than 2 is mathematically nonsensical for a reduction.
-        # This enforces a sane lower bound on the final return value.
-        return max(2, int(final_k))
+    # ── Per-stage thresholds ──────────────────────────────────────
+
+    def stage_threshold(self, stage_j: int, fan_in: int) -> float:
+        """Clipping threshold for reduction stage *j*.
+
+        Implements the canonical two-step formula (CONCEPT.md §3.3–3.4)::
+
+            policy = T_algorithmic + λ · j²
+            safety = compute_fp_format_max / K
+            result = min(policy, safety)
+
+        Parameters
+        ----------
+        stage_j:
+            Stage index relative to root.  ``j = 0`` is the root
+            (most restrictive); higher values are earlier stages
+            (leaves, more permissive).
+        fan_in:
+            Reduction fan-in K at this stage.
+        """
+        policy = self.t_algorithmic + self.lambda_ * (stage_j ** 2)
+        safety = self.compute_fp_format_max / max(1, fan_in)
+        return min(policy, safety)
+
+    def render_schedule(
+        self,
+        num_stages: int,
+        fan_in: int,
+    ) -> tuple[float, ...]:
+        """Threshold schedule for all stages of a reduction tree.
+
+        Returns a tuple of length *num_stages*.  Index 0 is the leaf
+        stage (``j = num_stages − 1``, most permissive); the last
+        index is the root (``j = 0``, most restrictive).
+
+        This ordering matches ``ReductionTreePlan`` convention:
+        "Index 0 is the leaf stage; index ``num_stages - 1`` is
+        the root."
+        """
+        return tuple(
+            self.stage_threshold(num_stages - 1 - s, fan_in)
+            for s in range(num_stages)
+        )
+
+    # ── Safety ceilings (CONCEPT.md §3.4) ─────────────────────────
+
+    def safety_ceiling(self, divisor: int) -> float:
+        """``compute_fp_format_max / divisor``.
+
+        The orthogonal safety bound preventing summation-induced
+        overflow.  Used for pre-reduction leaf clipping (Nodes 11,
+        19) where *divisor* encodes the downstream amplification
+        factor or first-stage fan-in.
+
+        Examples::
+
+            # Node 11: downstream Node 13 sums num_class_chunks tiles
+            t_11 = policy.safety_ceiling(num_class_chunks)
+
+            # Node 19: downstream Node 20 first stage sums K partials
+            t_19 = policy.safety_ceiling(K_first_stage)
+        """
+        return self.compute_fp_format_max / max(1, divisor)
+
+    def leaf_safety_ceiling(
+        self,
+        num_partials: int,
+        hardware_max_fan_in: int,
+        *,
+        amplification: int = 1,
+    ) -> float:
+        """Safety ceiling for pre-reduction leaf clipping.
+
+        Computes ``compute_fp_format_max / (K × A)`` where K is the
+        first-stage fan-in of the downstream reduction tree and A is
+        the pre-summation amplification factor.
+
+        When ``num_partials ≤ 1`` (Identity tier bypass), K = 1.
+
+        Parameters
+        ----------
+        num_partials:
+            Number of partials entering the downstream reduction tree.
+        hardware_max_fan_in:
+            ``HardwareProfile.max_reduce_fan_in``.
+        amplification:
+            Pre-summation amplification factor.  E.g.
+            ``num_class_chunks`` for the Node 11 → Node 13 path
+            where Node 13 sums across class chunks before Node 16.
+            Defaults to 1 (no upstream summation).
+        """
+        topo = self.plan_reduction_tree(num_partials, hardware_max_fan_in)
+        return self.safety_ceiling(max(1, topo.fan_in) * max(1, amplification))
+
+    # ── Node 16 specialisation ────────────────────────────────────
 
     def render_node16_schedule(
         self,
         total_modules: int,
         workgroup_size: int,
-        max_fan_in: int,
-    ) -> Tuple[int, float, List[float]]:
-        """Render a host-prescribed threshold schedule for Node 16.
+        hardware_max_fan_in: int,
+    ) -> Node16Schedule:
+        """Render the threshold schedule for the Grad_H reducer.
 
-        Implements the §6.2 algorithm from the report: computes the
-        pre-accumulation threshold, number of staged reduction stages,
-        and per-stage threshold schedule adapted to the backend's
-        dispatch topology.
+        Adapts the Quadratic Scaling Policy to the backend's dispatch
+        topology, accounting for GPU work-group-limited
+        pre-accumulation (CONCEPT.md §3.4, §11 item 4).
 
-        Args:
-            total_modules: M — number of modules to reduce.
-            workgroup_size: W — dispatch workgroup size. For CPU, pass M.
-            max_fan_in: Host-provided upper bound on fan-in K.
+        The staged reduction tree operates over
+        ``P = min(total_modules, workgroup_size)`` post-accumulation
+        intermediates — not over ``total_modules`` directly.
 
-        Returns:
-            (num_reduction_stages, pre_accum_threshold, threshold_schedule)
+        Pre-accumulation threshold derivation (CONCEPT.md §3.4)::
+
+            When total_modules > workgroup_size, each thread serially
+            accumulates ⌈M/W⌉ elements.  The first clip stage then
+            sums K of these accumulators.  For non-overflow:
+                K × T_pre ≤ cfm  →  T_pre = cfm / K
+
+            When total_modules ≤ workgroup_size, each thread loads
+            at most one element (no pre-accumulation):
+                T_pre = cfm
+
+        Parameters
+        ----------
+        total_modules:
+            M — number of modules to reduce across.
+        workgroup_size:
+            W — dispatch workgroup size.  For the CPU backend,
+            pass ``total_modules`` (no pre-accumulation).  For
+            GPU backends, pass the actual workgroup size.
+        hardware_max_fan_in:
+            ``HardwareProfile.max_reduce_fan_in``.
         """
-        return render_node16_threshold_schedule(
-            t_algorithmic=self.t_algorithmic,
-            lambda_=self.lambda_,
-            compute_fp_format_max=self.compute_fp_format_max,
-            total_modules=total_modules,
-            workgroup_size=workgroup_size,
-            max_fan_in=max_fan_in,
+        cfm = self.compute_fp_format_max
+        p = min(total_modules, workgroup_size)
+
+        if p <= 1:
+            return Node16Schedule(
+                num_stages=0,
+                pre_accumulation_threshold=cfm,
+                stage_thresholds=(),
+            )
+
+        k = min(self.resolve_fan_in(hardware_max_fan_in), p)
+        k = max(2, k)
+        num_stages = math.ceil(math.log(p) / math.log(k))
+
+        t_pre = cfm / k if total_modules > p else cfm
+
+        schedule = self.render_schedule(num_stages, k)
+
+        return Node16Schedule(
+            num_stages=num_stages,
+            pre_accumulation_threshold=t_pre,
+            stage_thresholds=schedule,
         )
-
-    # =========================================================================
-    # === API for Generic Reduction Trees (Consumed by Nodes 15 & 20)       ===
-    # =========================================================================
-
-    def plan_uniform_reduction_tree(self, num_partials: int, hardware_max_fan_in: int) -> Tuple[int, int]:
-        """
-        Function: Strategic Reduction Planner.
-
-        Architectural Mandate:
-        This method devises a uniform, globally-valid reduction plan for a
-        host-driven reduction tree. It resolves the paradox of needing `num_stages`
-        to find the safest `K`, and needing `K` to find `num_stages`. It does so
-        by first calculating a candidate plan, then finding the mathematical fan-in
-        limit (`math_limit`) for the most restrictive stage (the leaves), and
-        finally synthesizing a final, safe `K` that is valid for the entire tree.
-        """
-        if num_partials <= 1:
-            return (1, 0)
-
-        # Stage 1: Candidate Plan Formulation.
-        # WHY: A candidate `K` is determined by hardware limits to derive a
-        # plausible number of stages, `num_stages`, which is required to
-        # identify the most mathematically restrictive point in the plan.
-        k_candidate = max(2, min(hardware_max_fan_in, num_partials))
-        num_stages = math.ceil(math.log(num_partials) / math.log(k_candidate))
-
-        # Stage 2: Worst-Case Constraint Analysis.
-        # WHY: The leaf stage (`j = num_stages - 1`) is the most restrictive due
-        # to the `j^2` policy term. We must calculate the theoretical maximum
-        # fan-in that this single stage can tolerate.
-        leaf_stage_j = num_stages - 1
-        math_limit = self._get_max_fan_in_for_stage_math_only(leaf_stage_j)
-
-        # Stage 3: Synthesis of Final, Globally-Valid Plan.
-        # WHY: The final, safe `K` must respect both the hardware limits and
-        # the single most restrictive mathematical constraint of the entire tree.
-        safe_k = max(2, int(min(k_candidate, math_limit)))
-
-        # WHY: With the definitive `safe_k`, the final number of stages is
-        # recalculated for the Host Orchestrator to execute.
-        if safe_k <= 1:
-            num_stages = num_partials - 1 if num_partials > 1 else 0
-        else:
-            num_stages = math.ceil(math.log(num_partials) / math.log(safe_k))
-        return (safe_k, num_stages)
-
-    def get_threshold_for_generic_stage(self, stage_j: int, runtime_fan_in_k: int) -> float:
-        """
-        Function: Tactical Threshold Synthesizer.
-
-        Architectural Mandate:
-        This is the tactical, runtime counterpart to the strategic planner.
-        Its purpose is to compute the precise, final scalar threshold value for
-        a *specific* stage `j` of a generic reduction tree, providing the
-        `src_scalar_REAL_clipping_threshold_t_j` value required by the
-        `clip_intermediate_grad` kernel at that point in the DAG.
-        """
-        return self._get_final_threshold(stage_j, runtime_fan_in_k)
-
-    # =========================================================================
-    # === API for Leaf-Level Clipping (Consumed by Nodes 11 & 19)           ===
-    # =========================================================================
-
-    def get_leaf_safety_threshold(self) -> float:
-        """
-        Function: Leaf-Level Safety Gate.
-
-        Architectural Mandate:
-        The clipping performed at the leaf level (Nodes 11 & 19) serves a
-        distinct architectural purpose from the main reduction engine. It is a
-        coarse, pre-emptive safety primitive, not a policy-driven shaping tool.
-        Its sole function is to prevent pathologically large raw gradients from
-        entering the reduction pipeline. Therefore, this function provides a
-        simple, high, and robust safety threshold that is independent of the
-        quadratic policy.
-
-        Pre-summation Amplification (CONCEPT §3.4):
-        Callers must account for any downstream summation that occurs before
-        the values enter a reduction kernel. For Node 11, the clipped gradients
-        pass through Node 13, which sums across `num_class_chunks`. The caller
-        should divide this threshold by `num_class_chunks` to ensure the
-        post-summation magnitude stays within safe bounds for Node 16.
-        """
-        # WHY: A 10% safety margin below the absolute hardware maximum provides
-        # a robust buffer against unforeseen floating-point edge cases without
-        # being overly restrictive for a coarse safety gate.
-        return self.compute_fp_format_max * 0.9
-
-    # =========================================================================
-    # === Internal Calculation Primitives                                   ===
-    # =========================================================================
-
-    def _get_max_fan_in_for_stage_math_only(self, stage_j: int) -> float:
-        """Calculates the theoretical upper bound on fan-in K for a given stage."""
-        # Calculate the policy-defined threshold for stage j.
-        policy_threshold = self.t_algorithmic + self.lambda_ * (stage_j**2)
-
-        # Enforce the system-wide minimum threshold to produce a floor.
-        effective_floor = max(policy_threshold, self.min_threshold)
-
-        if effective_floor <= 0:
-            return float("inf")
-
-        # Calculate the K-limit imposed by the absolute minimum threshold.
-        absolute_k_max = self.compute_fp_format_max / self.min_threshold if self.min_threshold > 0 else float("inf")
-        # Calculate the K-limit imposed by the policy at this stage.
-        policy_k_max = self.compute_fp_format_max / effective_floor
-
-        # The true limit is the more restrictive of the two.
-        return min(absolute_k_max, policy_k_max)
-
-    def _get_final_threshold(self, stage_j: int, runtime_fan_in_k: int) -> float:
-        """Synthesizes policy and safety limits into a final, authoritative threshold."""
-        # Defensively validate the runtime K against the stage's math limit.
-        math_limit = self._get_max_fan_in_for_stage_math_only(stage_j)
-        validated_k = max(2, min(runtime_fan_in_k, math_limit))
-
-        # Calculate the canonical hardware safety ceiling for this fan-in.
-        safety_ceiling = self.compute_fp_format_max / validated_k
-
-        # For safety-only policies, the hardware ceiling is the only constraint.
-        if self.t_algorithmic <= 0:
-            return safety_ceiling
-
-        # Recalculate the policy threshold and enforce the minimum floor.
-        policy_threshold = self.t_algorithmic + self.lambda_ * (stage_j**2)
-        floored_policy = max(policy_threshold, self.min_threshold)
-
-        # The final, authoritative value respects the policy, but is bound by safety.
-        # This is the canonical clamp that embodies the system's core principle.
-        return min(floored_policy, safety_ceiling)
-
-
-# =========================================================================
-# Standalone schedule rendering — callable from any tier
-# =========================================================================
-
-def render_node16_threshold_schedule(
-    t_algorithmic: float,
-    lambda_: float,
-    compute_fp_format_max: float,
-    total_modules: int,
-    workgroup_size: int,
-    max_fan_in: int,
-) -> Tuple[int, float, List[float]]:
-    """Render the host-prescribed threshold schedule for Node 16.
-
-    Implements the §6.2 rendering algorithm. Each backend calls this
-    with its own workgroup_size (CPU: W = M; GPU: W = dispatch workgroup).
-
-    Returns:
-        (num_reduction_stages, pre_accum_threshold, threshold_schedule)
-    """
-    fp_max = compute_fp_format_max
-    M = total_modules
-    W = workgroup_size
-
-    P = min(M, W)
-    K = max(min(max_fan_in, P), 2)
-
-    if P <= 1:
-        return (0, fp_max, [])
-
-    num_stages = math.ceil(math.log(P) / math.log(K))
-
-    if M > P:
-        pre_accum_threshold = fp_max / K
-    else:
-        pre_accum_threshold = fp_max
-
-    schedule: List[float] = []
-    for s in range(num_stages):
-        j = num_stages - 1 - s  # leaf = highest j, root = j=0
-        T_policy = t_algorithmic + lambda_ * (j * j)
-        T_safety = fp_max / K
-        schedule.append(min(T_policy, T_safety))
-
-    return (num_stages, pre_accum_threshold, schedule)

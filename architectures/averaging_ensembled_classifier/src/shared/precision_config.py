@@ -1,333 +1,351 @@
 # src/shared/precision_config.py
-"""Backend-neutral precision configuration (ADR-008, ADR-020, ADR-022 §1, ADR-025)."""
-from dataclasses import dataclass
+"""Backend-neutral precision configuration (CONTRACT §5.2, ADR-020, ADR-025).
+
+Decomposes numeric precision into three independent roles:
+
+* **storage_dtype** — bandwidth optimisation (the narrowest format that
+  preserves sufficient information for the downstream operation)
+* **compute_dtype** — arithmetic fidelity (the format used for all
+  transformative arithmetic)
+* **state_dtype** — long-term stability (the format for optimizer moment
+  vectors and learnable parameters)
+
+A configuration where all three roles share a type
+(e.g. ``PrecisionConfig.float32()``) is a parameterisation — not a
+distinct mode.
+
+Derived scalar constants (``storage_fp_format_max``, ``compute_epsilon``,
+etc.) are computed automatically from the primary dtype fields in
+``__post_init__`` and cannot be supplied independently.  This eliminates
+the possibility of inconsistent direct construction.
+
+FP8 storage requires the ``ml_dtypes`` package.  When absent, all
+non-FP8 configurations remain fully functional; FP8 factory methods
+raise ``ImportError`` at call time.
+
+Authoritative source
+────────────────────
+CONTRACT.md §5.2 (Revision 10)
+CONCEPT.md  §2   (Primacy of Memory Strategy)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from typing import Literal
 
-import ml_dtypes
 import numpy as np
 
-# FP8 dtype references (ADR-025 §1)
-# ml_dtypes exports type objects (not dtype instances) — wrap with np.dtype() for consistency
-# These constants ARE np.dtype instances — use directly without re-wrapping
-FP8_E4M3 = np.dtype(ml_dtypes.float8_e4m3fn)
-FP8_E5M2 = np.dtype(ml_dtypes.float8_e5m2)
-FP8_DTYPES = frozenset({FP8_E4M3, FP8_E5M2})
+# ═════════════════════════════════════════════════════════════════════
+# FP8 dtype support (optional dependency)
+#
+# ml_dtypes is required only for FP8 storage configurations.  When
+# absent, the module-level constants are None, FP8_DTYPES is empty,
+# and all non-FP8 code paths remain fully functional.
+# ═════════════════════════════════════════════════════════════════════
+
+try:
+    import ml_dtypes as _ml_dtypes
+
+    FP8_E4M3: np.dtype | None = np.dtype(_ml_dtypes.float8_e4m3fn)
+    FP8_E5M2: np.dtype | None = np.dtype(_ml_dtypes.float8_e5m2)
+    FP8_DTYPES: frozenset[np.dtype] = frozenset({FP8_E4M3, FP8_E5M2})
+except ImportError:
+    FP8_E4M3 = None
+    FP8_E5M2 = None
+    FP8_DTYPES = frozenset()
+
+# ═════════════════════════════════════════════════════════════════════
+# Type aliases
+# ═════════════════════════════════════════════════════════════════════
+
+MaskStrategy = Literal["explicit", "recompute"]
+"""CONTRACT §5.2.3 — hidden-mask lifecycle strategy.
+
+``"explicit"``:  Node 4 materialises the mask buffer capturing
+                 compute-precision derivative truth before storage
+                 narrowing.  Consuming kernels read the mask directly.
+``"recompute"``: No mask buffer allocated.  Consuming kernels derive
+                 the mask from stored activations (``activation > 0``).
+                 Valid only when ``storage_dtype == compute_dtype``.
+"""
+
+# ═════════════════════════════════════════════════════════════════════
+# Internal helpers
+# ═════════════════════════════════════════════════════════════════════
 
 
-@dataclass(frozen=True)
-class MaskStrategy:
-    """Controls hidden_mask buffer lifecycle in the execution plan.
+def _storage_fp_constants(dt: np.dtype) -> tuple[float, float, int]:
+    """Derive ``(format_max, min_positive_subnormal, mantissa_bits)``.
 
-    Policy-tier decision (§5) determining whether the hidden_mask buffer is
-    explicitly materialized or derived at consumption time.
-
-    Modes:
-        "recompute": Consuming kernels derive mask from stored activations.
-                     No mask buffer allocated. Valid only when storage_dtype
-                     == compute_dtype (no precision boundary).
-        "explicit":  Node 4 produces mask buffer capturing compute-precision
-                     derivative truth before storage narrowing. Consuming
-                     kernels read mask directly.
-
-    The mask carries non-zero information whenever the derivative cannot be
-    reconstructed from the stored representation — this occurs when:
-      - storage_dtype != compute_dtype (precision boundary)
-      - External gating (dropout, pruning) is applied (future)
-      - Non-ReLU activations are used (future)
-
-    Selection is automatic based on PrecisionConfig via the
-    select_mask_strategy() factory or PrecisionConfig.mask_strategy property.
+    FP8 values are architectural constants from CONTRACT §5.2.6.
+    Standard IEEE types delegate to ``np.finfo``.
     """
-    mode: Literal["recompute", "explicit"]
+    if FP8_E4M3 is not None and dt == FP8_E4M3:
+        return (448.0, 0.001953125, 3)  # max, 2⁻⁹, 3-bit mantissa
+    if FP8_E5M2 is not None and dt == FP8_E5M2:
+        return (57344.0, 0.0000152587890625, 2)  # max, 2⁻¹⁶, 2-bit mantissa
+    info = np.finfo(dt)
+    return (float(info.max), float(info.smallest_subnormal), info.nmant)
 
-    @property
-    def is_explicit(self) -> bool:
-        """True if mask buffer must be materialized."""
-        return self.mode == "explicit"
 
-    @property
-    def is_recompute(self) -> bool:
-        """True if mask can be derived from stored activations."""
-        return self.mode == "recompute"
+def _require_fp8(factory_name: str) -> None:
+    """Raise ``ImportError`` if ``ml_dtypes`` is not available."""
+    if FP8_E4M3 is None:
+        raise ImportError(
+            f"PrecisionConfig.{factory_name}() requires the ml_dtypes "
+            f"package: pip install ml_dtypes"
+        )
+
+
+# ═════════════════════════════════════════════════════════════════════
+# PrecisionConfig
+# ═════════════════════════════════════════════════════════════════════
 
 
 @dataclass(frozen=True)
 class PrecisionConfig:
     """Immutable three-role precision configuration for plan construction.
 
-    Three independent dtype roles separate bandwidth, arithmetic fidelity,
-    and optimizer-state stability concerns (ADR-020 §4.1):
-      - storage_dtype:  element type for storage-role buffers (bandwidth lever)
-      - compute_dtype:  element type for arithmetic (fidelity lever)
-      - state_dtype:    element type for optimizer state (stability lever)
+    The constructor accepts **only** the three primary dtype fields.
+    All derived scalar constants are computed in ``__post_init__``
+    from the primaries and cannot be overridden.
 
-    All fields are required (no defaults). Factory classmethods provide
-    the standard configurations; direct construction is supported but
-    requires all fields to be specified explicitly.
+    Parameters
+    ----------
+    storage_dtype:
+        Element type for storage-role buffers (bandwidth lever).
+    compute_dtype:
+        Element type for arithmetic operations (fidelity lever).
+        FP8 is architecturally prohibited.
+    state_dtype:
+        Element type for optimizer state (stability lever).
+        FP8 is architecturally prohibited.
 
-    Consumed by ModelSpec, StabilizationPolicy, and the plan builder.
+    Construction invariants (CONTRACT §5.2.4)
+    ──────────────────────────────────────────
+    1. ``storage_dtype.itemsize ≤ compute_dtype.itemsize``
+    2. ``storage_dtype.itemsize ≤ state_dtype.itemsize``
+    3. FP8 is storage-only (never compute or state).
+
+    The state role has **no** ordering constraint relative to compute —
+    ``state_dtype.itemsize`` may be >, ==, or < ``compute_dtype.itemsize``.
     """
-    # --- Core dtype fields (3 roles) ---
+
+    # ── Primary fields (3 roles) — sole constructor arguments ─────
+
     storage_dtype: np.dtype
     compute_dtype: np.dtype
     state_dtype: np.dtype
 
-    # --- Storage-role derived constants ---
-    storage_fp_format_max: float
-    storage_fp_min_positive: float
-    storage_mantissa_bits: int
+    # ── Derived storage-role constants (CONTRACT §5.2.2) ──────────
 
-    # --- Compute-role derived constants ---
-    compute_fp_format_max: float
-    compute_epsilon: float
+    storage_fp_format_max: float = field(init=False)
+    """Maximum finite value representable in the storage format."""
+
+    storage_fp_min_positive: float = field(init=False)
+    """Minimum positive subnormal in the storage format."""
+
+    storage_mantissa_bits: int = field(init=False)
+    """Mantissa bit count in the storage format."""
+
+    # ── Derived compute-role constants (CONTRACT §5.2.2) ──────────
+
+    compute_fp_format_max: float = field(init=False)
+    """Maximum finite value in the compute format."""
+
+    compute_epsilon: float = field(init=False)
+    """Machine epsilon for the compute format."""
+
+    # ── Validation & derivation ───────────────────────────────────
 
     def __post_init__(self) -> None:
-        # Normalize dtype fields to np.dtype instances for reliable comparison
-        object.__setattr__(self, 'storage_dtype', np.dtype(self.storage_dtype))
-        object.__setattr__(self, 'compute_dtype', np.dtype(self.compute_dtype))
-        object.__setattr__(self, 'state_dtype', np.dtype(self.state_dtype))
+        # Normalise to np.dtype instances for reliable comparison.
+        object.__setattr__(self, "storage_dtype", np.dtype(self.storage_dtype))
+        object.__setattr__(self, "compute_dtype", np.dtype(self.compute_dtype))
+        object.__setattr__(self, "state_dtype", np.dtype(self.state_dtype))
 
-        # FP8 role constraints: storage-only (never compute or state)
+        # Invariant: FP8 is storage-only (CONTRACT §5.2.4 #3).
         if self.compute_dtype in FP8_DTYPES:
             raise ValueError(
-                f"FP8 compute is architecturally prohibited: "
-                f"hardware lacks native FP8 arithmetic. "
-                f"Use FP16, FP32, or FP64 for compute_dtype, "
-                f"got {self.compute_dtype}."
+                f"FP8 compute is architecturally prohibited: hardware lacks "
+                f"native FP8 arithmetic.  Use FP16, FP32, or FP64 for "
+                f"compute_dtype, got {self.compute_dtype}."
             )
         if self.state_dtype in FP8_DTYPES:
             raise ValueError(
-                f"FP8 state is architecturally prohibited: "
-                f"EMA updates require higher precision. "
-                f"Use FP16, FP32, or FP64 for state_dtype, "
-                f"got {self.state_dtype}."
+                f"FP8 state is architecturally prohibited: EMA updates "
+                f"require higher precision.  Use FP16, FP32, or FP64 for "
+                f"state_dtype, got {self.state_dtype}."
             )
 
-        # Existing invariants (storage ≤ compute, storage ≤ state)
+        # Invariant: storage ≤ compute (CONTRACT §5.2.4 #1).
         if self.storage_dtype.itemsize > self.compute_dtype.itemsize:
             raise ValueError(
                 f"storage_dtype ({self.storage_dtype}) cannot be wider than "
                 f"compute_dtype ({self.compute_dtype})"
             )
+
+        # Invariant: storage ≤ state (CONTRACT §5.2.4 #2).
         if self.storage_dtype.itemsize > self.state_dtype.itemsize:
             raise ValueError(
                 f"storage_dtype ({self.storage_dtype}) cannot be wider than "
                 f"state_dtype ({self.state_dtype})"
             )
 
-    @classmethod
-    def float32(cls) -> "PrecisionConfig":
-        f32_info = np.finfo(np.float32)
-        return cls(
-            storage_dtype=np.dtype(np.float32),
-            compute_dtype=np.dtype(np.float32),
-            state_dtype=np.dtype(np.float32),
-            storage_fp_format_max=float(f32_info.max),
-            storage_fp_min_positive=float(f32_info.smallest_subnormal),
-            storage_mantissa_bits=f32_info.nmant,
-            compute_fp_format_max=float(f32_info.max),
-            compute_epsilon=float(f32_info.eps),
-        )
+        # Derive storage-role constants.
+        s_max, s_min, s_mant = _storage_fp_constants(self.storage_dtype)
+        object.__setattr__(self, "storage_fp_format_max", s_max)
+        object.__setattr__(self, "storage_fp_min_positive", s_min)
+        object.__setattr__(self, "storage_mantissa_bits", s_mant)
 
-    @classmethod
-    def mixed_f16_f32(cls) -> "PrecisionConfig":
-        """FP16 storage, FP32 compute, FP32 state.
+        # Derive compute-role constants.
+        # FP8 compute is rejected above, so np.finfo is always valid.
+        c_info = np.finfo(self.compute_dtype)
+        object.__setattr__(self, "compute_fp_format_max", float(c_info.max))
+        object.__setattr__(self, "compute_epsilon", float(c_info.eps))
 
-        Recommended replacement for the deleted float16() factory.
-        Provides FP16 bandwidth savings with FP32 compute fidelity and FP32 state stability.
-        """
-        f16_info = np.finfo(np.float16)
-        f32_info = np.finfo(np.float32)
-        return cls(
-            storage_dtype=np.dtype(np.float16),
-            compute_dtype=np.dtype(np.float32),
-            state_dtype=np.dtype(np.float32),
-            storage_fp_format_max=float(f16_info.max),
-            storage_fp_min_positive=float(f16_info.smallest_subnormal),
-            storage_mantissa_bits=f16_info.nmant,
-            compute_fp_format_max=float(f32_info.max),
-            compute_epsilon=float(f32_info.eps),
-        )
-
-    @classmethod
-    def float64(cls) -> "PrecisionConfig":
-        f64_info = np.finfo(np.float64)
-        return cls(
-            storage_dtype=np.dtype(np.float64),
-            compute_dtype=np.dtype(np.float64),
-            state_dtype=np.dtype(np.float64),
-            storage_fp_format_max=float(f64_info.max),
-            storage_fp_min_positive=float(f64_info.smallest_subnormal),
-            storage_mantissa_bits=f64_info.nmant,
-            compute_fp_format_max=float(f64_info.max),
-            compute_epsilon=float(f64_info.eps),
-        )
-
-    @classmethod
-    def mixed_f32_f64_state(cls) -> "PrecisionConfig":
-        f32_info = np.finfo(np.float32)
-        return cls(
-            storage_dtype=np.dtype(np.float32),
-            compute_dtype=np.dtype(np.float32),
-            state_dtype=np.dtype(np.float64),
-            storage_fp_format_max=float(f32_info.max),
-            storage_fp_min_positive=float(f32_info.smallest_subnormal),
-            storage_mantissa_bits=f32_info.nmant,
-            compute_fp_format_max=float(f32_info.max),
-            compute_epsilon=float(f32_info.eps),
-        )
-
-    @classmethod
-    def mixed_f16_f64_state(cls) -> "PrecisionConfig":
-        """FP16 storage, FP32 compute, FP64 state for extended optimizer stability."""
-        f16_info = np.finfo(np.float16)
-        f32_info = np.finfo(np.float32)
-        return cls(
-            storage_dtype=np.dtype(np.float16),
-            compute_dtype=np.dtype(np.float32),
-            state_dtype=np.dtype(np.float64),
-            storage_fp_format_max=float(f16_info.max),
-            storage_fp_min_positive=float(f16_info.smallest_subnormal),
-            storage_mantissa_bits=f16_info.nmant,
-            compute_fp_format_max=float(f32_info.max),
-            compute_epsilon=float(f32_info.eps),
-        )
-
-    @classmethod
-    def mixed_f32_f64(cls) -> "PrecisionConfig":
-        f32_info = np.finfo(np.float32)
-        f64_info = np.finfo(np.float64)
-        return cls(
-            storage_dtype=np.dtype(np.float32),
-            compute_dtype=np.dtype(np.float64),
-            state_dtype=np.dtype(np.float64),
-            storage_fp_format_max=float(f32_info.max),
-            storage_fp_min_positive=float(f32_info.smallest_subnormal),
-            storage_mantissa_bits=f32_info.nmant,
-            compute_fp_format_max=float(f64_info.max),
-            compute_epsilon=float(f64_info.eps),
-        )
-
-    # --- FP8 E4M3 Factories (ADR-025 §2.3) ---
-
-    @classmethod
-    def fp8_e4m3(cls) -> "PrecisionConfig":
-        """E4M3 storage (8-bit, max=448), FP32 compute, FP32 state.
-
-        Maximum bandwidth configuration for standard training.
-        4× storage compression vs. FP32, 2× vs. FP16.
-        """
-        f32_info = np.finfo(np.float32)
-        return cls(
-            storage_dtype=FP8_E4M3,
-            compute_dtype=np.dtype(np.float32),
-            state_dtype=np.dtype(np.float32),
-            storage_fp_format_max=448.0,
-            storage_fp_min_positive=0.001953125,  # 2^-9
-            storage_mantissa_bits=3,
-            compute_fp_format_max=float(f32_info.max),
-            compute_epsilon=float(f32_info.eps),
-        )
-
-    @classmethod
-    def fp8_e4m3_f16(cls) -> "PrecisionConfig":
-        """E4M3 storage (8-bit), FP16 compute, FP32 state."""
-        f16_info = np.finfo(np.float16)
-        return cls(
-            storage_dtype=FP8_E4M3,
-            compute_dtype=np.dtype(np.float16),
-            state_dtype=np.dtype(np.float32),
-            storage_fp_format_max=448.0,
-            storage_fp_min_positive=0.001953125,  # 2^-9
-            storage_mantissa_bits=3,
-            compute_fp_format_max=float(f16_info.max),
-            compute_epsilon=float(f16_info.eps),
-        )
-
-    @classmethod
-    def fp8_e4m3_f64(cls) -> "PrecisionConfig":
-        """E4M3 storage (8-bit), FP64 compute, FP64 state."""
-        f64_info = np.finfo(np.float64)
-        return cls(
-            storage_dtype=FP8_E4M3,
-            compute_dtype=np.dtype(np.float64),
-            state_dtype=np.dtype(np.float64),
-            storage_fp_format_max=448.0,
-            storage_fp_min_positive=0.001953125,  # 2^-9
-            storage_mantissa_bits=3,
-            compute_fp_format_max=float(f64_info.max),
-            compute_epsilon=float(f64_info.eps),
-        )
-
-    # --- FP8 E5M2 Factories (ADR-025 §2.3) ---
-
-    @classmethod
-    def fp8_e5m2(cls) -> "PrecisionConfig":
-        """E5M2 storage (8-bit, max=57344), FP32 compute, FP32 state.
-
-        Maximum bandwidth with wider dynamic range.
-        """
-        f32_info = np.finfo(np.float32)
-        return cls(
-            storage_dtype=FP8_E5M2,
-            compute_dtype=np.dtype(np.float32),
-            state_dtype=np.dtype(np.float32),
-            storage_fp_format_max=57344.0,
-            storage_fp_min_positive=0.0000152587890625,  # 2^-16, exact
-            storage_mantissa_bits=2,
-            compute_fp_format_max=float(f32_info.max),
-            compute_epsilon=float(f32_info.eps),
-        )
-
-    @classmethod
-    def fp8_e5m2_f16(cls) -> "PrecisionConfig":
-        """E5M2 storage (8-bit), FP16 compute, FP32 state."""
-        f16_info = np.finfo(np.float16)
-        return cls(
-            storage_dtype=FP8_E5M2,
-            compute_dtype=np.dtype(np.float16),
-            state_dtype=np.dtype(np.float32),
-            storage_fp_format_max=57344.0,
-            storage_fp_min_positive=0.0000152587890625,  # 2^-16, exact
-            storage_mantissa_bits=2,
-            compute_fp_format_max=float(f16_info.max),
-            compute_epsilon=float(f16_info.eps),
-        )
-
-    @classmethod
-    def fp8_e5m2_f64(cls) -> "PrecisionConfig":
-        """E5M2 storage (8-bit), FP64 compute, FP64 state."""
-        f64_info = np.finfo(np.float64)
-        return cls(
-            storage_dtype=FP8_E5M2,
-            compute_dtype=np.dtype(np.float64),
-            state_dtype=np.dtype(np.float64),
-            storage_fp_format_max=57344.0,
-            storage_fp_min_positive=0.0000152587890625,  # 2^-16, exact
-            storage_mantissa_bits=2,
-            compute_fp_format_max=float(f64_info.max),
-            compute_epsilon=float(f64_info.eps),
-        )
-
-    # --- Mask Strategy Selection (Policy Tier §5) ---
+    # ── Mask strategy (CONTRACT §5.2.3) ───────────────────────────
 
     @property
     def mask_strategy(self) -> MaskStrategy:
-        """Select mask strategy based on precision configuration.
+        """Hidden-mask lifecycle strategy derived from the precision roles.
 
-        When storage_dtype != compute_dtype, the precision boundary destroys
-        derivative information for activations below the storage format's
-        quantization floor. The mask must be explicitly materialized to
-        preserve the compute-precision derivative truth.
+        When ``storage_dtype != compute_dtype``, the precision boundary
+        can destroy derivative information for activations near the
+        storage format's quantisation floor.  The mask must be
+        explicitly materialised to preserve compute-precision truth.
 
-        When storage_dtype == compute_dtype, the mask is fully derivable
-        from stored activations (mask = activation > 0).
-
-        Returns:
-            MaskStrategy with mode "explicit" or "recompute".
+        When ``storage_dtype == compute_dtype``, the mask is bit-
+        identical to ``activation > 0`` and can be recomputed from
+        the stored activations.
         """
         if self.storage_dtype != self.compute_dtype:
-            # Precision boundary destroys derivative information — mask required
-            return MaskStrategy(mode="explicit")
-        # Mask is fully derivable from stored activations
-        return MaskStrategy(mode="recompute")
+            return "explicit"
+        return "recompute"
+
+    # ═════════════════════════════════════════════════════════════════
+    # Factory classmethods (CONTRACT §5.2.5)
+    # ═════════════════════════════════════════════════════════════════
+
+    # ── Standard IEEE configurations ──────────────────────────────
+
+    @classmethod
+    def float32(cls) -> PrecisionConfig:
+        """FP32 storage, FP32 compute, FP32 state.  Default reference."""
+        dt = np.dtype(np.float32)
+        return cls(storage_dtype=dt, compute_dtype=dt, state_dtype=dt)
+
+    @classmethod
+    def float64(cls) -> PrecisionConfig:
+        """FP64 storage, FP64 compute, FP64 state.  Validation reference."""
+        dt = np.dtype(np.float64)
+        return cls(storage_dtype=dt, compute_dtype=dt, state_dtype=dt)
+
+    # ── Mixed IEEE configurations ─────────────────────────────────
+
+    @classmethod
+    def mixed_f16_f32(cls) -> PrecisionConfig:
+        """FP16 storage, FP32 compute, FP32 state.  Production mixed-precision."""
+        return cls(
+            storage_dtype=np.dtype(np.float16),
+            compute_dtype=np.dtype(np.float32),
+            state_dtype=np.dtype(np.float32),
+        )
+
+    @classmethod
+    def mixed_f32_f64(cls) -> PrecisionConfig:
+        """FP32 storage, FP64 compute, FP64 state.  High-fidelity scientific."""
+        return cls(
+            storage_dtype=np.dtype(np.float32),
+            compute_dtype=np.dtype(np.float64),
+            state_dtype=np.dtype(np.float64),
+        )
+
+    @classmethod
+    def mixed_f32_f64_state(cls) -> PrecisionConfig:
+        """FP32 storage, FP32 compute, FP64 state.  Extended-stability training."""
+        return cls(
+            storage_dtype=np.dtype(np.float32),
+            compute_dtype=np.dtype(np.float32),
+            state_dtype=np.dtype(np.float64),
+        )
+
+    @classmethod
+    def mixed_f16_f64_state(cls) -> PrecisionConfig:
+        """FP16 storage, FP32 compute, FP64 state.  Bandwidth + extended stability."""
+        return cls(
+            storage_dtype=np.dtype(np.float16),
+            compute_dtype=np.dtype(np.float32),
+            state_dtype=np.dtype(np.float64),
+        )
+
+    # ── FP8 E4M3 configurations (CONTRACT §5.2.5, §5.2.6) ────────
+
+    @classmethod
+    def fp8_e4m3(cls) -> PrecisionConfig:
+        """E4M3 storage, FP32 compute, FP32 state.  4× compression vs FP32."""
+        _require_fp8("fp8_e4m3")
+        assert FP8_E4M3 is not None  # narrowing; guarded by _require_fp8
+        return cls(
+            storage_dtype=FP8_E4M3,
+            compute_dtype=np.dtype(np.float32),
+            state_dtype=np.dtype(np.float32),
+        )
+
+    @classmethod
+    def fp8_e4m3_f16(cls) -> PrecisionConfig:
+        """E4M3 storage, FP16 compute, FP32 state."""
+        _require_fp8("fp8_e4m3_f16")
+        assert FP8_E4M3 is not None
+        return cls(
+            storage_dtype=FP8_E4M3,
+            compute_dtype=np.dtype(np.float16),
+            state_dtype=np.dtype(np.float32),
+        )
+
+    @classmethod
+    def fp8_e4m3_f64(cls) -> PrecisionConfig:
+        """E4M3 storage, FP64 compute, FP64 state.  Full FP64 fidelity."""
+        _require_fp8("fp8_e4m3_f64")
+        assert FP8_E4M3 is not None
+        return cls(
+            storage_dtype=FP8_E4M3,
+            compute_dtype=np.dtype(np.float64),
+            state_dtype=np.dtype(np.float64),
+        )
+
+    # ── FP8 E5M2 configurations (CONTRACT §5.2.5, §5.2.6) ────────
+
+    @classmethod
+    def fp8_e5m2(cls) -> PrecisionConfig:
+        """E5M2 storage, FP32 compute, FP32 state.  Wider dynamic range."""
+        _require_fp8("fp8_e5m2")
+        assert FP8_E5M2 is not None
+        return cls(
+            storage_dtype=FP8_E5M2,
+            compute_dtype=np.dtype(np.float32),
+            state_dtype=np.dtype(np.float32),
+        )
+
+    @classmethod
+    def fp8_e5m2_f16(cls) -> PrecisionConfig:
+        """E5M2 storage, FP16 compute, FP32 state."""
+        _require_fp8("fp8_e5m2_f16")
+        assert FP8_E5M2 is not None
+        return cls(
+            storage_dtype=FP8_E5M2,
+            compute_dtype=np.dtype(np.float16),
+            state_dtype=np.dtype(np.float32),
+        )
+
+    @classmethod
+    def fp8_e5m2_f64(cls) -> PrecisionConfig:
+        """E5M2 storage, FP64 compute, FP64 state."""
+        _require_fp8("fp8_e5m2_f64")
+        assert FP8_E5M2 is not None
+        return cls(
+            storage_dtype=FP8_E5M2,
+            compute_dtype=np.dtype(np.float64),
+            state_dtype=np.dtype(np.float64),
+        )

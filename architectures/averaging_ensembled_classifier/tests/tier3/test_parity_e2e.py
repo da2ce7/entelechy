@@ -45,7 +45,7 @@ def _build_act_plan(problem_type: str) -> Any:
     from src.shared.model_spec import ModelSpec
     from src.shared.plan_builder import build_act_plan
     from src.shared.precision_config import PrecisionConfig
-    from src.shared.problem_type_strategy import PlanBceStrategy, PlanCceStrategy
+    from architectures.averaging_ensembled_classifier.src.shared.problem_type_spec import PlanBceStrategy, PlanCceStrategy
 
     prec = PrecisionConfig.float32()
     spec = ModelSpec(precision=prec, simd_width=4, cache_line_bytes=64, **_IRIS)
@@ -63,7 +63,7 @@ def _build_learn_plan(problem_type: str) -> Any:
     from src.shared.model_spec import ModelSpec
     from src.shared.plan_builder import build_learn_plan
     from src.shared.precision_config import PrecisionConfig
-    from src.shared.problem_type_strategy import PlanBceStrategy, PlanCceStrategy
+    from architectures.averaging_ensembled_classifier.src.shared.problem_type_spec import PlanBceStrategy, PlanCceStrategy
     from src.shared.stabilization_policy import StabilizationPolicy
 
     prec = PrecisionConfig.float32()
@@ -191,7 +191,7 @@ class TestParityE2E:
         from src.shared.model_spec import ModelSpec
         from src.shared.plan_builder import build_act_plan
         from src.shared.precision_config import PrecisionConfig
-        from src.shared.problem_type_strategy import PlanBceStrategy, PlanCceStrategy
+        from architectures.averaging_ensembled_classifier.src.shared.problem_type_spec import PlanBceStrategy, PlanCceStrategy
 
         oracle_name, comp_name = pair
         prec = PrecisionConfig.float32()

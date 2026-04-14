@@ -11,7 +11,7 @@ from src.shared.plan_types import (
     RetrievalNode,
     StreamingLoopNode,
 )
-from src.shared.problem_type_strategy import PlanBceStrategy, PlanCceStrategy
+from architectures.averaging_ensembled_classifier.src.shared.problem_type_spec import PlanBceStrategy, PlanCceStrategy
 from src.shared.stabilization_policy import StabilizationPolicy
 
 
@@ -19,9 +19,10 @@ class TestActPlan:
     def test_minimal_act_plan(self, small_spec: ModelSpec, hardware: HardwareProfile, cce_strategy: PlanCceStrategy) -> None:
         plan = build_act_plan(small_spec, hardware, cce_strategy, batch_size=1)
         assert "forward_pass" in plan.nodes
-        assert "render_logits" in plan.nodes
-        assert "loss_computation" in plan.nodes
-        assert "diag_reduction" in plan.nodes
+        assert "render_logits_chunk" in plan.nodes
+        assert "compute_probs_loss_cce_chunk" in plan.nodes
+        # Node 14 (reduce_diagnostic_probs) removed in single-tile config
+        # inference_retrieval now depends directly on the loss node
         assert "inference_retrieval" in plan.nodes
 
     def test_act_plan_is_dag(self, model_spec: ModelSpec, hardware: HardwareProfile, cce_strategy: PlanCceStrategy) -> None:
@@ -31,28 +32,22 @@ class TestActPlan:
 
     def test_act_plan_dependency_chain(self, model_spec: ModelSpec, hardware: HardwareProfile, cce_strategy: PlanCceStrategy) -> None:
         plan = build_act_plan(model_spec, hardware, cce_strategy, batch_size=64)
-        assert "forward_pass" in plan.nodes["render_logits"].depends_on
-        assert "render_logits" in plan.nodes["loss_computation"].depends_on
-        assert "loss_computation" in plan.nodes["diag_reduction"].depends_on
-        assert "diag_reduction" in plan.nodes["inference_retrieval"].depends_on
+        assert "forward_pass" in plan.nodes["render_logits_chunk"].depends_on
+        assert "render_logits_chunk" in plan.nodes["compute_probs_loss_cce_chunk"].depends_on
+        # Single-tile config: inference_retrieval depends directly on loss node (no diagnostic reduction)
+        assert "compute_probs_loss_cce_chunk" in plan.nodes["inference_retrieval"].depends_on
 
     def test_act_plan_node_types(self, model_spec: ModelSpec, hardware: HardwareProfile, cce_strategy: PlanCceStrategy) -> None:
         plan = build_act_plan(model_spec, hardware, cce_strategy, batch_size=32)
         assert isinstance(plan.nodes["forward_pass"], KernelDispatchNode)
-        assert isinstance(plan.nodes["diag_reduction"], ReductionTreeNode)
+        # Node 14 (reduce_diagnostic_probs) removed in single-tile config
         assert isinstance(plan.nodes["inference_retrieval"], RetrievalNode)
-
-    def test_diag_reduction_is_sum(self, model_spec: ModelSpec, hardware: HardwareProfile, cce_strategy: PlanCceStrategy) -> None:
-        plan = build_act_plan(model_spec, hardware, cce_strategy, batch_size=32)
-        rt = plan.nodes["diag_reduction"]
-        assert isinstance(rt, ReductionTreeNode)
-        assert rt.reduction_plan.tree_variant == "sum"
 
     def test_cce_vs_bce_loss_contract(self, model_spec: ModelSpec, hardware: HardwareProfile, cce_strategy: PlanCceStrategy, bce_strategy: PlanBceStrategy) -> None:
         act_cce = build_act_plan(model_spec, hardware, cce_strategy, batch_size=32)
         act_bce = build_act_plan(model_spec, hardware, bce_strategy, batch_size=32)
-        cce_loss = act_cce.nodes["loss_computation"]
-        bce_loss = act_bce.nodes["loss_computation"]
+        cce_loss = act_cce.nodes["compute_probs_loss_cce_chunk"]
+        bce_loss = act_bce.nodes["compute_probs_loss_bce_chunk"]
         assert isinstance(cce_loss, KernelDispatchNode)
         assert isinstance(bce_loss, KernelDispatchNode)
         assert cce_loss.kernel_name != bce_loss.kernel_name
@@ -62,7 +57,8 @@ class TestActPlan:
         assert len(plan.buffers) > 0
         names = {d.logical_name for d in plan.buffers.values()}
         assert "shared_weights" in names
-        assert "final_probs" in names
+        # partial_probs serves as inference output in single-tile config (no final_probs)
+        assert "partial_probs" in names
 
 
 class TestLearnPlan:
@@ -127,9 +123,10 @@ class TestLearnPlan:
         plan = build_learn_plan(
             model_spec, hardware, cce_strategy, batch_size=32, policy=policy,
         )
-        assert "adam_update_shared" in plan.nodes
-        assert "adam_update_module" in plan.nodes
-        assert "adam_update_temps" in plan.nodes
+        assert "adam_update__shared_weights" in plan.nodes
+        # Module-chunk scoped nodes use __mc<N> suffixes (ADR-030)
+        assert "adam_update__module_weights__mc0" in plan.nodes
+        assert "adam_update__temps__mc0" in plan.nodes
 
     def test_learn_plan_has_retrieval(self, model_spec: ModelSpec, hardware: HardwareProfile, cce_strategy: PlanCceStrategy, policy: StabilizationPolicy) -> None:
         plan = build_learn_plan(

@@ -332,7 +332,7 @@ class _SingleKernelPlanBuilder:
         from src.shared.model_spec import ModelSpec
         from src.shared.plan_builder import build_act_plan, build_learn_plan
         from src.shared.precision_config import PrecisionConfig
-        from src.shared.problem_type_strategy import PlanBceStrategy, PlanCceStrategy
+        from architectures.averaging_ensembled_classifier.src.shared.problem_type_spec import PlanBceStrategy, PlanCceStrategy
         from src.shared.stabilization_policy import StabilizationPolicy
 
         iris = dict(input_dim=4, hidden_dim=32, output_classes=3, num_modules=8)

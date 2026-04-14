@@ -33,7 +33,7 @@ from .shared.hardware_profile import HardwareProfile
 from .shared.stabilization_policy import StabilizationPolicy
 from .shared.plan_builder import build_act_plan, build_learn_plan
 from .shared.plan_renderer import PlanRenderer
-from .shared.problem_type_strategy import PlanCceStrategy, PlanBceStrategy, PlanProblemTypeStrategy
+from .shared.problem_type_spec import PlanCceStrategy, PlanBceStrategy, PlanProblemTypeStrategy
 
 
 @dataclass(frozen=True)

@@ -34,7 +34,7 @@ from src.shared.hardware_profile import HardwareProfile  # noqa: E402
 from src.shared.model_spec import ModelSpec  # noqa: E402
 from src.shared.precision_config import PrecisionConfig  # noqa: E402
 from src.shared.plan_builder import build_act_plan, build_learn_plan  # noqa: E402
-from src.shared.problem_type_strategy import PlanCceStrategy, PlanBceStrategy  # noqa: E402
+from architectures.averaging_ensembled_classifier.src.shared.problem_type_spec import PlanCceStrategy, PlanBceStrategy  # noqa: E402
 from src.shared.stabilization_policy import StabilizationPolicy  # noqa: E402
 
 

@@ -43,7 +43,7 @@ from .model_spec import ModelSpec
 from .parameter_space import ParameterSpace
 from .stabilization_policy import StabilizationPolicy
 from .optimizer_config import OptimizerConfig
-from .problem_type_strategy import PlanProblemTypeStrategy, PlanCceStrategy, PlanBceStrategy
+from .problem_type_spec import ProblemTypeSpec, PlanCceStrategy, PlanBceStrategy
 
 # Plan builder
 from .plan_builder import build_act_plan, build_learn_plan

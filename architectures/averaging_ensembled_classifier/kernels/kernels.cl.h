@@ -2409,12 +2409,21 @@ __kernel void narrow_to_storage(
  *             threshold sufficiently high).
  *
  *          2. **Staged Reduction Phase:**
- *             num_reduction_stages rounds of work-group-parallel tree reduction.
- *             After each round's summation, the per-element result is clipped
- *             to src_buffer_GLOBAL_CONST_clipping_threshold_per_stage[s]
- *             (where s indexes the round from 0 to num_reduction_stages - 1).
- *             The kernel determines the internal binary tree structure and
- *             fan-in distribution among stages.
+ *             `num_reduction_stages` rounds of work-group-parallel tree
+ *             reduction, where the Host prescribes
+ *             `num_reduction_stages = ⌈log_K(P)⌉` (`K` = Reduction Batch
+ *             Size, `P` = post-accumulation intermediate count). Each round
+ *             reduces the active intermediate count by an effective fan-in
+ *             of approximately `K`. After each round's summation, the
+ *             per-element result is clipped to
+ *             `src_buffer_GLOBAL_CONST_clipping_threshold_per_stage[s]`
+ *             (where `s` indexes the round from 0 to
+ *             `num_reduction_stages - 1`). The kernel's internal tree
+ *             topology (branching factor, thread assignment, local memory
+ *             access pattern) is an Execution-tier concern —
+ *             implementations may use K-ary, binary, mixed-radix, or any
+ *             equivalent structure provided the clip is applied after each
+ *             prescribed stage with the prescribed threshold.
  *             Thread 0 writes the final single-element result to the
  *             destination buffer.
  *
@@ -2440,7 +2449,7 @@ __kernel void narrow_to_storage(
  *          kernel applies it — consistent with the threshold injection pattern
  *          used by the generic reduction engine (Nodes 14/15/20). The kernel
  *          retains sole control of its internal execution geometry (thread
- *          assignment, pre-accumulation fan-in, binary tree structure), while
+ *          assignment, pre-accumulation fan-in, tree topology), while
  *          the Host retains sole control of stabilization policy through the
  *          prescribed schedule."
  */
@@ -2544,10 +2553,14 @@ __kernel void stabilize_and_reduce_grad_hidden_activations(
     /**
      * @param src_scalar_REAL_clipping_threshold_t_pre Clip threshold for
      *        each thread's pre-accumulation phase. Set to
-     *        compute_fp_format_max / K by the Orchestration tier when
-     *        pre-accumulation occurs (total_modules_count >
-     *        dispatch workgroup size); set to compute_fp_format_max when
-     *        each thread loads at most one element.
+     *        `COMPUTE_FP_FORMAT_MAX / K` by the Orchestration tier, where
+     *        `K` is the Reduction Batch Size (the same host-selected fan-in
+     *        used by `reduce_k_fan_in_and_clip`). This bound ensures the
+     *        first K-ary clip stage of the subsequent tree reduction cannot
+     *        overflow. Applied when pre-accumulation occurs
+     *        (`total_modules_count > dispatch workgroup_size`); set to
+     *        `COMPUTE_FP_FORMAT_MAX` when each thread loads at most one
+     *        element (no pre-accumulation).
      *        - Validation Preconditions: Must be a positive real number.
      */
     COMPUTE_TYPE src_scalar_REAL_clipping_threshold_t_pre,

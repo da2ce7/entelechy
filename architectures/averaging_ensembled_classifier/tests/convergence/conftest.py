@@ -14,7 +14,7 @@ from src.shared.model_spec import ModelSpec
 from src.shared.optimizer_config import OptimizerConfig
 from src.shared.parameter_space import ParameterSpace
 from src.shared.precision_config import PrecisionConfig
-from src.shared.problem_type_strategy import PlanCceStrategy, PlanBceStrategy
+from architectures.averaging_ensembled_classifier.src.shared.problem_type_spec import PlanCceStrategy, PlanBceStrategy
 from src.shared.stabilization_policy import StabilizationPolicy
 
 

@@ -6,7 +6,7 @@ from src.shared.kernel_contracts import (
     compute_probs_loss_bce_chunk,
     compute_probs_loss_cce_chunk,
 )
-from src.shared.problem_type_strategy import (
+from architectures.averaging_ensembled_classifier.src.shared.problem_type_spec import (
     PlanBceStrategy,
     PlanCceStrategy,
 )
@@ -45,4 +45,4 @@ class TestNoOpenclImports:
         # .kernel_contracts which is pure shared layer.
         s = PlanCceStrategy()
         c = s.get_loss_contract()
-        assert c.name  # valid contract, no backend
+        assert c.kernel_name  # valid contract, no backend
