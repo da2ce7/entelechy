@@ -34,6 +34,17 @@ The hidden-gradient path (Nodes 9 → 11 → 13 → 16) is *not* a parameter
 group.  It is an intermediate error signal consumed by the streaming
 path; it carries no optimizer state and never enters ``adam_update``.
 
+Optimizer state sizing
+──────────────────────
+Optimizer moment vectors (m1, m2) are allocated at the **full padded
+extent** of the state buffer — ``total_flat_elements``, not a narrower
+logical count.  The adam kernel processes the complete padded range
+``[parameter_offset, parameter_offset + parameter_count)``; padding
+positions maintain zeros by the inductive invariant (CONCEPT.md §3.6,
+Node 24 Padding Zero-Preservation).  ``optimizer_state_elements`` is
+a derived property that always equals ``total_flat_elements``,
+formalising this identity.
+
 Plan-builder usage sketch
 ─────────────────────────
 ::
@@ -54,17 +65,17 @@ Plan-builder usage sketch
     for group in SHARED_GROUPS:
         geo = geos[group.name]
         gather = StridedGather(num_streaming_chunks, geo.total_flat_elements)
-        ps = ParameterSlice.full(geo.optimizer_state_elements)
+        ps = ParameterSlice.full(geo.total_flat_elements)
         # build: ReductionTreeNode  → group.reduce_node_id()
         # build: normalize_gradients → group.normalize_node_id()
         # build: adam_update         → group.adam_node_id()
 
 Organisation
 ────────────
-§1  ``ParameterGroup``   — structural identity and naming conventions
+§1  ``ParameterGroup``    — structural identity and naming conventions
 §2  ``ParameterGeometry`` — concrete shapes resolved from a ModelSpec
-§3  Registry constants   — the five canonical groups
-§4  Resolution functions — geometry computation
+§3  Registry constants    — the five canonical groups
+§4  Resolution functions  — geometry computation
 """
 
 from __future__ import annotations
@@ -231,24 +242,35 @@ class ParameterGeometry:
         Flat element count per single module — the denominator for
         ``ParameterSlice.from_chunk()``.  ``None`` for shared-scope
         groups where the concept is inapplicable.
-    optimizer_state_elements:
-        Flat element count for the optimizer moment vectors (m1, m2).
-        May differ from :attr:`total_flat_elements` when the state
-        buffer is padded beyond the logical module count (e.g.
-        ``temperatures``: state buffer is ``padded_module_dim``,
-        optimizer state is ``num_modules``).
     """
 
     group: ParameterGroup
     state_shape: tuple[int, ...]
     logical_shape: tuple[int, ...] | None
     elements_per_module: int | None
-    optimizer_state_elements: int
+
+    # ── Derived properties ────────────────────────────────────────
 
     @property
     def total_flat_elements(self) -> int:
         """Product of ``state_shape`` — total elements in the state buffer."""
         return math.prod(self.state_shape)
+
+    @property
+    def optimizer_state_elements(self) -> int:
+        """Flat element count for the optimizer moment vectors (m1, m2).
+
+        Always equals :attr:`total_flat_elements` — the adam kernel
+        processes the full padded extent of the state buffer.  Padding
+        positions maintain zeros by the inductive invariant
+        (CONCEPT.md §3.6, Node 24 Padding Zero-Preservation).
+
+        This property exists as a semantic alias: callers wanting to
+        know "how large should m1/m2 be?" read
+        ``geo.optimizer_state_elements`` rather than needing to know
+        that the answer is always the state buffer's physical extent.
+        """
+        return self.total_flat_elements
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -329,6 +351,8 @@ def resolve_geometry(
     -------
     ParameterGeometry
         Concrete shapes and element counts for buffer allocation.
+        ``optimizer_state_elements`` is derived (always equals
+        ``total_flat_elements``); it is not an independent input.
 
     Raises
     ------
@@ -345,7 +369,6 @@ def resolve_geometry(
                     f"divisible by simd_width ({simd_width}) for "
                     f"SIMD-major layout"
                 )
-            flat = spec.padded_hidden_dim * spec.padded_input_dim
             return ParameterGeometry(
                 group=group,
                 state_shape=(
@@ -355,7 +378,6 @@ def resolve_geometry(
                 ),
                 logical_shape=(spec.hidden_dim, spec.input_dim),
                 elements_per_module=None,
-                optimizer_state_elements=flat,
             )
 
         case "shared_biases":
@@ -364,7 +386,6 @@ def resolve_geometry(
                 state_shape=(spec.padded_hidden_dim,),
                 logical_shape=(spec.hidden_dim,),
                 elements_per_module=None,
-                optimizer_state_elements=spec.padded_hidden_dim,
             )
 
         case "module_weights":
@@ -382,7 +403,6 @@ def resolve_geometry(
                     spec.output_classes,
                 ),
                 elements_per_module=epm,
-                optimizer_state_elements=spec.num_modules * epm,
             )
 
         case "module_biases":
@@ -392,16 +412,19 @@ def resolve_geometry(
                 state_shape=(spec.num_modules, spec.padded_class_dim),
                 logical_shape=(spec.num_modules, spec.output_classes),
                 elements_per_module=epm,
-                optimizer_state_elements=spec.num_modules * epm,
             )
 
         case "temperatures":
+            # state_shape uses the padded module dimension so that
+            # total_flat_elements (and therefore optimizer_state_elements)
+            # equals the physical buffer extent.  The adam kernel
+            # processes the full padded range; padding positions
+            # maintain zeros inductively (CONCEPT.md §3.6).
             return ParameterGeometry(
                 group=group,
                 state_shape=(spec.padded_module_dim,),
                 logical_shape=(spec.num_modules,),
                 elements_per_module=1,
-                optimizer_state_elements=spec.num_modules,
             )
 
         case _:
@@ -423,6 +446,8 @@ def resolve_all(
     4096
     >>> geos["shared_weights"].total_flat_elements
     32768
+    >>> geos["temperatures"].optimizer_state_elements == geos["temperatures"].total_flat_elements
+    True
     """
     return {
         g.name: resolve_geometry(g, spec, simd_width)

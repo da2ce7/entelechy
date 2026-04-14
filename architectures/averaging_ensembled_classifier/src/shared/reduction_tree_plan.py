@@ -1,3 +1,4 @@
+# src/shared/reduction_tree_plan.py
 """Parametric reduction-tree descriptor (ADR-003).
 
 Bridges the Policy tier (which plans the reduction topology) and the

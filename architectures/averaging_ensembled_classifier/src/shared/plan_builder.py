@@ -27,6 +27,9 @@ Design
 * **Dispatch validation:** ``_check_dispatch_params`` verifies that every
   ``KernelDispatchNode``'s buffer bindings and scalar parameters match
   its ``KernelContract`` at plan-construction time (Axiom 1.4).
+* **Typed dispatch grids:** Tile-parallel dispatch is expressed via
+  ``DispatchGrid`` / ``DispatchAxis`` / ``ScalarStride``, replacing
+  the former unstructured ``tile_count`` integer.
 
 Key invariants
 --------------
@@ -35,11 +38,16 @@ Key invariants
 * **Probs assembly:** Act-plan currently requires ``total_tiles == 1``.
 * **Batch chunking:** ``num_batch_chunks`` is fixed at 1 throughout.
 * **Leaf safety ceiling:** Pre-reduction clipping thresholds (Nodes 11,
-  19) account for the downstream fan-in of the first reduction stage
-  to prevent summation-induced overflow (CONCEPT.md §3.4).
+  19) account for the downstream amplification to prevent summation-
+  induced overflow (CONCEPT.md §3.4).
 * **Identity tier:** When a reduction tree has a single partial (N=1),
   the plan emits a ``ReductionTreePlan`` with ``num_stages=0``,
   signalling the backend to bypass reduction dispatch (CONCEPT.md §2).
+* **Diagnostic loss:** The learn plan does not currently expose a loss
+  retrieval path.  For CCE, the scatter-written loss buffer is
+  architecturally complete but unretrieved.  For BCE, the tiled partial
+  loss buffer would require a Node-14 ``ReductionTreeNode`` for
+  aggregation; this is a known gap.
 """
 from __future__ import annotations
 
@@ -70,11 +78,15 @@ from .parameter_space import (
 )
 from .plan_types import (
     BarrierNode,
+    DispatchAxis,
+    DispatchGrid,
     ExecutionPlan,
     KernelDispatchNode,
     PlanNode,
     ReductionTreeNode,
     RetrievalNode,
+    ScalarStride,
+    SINGLE_DISPATCH,
     StreamingLoopNode,
 )
 from .precision_config import PrecisionConfig
@@ -104,32 +116,6 @@ from .workload_primitives import (
 def _ceildiv(a: int, b: int) -> int:
     """Integer ceiling division.  *b* must be positive."""
     return (a + b - 1) // b
-
-
-def _compute_leaf_safety_ceiling(
-    policy: StabilizationPolicy,
-    hardware: HardwareProfile,
-    num_partials: int,
-    *,
-    amplification: int = 1,
-) -> float:
-    """Safety ceiling for pre-reduction leaf clipping (CONCEPT §3.4).
-
-    Computes ``compute_fp_format_max / (K × A)`` where *K* is the
-    fan-in of the first reduction stage and *A* is the pre-summation
-    amplification factor (defaults to 1 when there is no implicit
-    upstream summation).
-
-    When *num_partials* ≤ 1, no reduction occurs (Identity tier
-    bypass) and the ceiling is ``compute_fp_format_max / A``.
-    """
-    if num_partials > 1:
-        fan_in, _ = policy.plan_uniform_reduction_tree(
-            num_partials, hardware.max_reduce_fan_in,
-        )
-    else:
-        fan_in = 1
-    return policy.compute_fp_format_max / max(1, fan_in * amplification)
 
 
 def _check_dispatch_params(
@@ -178,6 +164,32 @@ def _check_dispatch_params(
         raise ValueError(
             f"{contract.kernel_name}: unexpected scalars {extra}"
         )
+
+
+def _tile_grid(tile_count: int) -> DispatchGrid:
+    """Create a 1-D dispatch grid striding ``flat_tile_index``.
+
+    Returns ``SINGLE_DISPATCH`` when *tile_count* ≤ 1 (no tiling).
+    For *tile_count* > 1, returns a grid with one axis whose
+    ``ScalarStride`` advances ``src_scalar_NATURAL_flat_tile_index``
+    by 1 per dispatch::
+
+        flat_tile_index(dispatch_i) = base + i × 1
+
+    The base value lives in the hosting node's ``scalar_params``
+    (conventionally 0).
+    """
+    if tile_count <= 1:
+        return SINGLE_DISPATCH
+    return DispatchGrid(axes=(
+        DispatchAxis(
+            name="tile",
+            extent=tile_count,
+            strides=(
+                ScalarStride("src_scalar_NATURAL_flat_tile_index", 1),
+            ),
+        ),
+    ))
 
 
 # =====================================================================
@@ -262,7 +274,6 @@ class _BufferAllocator:
             consumers = frozenset(self._consumers[handle])
             last: str | None = None
             if consumers:
-                # Hard lookup — KeyError exposes misregistered consumer IDs.
                 last = max(consumers, key=lambda c: order_index[c])
             result[handle] = BufferDescriptor(
                 handle=desc.handle,
@@ -427,15 +438,6 @@ def _allocate_moments(
     Zero-Preservation); the adam kernel processes the full padded
     range ``[parameter_offset, parameter_offset + parameter_count)``
     without distinguishing padding from logical positions.
-
-    NOTE: ``ParameterGeometry.optimizer_state_elements`` for the
-    ``temperatures`` group is ``num_modules`` (the *logical* extent),
-    which is narrower than ``total_flat_elements`` (the *padded*
-    extent ``padded_module_dim``).  This allocator uses the latter
-    so that ``total_parameter_count`` passed to the adam kernel
-    equals the state buffer extent.  ``parameter_space.py`` should
-    be updated to align ``optimizer_state_elements`` with the
-    padded allocation.
     """
     result: dict[str, BufferHandle] = {}
     for group in ALL_GROUPS:
@@ -493,13 +495,19 @@ def _dispatch(
     contract: KernelContract,
     buffer_bindings: dict[str, BufferHandle],
     scalar_params: dict[str, int | float],
-    tile_count: int,
-    placement_strategy: str | None = None,
+    grid: DispatchGrid = SINGLE_DISPATCH,
 ) -> KernelDispatchNode:
     """Create a ``KernelDispatchNode`` with pre-dispatch validation.
 
     Validates buffer bindings and scalar parameters against the
     contract before constructing the node (Axiom 1.4).
+
+    Parameters
+    ----------
+    grid:
+        Dispatch decomposition.  ``SINGLE_DISPATCH`` (default)
+        for kernels with no tile parallelism.  Use ``_tile_grid(tc)``
+        for tile-parallel kernels that stride ``flat_tile_index``.
     """
     _check_dispatch_params(contract, buffer_bindings, scalar_params)
     return KernelDispatchNode(
@@ -509,9 +517,7 @@ def _dispatch(
         contract=contract,
         buffer_bindings=buffer_bindings,
         scalar_params=scalar_params,
-        tile_count=tile_count,
-        local_work_size=None,
-        placement_strategy=placement_strategy,
+        grid=grid,
     )
 
 
@@ -541,6 +547,19 @@ def _build_forward_subgraph(
 
     All CCE/BCE structural divergence (loss shape, init contract,
     binding key) is delegated to ``ProblemTypeSpec``.
+
+    **Dispatch geometry:**
+
+    * Node 4 (``forward_pass``): ``SINGLE_DISPATCH`` — processes the
+      full batch with explicit chunk scalars.
+    * Node 5 (``render_logits_chunk``): ``SINGLE_DISPATCH`` — writes
+      the complete monolithic logits buffer in one dispatch, with
+      chunk scalars covering the full module × class extent.  Tiling
+      Node 5 across module/class chunks is a future performance
+      optimisation.
+    * Node 6/7 (loss kernel): ``_tile_grid(tc)`` — one dispatch per
+      tile, striding ``flat_tile_index``.  The kernel uses the tile
+      index to derive module-chunk and class-chunk coordinates.
     """
     prec = spec.precision
     es, ec = prec.storage_dtype.itemsize, prec.compute_dtype.itemsize
@@ -569,9 +588,6 @@ def _build_forward_subgraph(
         "partial_probs", (tc, mpc, batch_size, cpc),
         es, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
-
-    # Loss buffer shape, init contract, and binding key are all
-    # determined by the operating mode via ProblemTypeSpec.
     b_loss = alloc.allocate(
         "loss_output",
         strategy.loss_shape(
@@ -598,15 +614,14 @@ def _build_forward_subgraph(
             "dest_buffer_GLOBAL_hidden_mask": b_mask,
         },
         {
+            "out_scalar_FLAG_produce_hidden_mask": flag_mask,
             "src_scalar_NATURAL_batch_chunk_offset": 0,
             "src_scalar_NATURAL_batch_chunk_count": batch_size,
-            "out_scalar_FLAG_produce_hidden_mask": flag_mask,
             "src_scalar_NATURAL_total_batch_count": batch_size,
             "src_scalar_NATURAL_input_count": spec.input_dim,
             "src_scalar_NATURAL_padded_input_count": spec.padded_input_dim,
             "src_scalar_NATURAL_padded_hidden_count": spec.padded_hidden_dim,
         },
-        tile_count=1,
     )
     alloc.set_producer(b_hidden, n4)
     alloc.set_producer(b_mask, n4)
@@ -617,20 +632,21 @@ def _build_forward_subgraph(
     # ── Node 5: render_logits_chunk ──────────────────────────────
 
     n5 = "render_logits_chunk"
+    n5_bufs: dict[str, BufferHandle] = {
+        "src_buffer_GLOBAL_hidden_activations": b_hidden,
+        "src_buffer_GLOBAL_hidden_mask": b_mask,
+        "src_buffer_GLOBAL_sample_mask": inputs.sample_mask,
+        "src_buffer_GLOBAL_CONST_weights_module": state.module_weights,
+        "src_buffer_GLOBAL_CONST_biases_module": state.module_biases,
+        "dest_buffer_GLOBAL_logits": b_logits,
+    }
     nodes[n5] = _dispatch(
         n5, frozenset({n4}), KERNEL_REGISTRY[n5],
+        n5_bufs,
         {
-            "src_buffer_GLOBAL_hidden_activations": b_hidden,
-            "src_buffer_GLOBAL_hidden_mask": b_mask,
-            "src_buffer_GLOBAL_sample_mask": inputs.sample_mask,
-            "src_buffer_GLOBAL_CONST_weights_module": state.module_weights,
-            "src_buffer_GLOBAL_CONST_biases_module": state.module_biases,
-            "dest_buffer_GLOBAL_logits": b_logits,
-        },
-        {
+            "src_scalar_FLAG_use_explicit_hidden_mask": flag_mask,
             "src_scalar_NATURAL_batch_chunk_offset": 0,
             "src_scalar_NATURAL_batch_chunk_count": batch_size,
-            "src_scalar_FLAG_use_explicit_hidden_mask": flag_mask,
             "src_scalar_NATURAL_module_chunk_offset": 0,
             "src_scalar_NATURAL_module_chunk_count": spec.num_modules,
             "src_scalar_NATURAL_class_chunk_offset": 0,
@@ -642,12 +658,13 @@ def _build_forward_subgraph(
             "src_scalar_NATURAL_padded_total_output_class_count": spec.padded_class_dim,
             "src_scalar_NATURAL_total_modules_count": spec.num_modules,
         },
-        tile_count=tc,
     )
     alloc.set_producer(b_logits, n5)
-    for h in (b_hidden, b_mask, inputs.sample_mask,
+    for h in (b_hidden, inputs.sample_mask,
               state.module_weights, state.module_biases):
         alloc.add_consumer(h, n5)
+    if flag_mask:
+        alloc.add_consumer(b_mask, n5)
 
     # ── Node 6/7: loss computation ───────────────────────────────
     #
@@ -679,11 +696,12 @@ def _build_forward_subgraph(
             "src_scalar_NATURAL_total_modules_count": spec.num_modules,
             "src_scalar_NATURAL_total_tile_count": tc,
         },
-        tile_count=tc,
+        grid=_tile_grid(tc),
     )
     alloc.set_producer(b_probs, loss_id)
     alloc.set_producer(b_loss, loss_id)
-    for h in (b_logits, state.temperatures, inputs.targets, inputs.sample_mask):
+    for h in (b_logits, state.temperatures,
+              inputs.targets, inputs.sample_mask):
         alloc.add_consumer(h, loss_id)
 
     return _ForwardSubgraph(
@@ -740,22 +758,17 @@ def _build_reduction_plan(
             destination_buffer=dest_buf,
         )
 
-    fan_in_k, num_stages = policy.plan_uniform_reduction_tree(
-        n, hardware.max_reduce_fan_in,
-    )
-    # Defensive: plan_uniform_reduction_tree should return ≥ 1 for N ≥ 2.
-    num_stages = max(1, num_stages)
+    topo = policy.plan_reduction_tree(n, hardware.max_reduce_fan_in)
+    fan_in = topo.fan_in
+    num_stages = max(1, topo.num_stages)
 
     schedule: tuple[float, ...] = ()
     if tree_variant == "sum_and_clip":
-        schedule = tuple(
-            policy.get_threshold_for_generic_stage(j, fan_in_k)
-            for j in reversed(range(num_stages))
-        )
+        schedule = policy.render_schedule(num_stages, fan_in)
 
     return ReductionTreePlan(
         num_partials=n,
-        fan_in=fan_in_k,
+        fan_in=fan_in,
         num_stages=num_stages,
         initial_offset_list=offsets,
         tree_variant=tree_variant,
@@ -809,7 +822,7 @@ class _GradientChainSpec:
 def _build_gradient_chain(
     alloc: _BufferAllocator,
     nodes: dict[str, PlanNode],
-    spec: _GradientChainSpec,
+    chain: _GradientChainSpec,
     policy: StabilizationPolicy,
     hardware: HardwareProfile,
     prec: PrecisionConfig,
@@ -822,36 +835,34 @@ def _build_gradient_chain(
 
     Returns ``(topo_ordered_node_ids, terminal_node_ids)``.
     """
-    group = spec.group
+    group = chain.group
     ec = prec.compute_dtype.itemsize
 
-    # The uniform tile extent (includes padding positions for the
-    # last module chunk; trailing zeros are harmless).
-    buf_elems = spec.gather.elements_per_partial
+    buf_elems = chain.gather.elements_per_partial
 
     # ── Reduction tree ────────────────────────────────────────────
 
-    rid = group.reduce_node_id(spec.mc)
+    rid = group.reduce_node_id(chain.mc)
     b_summed = alloc.allocate(
-        group.summed_grad_name(spec.mc), (buf_elems,),
+        group.summed_grad_name(chain.mc), (buf_elems,),
         ec, BufferRole.BATCH_INTERMEDIATE, "compute",
     )
     nodes[rid] = ReductionTreeNode(
         node_id=rid,
         depends_on=upstream_deps,
         reduction_plan=_build_reduction_plan(
-            policy, hardware, spec.gather,
-            spec.clipped_buf, b_summed, "sum_and_clip",
+            policy, hardware, chain.gather,
+            chain.clipped_buf, b_summed, "sum_and_clip",
         ),
     )
-    alloc.add_consumer(spec.clipped_buf, rid)
+    alloc.add_consumer(chain.clipped_buf, rid)
     alloc.set_producer(b_summed, rid)
 
     # ── Normalisation ─────────────────────────────────────────────
 
-    nid = group.normalize_node_id(spec.mc)
+    nid = group.normalize_node_id(chain.mc)
     b_final = alloc.allocate(
-        group.final_grad_name(spec.mc), (buf_elems,),
+        group.final_grad_name(chain.mc), (buf_elems,),
         ec, BufferRole.BATCH_INTERMEDIATE, "compute",
     )
     nodes[nid] = _dispatch(
@@ -866,33 +877,31 @@ def _build_gradient_chain(
             "src_scalar_REAL_epsilon": prec.compute_epsilon,
             "src_scalar_NATURAL_parameter_count": buf_elems,
         },
-        tile_count=1,
     )
     alloc.set_producer(b_final, nid)
     alloc.add_consumer(b_summed, nid)
 
     # ── Adam update ───────────────────────────────────────────────
 
-    aid = group.adam_node_id(spec.mc)
+    aid = group.adam_node_id(chain.mc)
     nodes[aid] = _dispatch(
         aid, frozenset({nid}),
         KERNEL_REGISTRY["adam_update"],
         {
             "src_buffer_GLOBAL_final_grad": b_final,
-            "update_buffer_GLOBAL_parameters": spec.param_buf,
-            "update_buffer_GLOBAL_m1": spec.m1_buf,
-            "update_buffer_GLOBAL_m2": spec.m2_buf,
+            "update_buffer_GLOBAL_parameters": chain.param_buf,
+            "update_buffer_GLOBAL_m1": chain.m1_buf,
+            "update_buffer_GLOBAL_m2": chain.m2_buf,
         },
         {
             **adam_scalars,
-            "src_scalar_NATURAL_parameter_offset": spec.param_slice.offset,
-            "src_scalar_NATURAL_parameter_count": spec.param_slice.count,
-            "src_scalar_NATURAL_total_parameter_count": spec.param_slice.total,
+            "src_scalar_NATURAL_parameter_offset": chain.param_slice.offset,
+            "src_scalar_NATURAL_parameter_count": chain.param_slice.count,
+            "src_scalar_NATURAL_total_parameter_count": chain.param_slice.total,
         },
-        tile_count=1,
     )
     alloc.add_consumer(b_final, aid)
-    for h in (spec.param_buf, spec.m1_buf, spec.m2_buf):
+    for h in (chain.param_buf, chain.m1_buf, chain.m2_buf):
         alloc.add_consumer(h, aid)
 
     topo: list[str] = [rid, nid, aid]
@@ -901,7 +910,7 @@ def _build_gradient_chain(
     # ── Optional post-update ──────────────────────────────────────
 
     if group.has_post_update:
-        pid = group.post_update_node_id(spec.mc)
+        pid = group.post_update_node_id(chain.mc)
 
         if group.post_update_kernel == "clamp_temperatures":
             assert temp_bounds is not None, (
@@ -910,17 +919,16 @@ def _build_gradient_chain(
             nodes[pid] = _dispatch(
                 pid, frozenset({aid}),
                 KERNEL_REGISTRY["clamp_temperatures"],
-                {"update_buffer_GLOBAL_temps": spec.param_buf},
+                {"update_buffer_GLOBAL_temps": chain.param_buf},
                 {
                     "src_scalar_REAL_min_value": temp_bounds[0],
                     "src_scalar_REAL_max_value": temp_bounds[1],
-                    "src_scalar_NATURAL_parameter_offset": spec.param_slice.offset,
-                    "src_scalar_NATURAL_parameter_count": spec.param_slice.count,
-                    "src_scalar_NATURAL_total_parameter_count": spec.param_slice.total,
+                    "src_scalar_NATURAL_parameter_offset": chain.param_slice.offset,
+                    "src_scalar_NATURAL_parameter_count": chain.param_slice.count,
+                    "src_scalar_NATURAL_total_parameter_count": chain.param_slice.total,
                 },
-                tile_count=1,
             )
-            alloc.add_consumer(spec.param_buf, pid)
+            alloc.add_consumer(chain.param_buf, pid)
             topo.append(pid)
             terminals.add(pid)
         else:
@@ -1034,9 +1042,7 @@ def build_learn_plan(
         Defaults to 1 (True Streaming: one sample per iteration).
         Must evenly divide *batch_size* when > 1, because the
         ``StreamingLoopPlan`` uses fixed per-iteration strides and
-        cannot express a variable-size tail chunk.  Future revisions
-        may lift this restriction via batch-dimension padding or
-        variable stride support.
+        cannot express a variable-size tail chunk.
     """
     if activation_lifecycle == "cache":
         raise NotImplementedError(
@@ -1073,11 +1079,20 @@ def build_learn_plan(
     # Batch chunking is fixed at 1.  When > 1 is eventually
     # supported, Node 8's output gains a non-trivial batch-chunk
     # axis and a ReductionTreeNode + optional Precision Bridge
-    # collapse it before Node 11.
+    # collapse it before Node 11 (CONCEPT.md §11 item 1).
     num_batch_chunks = 1
+    if num_batch_chunks != 1:
+        raise NotImplementedError(
+            "num_batch_chunks > 1 requires reshaping Node 8 output to 5D "
+            "and inserting a batch-chunk ReductionTreeNode + optional "
+            "Precision Bridge before Node 11."
+        )
 
     geos = resolve_all(spec, simd_w)
-    eff_batch = effective_batch_size if effective_batch_size is not None else batch_size
+    eff_batch = (
+        effective_batch_size if effective_batch_size is not None
+        else batch_size
+    )
     grad_h_total = batch_size * spec.padded_hidden_dim
 
     stream_decomp = ChunkDecomposition.from_chunk_size(
@@ -1113,6 +1128,7 @@ def build_learn_plan(
     # ═══════════════════════════════════════════════════════════════
 
     grad_gen_deps = frozenset({fwd.loss_node_id})
+    tile_grid = _tile_grid(tc)
 
     # Common scalar dicts for tiled gradient kernels (Nodes 8–10).
     # These kernels are mode-invariant (Principle 3(A)); the FLAG
@@ -1140,12 +1156,6 @@ def build_learn_plan(
     # num_batch_chunks axis.  Since num_batch_chunks is fixed at 1,
     # the shape here omits the trivial dimension so the flat buffer
     # matches Node 11's 4D input contract directly.
-
-    assert num_batch_chunks == 1, (
-        "num_batch_chunks > 1 requires reshaping Node 8 output to 5D "
-        "and inserting a batch-chunk ReductionTreeNode + optional "
-        "Precision Bridge before Node 11"
-    )
 
     b_partial_w = alloc.allocate(
         "partial_grad_weights_module",
@@ -1208,7 +1218,7 @@ def build_learn_plan(
         "temperatures": b_clipped_t,
     }
 
-    # ── Node 11 leaf safety ceiling (CONCEPT §3.4) ───────────────
+    # ── Node 11 leaf safety ceiling (CONCEPT.md §3.4) ────────────
     #
     # The binding constraint is Node 13's class-chunk amplification:
     # after clipping to T_pre, Node 13 sums C class-chunk tiles per
@@ -1217,13 +1227,16 @@ def build_learn_plan(
     #     T_pre ≤ compute_fp_format_max / C
     #
     # The module gradient path (clipped_partial → Node 15 reduction)
-    # is independently safe because its reduction fan-in K ≤ C (each
-    # module chunk has one tile per class chunk, so the reduction
-    # sums at most C tiles): K × T_pre ≤ C × T_pre ≤ cfm.
+    # is independently safe because its first-stage fan-in K ≤ C
+    # (each module chunk has C class-chunk tiles):
+    #     K × T_pre ≤ C × T_pre ≤ cfm.
+    #
+    # Node 11 is a pre-reduction leaf clip — the Quadratic Scaling
+    # Policy applies only within the subsequent reduction tree
+    # (CONCEPT.md §3.5).  The threshold here is the pure safety
+    # ceiling, not a policy-derived value.
     num_class_chunks = tiling.classes.num_chunks
-    node11_leaf_threshold = (
-        policy.compute_fp_format_max / max(1, num_class_chunks)
-    )
+    node11_leaf_threshold = policy.safety_ceiling(num_class_chunks)
 
     # ── Node 8: module parameter gradients ────────────────────────
 
@@ -1246,7 +1259,7 @@ def build_learn_plan(
             "src_scalar_NATURAL_batch_chunk_count": batch_size,
             "src_scalar_NATURAL_num_batch_chunks": num_batch_chunks,
         },
-        tile_count=tc,
+        grid=tile_grid,
     )
     alloc.set_producer(b_partial_w, n8)
     alloc.set_producer(b_partial_b, n8)
@@ -1268,7 +1281,7 @@ def build_learn_plan(
             "dest_buffer_GLOBAL_partial_grad_hidden_activations_aos": b_partial_h,
         },
         {**_tile_scalars, **_hidden_dims},
-        tile_count=tc,
+        grid=tile_grid,
     )
     alloc.set_producer(b_partial_h, n9)
     for h in (fwd.partial_probs, inputs.targets, inputs.sample_mask,
@@ -1289,7 +1302,7 @@ def build_learn_plan(
             "dest_buffer_GLOBAL_partial_grad_temps": b_partial_t,
         },
         {**_tile_scalars},
-        tile_count=tc,
+        grid=tile_grid,
     )
     alloc.set_producer(b_partial_t, n10)
     for h in (fwd.logits, fwd.partial_probs, inputs.targets,
@@ -1325,7 +1338,7 @@ def build_learn_plan(
             "src_scalar_NATURAL_padded_total_output_class_count": spec.padded_class_dim,
             "src_scalar_NATURAL_total_tile_count": tc,
         },
-        tile_count=tc,
+        grid=tile_grid,
     )
     for b in (b_clipped_w, b_clipped_b, b_clipped_h, b_clipped_t):
         alloc.set_producer(b, n11)
@@ -1369,7 +1382,6 @@ def build_learn_plan(
             "src_scalar_NATURAL_num_class_chunks": num_class_chunks,
             "src_scalar_NATURAL_total_tile_count": tc,
         },
-        tile_count=1,
     )
     alloc.set_producer(b_permuted_h, n13)
     alloc.add_consumer(b_clipped_h, n13)
@@ -1382,22 +1394,22 @@ def build_learn_plan(
 
     # ── Node 16 schedule ──────────────────────────────────────────
     #
-    # TIER BOUNDARY NOTE: The threshold schedule is computed here
-    # (Policy tier) assuming CPU-style rendering where
-    # workgroup_size == total_modules (no pre-accumulation).  For
-    # GPU backends with workgroup-limited pre-accumulation, the
-    # Orchestration tier must re-render the schedule from the
-    # abstract policy parameters (CONCEPT.md §5, §11 item 4).
-    # This is acceptable for the initial CPU-backend implementation;
-    # a backend-neutral schedule representation should be introduced
-    # when a GPU backend is integrated.
+    # The threshold schedule is computed here (Policy tier) assuming
+    # CPU-style rendering where workgroup_size == total_modules (no
+    # pre-accumulation).  For GPU backends with workgroup-limited
+    # pre-accumulation, the Orchestration tier must re-render the
+    # schedule from the abstract policy parameters (CONCEPT.md §5,
+    # §11 item 4).
 
-    n16_max_k = policy.get_specialized_reduction_policy_k(
-        spec.num_modules, hardware.max_reduce_fan_in,
+    n16_sched = policy.render_node16_schedule(
+        total_modules=spec.num_modules,
+        workgroup_size=spec.num_modules,  # CPU-style: W = M
+        hardware_max_fan_in=hardware.max_reduce_fan_in,
     )
-    n16_stages, n16_t_pre, n16_schedule = policy.render_node16_schedule(
-        spec.num_modules, spec.num_modules, n16_max_k,
-    )
+    n16_stages = n16_sched.num_stages
+    n16_t_pre = n16_sched.pre_accumulation_threshold
+    n16_schedule = n16_sched.stage_thresholds
+
     b_n16_sched = alloc.allocate(
         "clipping_threshold_per_stage", (max(1, n16_stages),),
         ec, BufferRole.BATCH_INTERMEDIATE, "compute",
@@ -1424,7 +1436,6 @@ def build_learn_plan(
             "src_scalar_NATURAL_total_modules_count": spec.num_modules,
             "src_scalar_NATURAL_padded_total_modules_count": spec.padded_module_dim,
         },
-        tile_count=1,
     )
     alloc.set_producer(b_summed_h, n16)
     alloc.add_consumer(b_permuted_h, n16)
@@ -1528,25 +1539,24 @@ def build_learn_plan(
         SHARED_BIASES.name: b_coll_sb,
     }
 
-    # ── Node 19 leaf safety ceiling (CONCEPT §3.4) ───────────────
+    # ── Node 19 leaf safety ceiling (CONCEPT.md §3.4) ────────────
     #
     # Node 19 clips each streaming chunk's concatenated (weights,
     # biases) gradient vector before it enters the collection
-    # buffer.  The reduction tree (Node 20) sums K of these clipped
-    # partials at its first stage.  For the stage-0 summation not
-    # to overflow: K × T_pre ≤ cfm.
+    # buffer.  The downstream reduction tree (Node 20) sums K of
+    # these clipped partials at its first stage.  For the stage-0
+    # summation not to overflow: K × T_pre ≤ cfm.
     #
     # The algorithmic component of the threshold (Quadratic Scaling
     # Policy) is applied within the Node 20 reduction tree, not
     # here — Node 19's threshold is purely a safety ceiling.
-    node19_leaf_threshold = _compute_leaf_safety_ceiling(
-        policy, hardware, n_stream,
+    node19_leaf_threshold = policy.leaf_safety_ceiling(
+        n_stream, hardware.max_reduce_fan_in,
     )
 
     # ── Streaming loop body ───────────────────────────────────────
 
     LOOP_ID = "streaming_backprop_loop"
-    grad_h_done = frozenset({n16})
 
     n17_id = "backprop_shared_weights_chunk"
     n18_id = "backprop_shared_biases_chunk"
@@ -1574,7 +1584,6 @@ def build_learn_plan(
             "src_scalar_NATURAL_padded_hidden_count": spec.padded_hidden_dim,
             "src_scalar_NATURAL_final_grad_hidden_activations_total_count": grad_h_total,
         },
-        tile_count=1,
     )
 
     # Body Node 18 — no intra-body predecessors.
@@ -1596,7 +1605,6 @@ def build_learn_plan(
             "src_scalar_NATURAL_padded_hidden_count": spec.padded_hidden_dim,
             "src_scalar_NATURAL_final_grad_hidden_activations_total_count": grad_h_total,
         },
-        tile_count=1,
     )
 
     # Body Node 19 — waits for both siblings within each iteration.
@@ -1617,7 +1625,6 @@ def build_learn_plan(
             "out_scalar_NATURAL_biases_write_offset": 0,
             "src_scalar_NATURAL_num_batch_chunks": n_stream,
         },
-        tile_count=1,
     )
 
     # ── Lifecycle: attribute loop-managed buffers to LOOP_ID ──────
@@ -1630,10 +1637,12 @@ def build_learn_plan(
 
     for h in (b_scratch_sw, b_scratch_sb, b_coll_sw, b_coll_sb):
         alloc.set_producer(h, LOOP_ID)
-    for h in (inputs.input_data, fwd.hidden, fwd.hidden_mask,
+    for h in (inputs.input_data, fwd.hidden,
               b_summed_h, inputs.sample_mask,
               b_scratch_sw, b_scratch_sb):
         alloc.add_consumer(h, LOOP_ID)
+    if flag_mask:
+        alloc.add_consumer(fwd.hidden_mask, LOOP_ID)
 
     # ── Assemble the streaming loop node ──────────────────────────
 
@@ -1646,18 +1655,18 @@ def build_learn_plan(
         body=(n17_id, n18_id, n19_id),
         parameter_strides=(
             ParameterStride(
-                "src_scalar_NATURAL_batch_chunk_offset",
-                base=0, stride=stream_chunk_sz,
+                param_name="src_scalar_NATURAL_batch_chunk_offset",
+                stride=stream_chunk_sz,
                 target_nodes=frozenset({n17_id, n18_id}),
             ),
             ParameterStride(
-                "out_scalar_NATURAL_weights_write_offset",
-                base=0, stride=sw_count,
+                param_name="out_scalar_NATURAL_weights_write_offset",
+                stride=sw_count,
                 target_nodes=frozenset({n19_id}),
             ),
             ParameterStride(
-                "out_scalar_NATURAL_biases_write_offset",
-                base=0, stride=sb_count,
+                param_name="out_scalar_NATURAL_biases_write_offset",
+                stride=sb_count,
                 target_nodes=frozenset({n19_id}),
             ),
         ),
@@ -1666,7 +1675,7 @@ def build_learn_plan(
     )
     nodes[LOOP_ID] = StreamingLoopNode(
         node_id=LOOP_ID,
-        depends_on=grad_h_done,
+        depends_on=frozenset({n16}),
         streaming_plan=streaming_plan,
         body_nodes=(body_n17, body_n18, body_n19),
     )

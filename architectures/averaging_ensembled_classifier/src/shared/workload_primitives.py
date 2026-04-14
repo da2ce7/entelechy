@@ -1,3 +1,4 @@
+# src/shared/workload_primitives.py
 """Foundational, stateless primitives for workload decomposition.
 
 This module provides the vocabulary that the Policy tier's plan-construction
