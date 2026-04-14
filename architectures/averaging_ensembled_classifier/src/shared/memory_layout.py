@@ -1,193 +1,464 @@
-# memory_layout.py
+# src/shared/memory_layout.py
+"""Padded dimension synthesis (CONCEPT.md §11, CONTRACT §3.3).
 
+Resolves logical model dimensions into padded physical extents by
+unifying alignment constraints across all precision roles.
+
+The core problem
+────────────────
+A single dimension like ``hidden_count`` governs buffers in multiple
+precision roles (storage, state, compute), each imposing independent
+alignment requirements:
+
+    Storage-role activations:   CACHE → hidden × sizeof(STORAGE) ≡ 0 (mod 128)
+    State-role module weights:  CACHE → hidden × sizeof(STATE)   ≡ 0 (mod 128)
+    State-role shared weights:  SIMD  → hidden ≡ 0 (mod SIMD_WIDTH)
+
+Each requirement reduces to an element-count divisibility constraint.
+The padded extent is the smallest value ≥ logical satisfying all
+constraints simultaneously — computed as::
+
+    alignment = lcm(all constraint multiples)
+    padded    = ⌈logical / alignment⌉ × alignment
+
+Example: ``hidden_count=200``, ``SIMD_WIDTH=8``,
+``PrecisionConfig.fp8_e4m3()`` (1-byte storage, 4-byte state):
+
+    CACHE @ storage (1B elem):  128 / gcd(128, 1) = 128-element multiple
+    CACHE @ state   (4B elem):  128 / gcd(128, 4) =  32-element multiple
+    SIMD  (width=8):                                   8-element multiple
+
+    alignment = lcm(128, 32, 8) = 128
+    padded_hidden = ⌈200 / 128⌉ × 128 = 256
+
+Under ``PrecisionConfig.float32()`` (4-byte storage, 4-byte state):
+
+    CACHE @ storage (4B elem):  32-element multiple
+    CACHE @ state   (4B elem):  32-element multiple  (deduplicates)
+    SIMD  (width=8):             8-element multiple
+
+    alignment = lcm(32, 8) = 32
+    padded_hidden = ⌈200 / 32⌉ × 32 = 224
+
+The FP8 configuration requires wider padding (128 vs 32 elements)
+because its 1-byte elements need more elements per cache line — a
+direct expression of the Primacy of Memory Strategy's impact on
+physical layout.
+
+Organisation
+────────────
+§1  Pure arithmetic primitives — ``pad_to_multiple`` and LCM
+§2  Alignment constraints — typed requirements with diagnostic provenance
+§3  Dimension resolution — constraint unification via LCM
+§4  Model dimensions — the four canonical padded dimension sets,
+    with constraint specifications derived from ``kernels.cl.h``
+
+Authoritative sources
+─────────────────────
+CONCEPT.md §11        — Padded dimension synthesis mandate
+CONTRACT.md §3.3      — Padding Contract specification vocabulary
+kernels.cl.h rev. 10  — Per-buffer padding declarations (source of
+                         the §4 constraint sets)
 """
-The Contractual Memory Layout Abstraction.
 
-Jurisdictional Mandate:
-This module provides the canonical, compositional abstractions for translating a
-tensor's logical, human-intelligible shape into its final, device-optimized
-physical memory layout. Its sole jurisdiction is to serve as the physical
-manifestation of the `Padding Contract` rules defined within the system's C-level
-kernel headers (`kernels.cl.h`).
+from __future__ import annotations
 
-Architectural Role:
-This module provides the primitive 'nouns'—`PaddingType`, `PaddingStrategy`, and
-`MemoryLayout`—that allow the `ParameterSpace` to declaratively specify memory
-requirements. The `MemoryLayout` object is the final blueprint, consumed by the
-`BufferManager`, which executes the allocation. This architecture upholds the
-principle of "explicit is better than implicit," replacing scattered, ad-hoc
-padding logic with a centralized, verifiable, and compositional planning system.
-"""
-
-import enum
+import math
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Sequence
 
-import numpy as np
+from .precision_config import PrecisionConfig
+
+__all__ = [
+    "AlignmentConstraint",
+    "ModelDimensions",
+    "PaddedExtent",
+    "cache_constraint",
+    "pad_to_multiple",
+    "resolve_extent",
+    "resolve_model_dimensions",
+    "simd_constraint",
+]
 
 
-# =========================================================================
-# === Foundational Primitives (The Vocabulary of Physical Form)         ===
-# =========================================================================
+# ═══════════════════════════════════════════════════════════════════
+# §1  Pure Arithmetic Primitives
+# ═══════════════════════════════════════════════════════════════════
 
 
-class PaddingType(enum.Enum):
+def _ceildiv(a: int, b: int) -> int:
+    """``⌈a / b⌉``.  *b* must be positive."""
+    return (a + b - 1) // b
+
+
+def pad_to_multiple(value: int, multiple: int) -> int:
+    """Smallest integer ≥ *value* that is divisible by *multiple*.
+
+    Returns *value* unchanged when ``multiple ≤ 1``.
     """
-    The canonical, type-safe representation of the *reason* for applying padding.
+    if multiple <= 1:
+        return value
+    return _ceildiv(value, multiple) * multiple
 
-    Contractual Role:
-    This enum translates the string literals from a kernel's `Padding Contract`
-    block into a controlled, explicit vocabulary, ensuring clarity of intent and
-    preventing errors from ambiguous or misspelled strategy types.
-    """
 
-    # WHY: Represents the null case where no padding is required.
-    NONE = enum.auto()
-    # WHY: Represents padding to meet a specific element count, typically to
-    # align a dimension with the hardware's natural SIMD vector width.
-    ELEMENT_COUNT = enum.auto()
-    # WHY: Represents padding a row's total size in bytes to a boundary,
-    # typically to align with a hardware cache line for optimal memory access.
-    BYTE_ALIGNMENT = enum.auto()
+def _lcm(a: int, b: int) -> int:
+    """Least common multiple of two positive integers."""
+    return a * b // math.gcd(a, b)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §2  Alignment Constraints
+# ═══════════════════════════════════════════════════════════════════
 
 
 @dataclass(frozen=True)
-class PaddingStrategy:
-    """
-    Defines a single, atomic padding rule for one dimension of a tensor.
+class AlignmentConstraint:
+    """A resolved element-count divisibility requirement.
 
-    Contractual Role:
-    This is the fundamental, immutable building block of a memory layout plan.
-    It is a pure data contract, carrying a single, unambiguous instruction. A
-    complex `MemoryLayout` is constructed by composing these simple rules.
-    """
+    Expresses: ``padded_extent ≡ 0 (mod multiple)``.
 
-    # WHY: Enforces that the strategy's purpose is chosen from the controlled
-    # vocabulary defined in `PaddingType`, preventing ambiguity.
-    type: PaddingType
-    # WHY: Carries the primitive integer value of the constraint (e.g., the
-    # SIMD width `8`, or the cache line size `128` bytes).
-    value: int
-    # WHY: Explicitly declares which tensor dimension this rule applies to,
-    # conforming to standard list indexing (e.g., -1 for the last dimension).
-    # This removes all ambiguity in multi-dimensional padding scenarios.
-    target_dim_idx: int = -1
+    This is the irreducible output of converting a contractual padding
+    specification (CACHE with a dtype, or SIMD with a lane count) into
+    a concrete requirement on a dimension's element count.
 
-
-def pad_to_multiple(dim: int, multiple: int | None) -> int:
-    """A pure, stateless utility to calculate the next highest multiple."""
-    # WHY: A defensive guard. If the padding multiple is zero or None, it would
-    # cause a division-by-zero error or TypeError. This ensures the function is robust.
-    if multiple is None or multiple == 0:
-        return dim
-    return (dim + multiple - 1) // multiple * multiple
-
-
-# =========================================================================
-# === The Core Abstraction: The Declarative Memory Layout Plan          ===
-# =========================================================================
-
-
-class MemoryLayout:
-    """
-    Encapsulates the complete, compositional layout plan for a device buffer.
-
-    Contractual Role:
-    This object is the declarative blueprint passed from the `ParameterSpace` to
-    the `BufferManager`. It serves as the explicit, unambiguous instruction for
-    how a buffer's memory must be physically arranged.
+    Parameters
+    ----------
+    source:
+        Human-readable provenance for diagnostics and plan inspection
+        (e.g. ``"CACHE@storage(2B elem, 128B line)"``).
+    multiple:
+        The element-count divisor.  The padded extent must be an
+        integer multiple of this value.
     """
 
-    def __init__(self, logical_shape: Tuple[int, ...]):
-        """Initializes a layout plan with its base logical shape."""
-        # WHY: A defensive check to enforce the contract that a logical shape
-        # must be composed of non-negative integers from the moment of creation.
-        if not all(d >= 0 for d in logical_shape):
-            raise ValueError("Logical shape must be a tuple of non-negative integers.")
-        self.logical_shape: Tuple[int, ...] = logical_shape
-        self.strategies: List[PaddingStrategy] = []
+    source: str
+    multiple: int
 
-    def add_strategy(self, strategy: PaddingStrategy) -> "MemoryLayout":
+    def __post_init__(self) -> None:
+        if self.multiple < 1:
+            raise ValueError(
+                f"AlignmentConstraint multiple must be ≥ 1, "
+                f"got {self.multiple} (source: {self.source!r})"
+            )
+
+
+def cache_constraint(
+    role: str,
+    element_size: int,
+    cache_line_bytes: int = 128,
+) -> AlignmentConstraint:
+    """CACHE padding — row byte-width must be a cache-line multiple.
+
+    Converts the byte-alignment requirement from CONTRACT §3.3.1
+    to an element-count constraint::
+
+        padded × element_size ≡ 0 (mod cache_line_bytes)
+        ⟹  padded ≡ 0 (mod cache_line_bytes / gcd(cache_line_bytes, element_size))
+
+    For the architecture's standard element sizes (1, 2, 4, 8 bytes)
+    and 128-byte cache line::
+
+        FP8  (1B): 128 / gcd(128,1) = 128-element multiple
+        FP16 (2B): 128 / gcd(128,2) =  64-element multiple
+        FP32 (4B): 128 / gcd(128,4) =  32-element multiple
+        FP64 (8B): 128 / gcd(128,8) =  16-element multiple
+
+    Parameters
+    ----------
+    role:
+        Precision role name (``"storage"``, ``"compute"``,
+        ``"state"``).  For the diagnostic ``source`` string only.
+    element_size:
+        ``PrecisionConfig.<role>_dtype.itemsize``.
+    cache_line_bytes:
+        Hardware cache line size.  Defaults to 128 — the
+        architecture's standard alignment target.
+    """
+    g = math.gcd(cache_line_bytes, element_size)
+    multiple = cache_line_bytes // g
+    return AlignmentConstraint(
+        source=f"CACHE@{role}({element_size}B elem, {cache_line_bytes}B line)",
+        multiple=multiple,
+    )
+
+
+def simd_constraint(simd_width: int) -> AlignmentConstraint:
+    """SIMD padding — element count must be a SIMD-lane multiple.
+
+    Role-independent: the SIMD width is a hardware constant,
+    invariant across precision roles.
+
+    Parameters
+    ----------
+    simd_width:
+        ``HardwareProfile.simd_width``.
+    """
+    return AlignmentConstraint(
+        source=f"SIMD(width={simd_width})",
+        multiple=simd_width,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §3  Dimension Resolution
+# ═══════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class PaddedExtent:
+    """A resolved dimension carrying both logical and physical extents.
+
+    Produced by :func:`resolve_extent`.  Carries the numeric result
+    and the constraint provenance for plan inspection and diagnostics.
+
+    Parameters
+    ----------
+    name:
+        Canonical dimension name (e.g. ``"hidden"``).
+    logical:
+        Original unpadded element count.
+    padded:
+        Physical element count satisfying all constraints — the
+        value used for buffer allocation and kernel scalar injection.
+    alignment:
+        LCM of all constraint multiples.  ``padded`` is always a
+        multiple of ``alignment``.  1 when no constraints apply.
+    constraints:
+        The constraints that produced this result (frozen provenance).
+    """
+
+    name: str
+    logical: int
+    padded: int
+    alignment: int
+    constraints: tuple[AlignmentConstraint, ...]
+
+    @property
+    def padding_elements(self) -> int:
+        """Number of padding elements: ``padded - logical``."""
+        return self.padded - self.logical
+
+    @property
+    def is_padded(self) -> bool:
+        """Whether any padding was applied."""
+        return self.padded != self.logical
+
+
+def resolve_extent(
+    name: str,
+    logical: int,
+    constraints: Sequence[AlignmentConstraint],
+) -> PaddedExtent:
+    """Resolve a logical dimension to its padded extent.
+
+    Computes ``alignment = lcm(c.multiple for c in constraints)``
+    then ``padded = ⌈logical / alignment⌉ × alignment``.
+
+    When *constraints* is empty, ``alignment = 1`` and
+    ``padded = logical`` (the identity case).
+
+    Parameters
+    ----------
+    name:
+        Canonical dimension name for the result.
+    logical:
+        Unpadded element count (≥ 0).
+    constraints:
+        Alignment requirements to unify.
+
+    Raises
+    ------
+    ValueError
+        If *logical* is negative.
+    """
+    if logical < 0:
+        raise ValueError(
+            f"logical extent must be ≥ 0 for dimension {name!r}, "
+            f"got {logical}"
+        )
+
+    frozen = tuple(constraints)
+    alignment = 1
+    for c in frozen:
+        alignment = _lcm(alignment, c.multiple)
+
+    return PaddedExtent(
+        name=name,
+        logical=logical,
+        padded=pad_to_multiple(logical, alignment),
+        alignment=alignment,
+        constraints=frozen,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §4  Model Dimensions
+# ═══════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class ModelDimensions:
+    """Resolved padded extents for all four model dimensions.
+
+    Produced by :func:`resolve_model_dimensions`.  Provides typed
+    attribute access for self-documenting code and name-based lookup
+    for generic plan-builder iteration.
+
+    Parameters
+    ----------
+    input:
+        ``padded_input_count`` — shared-layer feature dimension.
+    hidden:
+        ``padded_hidden_count`` — shared-layer activation dimension.
+    output_classes:
+        ``padded_total_output_class_count`` — classifier output.
+    modules:
+        ``padded_total_modules_count`` — classifier module count.
+    """
+
+    input: PaddedExtent
+    hidden: PaddedExtent
+    output_classes: PaddedExtent
+    modules: PaddedExtent
+
+    def __getitem__(self, name: str) -> PaddedExtent:
+        """Look up by canonical dimension name.
+
+        Raises ``KeyError`` for unrecognised names.
         """
-        Applies a padding strategy to the plan.
+        for ext in self._all():
+            if ext.name == name:
+                return ext
+        raise KeyError(
+            f"Unknown dimension {name!r}; "
+            f"known: {[e.name for e in self._all()]}"
+        )
 
-        Architectural Mandate:
-        This method returns `self` to enable a fluent, compositional interface.
-        This allows the `ParameterSpace` to describe complex, multi-rule layouts
-        in a highly readable, declarative style, improving maintainability.
-        """
-        # WHY: Ensures that only valid `PaddingStrategy` objects can be added
-        # to the plan, upholding the integrity of the layout contract.
-        self.strategies.append(strategy)
-        return self
+    def __iter__(self):
+        """Iterate over all four extents in canonical order."""
+        return iter(self._all())
 
-    def get_padded_shape(self, dtype: np.dtype) -> Tuple[int, ...]:
-        """
-        Synthesizes the final physical (padded) shape from all applied strategies.
+    def _all(self) -> tuple[PaddedExtent, ...]:
+        return (self.input, self.hidden, self.output_classes, self.modules)
 
-        Architectural Mandate:
-        This is the method where the declarative plan is made concrete. It is
-        contractually obligated to apply all strategies in the order they were
-        added, allowing for the correct resolution of compound padding rules.
-        """
-        # WHY: A trivial performance optimization. If there are no strategies,
-        # the physical shape is identical to the logical shape.
-        if not self.strategies:
-            return self.logical_shape
 
-        padded_shape = list(self.logical_shape)
-        # WHY: The size of the fundamental data type is essential for any
-        # byte-based alignment calculations. This makes the method self-sufficient.
-        element_size_bytes = np.dtype(dtype).itemsize
+def resolve_model_dimensions(
+    *,
+    input_dim: int,
+    hidden_dim: int,
+    output_classes: int,
+    num_modules: int,
+    precision: PrecisionConfig,
+    simd_width: int,
+    cache_line_bytes: int = 128,
+) -> ModelDimensions:
+    """Resolve all model dimensions to their padded extents.
 
-        for strategy in self.strategies:
-            if strategy.type == PaddingType.NONE:
-                continue
+    Constraint sets are derived from the kernel contracts
+    (``kernels.cl.h`` rev. 10).  Each set is annotated with the
+    contract provisions — buffer names and node numbers — that
+    establish its requirements.
 
-            dim_idx = strategy.target_dim_idx
-            if dim_idx < 0:
-                dim_idx += len(padded_shape)
+    When a future kernel revision adds or changes a dimension's
+    padding requirements, update the constraint tuples below and
+    add a comment citing the new provision.
 
-            # WHY: A defensive check ensuring the strategy is valid for the rank
-            # of the tensor being planned, preventing runtime indexing errors.
-            if not (0 <= dim_idx < len(padded_shape)):
-                raise IndexError(
-                    f"PaddingStrategy has invalid target_dim_idx {strategy.target_dim_idx} "
-                    f"for shape with {len(padded_shape)} dimensions."
-                )
+    Parameters
+    ----------
+    input_dim:
+        Logical input feature count.
+    hidden_dim:
+        Logical hidden-layer unit count.
+    output_classes:
+        Logical output class count (per module).
+    num_modules:
+        Number of classifier modules (heads).
+    precision:
+        Active three-role precision configuration.
+    simd_width:
+        Hardware SIMD lane count (``HardwareProfile.simd_width``).
+    cache_line_bytes:
+        Hardware cache line size in bytes.
+    """
+    s = precision.storage_dtype.itemsize
+    st = precision.state_dtype.itemsize
+    cl = cache_line_bytes
 
-            current_dim_size = padded_shape[dim_idx]
+    # ── padded_input_count ────────────────────────────────────────
+    #
+    # CACHE @ storage:
+    #   Node 4  src_buffer_GLOBAL_input
+    #   Node 17 src_buffer_GLOBAL_input
+    #   Node 17 dest_buffer_GLOBAL_partial_grad_weights_shared_simd_major
+    #
+    # CACHE @ state:
+    #   Node 4  src_buffer_GLOBAL_CONST_weights_shared_simd_major
+    #           (input dim = dim[1])
+    #
+    input_ext = resolve_extent("input", input_dim, (
+        cache_constraint("storage", s, cl),
+        cache_constraint("state", st, cl),
+    ))
 
-            if strategy.type == PaddingType.ELEMENT_COUNT:
-                padded_shape[dim_idx] = pad_to_multiple(current_dim_size, strategy.value)
+    # ── padded_hidden_count ───────────────────────────────────────
+    #
+    # CACHE @ storage:
+    #   Node 4  dest_buffer_GLOBAL_hidden_activations
+    #   Node 4  dest_buffer_GLOBAL_hidden_mask
+    #   Node 5  src_buffer_GLOBAL_hidden_activations
+    #   Node 8  dest_buffer_GLOBAL_partial_grad_weights_module (dim[3])
+    #   Node 9  dest_buffer_GLOBAL_partial_grad_hidden_activations_aos
+    #   Node 11 src/dest clipped grad buffers
+    #   Node 13 src/dest permuted SoA buffers
+    #   Node 18 dest_buffer_GLOBAL_partial_grad_biases_shared
+    #
+    # CACHE @ state:
+    #   Node 5  src_buffer_GLOBAL_CONST_weights_module (dim[1])
+    #
+    # SIMD (role-independent):
+    #   Node 4  src_buffer_GLOBAL_CONST_weights_shared_simd_major
+    #           (dim[0] = padded_hidden/SIMD_WIDTH requires divisibility)
+    #   Node 4  src_buffer_GLOBAL_CONST_biases_shared
+    #
+    hidden_ext = resolve_extent("hidden", hidden_dim, (
+        cache_constraint("storage", s, cl),
+        cache_constraint("state", st, cl),
+        simd_constraint(simd_width),
+    ))
 
-            elif strategy.type == PaddingType.BYTE_ALIGNMENT:
-                # WHY: This check enforces a critical architectural constraint.
-                # For a contiguous, row-major memory layout, padding a row's
-                # byte-stride is only physically achievable by increasing the
-                # number of elements in the *last* dimension of that row-slice.
-                # This check makes a subtle but fundamental rule explicit.
-                if dim_idx != len(padded_shape) - 1:
-                    raise ValueError(
-                        "BYTE_ALIGNMENT padding is only logically sound for the last dimension "
-                        "in a contiguous row-major memory layout."
-                    )
+    # ── padded_total_output_class_count ───────────────────────────
+    #
+    # SIMD (role-independent):
+    #   Node 5  src_buffer_GLOBAL_CONST_weights_module (dim[2])
+    #   Node 5  src_buffer_GLOBAL_CONST_biases_module
+    #   Node 8  dest_buffer_GLOBAL_partial_grad_weights_module (dim[4])
+    #   Node 8  dest_buffer_GLOBAL_partial_grad_biases_module (dim[3])
+    #   Node 11 src/dest clipped grad weight/bias buffers
+    #
+    # CACHE @ storage:
+    #   Node 5  dest_buffer_GLOBAL_logits
+    #   Node 7  src_buffer_GLOBAL_targets (BCE multi-hot)
+    #
+    classes_ext = resolve_extent("output_classes", output_classes, (
+        simd_constraint(simd_width),
+        cache_constraint("storage", s, cl),
+    ))
 
-                row_elements = current_dim_size
-                row_bytes = row_elements * element_size_bytes
-                padded_row_bytes = pad_to_multiple(row_bytes, strategy.value)
+    # ── padded_total_modules_count ────────────────────────────────
+    #
+    # CACHE @ storage:
+    #   Node 13 dest_buffer_GLOBAL_clipped_grad_hidden_activations_
+    #           permuted_soa (dim[1])
+    #   Node 16 src_buffer_GLOBAL_clipped_grad_hidden_activations_
+    #           permuted_soa (dim[1])
+    #
+    modules_ext = resolve_extent("modules", num_modules, (
+        cache_constraint("storage", s, cl),
+    ))
 
-                # WHY: A CONTRACTUAL VERIFICATION. This is a critical sanity check.
-                # It is physically impossible for a padded row's byte count to
-                # not be perfectly divisible by the size of a single element. This
-                # check prevents the creation of a physically unrealizable plan.
-                if padded_row_bytes % element_size_bytes != 0:
-                    raise ValueError(
-                        f"Byte alignment padding of {strategy.value} bytes is invalid. "
-                        f"It results in a padded row of {padded_row_bytes} bytes, which is not "
-                        f"divisible by the element size of {element_size_bytes} bytes."
-                    )
-
-                padded_shape[dim_idx] = padded_row_bytes // element_size_bytes
-
-        return tuple(padded_shape)
+    return ModelDimensions(
+        input=input_ext,
+        hidden=hidden_ext,
+        output_classes=classes_ext,
+        modules=modules_ext,
+    )
