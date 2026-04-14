@@ -48,6 +48,107 @@ Key invariants
   architecturally complete but unretrieved.  For BCE, the tiled partial
   loss buffer would require a Node-14 ``ReductionTreeNode`` for
   aggregation; this is a known gap.
+
+Known limitations vs. CONCEPT.md
+─────────────────────────────────
+
+**Guarded divergences** (``NotImplementedError`` at construction time):
+
+1. **Activation cache strategy** (CONCEPT §11 item 2):
+   Only ``"recompute"`` is supported.  The cache strategy would
+   eliminate the Learn plan's forward recomputation but requires
+   cross-plan buffer persistence, which violates the current plan
+   isolation model (CONCEPT §10: *"No device buffers persist across
+   plan boundaries"*).
+
+2. **Batch-chunk decomposition** (CONCEPT §11 item 1):
+   ``num_batch_chunks`` is fixed at 1.  Supporting >1 requires
+   reshaping Node 8's output to 5D, inserting a batch-chunk
+   ``ReductionTreeNode`` per tile, and a ``narrow_to_storage``
+   Precision Bridge when ``storage_dtype != compute_dtype``.
+
+3. **Multi-tile Act plan** (CONCEPT §6 DAG, Node 14):
+   Probability tiles from different ``(module_chunk, class_chunk)``
+   regions are disjoint — assembly requires a scatter kernel not in
+   the current vocabulary.  The Learn plan handles multi-tile
+   correctly.
+
+4. **Non-divisible streaming chunk size**:
+   ``StreamingLoopPlan`` uses fixed per-iteration strides.  A
+   variable-size tail chunk is not expressible.
+
+**Absent features** (no guard, documented here):
+
+5. **Per-module operating mode** (CONCEPT §1 item 1):
+   A single ``ProblemTypeSpec`` governs the entire plan.  Per-module
+   CCE/BCE heterogeneity requires per-module loss dispatch, target
+   buffers, and FLAG injection — not yet supported.
+
+6. **Loss retrieval in Learn plan** (CONCEPT §6 DAG):
+   Neither CCE nor BCE mode exposes a loss ``RetrievalNode`` in the
+   Learn plan.  The loss buffer is allocated and written (the kernel
+   requires a valid destination) but is architecturally unretrieved.
+   CONCEPT §4 does not mandate Learn-plan loss retrieval.
+
+7. **Precision Bridge dispatch** (CONCEPT §5):
+   ``narrow_to_storage`` is never emitted because the sole use case
+   (batch-chunk reduction output → Node 11) is blocked by limitation
+   #2.  The current DAG has no compute→storage edges lacking a
+   natural conversion.
+
+8. **Per-item threshold override** (CONCEPT §3.5):
+   ``src_scalar_FLAG_use_per_item_norm`` is hardcoded to 0.
+   Non-uniform per-tile regularisation has no plan-builder entry
+   point.
+
+9. **Full-Group-Wise clipping** (CONCEPT §3.5):
+   Only the default Component-Wise / Partial-Group-Wise combination
+   is implemented.  CONCEPT describes this as a *"specialized,
+   scientific execution path"* at significant cost.
+
+**Simplifying assumptions:**
+
+10. **Node 16 schedule is CPU-only** (CONCEPT §11 item 4):
+    The plan carries a concrete threshold schedule rendered with
+    ``workgroup_size = total_modules`` (no pre-accumulation).  GPU
+    backends with workgroup-limited pre-accumulation must re-render
+    from abstract policy parameters.  A future revision should carry
+    the policy parameters alongside (or instead of) the concrete
+    schedule.
+
+11. **Tiling heuristic is opaque** (CONCEPT §11 item 1):
+    ``_derive_tiling`` caps chunk sizes at ``simd_width``.  When
+    either model dimension exceeds ``simd_width``, the Act plan is
+    rejected (limitation #3).  The user cannot influence tiling
+    directly — an implicit coupling between ``simd_width`` and
+    Act-plan viability.
+
+12. **``final_batch_event`` uses a sentinel buffer**:
+    ``RetrievalNode`` semantics imply a D2H transfer, but
+    ``final_batch_event`` is a pure completion signal (CONCEPT §4).
+    The sentinel ``source_buffer`` may trigger an unnecessary D2H
+    copy.  Extending the plan vocabulary to support event-only
+    retrieval nodes is deferred per CONCEPT §1 (Architectural
+    Elegance Feedback).
+
+13. **Plan-time optimizer constants** (CONCEPT §11 item 7):
+    ``beta1_pow_t`` and ``beta2_pow_t`` are baked into the plan at
+    construction time.  A new plan must be constructed for every
+    training step.  This is architecturally correct (CONCEPT §10:
+    *"Explicit batch submission"*) but means Learn plans are
+    non-reusable across steps.
+
+14. **Module-dimension phantom positions in tiled buffers**:
+    When ``num_modules`` is not divisible by ``modules_per_chunk``,
+    the last module chunk's tiles contain phantom module positions.
+    Kernel contracts (Nodes 6/7, 8, 9, 10) receive
+    ``total_modules_count`` for bounds checking, but the plan
+    builder does not mandate ``ZERO_REQUIRED`` for the ``partial_probs``
+    buffer's phantom positions.  Correct kernel implementations must
+    skip or zero phantom modules within their tiles.  In practice,
+    the Act plan rejects multi-tile (limitation #3), and the Learn
+    plan's phantom positions are neutralised by downstream norm-based
+    clipping (Node 11).
 """
 from __future__ import annotations
 
@@ -248,7 +349,7 @@ class _BufferAllocator:
     def set_producer(self, handle: BufferHandle, node_id: str) -> None:
         prior = self._producers.get(handle)
         if prior is not None:
-            raise AssertionError(
+            raise ValueError(
                 f"Buffer {self._descs[handle].logical_name!r} already has "
                 f"producer {prior!r}; cannot reassign to {node_id!r}"
             )
@@ -338,6 +439,8 @@ class _ForwardSubgraph:
     write-only.  The allocation is necessary because the kernel requires
     a valid destination buffer regardless of whether its output is
     consumed.
+
+    See Known Limitation #6 (loss retrieval in Learn plan).
     """
 
     node_ids: tuple[str, ...]
@@ -400,6 +503,10 @@ def _allocate_batch_inputs(
     Target buffer shape and element size are determined by the
     ``ProblemTypeSpec``, which encapsulates the CCE/BCE divergence
     (CONTRACT Article 8 §7.0).
+
+    Note — Known Limitation #5: a single ``ProblemTypeSpec`` governs
+    the entire plan.  Per-module CCE/BCE heterogeneity is not yet
+    supported.
     """
     es = spec.precision.storage_dtype.itemsize
     return _BatchInputBuffers(
@@ -464,10 +571,17 @@ def _derive_tiling(
 
     The heuristic selects chunk sizes up to ``simd_width``, capped by
     the dimension's extent.  This can produce multi-tile geometries
-    when ``num_modules`` *and* ``output_classes`` both exceed their
+    when ``num_modules`` *and/or* ``output_classes`` exceed their
     respective chunk sizes.  Multi-tile Act plans are not yet
     supported (per CONCEPT.md §1, Architectural Elegance Feedback);
     ``build_act_plan`` rejects them at construction time.
+
+    Known Limitation #11: this heuristic creates an implicit coupling
+    between ``simd_width`` and Act-plan viability.  When either model
+    dimension exceeds ``simd_width``, the Act plan is rejected by
+    limitation #3.  The user cannot influence tiling directly —
+    adjusting ``simd_width`` in the ``HardwareProfile`` or reducing
+    the model dimensions are the available workarounds.
     """
     base = max(1, hardware.simd_width)
     mc = min(base, max(1, spec.num_modules))
@@ -543,7 +657,8 @@ def _build_forward_subgraph(
     Loss output is architecturally write-only — no downstream kernel in
     either the Act or Learn plan consumes it.  The allocation and
     dispatch are necessary because the kernel requires a valid
-    destination buffer regardless of consumption.
+    destination buffer regardless of consumption.  See Known
+    Limitation #6 (loss retrieval).
 
     All CCE/BCE structural divergence (loss shape, init contract,
     binding key) is delegated to ``ProblemTypeSpec``.
@@ -574,6 +689,11 @@ def _build_forward_subgraph(
         "hidden_activations", (batch_size, spec.padded_hidden_dim),
         es, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
+    # When flag_mask=0, this is a minimal 1-element stub.  It is still
+    # bound to downstream kernels (Nodes 5, 17, 18) as a conditional-
+    # access buffer (CONTRACT §3.6: "Host MAY pass a minimal stub").
+    # Consumer registration is unconditional so the lifecycle manager
+    # can track the handle regardless of the flag value.
     b_mask = alloc.allocate(
         "hidden_mask",
         (batch_size, spec.padded_hidden_dim) if flag_mask else (1,),
@@ -584,10 +704,18 @@ def _build_forward_subgraph(
         (spec.num_modules, batch_size, spec.padded_class_dim),
         es, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
+    # NOTE (Known Limitation #14): when num_modules is not divisible by
+    # modules_per_chunk, the last module chunk's tiles contain phantom
+    # module positions.  This buffer has no ZERO_REQUIRED init; correct
+    # kernel implementations must skip or zero phantom modules.
     b_probs = alloc.allocate(
         "partial_probs", (tc, mpc, batch_size, cpc),
         es, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
+    # Known Limitation #6: this buffer is architecturally write-only —
+    # no downstream Learn-plan node reads it.  For BCE, aggregation via
+    # a Node-14 ReductionTreeNode is not yet implemented.  For CCE, the
+    # scatter-written value is final but unretrieved (no RetrievalNode).
     b_loss = alloc.allocate(
         "loss_output",
         strategy.loss_shape(
@@ -660,11 +788,12 @@ def _build_forward_subgraph(
         },
     )
     alloc.set_producer(b_logits, n5)
-    for h in (b_hidden, inputs.sample_mask,
+    # b_mask registered unconditionally — the handle IS bound to Node 5
+    # regardless of flag_mask.  The flag controls kernel-internal read
+    # behaviour, not plan-level binding or lifecycle tracking.
+    for h in (b_hidden, b_mask, inputs.sample_mask,
               state.module_weights, state.module_biases):
         alloc.add_consumer(h, n5)
-    if flag_mask:
-        alloc.add_consumer(b_mask, n5)
 
     # ── Node 6/7: loss computation ───────────────────────────────
     #
@@ -799,7 +928,15 @@ class _GradientChainSpec:
     For the last module chunk the gradient buffer may be over-allocated
     relative to the adam kernel's ``parameter_count``.  The kernel reads
     only ``[0, parameter_count)``; trailing padding elements are
-    architecturally dead.
+    architecturally dead.  This is a minor deviation from the adam
+    contract's literal ``"allocate exactly [parameter_count × ...]"``
+    wording, but is functionally correct because:
+
+    * The adam kernel never reads beyond ``parameter_count``.
+    * Trailing positions contain zero from the reduction of
+      zero-padded partials.
+    * The ``total_parameter_count`` scalar and ``parameter_offset``
+      accurately address the state buffer.
     """
 
     group: ParameterGroup
@@ -884,6 +1021,10 @@ def _build_gradient_chain(
     # ── Adam update ───────────────────────────────────────────────
 
     aid = group.adam_node_id(chain.mc)
+    # NOTE: b_final has buf_elems elements; adam reads [0, param_slice.count).
+    # Over-allocation for the last module chunk is architecturally harmless
+    # — trailing positions contain zeros from the reduction of zero-padded
+    # partials, and the kernel never accesses beyond parameter_count.
     nodes[aid] = _dispatch(
         aid, frozenset({nid}),
         KERNEL_REGISTRY["adam_update"],
@@ -958,11 +1099,19 @@ def build_act_plan(
     tiles from different ``(module_chunk, class_chunk)`` regions are
     disjoint, not additive — assembly requires a dedicated scatter
     kernel.  Multi-tile assembly is deferred per CONCEPT.md §1
-    (Architectural Elegance Feedback).
+    (Architectural Elegance Feedback).  See Known Limitation #3.
 
     For model configurations that produce a multi-tile geometry,
     either reduce the model dimensions or adjust the hardware
-    profile's ``simd_width`` to constrain the tiling.
+    profile's ``simd_width`` to constrain the tiling.  The tiling
+    heuristic (``_derive_tiling``) caps chunk sizes at ``simd_width``;
+    when either ``num_modules`` or ``output_classes`` exceeds
+    ``simd_width``, a multi-tile geometry results and this function
+    raises ``NotImplementedError``.  See Known Limitation #11.
+
+    Note (Known Limitation #5): a single ``ProblemTypeSpec`` governs
+    the entire plan.  Per-module CCE/BCE heterogeneity is not yet
+    supported by the plan builder.
     """
     alloc = _BufferAllocator()
     tiling = _derive_tiling(model_spec, hardware)
@@ -970,7 +1119,10 @@ def build_act_plan(
     if tiling.total_tiles > 1:
         raise NotImplementedError(
             f"Multi-tile probability assembly requires a dedicated "
-            f"scatter kernel (total_tiles={tiling.total_tiles}).  "
+            f"scatter kernel (total_tiles={tiling.total_tiles}, "
+            f"modules_per_chunk={tiling.modules.chunk_size}, "
+            f"classes_per_chunk={tiling.classes.chunk_size}, "
+            f"simd_width={hardware.simd_width}).  "
             f"Per CONCEPT.md §1: suspend, formalise, then implement."
         )
 
@@ -1035,20 +1187,38 @@ def build_learn_plan(
         Defaults to *batch_size* (all valid).
     activation_lifecycle:
         ``"recompute"`` re-runs Nodes 4–7 from stored inputs.
+        See Known Limitation #1.
     temp_min, temp_max:
         Temperature clamping bounds for Node 25.
     streaming_chunk_size:
         Number of samples per streaming-loop iteration (Nodes 17–19).
         Defaults to 1 (True Streaming: one sample per iteration).
-        Must evenly divide *batch_size* when > 1, because the
-        ``StreamingLoopPlan`` uses fixed per-iteration strides and
-        cannot express a variable-size tail chunk.
+        Must evenly divide *batch_size* when > 1.  See Known
+        Limitation #4.
+
+    Notes
+    -----
+    Known Limitation #5: a single ``ProblemTypeSpec`` governs the
+    entire plan.  Per-module CCE/BCE heterogeneity is not supported.
+
+    Known Limitation #6: the loss buffer is allocated and written
+    (the kernel requires a valid destination) but no ``RetrievalNode``
+    exposes the loss value to the host.
+
+    Known Limitation #13: ``beta1_pow_t`` and ``beta2_pow_t`` are
+    baked into the plan at construction time from *adam_step*.  A
+    new plan must be constructed for every training step.
     """
+    # ── Known Limitation #1 ───────────────────────────────────────
     if activation_lifecycle == "cache":
         raise NotImplementedError(
-            "activation_lifecycle='cache' is not yet implemented."
+            "activation_lifecycle='cache' is not yet implemented.  "
+            "The cache strategy requires cross-plan buffer persistence, "
+            "violating the current plan isolation model (CONCEPT §10).  "
+            "See Known Limitation #1."
         )
 
+    # ── Known Limitation #4 ───────────────────────────────────────
     if streaming_chunk_size < 1:
         raise ValueError(
             f"streaming_chunk_size must be ≥ 1, got {streaming_chunk_size}"
@@ -1058,7 +1228,8 @@ def build_learn_plan(
             f"streaming_chunk_size={streaming_chunk_size} does not evenly "
             f"divide batch_size={batch_size}.  Either use chunk_size=1 "
             f"(default) or ensure divisibility.  Variable-size tail "
-            f"chunks require StreamingLoopPlan extensions."
+            f"chunks require StreamingLoopPlan extensions.  "
+            f"See Known Limitation #4."
         )
 
     alloc = _BufferAllocator()
@@ -1076,16 +1247,18 @@ def build_learn_plan(
     cpc = tiling.classes.chunk_size
     flag_mask = 1 if prec.mask_strategy == "explicit" else 0
 
+    # ── Known Limitation #2 ───────────────────────────────────────
     # Batch chunking is fixed at 1.  When > 1 is eventually
     # supported, Node 8's output gains a non-trivial batch-chunk
     # axis and a ReductionTreeNode + optional Precision Bridge
-    # collapse it before Node 11 (CONCEPT.md §11 item 1).
+    # (Known Limitation #7) collapse it before Node 11
+    # (CONCEPT.md §11 item 1).
     num_batch_chunks = 1
     if num_batch_chunks != 1:
         raise NotImplementedError(
             "num_batch_chunks > 1 requires reshaping Node 8 output to 5D "
             "and inserting a batch-chunk ReductionTreeNode + optional "
-            "Precision Bridge before Node 11."
+            "Precision Bridge before Node 11.  See Known Limitation #2."
         )
 
     geos = resolve_all(spec, simd_w)
@@ -1153,9 +1326,10 @@ def build_learn_plan(
     # ── Partial gradient buffers (Node 8, 9, 10 outputs) ─────────
     #
     # Node 8's kernel contract declares a 5D shape with a
-    # num_batch_chunks axis.  Since num_batch_chunks is fixed at 1,
-    # the shape here omits the trivial dimension so the flat buffer
-    # matches Node 11's 4D input contract directly.
+    # num_batch_chunks axis.  Since num_batch_chunks is fixed at 1
+    # (Known Limitation #2), the shape here omits the trivial
+    # dimension so the flat buffer matches Node 11's 4D input
+    # contract directly.
 
     b_partial_w = alloc.allocate(
         "partial_grad_weights_module",
@@ -1201,10 +1375,10 @@ def build_learn_plan(
         es, BufferRole.BATCH_INTERMEDIATE, "storage",
     )
 
-    # Stub buffer for the per-item clipping threshold (FLAG=0 ⟹
-    # unused).  Registered as precomputed so the Orchestration tier
-    # knows to upload valid data; the value is architecturally dead
-    # when the per-item flag is not set.
+    # Known Limitation #8: per-item threshold override is not
+    # exposed.  FLAG is hardcoded to 0; the stub buffer satisfies
+    # the conditional buffer contract (CONTRACT §3.6) and is
+    # architecturally dead.
     b_clip_stub = alloc.allocate(
         "clipping_threshold_per_item_stub", (1,),
         ec, BufferRole.BATCH_INTERMEDIATE, "compute",
@@ -1220,9 +1394,10 @@ def build_learn_plan(
 
     # ── Node 11 leaf safety ceiling (CONCEPT.md §3.4) ────────────
     #
-    # The binding constraint is Node 13's class-chunk amplification:
-    # after clipping to T_pre, Node 13 sums C class-chunk tiles per
-    # element, amplifying to C × T_pre.  For non-overflow:
+    # INVARIANT: the binding constraint is Node 13's class-chunk
+    # amplification.  After clipping to T_pre, Node 13 sums C
+    # class-chunk tiles per element, amplifying to C × T_pre.
+    # For non-overflow:
     #     C × T_pre ≤ compute_fp_format_max
     #     T_pre ≤ compute_fp_format_max / C
     #
@@ -1394,12 +1569,23 @@ def build_learn_plan(
 
     # ── Node 16 schedule ──────────────────────────────────────────
     #
-    # The threshold schedule is computed here (Policy tier) assuming
-    # CPU-style rendering where workgroup_size == total_modules (no
-    # pre-accumulation).  For GPU backends with workgroup-limited
-    # pre-accumulation, the Orchestration tier must re-render the
-    # schedule from the abstract policy parameters (CONCEPT.md §5,
-    # §11 item 4).
+    # Known Limitation #10: the threshold schedule is computed here
+    # (Policy tier) assuming CPU-style rendering where
+    # workgroup_size == total_modules (no pre-accumulation).
+    #
+    # For GPU backends with workgroup-limited pre-accumulation
+    # (CONCEPT §11 item 4), each of W threads accumulates ⌈M/W⌉
+    # elements, yielding P = min(M, W) post-accumulation
+    # intermediates.  The schedule should operate over P, not M.
+    #
+    # The Orchestration tier must either:
+    # (a) Re-derive the schedule from the abstract policy parameters
+    #     (t_algorithmic, lambda_, K), which are available via the
+    #     plan's StabilizationPolicy reference, or
+    # (b) Ignore the precomputed buffer and substitute its own.
+    #
+    # A future revision should carry abstract policy parameters in
+    # the plan alongside (or instead of) the concrete schedule.
 
     n16_sched = policy.render_node16_schedule(
         total_modules=spec.num_modules,
@@ -1455,6 +1641,11 @@ def build_learn_plan(
     clip_done = frozenset({n11})
 
     _opt = optimizer if optimizer is not None else OptimizerConfig()
+    # Python float exponentiation uses FP64 arithmetic, satisfying
+    # the host-side FP64 bias-correction computation mandate
+    # (CONCEPT §11 item 7, "host computes beta1**t using FP64").
+    # Known Limitation #13: these values are baked into the plan at
+    # construction time; a new plan is needed for each training step.
     _adam: dict[str, float] = {
         "src_scalar_REAL_learning_rate": _opt.learning_rate,
         "src_scalar_REAL_beta1_pow_t": _opt.beta1 ** adam_step,
@@ -1541,11 +1732,11 @@ def build_learn_plan(
 
     # ── Node 19 leaf safety ceiling (CONCEPT.md §3.4) ────────────
     #
-    # Node 19 clips each streaming chunk's concatenated (weights,
-    # biases) gradient vector before it enters the collection
-    # buffer.  The downstream reduction tree (Node 20) sums K of
-    # these clipped partials at its first stage.  For the stage-0
-    # summation not to overflow: K × T_pre ≤ cfm.
+    # INVARIANT: Node 19 clips each streaming chunk's concatenated
+    # (weights, biases) gradient vector before it enters the
+    # collection buffer.  The downstream reduction tree (Node 20)
+    # sums K of these clipped partials at its first stage.  For the
+    # stage-0 summation not to overflow: K × T_pre ≤ cfm.
     #
     # The algorithmic component of the threshold (Quadratic Scaling
     # Policy) is applied within the Node 20 reduction tree, not
@@ -1634,15 +1825,18 @@ def build_learn_plan(
     # buffers is reflected by setting the loop as both producer and
     # consumer.  Collection buffers are produced by the loop and
     # consumed by the downstream reduction trees.
+    #
+    # fwd.hidden_mask is registered unconditionally — the handle IS
+    # bound to body nodes 17 and 18 regardless of flag_mask.  The
+    # flag controls kernel-internal read behaviour, not plan-level
+    # binding or lifecycle tracking.
 
     for h in (b_scratch_sw, b_scratch_sb, b_coll_sw, b_coll_sb):
         alloc.set_producer(h, LOOP_ID)
-    for h in (inputs.input_data, fwd.hidden,
+    for h in (inputs.input_data, fwd.hidden, fwd.hidden_mask,
               b_summed_h, inputs.sample_mask,
               b_scratch_sw, b_scratch_sb):
         alloc.add_consumer(h, LOOP_ID)
-    if flag_mask:
-        alloc.add_consumer(fwd.hidden_mask, LOOP_ID)
 
     # ── Assemble the streaming loop node ──────────────────────────
 
@@ -1714,6 +1908,13 @@ def build_learn_plan(
     # Final Retrieval
     # ═══════════════════════════════════════════════════════════════
 
+    # Known Limitation #12: RetrievalNode semantics imply a D2H
+    # transfer, but final_batch_event is a pure completion signal
+    # (CONCEPT §4).  The sentinel source_buffer (b_summed_h) may
+    # trigger an unnecessary D2H copy in a backend that faithfully
+    # implements RetrievalNode as a transfer.  Extending the plan
+    # vocabulary to support event-only nodes is deferred per
+    # CONCEPT §1 (Architectural Elegance Feedback).
     final_id = "final_batch_retrieval"
     nodes[final_id] = RetrievalNode(
         node_id=final_id,
